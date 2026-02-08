@@ -2,7 +2,7 @@
 
 An interactive command-line client for the CommerceOS API. Supports interactive REPL mode with tab completion, one-shot commands for scripting, saved connections with OS keychain integration, and cross-platform binaries for macOS, Linux, and Windows.
 
-You can find more information about the CommerceOS API in the global API documentation
+You can find more information about the CommerceOS API in the global API documentation:
 
 https://dev.heads.com/api-docs
 
