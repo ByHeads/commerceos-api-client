@@ -1,0 +1,56 @@
+[package]
+name = "api-rust"
+version = "2.0.8"
+edition = "2021"
+description = "Interactive CLI client for CommerceOS API"
+repository = "https://github.com/byheads/commerceos-api-client"
+license = "MIT"
+
+[[bin]]
+name = "api"
+path = "src/main.rs"
+
+[dependencies]
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+# HTTP client (using rustls for cross-compilation without system OpenSSL)
+reqwest = { version = "0.11", features = ["blocking", "json", "rustls-tls"], default-features = false }
+
+# JSON handling
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+# Terminal handling
+crossterm = "0.27"
+
+# Base64 encoding for Basic auth
+base64 = "0.21"
+
+# Clipboard (text-only, no image deps)
+cli-clipboard = "0.4"
+
+# Home directory expansion
+dirs = "5"
+
+# TTY detection
+atty = "0.2"
+
+# Colored output for non-TUI mode
+colored = "2"
+
+# Platform keychain for credential storage (macOS Keychain, Windows Credential Manager, Linux file-based)
+# Note: sync-secret-service requires dbus which doesn't cross-compile, so we use linux-native (file-based) for Linux
+keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
+
+# Fast release builds for development (cargo build --release)
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true
+
+# Fully optimized distribution builds (cargo build --profile dist)
+[profile.dist]
+inherits = "release"
+opt-level = 3
+lto = true

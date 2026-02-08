@@ -1,0 +1,6 @@
+.api_history
+/.claude
+/target
+/dist
+spec.json
+.DS_Store
