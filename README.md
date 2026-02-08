@@ -1,17 +1,8 @@
 # CommerceOS API Client
 
-An interactive command-line client for the [CommerceOS](https://commerceos.dev) API. Supports interactive REPL mode with tab completion, one-shot commands for scripting, saved connections with OS keychain integration, and cross-platform binaries for macOS, Linux, and Windows.
+An interactive command-line client for the CommerceOS API. Supports interactive REPL mode with tab completion, one-shot commands for scripting, saved connections with OS keychain integration, and cross-platform binaries for macOS, Linux, and Windows.
 
 ## Install
-
-### Homebrew (macOS and Linux)
-
-```sh
-brew tap byheads/heads
-brew install api
-```
-
-### Manual install
 
 Download the binary for your platform from the [latest release](https://github.com/byheads/commerceos-api-client/releases/latest):
 
