@@ -3305,6 +3305,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
         print!("{}", display_output);
         io::stdout().flush()?;
         terminal::enable_raw_mode()?;
+        state.prev_input_lines = 1;
         execute!(stdout, Print("\r\n\r\n\r\n"))?;
         render(stdout, state)?;
         return Ok(());
@@ -3567,6 +3568,8 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     terminal::enable_raw_mode()?;
 
     // Print placeholder lines and render input area
+    // Reset prev_input_lines to match the 3 placeholder lines (ruler + 1 input + hint)
+    state.prev_input_lines = 1;
     execute!(stdout, Print("\r\n\r\n\r\n"))?;
     render(stdout, state)?;
 
@@ -3932,6 +3935,107 @@ fn copy_curl(state: &AppState) -> bool {
     false
 }
 
+fn render_input_content(state: &mut AppState, width: usize) -> (String, u16, String) {
+    // Build the rendered input string with cursor and ghost text
+    let cursor_byte = char_to_byte_idx(&state.input, state.cursor_pos);
+    let input_char_len = char_len(&state.input);
+    let before_cursor = &state.input[..cursor_byte];
+    let at_cursor = state.input.chars().nth(state.cursor_pos).unwrap_or(' ');
+    let after_cursor = if state.cursor_pos < input_char_len {
+        let next_byte = char_to_byte_idx(&state.input, state.cursor_pos + 1);
+        &state.input[next_byte..]
+    } else {
+        ""
+    };
+
+    let in_file_mode = extract_file_path_context(&state.input).is_some();
+    let cursor_at_end = state.cursor_pos == input_char_len;
+    let ghost = if cursor_at_end
+        && (in_file_mode || (state.config.complete && !state.endpoints.is_empty()))
+    {
+        get_completion_ghost(state)
+    } else if !cursor_at_end && state.config.complete && !state.endpoints.is_empty() {
+        get_completion_ghost_at_cursor(state)
+    } else {
+        String::new()
+    };
+
+    let mut rendered = String::new();
+    rendered.push_str(before_cursor);
+
+    if !ghost.is_empty() {
+        if cursor_at_end {
+            let ghost_chars: Vec<char> = ghost.chars().collect();
+            if state.completions.len() > 1 {
+                rendered.push_str(&format!("\x1b[48;5;240m{}\x1b[0m", ghost_chars[0]));
+            } else {
+                rendered.push_str(&format!("\x1b[7m{}\x1b[0m", ghost_chars[0]));
+            }
+            if ghost_chars.len() > 1 {
+                rendered.push_str(&format!("\x1b[38;5;240m{}\x1b[0m", ghost_chars[1..].iter().collect::<String>()));
+            }
+        } else {
+            rendered.push_str(&format!("\x1b[38;5;240m{}\x1b[0m", ghost));
+            if at_cursor == '\n' {
+                rendered.push_str("\x1b[7m \x1b[0m");
+                rendered.push('\n');
+                rendered.push_str(after_cursor.trim_start_matches('\n'));
+            } else {
+                rendered.push_str(&format!("\x1b[7m{}\x1b[0m", at_cursor));
+                rendered.push_str(after_cursor);
+            }
+        }
+    } else {
+        if at_cursor == '\n' {
+            rendered.push_str("\x1b[7m \x1b[0m");
+            rendered.push('\n');
+            rendered.push_str(after_cursor.trim_start_matches('\n'));
+        } else {
+            rendered.push_str(&format!("\x1b[7m{}\x1b[0m", at_cursor));
+            rendered.push_str(after_cursor);
+        }
+    }
+
+    let input_line_count = visual_line_count(&rendered, width);
+
+    // Build the final output lines with hints appended to the last line
+    let lines: Vec<&str> = rendered.split('\n').collect();
+    let mut output = String::new();
+    for line in &lines[..lines.len() - 1] {
+        output.push_str(line);
+        output.push_str("\r\n");
+    }
+
+    let last_line = lines.last().unwrap_or(&"");
+    let mut final_line = last_line.to_string();
+
+    let last_input_line = state.input.split('\n').last().unwrap_or("");
+    let last_line_len = char_len(last_input_line) + char_len(&ghost) + 1;
+
+    let parts: Vec<&str> = state.input.split_whitespace().collect();
+    let uri = if parts.len() >= 2 { parts[1] } else if parts.len() == 1 && parts[0].starts_with('/') { parts[0] } else { "/" };
+    let param_hint = if state.config.complete { get_param_hint(state, uri) } else { String::new() };
+
+    if !param_hint.is_empty() {
+        let padding = width.saturating_sub(last_line_len).saturating_sub(param_hint.len());
+        if padding > 0 {
+            final_line.push_str(&" ".repeat(padding));
+            final_line.push_str(&format!("\x1b[38;5;240m{}\x1b[0m", param_hint));
+        }
+    } else if state.completions.len() > 1 {
+        let counter = format!("({}/{})", state.completion_idx + 1, state.completions.len());
+        let padding = width.saturating_sub(last_line_len).saturating_sub(counter.len());
+        if padding > 0 {
+            final_line.push_str(&" ".repeat(padding));
+            final_line.push_str(&format!("\x1b[38;5;240m{}\x1b[0m", counter));
+        }
+    }
+
+    output.push_str(&final_line);
+
+    (output, input_line_count, ghost)
+}
+
 fn render(stdout: &mut io::Stdout, state: &mut AppState) -> io::Result<()> {
     let width = state.width as usize;
     state.prev_width = state.width;
@@ -4021,114 +4125,8 @@ fn render(stdout: &mut io::Stdout, state: &mut AppState) -> io::Result<()> {
             Print(format!("{}\r\n", "  ctrl+h or esc to close".dimmed()))
         )?;
     } else {
-        // Input with cursor (using reverse video block cursor)
-        // Use character-based indexing for safe UTF-8 handling
-        let cursor_byte = char_to_byte_idx(&state.input, state.cursor_pos);
-        let input_char_len = char_len(&state.input);
-        let before_cursor = &state.input[..cursor_byte];
-        let at_cursor = state.input.chars().nth(state.cursor_pos).unwrap_or(' ');
-        let after_cursor = if state.cursor_pos < input_char_len {
-            let next_byte = char_to_byte_idx(&state.input, state.cursor_pos + 1);
-            &state.input[next_byte..]
-        } else {
-            ""
-        };
-
-        // Get ghost text for completion
-        let in_file_mode = extract_file_path_context(&state.input).is_some();
-        let cursor_at_end = state.cursor_pos == input_char_len;
-        let ghost = if cursor_at_end
-            && (in_file_mode || (state.config.complete && !state.endpoints.is_empty()))
-        {
-            get_completion_ghost(state)
-        } else if !cursor_at_end && state.config.complete && !state.endpoints.is_empty() {
-            // Mid-cursor ghost: compute completions based on URI text before cursor
-            get_completion_ghost_at_cursor(state)
-        } else {
-            String::new()
-        };
-
-        // Build the input with ghost text and cursor
-        let mut rendered = String::new();
-        rendered.push_str(before_cursor);
-
-        if !ghost.is_empty() {
-            if cursor_at_end {
-                // Cursor at end: ghost replaces the block cursor
-                let ghost_chars: Vec<char> = ghost.chars().collect();
-                if state.completions.len() > 1 {
-                    rendered.push_str(&format!("\x1b[48;5;240m{}\x1b[0m", ghost_chars[0]));
-                } else {
-                    rendered.push_str(&format!("\x1b[7m{}\x1b[0m", ghost_chars[0]));
-                }
-                if ghost_chars.len() > 1 {
-                    rendered.push_str(&format!("\x1b[38;5;240m{}\x1b[0m", ghost_chars[1..].iter().collect::<String>()));
-                }
-            } else {
-                // Mid-cursor: show ghost inline, then cursor + after_cursor
-                rendered.push_str(&format!("\x1b[38;5;240m{}\x1b[0m", ghost));
-                if at_cursor == '\n' {
-                    rendered.push_str("\x1b[7m \x1b[0m");
-                    rendered.push('\n');
-                    rendered.push_str(after_cursor.trim_start_matches('\n'));
-                } else {
-                    rendered.push_str(&format!("\x1b[7m{}\x1b[0m", at_cursor));
-                    rendered.push_str(after_cursor);
-                }
-            }
-        } else {
-            if at_cursor == '\n' {
-                // Cursor is on a newline - show block cursor as space at end of current line
-                rendered.push_str("\x1b[7m \x1b[0m");
-                rendered.push('\n');
-                rendered.push_str(after_cursor.trim_start_matches('\n'));
-            } else {
-                rendered.push_str(&format!("\x1b[7m{}\x1b[0m", at_cursor));
-                rendered.push_str(after_cursor);
-            }
-        }
-
-        // Split into logical lines (by newline characters)
-        let lines: Vec<&str> = rendered.split('\n').collect();
-
-        // Calculate visual line count accounting for terminal width wrapping
-        let input_line_count = visual_line_count(&rendered, width);
-
-        // Print all lines except last
-        for line in &lines[..lines.len() - 1] {
-            execute!(stdout, Print(format!("{}\r\n", line)))?;
-        }
-
-        // Last line gets hints/counter appended
-        let last_line = lines.last().unwrap_or(&"");
-        let mut final_line = last_line.to_string();
-
-        // Hints only on last line — use last line's visible char count
-        let last_input_line = state.input.split('\n').last().unwrap_or("");
-        let last_line_len = char_len(last_input_line) + char_len(&ghost) + 1;
-
-        let parts: Vec<&str> = state.input.split_whitespace().collect();
-        let uri = if parts.len() >= 2 { parts[1] } else if parts.len() == 1 && parts[0].starts_with('/') { parts[0] } else { "/" };
-        let param_hint = if state.config.complete { get_param_hint(state, uri) } else { String::new() };
-
-        if !param_hint.is_empty() {
-            let padding = width.saturating_sub(last_line_len).saturating_sub(param_hint.len());
-            if padding > 0 {
-                final_line.push_str(&" ".repeat(padding));
-                final_line.push_str(&format!("\x1b[38;5;240m{}\x1b[0m", param_hint));
-            }
-        } else if state.completions.len() > 1 {
-            let counter = format!("({}/{})", state.completion_idx + 1, state.completions.len());
-            let padding = width.saturating_sub(last_line_len).saturating_sub(counter.len());
-            if padding > 0 {
-                final_line.push_str(&" ".repeat(padding));
-                final_line.push_str(&format!("\x1b[38;5;240m{}\x1b[0m", counter));
-            }
-        }
-
-        execute!(stdout, Print(final_line), Print("\r\n"))?;
-
-        // Track input line count for clearing on next render
+        let (input_output, input_line_count, _ghost) = render_input_content(state, width);
+        execute!(stdout, Print(&input_output), Print("\r\n"))?;
         state.prev_input_lines = input_line_count;
     }
 
@@ -5133,19 +5131,51 @@ fn get_completions(state: &AppState, uri: &str) -> Vec<String> {
     let mut completions = Vec::new();
     let base_path = parent_uri.trim_end_matches('/');
 
-    // If current type expects an index, offer array members and identifier completions
-    if expects_index {
+    // Detect *member projection mode (e.g., /pos-profiles/*name)
+    let (star_mode, clean_partial) = if partial.starts_with('*') {
+        (true, &partial[1..])
+    } else {
+        (false, partial)
+    };
+
+    if star_mode {
+        // *member completion: offer schema properties prefixed with *
+        // When at a collection (expects_index), resolve the return type to get item properties
+        let props_schema = if expects_index {
+            if let Some(indexer) = state.indexer_info.get(&schema_name) {
+                indexer.return_type.as_ref().map(|rt| rt.trim_end_matches('?').to_string())
+            } else {
+                None
+            }
+        } else {
+            Some(schema_name.clone())
+        };
+
+        if let Some(ref props_schema_name) = props_schema {
+            if let Some(props) = state.schema_props.get(props_schema_name) {
+                for prop in props {
+                    if prop.starts_with('@') {
+                        continue;
+                    }
+                    if prop.starts_with(clean_partial) {
+                        completions.push(format!("{}/*{}", base_path, prop));
+                    }
+                }
+            }
+        }
+    } else if expects_index {
+        // If current type expects an index, offer array members and identifier completions
         // Add array members (like count, add, after)
         if let Some(members) = state.array_members.get(&schema_name) {
             for member_name in members.keys() {
-                if member_name.starts_with(partial) {
+                if member_name.starts_with(clean_partial) {
                     completions.push(format!("{}/{}", base_path, member_name));
                 }
             }
         }
 
         // Add identifier property completions (e.g., currencyCode=)
-        let identifier_completions = get_identifier_completions_for_schema(state, &schema_name, base_path, partial);
+        let identifier_completions = get_identifier_completions_for_schema(state, &schema_name, base_path, clean_partial);
         completions.extend(identifier_completions);
     } else {
         // Complete with properties of current schema
@@ -5154,7 +5184,7 @@ fn get_completions(state: &AppState, uri: &str) -> Vec<String> {
                 if prop.starts_with('@') {
                     continue;
                 }
-                if prop.starts_with(partial) {
+                if prop.starts_with(clean_partial) {
                     completions.push(format!("{}/{}", base_path, prop));
                 }
             }
@@ -5163,7 +5193,7 @@ fn get_completions(state: &AppState, uri: &str) -> Vec<String> {
         // Also offer primitive members (e.g., string.length, string.upper)
         if let Some(members) = state.primitive_members.get(&schema_name) {
             for member_name in members.keys() {
-                if member_name.starts_with(partial) {
+                if member_name.starts_with(clean_partial) {
                     completions.push(format!("{}/{}", base_path, member_name));
                 }
             }
@@ -5580,6 +5610,10 @@ fn get_param_hint(state: &AppState, uri: &str) -> String {
 
     // Check if current segment matches a static property/member - if so, no hint
     if !current_segment.is_empty() {
+        // *member projection is never an index
+        if current_segment.starts_with('*') {
+            return String::new();
+        }
         if let Some(schema_name) = &schema_opt {
             // Check array members
             if let Some(members) = state.array_members.get(schema_name) {
