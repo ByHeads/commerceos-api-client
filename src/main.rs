@@ -362,6 +362,7 @@ struct BackgroundLoadResult {
     primitive_members: HashMap<String, HashMap<String, String>>,
     additional_props_key: HashMap<String, String>,
     array_schemas: std::collections::HashSet<String>,
+    array_endpoints: std::collections::HashSet<String>,
     mapped_types: Vec<String>,
     spec: Option<ApiSpec>,
 }
@@ -409,6 +410,7 @@ struct AppState {
     primitive_members: HashMap<String, HashMap<String, String>>,  // schema name -> (member name -> member type)
     additional_props_key: HashMap<String, String>,  // schema name -> additionalProperties key type (e.g., "date-time")
     array_schemas: std::collections::HashSet<String>,  // schemas that are array types (for fallback detection)
+    array_endpoints: std::collections::HashSet<String>,  // endpoints that return arrays (response has items)
     mapped_types: Vec<String>,  // mapped type names for ~map() completion
     completions: Vec<String>,
     completion_idx: usize,
@@ -466,6 +468,7 @@ impl AppState {
             primitive_members: HashMap::new(),
             additional_props_key: HashMap::new(),
             array_schemas: std::collections::HashSet::new(),
+            array_endpoints: std::collections::HashSet::new(),
             mapped_types: Vec::new(),
             completions: Vec::new(),
             completion_idx: 0,
@@ -481,6 +484,38 @@ impl AppState {
 }
 
 // Convert character index to byte index for safe UTF-8 string slicing
+/// Check if cursor position is inside unmatched `{}`/`[]` pairs, skipping quoted strings.
+fn cursor_inside_brackets(input: &str, cursor_pos: usize) -> bool {
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, ch) in input.chars().enumerate() {
+        if i >= cursor_pos {
+            break;
+        }
+        if escape {
+            escape = false;
+            continue;
+        }
+        if ch == '\\' && in_string {
+            escape = true;
+            continue;
+        }
+        if ch == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if !in_string {
+            match ch {
+                '{' | '[' => depth += 1,
+                '}' | ']' => depth -= 1,
+                _ => {}
+            }
+        }
+    }
+    depth > 0
+}
+
 fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {
     s.char_indices()
         .nth(char_idx)
@@ -961,7 +996,7 @@ impl ConnectionFlow {
         let w = self.width as usize;
 
         // Top ruler with embedded title (always "Choose a connection"), right-aligned
-        let title = " [Choose a connection] ";
+        let title = "  Choose a connection  ";
         let title_len = title.len();
         let right = 7;
         let left = w.saturating_sub(title_len).saturating_sub(right);
@@ -1082,7 +1117,7 @@ impl ConnectionFlow {
         let w = self.width as usize;
 
         // Top ruler with embedded title, right-aligned (matching picker style)
-        let title = " [New connection] ";
+        let title = "  New connection  ";
         let title_len = title.len();
         let right = 7;
         let left = w.saturating_sub(title_len).saturating_sub(right);
@@ -1172,7 +1207,7 @@ impl ConnectionFlow {
         let prefix = if is_active { "  › " } else { "    " };
 
         if is_active {
-            execute!(stdout, Print(format!("{}{:<14}{}\x1b[2m{}\x1b[0m\x1b[7m \x1b[0m\r\n",
+            execute!(stdout, Print(format!("{}{:<14}{}\x1b[2m{}\x1b[0m\x1b[48;5;247m\x1b[38;5;0m \x1b[0m\r\n",
                 prefix, "URL:".dimmed(), url, ghost)))?;
         } else if url.is_empty() {
             execute!(stdout, Print(format!("{}{:<14}\r\n", prefix, "URL:".dimmed())))?;
@@ -1210,7 +1245,7 @@ impl ConnectionFlow {
         let prefix = if is_active { "  › " } else { "    " };
 
         if is_active {
-            execute!(stdout, Print(format!("{}{:<14}{}\x1b[7m \x1b[0m\r\n", prefix, label.dimmed(), display_val)))?;
+            execute!(stdout, Print(format!("{}{:<14}{}\x1b[48;5;247m\x1b[38;5;0m \x1b[0m\r\n", prefix, label.dimmed(), display_val)))?;
         } else if !value.is_empty() && confirmed {
             execute!(stdout, Print(format!("{}{:<14}{} ✓\r\n", prefix, label.dimmed(), display_val)))?;
         } else if !value.is_empty() {
@@ -2999,6 +3034,18 @@ fn handle_key_event(
             handle_save_connection(state, stdout)?;
         }
 
+        // Clear scrollback (ctrl+k)
+        (KeyModifiers::CONTROL, KeyCode::Char('k')) => {
+            state.output_history.clear();
+            // Write escape bytes directly to stdout to clear scrollback + screen
+            stdout.write_all(b"\x1b[3J\x1b[2J\x1b[H")?;
+            stdout.flush()?;
+            // Print placeholder lines and render UI fresh
+            execute!(stdout, Print("\r\n\r\n\r\n"))?;
+            state.prev_input_lines = 1;
+            render(stdout, state)?;
+        }
+
         // Switch connection (ctrl+l)
         (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
             if let Some(rx) = handle_switch_connection(state, stdout)? {
@@ -3046,21 +3093,28 @@ fn handle_key_event(
             render(stdout, state)?;
         }
 
-        // Enter - execute request
+        // Enter - newline if inside brackets/braces, otherwise execute request
         (KeyModifiers::NONE, KeyCode::Enter) => {
-            let input = state.input.trim().to_string();
-            let input = if input.is_empty() { "GET /".to_string() } else { input };
+            if cursor_inside_brackets(&state.input, state.cursor_pos) {
+                let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
+                state.input.insert(byte_idx, '\n');
+                state.cursor_pos += 1;
+                render(stdout, state)?;
+            } else {
+                let input = state.input.trim().to_string();
+                let input = if input.is_empty() { "GET /".to_string() } else { input };
 
-            parse_input(state, &input);
-            state.history.push(input.clone());
-            append_history(&input);
-            state.history_idx = -1;
-            state.prev_method = state.method.clone();
-            state.prev_uri = state.uri.clone();
-            state.prev_body = state.body.clone();
-            state.prev_outfile = state.config.outfile.clone();
+                parse_input(state, &input);
+                state.history.push(input.clone());
+                append_history(&input);
+                state.history_idx = -1;
+                state.prev_method = state.method.clone();
+                state.prev_uri = state.uri.clone();
+                state.prev_body = state.body.clone();
+                state.prev_outfile = state.config.outfile.clone();
 
-            execute_request(state, stdout)?;
+                execute_request(state, stdout)?;
+            }
         }
 
         // Backspace
@@ -3171,6 +3225,9 @@ fn parse_input(state: &mut AppState, input: &str) {
 fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<()> {
     // Clear splash tracking since we're printing output
     state.last_was_splash = false;
+
+    // Flash rulers on send
+    flash_rulers(stdout, state, "\x1b[38;5;242m", 120)?;
 
     // Build output string to store for resize redraw
     let mut output_lines = String::new();
@@ -3353,8 +3410,8 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
             }
         }
 
-        // Show spinner after 1 second in the hint area (bottom line)
-        if start.elapsed() >= Duration::from_secs(1) {
+        // Show spinner after 0.5 seconds in the hint area (bottom line)
+        if start.elapsed() >= Duration::from_millis(500) {
             showing_spinner = true;
             let frame = SPINNER_FRAMES[frame_idx % SPINNER_FRAMES.len()];
             // Overwrite the hint line with spinner
@@ -3442,6 +3499,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
             }
         }
     }
+
 
     match response_opt {
         Some(Ok((status, body_text))) => {
@@ -3629,7 +3687,7 @@ fn read_inline_input(stdout: &mut io::Stdout, prompt: &str, mask: bool, prefill:
     let render_line = |stdout: &mut io::Stdout, prompt: &str, buf: &str, mask: bool| -> io::Result<()> {
         execute!(stdout, cursor::MoveToColumn(0), Clear(ClearType::CurrentLine))?;
         let display = if mask && !buf.is_empty() { "•".repeat(buf.len()) } else { buf.to_string() };
-        execute!(stdout, Print(format!("{}{}\x1b[7m \x1b[0m", prompt, display)))?;
+        execute!(stdout, Print(format!("{}{}\x1b[48;5;247m\x1b[38;5;0m \x1b[0m", prompt, display)))?;
         stdout.flush()?;
         Ok(())
     };
@@ -3969,7 +4027,7 @@ fn render_input_content(state: &mut AppState, width: usize) -> (String, u16, Str
             if state.completions.len() > 1 {
                 rendered.push_str(&format!("\x1b[48;5;240m{}\x1b[0m", ghost_chars[0]));
             } else {
-                rendered.push_str(&format!("\x1b[7m{}\x1b[0m", ghost_chars[0]));
+                rendered.push_str(&format!("\x1b[48;5;247m\x1b[38;5;0m{}\x1b[0m", ghost_chars[0]));
             }
             if ghost_chars.len() > 1 {
                 rendered.push_str(&format!("\x1b[38;5;240m{}\x1b[0m", ghost_chars[1..].iter().collect::<String>()));
@@ -3977,21 +4035,21 @@ fn render_input_content(state: &mut AppState, width: usize) -> (String, u16, Str
         } else {
             rendered.push_str(&format!("\x1b[38;5;240m{}\x1b[0m", ghost));
             if at_cursor == '\n' {
-                rendered.push_str("\x1b[7m \x1b[0m");
+                rendered.push_str("\x1b[48;5;247m\x1b[38;5;0m \x1b[0m");
                 rendered.push('\n');
                 rendered.push_str(after_cursor.trim_start_matches('\n'));
             } else {
-                rendered.push_str(&format!("\x1b[7m{}\x1b[0m", at_cursor));
+                rendered.push_str(&format!("\x1b[48;5;247m\x1b[38;5;0m{}\x1b[0m", at_cursor));
                 rendered.push_str(after_cursor);
             }
         }
     } else {
         if at_cursor == '\n' {
-            rendered.push_str("\x1b[7m \x1b[0m");
+            rendered.push_str("\x1b[48;5;247m\x1b[38;5;0m \x1b[0m");
             rendered.push('\n');
             rendered.push_str(after_cursor.trim_start_matches('\n'));
         } else {
-            rendered.push_str(&format!("\x1b[7m{}\x1b[0m", at_cursor));
+            rendered.push_str(&format!("\x1b[48;5;247m\x1b[38;5;0m{}\x1b[0m", at_cursor));
             rendered.push_str(after_cursor);
         }
     }
@@ -4036,6 +4094,89 @@ fn render_input_content(state: &mut AppState, width: usize) -> (String, u16, Str
     (output, input_line_count, ghost)
 }
 
+fn flash_rulers(stdout: &mut io::Stdout, state: &mut AppState, color: &str, ms: u64) -> io::Result<()> {
+    let w = state.width as usize;
+    let up = 2 + state.prev_input_lines;
+    let r = "\x1b[0m";
+
+    // Move to top ruler, clear and redraw each line (preserve hint line)
+    execute!(
+        stdout,
+        cursor::Hide,
+        cursor::MoveUp(up.min(state.height.saturating_sub(1))),
+        cursor::MoveToColumn(0),
+        Clear(ClearType::CurrentLine),
+    )?;
+
+    // Top ruler in color
+    if !state.config.base_uri.is_empty() {
+        let host = format!(" {} ", state.config.base_uri);
+        let host_len = host.len();
+        let right = 7;
+        let left = w.saturating_sub(host_len).saturating_sub(right);
+        execute!(stdout, Print(format!(
+            "{color}{}{r} \x1b[38;5;247m{}{r} {color}{}{r}\r\n",
+            "─".repeat(left),
+            state.config.base_uri,
+            "─".repeat(right),
+        )))?;
+    } else {
+        execute!(stdout, Print(format!("{color}{}{r}\r\n", "─".repeat(w))))?;
+    }
+
+    // Input text slightly lighter than rulers
+    execute!(stdout, Clear(ClearType::CurrentLine))?;
+    execute!(stdout, Print(format!("\x1b[38;5;253m{}{r}\r\n", state.input)))?;
+
+    // Bottom ruler in color
+    execute!(stdout, Clear(ClearType::CurrentLine))?;
+    execute!(stdout, Print(format!("{color}{}{r}", "─".repeat(w))))?;
+
+    // Move past hint line without touching it
+    execute!(stdout, cursor::MoveDown(1), cursor::MoveToColumn(0))?;
+
+    stdout.flush()?;
+
+    thread::sleep(Duration::from_millis(ms));
+
+    // Restore rulers to dimmed while text stays colored
+    execute!(
+        stdout,
+        cursor::MoveUp(2 + state.prev_input_lines),
+        cursor::MoveToColumn(0),
+        Clear(ClearType::CurrentLine),
+    )?;
+    let d = "\x1b[38;5;239m";
+    let rs = "\x1b[0m";
+    if !state.config.base_uri.is_empty() {
+        let host = format!(" {} ", state.config.base_uri);
+        let host_len = host.len();
+        let right = 7;
+        let left = w.saturating_sub(host_len).saturating_sub(right);
+        execute!(stdout, Print(format!(
+            "{d}{}{rs} {}{d} {}{rs}\r\n",
+            "─".repeat(left),
+            state.config.base_uri.dimmed(),
+            "─".repeat(right)
+        )))?;
+    } else {
+        execute!(stdout, Print(format!("{d}{}{rs}\r\n", "─".repeat(w))))?;
+    }
+    execute!(
+        stdout,
+        cursor::MoveDown(state.prev_input_lines),
+        cursor::MoveToColumn(0),
+        Clear(ClearType::CurrentLine),
+        Print(format!("{d}{}{rs}\r\n", "─".repeat(w))),
+    )?;
+    stdout.flush()?;
+
+    thread::sleep(Duration::from_millis(35));
+
+    render(stdout, state)?;
+    Ok(())
+}
+
 fn render(stdout: &mut io::Stdout, state: &mut AppState) -> io::Result<()> {
     let width = state.width as usize;
     state.prev_width = state.width;
@@ -4068,23 +4209,26 @@ fn render(stdout: &mut io::Stdout, state: &mut AppState) -> io::Result<()> {
     )?;
 
     // Top ruler
-    let ruler = "─".repeat(width);
+    let ruler_line = format!("\x1b[38;5;239m{}\x1b[0m", "─".repeat(width));
     if !state.config.base_uri.is_empty() {
-        let host = format!(" [{}] ", state.config.base_uri);
+        let host_text = &state.config.base_uri;
+        let host = format!(" {} ", host_text);
         let host_len = host.len();
         let right = 7;
         let left = width.saturating_sub(host_len).saturating_sub(right);
+        let d = "\x1b[38;5;239m";
+        let r = "\x1b[0m";
         execute!(
             stdout,
             Print(format!(
-                "{}{}{}\r\n",
-                "─".repeat(left).dimmed(),
-                host.dimmed(),
-                "─".repeat(right).dimmed()
+                "{d}{}{r} {}{d} {}{r}\r\n",
+                "─".repeat(left),
+                host_text.dimmed(),
+                "─".repeat(right)
             ))
         )?;
     } else {
-        execute!(stdout, Print(format!("{}\r\n", ruler.dimmed())))?;
+        execute!(stdout, Print(format!("{}\r\n", ruler_line)))?;
     }
 
     // Input line or help
@@ -4132,7 +4276,7 @@ fn render(stdout: &mut io::Stdout, state: &mut AppState) -> io::Result<()> {
 
     // Bottom ruler and hint (only when not showing help - help has its own)
     if !state.show_help {
-        execute!(stdout, Print(format!("{}\r\n", ruler.dimmed())))?;
+        execute!(stdout, Print(format!("{}\r\n", ruler_line)))?;
 
         // Hint line (only if terminal is wide enough - "ctrl+h for shortcuts" is 21 chars + 2 indent)
         if width >= 22 {
@@ -4296,6 +4440,7 @@ fn background_load(config: &Config, op_selector: Option<String>) -> BackgroundLo
                     primitive_members: HashMap::new(),
                     additional_props_key: HashMap::new(),
                     array_schemas: std::collections::HashSet::new(),
+                    array_endpoints: std::collections::HashSet::new(),
                     mapped_types: Vec::new(),
                     spec: None,
                 };
@@ -4327,6 +4472,7 @@ fn background_load(config: &Config, op_selector: Option<String>) -> BackgroundLo
                 primitive_members: HashMap::new(),
                 additional_props_key: HashMap::new(),
                 array_schemas: std::collections::HashSet::new(),
+                array_endpoints: std::collections::HashSet::new(),
                 spec: None,
                 mapped_types: Vec::new(),
             };
@@ -4351,6 +4497,7 @@ fn background_load(config: &Config, op_selector: Option<String>) -> BackgroundLo
         primitive_members: HashMap::new(),
         additional_props_key: HashMap::new(),
         array_schemas: std::collections::HashSet::new(),
+        array_endpoints: std::collections::HashSet::new(),
         mapped_types: Vec::new(),
         spec: None,
     };
@@ -4430,6 +4577,7 @@ fn apply_background_result(state: &mut AppState, result: BackgroundLoadResult) {
     state.primitive_members = result.primitive_members;
     state.additional_props_key = result.additional_props_key;
     state.array_schemas = result.array_schemas;
+    state.array_endpoints = result.array_endpoints;
     state.spec = result.spec;
     state.mapped_types = result.mapped_types;
 }
@@ -4579,6 +4727,7 @@ fn load_openapi_spec_into(config: &Config, result: &mut BackgroundLoadResult) {
                                         }
                                     }
                                     if let Some(items) = &schema.items {
+                                        result.array_endpoints.insert(path.clone());
                                         if let Some(ref_path) = &items.ref_path {
                                             if let Some(schema_name) = extract_schema_name(ref_path) {
                                                 result.endpoint_types.insert(path.clone(), schema_name);
@@ -5123,6 +5272,17 @@ fn get_completions(state: &AppState, uri: &str) -> Vec<String> {
 
     let (schema_opt, expects_index, _) = resolve_type_at_path(state, &parent_uri);
 
+    // DEBUG
+    if parent_uri.contains("api-versions") {
+        let _ = std::fs::write("/tmp/api-completion-debug.txt", format!(
+            "parent_uri={}\npartial={}\nschema={:?}\nexpects_index={}\nendpoints_matching={:?}\nprop_types_api_version_info={:?}\nschema_props_api_version_info={:?}\n",
+            parent_uri, partial, schema_opt, expects_index,
+            state.endpoints.iter().filter(|e| e.contains("api-version")).collect::<Vec<_>>(),
+            state.prop_types.get("api version info"),
+            state.schema_props.get("api version info"),
+        ));
+    }
+
     let schema_name = match schema_opt {
         Some(s) => s,
         None => return endpoint_completions,
@@ -5212,9 +5372,13 @@ fn get_completions(state: &AppState, uri: &str) -> Vec<String> {
     });
 
     // Merge endpoint completions with schema completions, avoiding duplicates
-    for ec in &endpoint_completions {
-        if !completions.contains(ec) {
-            completions.push(ec.clone());
+    // Skip endpoint completions when schema expects an index (e.g., string array)
+    // to avoid suggesting sibling endpoints as if they were array entries
+    if !expects_index {
+        for ec in &endpoint_completions {
+            if !completions.contains(ec) {
+                completions.push(ec.clone());
+            }
         }
     }
 
@@ -5232,6 +5396,11 @@ fn get_completions(state: &AppState, uri: &str) -> Vec<String> {
             }
         });
         return completions;
+    }
+
+    // Don't fall back to endpoint completions when schema expects an index
+    if expects_index {
+        return Vec::new();
     }
 
     endpoint_completions
@@ -5423,6 +5592,15 @@ fn complete_property_path(
 }
 
 fn complete_endpoint(state: &AppState, prefix: &str) -> Vec<String> {
+    // If typing inside a path that is itself an endpoint (after its trailing slash),
+    // don't suggest sub-endpoints — the user is navigating the resource, not looking for endpoints
+    if let Some(last_slash) = prefix.rfind('/') {
+        let parent = &prefix[..last_slash];
+        if !parent.is_empty() && state.endpoints.contains(&parent.to_string()) {
+            return Vec::new();
+        }
+    }
+
     let mut completions: Vec<String> = state
         .endpoints
         .iter()
@@ -5468,20 +5646,32 @@ fn resolve_type_at_path(state: &AppState, uri: &str) -> (Option<String>, bool, O
 
     // First, find the collection endpoint (e.g., /receipts, /v2/receipts)
     // Check endpoint_schemas (from tag x-type) first, then endpoint_types (from response schema)
+    let mut resolve_debug = String::new();
     for i in 1..=path_parts.len() {
         let prefix = format!("/{}", path_parts[..i].join("/"));
         if let Some(name) = state.endpoint_schemas.get(&prefix) {
+            resolve_debug.push_str(&format!("endpoint_schemas hit: {} -> {}\n", prefix, name));
             schema_name = Some(name.clone());
             start_idx = i;
         } else if let Some(name) = state.endpoint_types.get(&prefix) {
-            // Fallback to endpoint_types for singleton endpoints without tag x-type
+            resolve_debug.push_str(&format!("endpoint_types hit: {} -> {}\n", prefix, name));
             schema_name = Some(name.clone());
             start_idx = i;
+        } else {
+            resolve_debug.push_str(&format!("no hit for prefix: {}\n", prefix));
         }
     }
 
     let mut current_schema = match schema_name {
-        Some(s) => s,
+        Some(ref s) => {
+            if base_uri.contains("api-version") {
+                let _ = std::fs::write("/tmp/api-resolve-debug.txt", format!(
+                    "base_uri={}\npath_parts={:?}\nresolved_schema={}\nstart_idx={}\nresolve_log:\n{}\n",
+                    base_uri, path_parts, s, start_idx, resolve_debug
+                ));
+            }
+            s.clone()
+        },
         None => return (None, false, None),
     };
 
@@ -5546,6 +5736,14 @@ fn resolve_type_at_path(state: &AppState, uri: &str) -> (Option<String>, bool, O
             }
         }
 
+        // If the segment matches a property name but has no typed $ref, it's a leaf
+        // (primitive or array-of-primitives) — no further sub-properties exist
+        if let Some(props) = state.schema_props.get(&current_schema) {
+            if props.iter().any(|p| p == segment) {
+                return (None, false, None);
+            }
+        }
+
         // Otherwise, this segment is likely an index value
         // After indexing, we get the returnType from x-indexer or stay at same type
         if let Some(indexer) = state.indexer_info.get(&current_schema) {
@@ -5555,6 +5753,9 @@ fn resolve_type_at_path(state: &AppState, uri: &str) -> (Option<String>, bool, O
         } else if let Some(_key_type) = state.additional_props_key.get(&current_schema) {
             // For additionalProperties, the value type comes from items or stays same
             // For now, assume we can't navigate further
+        } else {
+            // Segment doesn't match anything — can't resolve further
+            return (None, false, None);
         }
 
         expects_index = false;
@@ -5579,6 +5780,13 @@ fn resolve_type_at_path(state: &AppState, uri: &str) -> (Option<String>, bool, O
         else if state.array_schemas.contains(&current_schema) {
             expects_index = true;
             // No hint available without x-indexer
+        }
+        // Fallback: if this endpoint returns an array (response had items)
+        else {
+            let base_path = base_uri.trim_end_matches('/');
+            if state.array_endpoints.contains(base_path) {
+                expects_index = true;
+            }
         }
     }
 
