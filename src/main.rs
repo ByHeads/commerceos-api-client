@@ -300,6 +300,9 @@ struct SchemaRef {
     schema_type: Option<String>,
     items: Option<Box<SchemaRef>>,
     properties: Option<HashMap<String, SchemaRef>>,
+    #[serde(rename = "enum")]
+    enum_values: Option<Vec<serde_json::Value>>,
+    examples: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -317,6 +320,10 @@ struct SchemaDefinition {
     x_primitive_members: Option<HashMap<String, ArrayMemberInfo>>,
     #[serde(rename = "additionalProperties")]
     additional_properties: Option<AdditionalPropertiesInfo>,
+    #[serde(rename = "x-parent-type")]
+    x_parent_type: Option<String>,
+    #[serde(rename = "x-child-types")]
+    x_child_types: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -363,6 +370,9 @@ struct BackgroundLoadResult {
     additional_props_key: HashMap<String, String>,
     array_schemas: std::collections::HashSet<String>,
     array_endpoints: std::collections::HashSet<String>,
+    enum_values: HashMap<String, HashMap<String, Vec<String>>>,  // schema → prop → enum values
+    subtypes: HashMap<String, Vec<String>>,  // base schema → list of subtype @type values
+    parent_types: HashMap<String, String>,  // schema → parent schema (from x-parent-type)
     mapped_types: Vec<String>,
     spec: Option<ApiSpec>,
 }
@@ -376,6 +386,7 @@ struct AppState {
     body: String,
     history: Vec<String>,
     history_idx: i32,
+    history_stash: String,  // saves unsent input when browsing history
     prev_method: String,
     prev_uri: String,
     prev_body: String,
@@ -411,12 +422,14 @@ struct AppState {
     additional_props_key: HashMap<String, String>,  // schema name -> additionalProperties key type (e.g., "date-time")
     array_schemas: std::collections::HashSet<String>,  // schemas that are array types (for fallback detection)
     array_endpoints: std::collections::HashSet<String>,  // endpoints that return arrays (response has items)
+    enum_values: HashMap<String, HashMap<String, Vec<String>>>,  // schema → prop → enum values
+    subtypes: HashMap<String, Vec<String>>,  // base schema → subtype @type values
+    parent_types: HashMap<String, String>,  // schema → parent schema (from x-parent-type)
     mapped_types: Vec<String>,  // mapped type names for ~map() completion
     completions: Vec<String>,
     completion_idx: usize,
     last_tab_input: String,
     completion_uri_suffix: String,  // URI text after cursor for mid-URI completion
-    completion_hint: String,  // Hint to show when placeholder expected
     connection_alias: String,  // Current connection alias (for Ctrl+S pre-fill)
     last_was_splash: bool,  // True if last output was a splash (for consecutive env switches)
     // OAuth2 credentials for token refresh
@@ -435,6 +448,7 @@ impl AppState {
             body: String::new(),
             history: Vec::new(),
             history_idx: -1,
+            history_stash: String::new(),
             prev_method: String::new(),
             prev_uri: String::new(),
             prev_body: String::new(),
@@ -469,12 +483,14 @@ impl AppState {
             additional_props_key: HashMap::new(),
             array_schemas: std::collections::HashSet::new(),
             array_endpoints: std::collections::HashSet::new(),
+            enum_values: HashMap::new(),
+            subtypes: HashMap::new(),
+            parent_types: HashMap::new(),
             mapped_types: Vec::new(),
             completions: Vec::new(),
             completion_idx: 0,
             last_tab_input: String::new(),
             completion_uri_suffix: String::new(),
-            completion_hint: String::new(),
             connection_alias: String::new(),
             last_was_splash: false,
             oauth2_client_id: String::new(),
@@ -484,8 +500,8 @@ impl AppState {
 }
 
 // Convert character index to byte index for safe UTF-8 string slicing
-/// Check if cursor position is inside unmatched `{}`/`[]` pairs, skipping quoted strings.
-fn cursor_inside_brackets(input: &str, cursor_pos: usize) -> bool {
+/// Return bracket nesting depth at cursor position, skipping quoted strings.
+fn bracket_depth_at(input: &str, cursor_pos: usize) -> i32 {
     let mut depth = 0i32;
     let mut in_string = false;
     let mut escape = false;
@@ -513,7 +529,257 @@ fn cursor_inside_brackets(input: &str, cursor_pos: usize) -> bool {
             }
         }
     }
-    depth > 0
+    depth
+}
+
+/// Check if cursor position is inside unmatched `{}`/`[]` pairs.
+fn cursor_inside_brackets(input: &str, cursor_pos: usize) -> bool {
+    bracket_depth_at(input, cursor_pos) > 0
+}
+
+/// Reformat a single-line JSON string to pretty-printed multi-line.
+/// Returns (formatted_string, new_cursor_char_offset) where cursor is placed at the
+/// equivalent position in the formatted output.
+fn reformat_json_multiline(json: &str, cursor_offset: usize) -> (String, usize) {
+    let mut out = String::new();
+    let mut depth: usize = 0;
+    let mut in_string = false;
+    let mut escape = false;
+    let mut new_cursor = 0usize;
+    let mut src_char_idx = 0usize;
+    let mut cursor_set = false;
+
+    for ch in json.chars() {
+        if src_char_idx == cursor_offset && !cursor_set {
+            new_cursor = out.chars().count();
+            cursor_set = true;
+        }
+
+        if escape {
+            escape = false;
+            out.push(ch);
+            src_char_idx += 1;
+            continue;
+        }
+        if ch == '\\' && in_string {
+            escape = true;
+            out.push(ch);
+            src_char_idx += 1;
+            continue;
+        }
+        if in_string {
+            out.push(ch);
+            if ch == '"' { in_string = false; }
+            src_char_idx += 1;
+            continue;
+        }
+
+        match ch {
+            '"' => {
+                in_string = true;
+                out.push(ch);
+            }
+            '{' | '[' => {
+                depth += 1;
+                out.push(ch);
+                // Peek ahead: if [ is followed by { (skipping whitespace), keep them on same line
+                let rest: String = json.chars().skip(src_char_idx + 1).collect();
+                let next_nws = rest.chars().find(|c| !c.is_whitespace());
+                if ch == '[' && next_nws == Some('{') {
+                    // Don't add newline — the { will handle it
+                } else {
+                    out.push('\n');
+                    out.push_str(&"  ".repeat(depth));
+                }
+            }
+            '}' | ']' => {
+                depth = depth.saturating_sub(1);
+                // Don't add extra newline before ] if it follows } (keep }] together)
+                let last_nws = out.chars().rev().find(|c| !c.is_whitespace());
+                if ch == ']' && last_nws == Some('}') {
+                    // Trim trailing whitespace/newline from after }
+                    let trimmed = out.trim_end().len();
+                    out.truncate(trimmed);
+                } else {
+                    out.push('\n');
+                    out.push_str(&"  ".repeat(depth));
+                }
+                out.push(ch);
+            }
+            ',' => {
+                out.push(ch);
+                out.push('\n');
+                out.push_str(&"  ".repeat(depth));
+            }
+            ':' => {
+                out.push_str(": ");
+            }
+            ' ' | '\t' => {
+                // Skip original whitespace outside strings (we add our own)
+            }
+            _ => {
+                out.push(ch);
+            }
+        }
+        src_char_idx += 1;
+    }
+
+    if !cursor_set {
+        new_cursor = out.chars().count();
+    }
+
+    (out, new_cursor)
+}
+
+/// Find the byte offset where the JSON body starts in the input (after method + URI).
+/// Returns None if there's no body.
+fn find_body_start(input: &str) -> Option<usize> {
+    let trimmed_start = input.len() - input.trim_start().len();
+    let trimmed = input.trim_start();
+    // Skip method (first word)
+    let first_end = trimmed.find(|c: char| c.is_whitespace())?;
+    let after_first = &trimmed[first_end..];
+    let after_first_trimmed = after_first.trim_start();
+    let skip1 = first_end + (after_first.len() - after_first_trimmed.len());
+    // If first word is a method, skip URI too
+    let methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+    let first_word = &trimmed[..first_end];
+    if methods.contains(&first_word.to_uppercase().as_str()) {
+        // Skip URI (second word)
+        let uri_end = after_first_trimmed.find(|c: char| c.is_whitespace())?;
+        let after_uri = &after_first_trimmed[uri_end..];
+        let body_offset = after_uri.len() - after_uri.trim_start().len();
+        Some(trimmed_start + skip1 + uri_end + body_offset)
+    } else if first_word.starts_with('/') {
+        // URI only, body follows
+        Some(trimmed_start + skip1)
+    } else {
+        None
+    }
+}
+
+/// Apply JSON syntax highlighting to a string. Returns ANSI-colored version.
+fn highlight_json(s: &str) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+    let r = "\x1b[0m";
+    let c_key = "\x1b[38;5;110m";     // keys: soft blue
+    let c_str = "\x1b[38;5;114m";     // string values: green
+    let c_num = "\x1b[38;5;179m";     // numbers: yellow
+    let c_bool = "\x1b[38;5;176m";    // booleans/null: magenta
+    let c_brace = "\x1b[38;5;245m";   // brackets/braces: gray
+    let c_at = "\x1b[38;5;147m";      // @type key: light purple
+
+    let mut out = String::with_capacity(s.len() * 2);
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+    let mut in_string = false;
+    let mut string_start = 0;
+    let mut is_key = true; // after { or , we expect a key
+    let mut escape = false;
+
+    while i < len {
+        let ch = chars[i];
+
+        if escape {
+            escape = false;
+            i += 1;
+            continue;
+        }
+
+        if in_string {
+            if ch == '\\' {
+                escape = true;
+                i += 1;
+                continue;
+            }
+            if ch == '"' {
+                // End of string — collect the whole string and colorize
+                let string_content: String = chars[string_start..=i].iter().collect();
+                let color = if is_key {
+                    if string_content.contains("@type") { c_at } else { c_key }
+                } else {
+                    c_str
+                };
+                out.push_str(&format!("{}{}{}", color, string_content, r));
+                in_string = false;
+                i += 1;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+
+        match ch {
+            '"' => {
+                in_string = true;
+                string_start = i;
+                i += 1;
+            }
+            '{' | '}' | '[' | ']' => {
+                out.push_str(&format!("{}{}{}", c_brace, ch, r));
+                if ch == '{' || ch == '[' {
+                    is_key = ch == '{';
+                }
+                i += 1;
+            }
+            ':' => {
+                out.push(ch);
+                is_key = false;
+                i += 1;
+            }
+            ',' => {
+                out.push(ch);
+                is_key = true;
+                i += 1;
+            }
+            't' | 'f' | 'n' => {
+                // Check for true/false/null
+                let remaining: String = chars[i..].iter().take(5).collect();
+                if remaining.starts_with("true") {
+                    out.push_str(&format!("{}true{}", c_bool, r));
+                    i += 4;
+                } else if remaining.starts_with("false") {
+                    out.push_str(&format!("{}false{}", c_bool, r));
+                    i += 5;
+                } else if remaining.starts_with("null") {
+                    out.push_str(&format!("{}null{}", c_bool, r));
+                    i += 4;
+                } else {
+                    out.push(ch);
+                    i += 1;
+                }
+            }
+            '0'..='9' | '-' => {
+                // Number
+                let start = i;
+                while i < len && (chars[i].is_ascii_digit() || chars[i] == '.' || chars[i] == '-' || chars[i] == 'e' || chars[i] == 'E' || chars[i] == '+') {
+                    i += 1;
+                }
+                let num: String = chars[start..i].iter().collect();
+                out.push_str(&format!("{}{}{}", c_num, num, r));
+            }
+            _ => {
+                out.push(ch);
+                i += 1;
+            }
+        }
+    }
+
+    // Handle unterminated string (user is still typing)
+    if in_string {
+        let string_content: String = chars[string_start..].iter().collect();
+        let color = if is_key {
+            if string_content.contains("@type") { c_at } else { c_key }
+        } else {
+            c_str
+        };
+        out.push_str(&format!("{}{}{}", color, string_content, r));
+    }
+
+    out
 }
 
 fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {
@@ -2927,6 +3193,8 @@ fn handle_key_event(
             if !state.completions.is_empty() {
                 if extract_file_path_context(&state.input).is_some() {
                     handle_file_tab_completion_reverse(state);
+                } else if cursor_inside_brackets(&state.input, state.cursor_pos) {
+                    handle_json_tab_completion(state, true, true);
                 } else if state.config.complete {
                     handle_tab_completion_reverse(state);
                 }
@@ -2944,17 +3212,69 @@ fn handle_key_event(
                 state.status_msg = "completion not available on this server".to_string();
                 state.status_msg_at = Some(std::time::Instant::now());
                 render(stdout, state)?;
+            } else if cursor_inside_brackets(&state.input, state.cursor_pos) {
+                // Check for closing bracket ghost before JSON key/value completion
+                let closing = get_closing_brackets_ghost(&state.input, state.cursor_pos);
+                if !closing.is_empty() {
+                    let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
+                    let is_multiline = state.input[..byte_idx].contains('\n');
+                    if is_multiline {
+                        let depth = bracket_depth_at(&state.input, state.cursor_pos) as usize;
+                        let dedent = depth.saturating_sub(1);
+                        let indent = "  ".repeat(dedent);
+                        // Check if cursor is on a blank/whitespace-only line — reuse it
+                        let line_start = state.input[..byte_idx].rfind('\n')
+                            .map_or(0, |p| p + 1);
+                        let line_before = &state.input[line_start..byte_idx];
+                        if line_before.chars().all(|c| c == ' ') {
+                            // Replace current blank line content with proper indent + bracket
+                            let replacement = format!("{}{}", indent, &closing[..1]);
+                            state.input.replace_range(line_start..byte_idx, &replacement);
+                            state.cursor_pos = char_len(&state.input[..line_start]) + dedent * 2 + 1;
+                        } else {
+                            let insert = format!("\n{}{}", indent, &closing[..1]);
+                            state.input.insert_str(byte_idx, &insert);
+                            state.cursor_pos += 1 + dedent * 2 + 1;
+                        }
+                    } else {
+                        state.input.insert_str(byte_idx, &closing[..1]);
+                        state.cursor_pos += 1;
+                    }
+                    state.completions.clear();
+                    state.last_tab_input.clear();
+                } else {
+                    // JSON body tab completion
+                    handle_json_tab_completion(state, false, true);
+                }
+                render(stdout, state)?;
             } else {
+                // If input already has body content (brackets), don't fall through to URI completion
+                let has_body_content = find_body_start(&state.input)
+                    .map_or(false, |bs| state.input[bs..].trim().starts_with(|c: char| c == '[' || c == '{'));
+                if has_body_content {
+                    // Tab at end of body — ignore
+                } else {
                 let had_completions = !state.completions.is_empty();
                 let parts: Vec<&str> = state.input.split_whitespace().collect();
                 let uri = if parts.len() >= 2 { parts[1] } else if parts.len() == 1 && parts[0].starts_with('/') { parts[0] } else { "" };
-                // Complete if URI contains a delimiter (we're typing after /, (, or ~)
-                let has_delim = uri.rfind(|c| c == '/' || c == '(' || c == '~').is_some();
-                let should_complete = has_delim || had_completions;
 
-                if !state.endpoints.is_empty() && should_complete {
-                    handle_tab_completion(state);
+                // Try body bracket completion first (e.g., Tab after "PUT /people ")
+                let bracket_ghost = get_body_bracket_ghost(state, &parts, uri);
+                if !bracket_ghost.is_empty() {
+                    let ins_byte = char_to_byte_idx(&state.input, state.cursor_pos);
+                    state.input.insert_str(ins_byte, &bracket_ghost);
+                    state.cursor_pos += char_len(&bracket_ghost);
                     render(stdout, state)?;
+                } else {
+                    // Complete if URI contains a delimiter (we're typing after /, (, or ~)
+                    let has_delim = uri.rfind(|c| c == '/' || c == '(' || c == '~').is_some();
+                    let should_complete = has_delim || had_completions;
+
+                    if !state.endpoints.is_empty() && should_complete {
+                        handle_tab_completion(state);
+                        render(stdout, state)?;
+                    }
+                }
                 }
             }
         }
@@ -3053,9 +3373,24 @@ fn handle_key_event(
             }
         }
 
-        // History up
+        // Up — line navigation in multiline, history from top line
         (_, KeyCode::Up) => {
-            if !state.history.is_empty() && state.history_idx < state.history.len() as i32 - 1 {
+            let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
+            let on_first_line = !state.input[..byte_idx].contains('\n');
+            if !on_first_line {
+                // Move cursor to same column on previous line
+                let line_start = state.input[..byte_idx].rfind('\n').unwrap(); // safe: not first line
+                let col = byte_idx - line_start - 1;
+                let prev_line_start = state.input[..line_start].rfind('\n')
+                    .map_or(0, |p| p + 1);
+                let prev_line_len = line_start - prev_line_start;
+                let target_col = col.min(prev_line_len);
+                state.cursor_pos = char_len(&state.input[..prev_line_start + target_col]);
+                render(stdout, state)?;
+            } else if !state.history.is_empty() && state.history_idx < state.history.len() as i32 - 1 {
+                if state.history_idx == -1 {
+                    state.history_stash = state.input.clone();
+                }
                 state.history_idx += 1;
                 let idx = state.history.len() - 1 - state.history_idx as usize;
                 state.input = state.history[idx].clone();
@@ -3064,9 +3399,24 @@ fn handle_key_event(
             }
         }
 
-        // History down
+        // Down — line navigation in multiline, history when browsing
         (_, KeyCode::Down) => {
-            if state.history_idx > 0 {
+            let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
+            let on_last_line = !state.input[byte_idx..].contains('\n');
+            if !on_last_line && state.history_idx == -1 {
+                // Move cursor to same column on next line
+                let line_start = state.input[..byte_idx].rfind('\n')
+                    .map_or(0, |p| p + 1);
+                let col = byte_idx - line_start;
+                let next_newline = byte_idx + state.input[byte_idx..].find('\n').unwrap(); // safe: not last line
+                let next_line_start = next_newline + 1;
+                let next_line_end = state.input[next_line_start..].find('\n')
+                    .map_or(state.input.len(), |p| next_line_start + p);
+                let next_line_len = next_line_end - next_line_start;
+                let target_col = col.min(next_line_len);
+                state.cursor_pos = char_len(&state.input[..next_line_start + target_col]);
+                render(stdout, state)?;
+            } else if state.history_idx > 0 {
                 state.history_idx -= 1;
                 let idx = state.history.len() - 1 - state.history_idx as usize;
                 state.input = state.history[idx].clone();
@@ -3074,7 +3424,7 @@ fn handle_key_event(
                 render(stdout, state)?;
             } else if state.history_idx == 0 {
                 state.history_idx = -1;
-                state.input = format!("{} {}", state.method, state.uri);
+                state.input = state.history_stash.clone();
                 state.cursor_pos = char_len(&state.input);
                 render(stdout, state)?;
             }
@@ -3093,13 +3443,102 @@ fn handle_key_event(
             render(stdout, state)?;
         }
 
-        // Enter - newline if inside brackets/braces, otherwise execute request
+        // Enter - auto-indented newline if inside brackets/braces, otherwise execute request
         (KeyModifiers::NONE, KeyCode::Enter) => {
             if cursor_inside_brackets(&state.input, state.cursor_pos) {
-                let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
-                state.input.insert(byte_idx, '\n');
-                state.cursor_pos += 1;
-                render(stdout, state)?;
+                // Check if body is currently single-line — if so, reformat to multi-line
+                if let Some(bs) = find_body_start(&state.input) {
+                    let body = &state.input[bs..];
+                    if !body.contains('\n') {
+                        // Body is single-line — reformat it to multi-line
+                        let prefix = state.input[..bs].trim_end();
+                        let cursor_in_body = state.cursor_pos.saturating_sub(char_len(&state.input[..bs]));
+                        let (formatted, new_body_cursor) = reformat_json_multiline(body, cursor_in_body);
+                        let prefix_char_len = char_len(prefix);
+                        state.input = format!("{}\n{}", prefix, formatted);
+                        // +1 for the newline between prefix and body
+                        state.cursor_pos = prefix_char_len + 1 + new_body_cursor;
+
+                        // The reformat already placed the cursor on a new indented line
+                        // after the comma/bracket. Only insert an additional newline if
+                        // the cursor is NOT already on a fresh indented line (i.e., when
+                        // the cursor sits right after content, not after whitespace-only).
+                        let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
+                        let current_line_start = state.input[..byte_idx].rfind('\n')
+                            .map_or(0, |p| p + 1);
+                        let line_before_cursor = &state.input[current_line_start..byte_idx];
+                        let on_blank_indented_line = line_before_cursor.chars().all(|c| c == ' ');
+
+                        if !on_blank_indented_line {
+                            let depth = bracket_depth_at(&state.input, state.cursor_pos) as usize;
+                            let last_nws = state.input[..byte_idx].chars().rev()
+                                .find(|c| !c.is_whitespace());
+
+                            if matches!(last_nws, Some(',') | Some('{') | Some('[') | Some(':')) {
+                                let indent = "  ".repeat(depth);
+                                let insert = format!("\n{}", indent);
+                                state.input.insert_str(byte_idx, &insert);
+                                state.cursor_pos += 1 + depth * 2;
+                            } else {
+                                let dedent = depth.saturating_sub(1);
+                                let indent = "  ".repeat(dedent);
+                                let insert = format!("\n{}", indent);
+                                state.input.insert_str(byte_idx, &insert);
+                                state.cursor_pos += 1 + dedent * 2;
+                            }
+                        }
+
+                        render(stdout, state)?;
+                    } else {
+                        // Body is already multi-line — normal Enter behavior
+                        let depth = bracket_depth_at(&state.input, state.cursor_pos) as usize;
+                        let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
+
+                        let char_before = if state.cursor_pos > 0 {
+                            state.input.chars().nth(state.cursor_pos - 1)
+                        } else { None };
+                        let char_after = state.input.chars().nth(state.cursor_pos);
+                        let between_brackets = matches!(
+                            (char_before, char_after),
+                            (Some('{'), Some('}')) | (Some('['), Some(']'))
+                        );
+
+                        let last_nws = state.input[..byte_idx].chars().rev()
+                            .find(|c| !c.is_whitespace());
+
+                        if between_brackets {
+                            let indent = "  ".repeat(depth);
+                            let closing_indent = "  ".repeat(depth.saturating_sub(1));
+                            let insert = format!("\n{}\n{}", indent, closing_indent);
+                            state.input.insert_str(byte_idx, &insert);
+                            state.cursor_pos += 1 + depth * 2;
+                        } else if matches!(last_nws, Some(',') | Some('{') | Some('[') | Some(':')) {
+                            let indent = "  ".repeat(depth);
+                            let insert = format!("\n{}", indent);
+                            state.input.insert_str(byte_idx, &insert);
+                            state.cursor_pos += 1 + depth * 2;
+                        } else {
+                            // After a closing bracket without comma, de-indent to
+                            // the enclosing bracket's level (ready to close it too)
+                            let extra = if matches!(last_nws, Some('}') | Some(']')) { 2 } else { 1 };
+                            let dedent = depth.saturating_sub(extra);
+                            let indent = "  ".repeat(dedent);
+                            let insert = format!("\n{}", indent);
+                            state.input.insert_str(byte_idx, &insert);
+                            state.cursor_pos += 1 + dedent * 2;
+                        }
+                        render(stdout, state)?;
+                    }
+                } else {
+                    // No body found — just insert newline
+                    let depth = bracket_depth_at(&state.input, state.cursor_pos) as usize;
+                    let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
+                    let indent = "  ".repeat(depth);
+                    let insert = format!("\n{}", indent);
+                    state.input.insert_str(byte_idx, &insert);
+                    state.cursor_pos += 1 + depth * 2;
+                    render(stdout, state)?;
+                }
             } else {
                 let input = state.input.trim().to_string();
                 let input = if input.is_empty() { "GET /".to_string() } else { input };
@@ -3168,9 +3607,53 @@ fn handle_key_event(
 
         // Regular character input
         (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(c)) => {
-            let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
-            state.input.insert(byte_idx, c);
-            state.cursor_pos += 1;
+            // Smart closing bracket: remove trailing comma and fix indentation
+            if (c == '}' || c == ']') && cursor_inside_brackets(&state.input, state.cursor_pos) {
+                let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
+                let before = &state.input[..byte_idx];
+
+                // Find and remove trailing comma before this closing bracket
+                // Look backwards past whitespace for a comma
+                let trimmed = before.trim_end();
+                let has_trailing_comma = trimmed.ends_with(',');
+                let mut new_before = if has_trailing_comma {
+                    let comma_pos = trimmed.len() - 1;
+                    format!("{}{}", &before[..comma_pos], &before[trimmed.len()..])
+                } else {
+                    before.to_string()
+                };
+
+                // Fix indentation: remove whitespace on current line, replace with proper indent
+                // Find the start of the current line
+                let line_start = new_before.rfind('\n').map(|p| p + 1).unwrap_or(0);
+                let line_content = &new_before[line_start..];
+                if line_content.chars().all(|ch| ch == ' ' || ch == '\t') {
+                    // Current line is only whitespace — replace with proper dedented indent
+                    let depth_after = bracket_depth_at(&new_before, char_len(&new_before)).saturating_sub(1) as usize;
+                    let indent = "  ".repeat(depth_after);
+                    new_before = format!("{}{}", &new_before[..line_start], indent);
+                }
+
+                let after = &state.input[byte_idx..];
+                state.input = format!("{}{}{}", new_before, c, after);
+                state.cursor_pos = char_len(&new_before) + 1;
+            } else {
+                let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
+                let inside_brackets = cursor_inside_brackets(&state.input, state.cursor_pos);
+                state.input.insert(byte_idx, c);
+                state.cursor_pos += 1;
+
+                // Auto-trigger JSON completion for ghost text when typing a key name
+                if inside_brackets {
+                    if let Some(ctx) = json_context_at_cursor(state) {
+                        let (_schema, partial, is_value, _key, _existing) = ctx;
+                        // Only trigger when actually in a key string: either just opened " or typing chars inside it
+                        if !is_value && (!partial.is_empty() || c == '"') {
+                            handle_json_tab_completion(state, false, false);
+                        }
+                    }
+                }
+            }
             state.status_msg.clear();
             state.status_msg_at = None;
             render(stdout, state)?;
@@ -3203,22 +3686,42 @@ fn parse_input(state: &mut AppState, input: &str) {
         }
     }
 
-    let parts: Vec<&str> = input.split_whitespace().collect();
-    if parts.is_empty() {
+    // Extract method and URI using whitespace splitting, but preserve body verbatim
+    let trimmed = input.trim_start();
+    if trimmed.is_empty() {
         return;
     }
 
     let methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
-    let first_upper = parts[0].to_uppercase();
+
+    // Find first whitespace-delimited word
+    let first_end = trimmed.find(|c: char| c.is_whitespace()).unwrap_or(trimmed.len());
+    let first_word = &trimmed[..first_end];
+    let first_upper = first_word.to_uppercase();
 
     if methods.contains(&first_upper.as_str()) {
         state.method = first_upper;
-        state.uri = parts.get(1).map(|s| s.to_string()).unwrap_or_else(|| "/".to_string());
-        state.body = parts.get(2..).map(|p| p.join(" ")).unwrap_or_default();
-    } else if parts[0].starts_with('/') {
+        // Find URI (second word)
+        let after_method = &trimmed[first_end..];
+        let after_method_trimmed = after_method.trim_start();
+        if after_method_trimmed.is_empty() {
+            state.uri = "/".to_string();
+            state.body = String::new();
+        } else {
+            let uri_end = after_method_trimmed.find(|c: char| c.is_whitespace()).unwrap_or(after_method_trimmed.len());
+            state.uri = after_method_trimmed[..uri_end].to_string();
+            // Body is everything after URI, preserving newlines (just trim leading whitespace)
+            let after_uri = &after_method_trimmed[uri_end..];
+            let body = after_uri.strip_prefix(' ').unwrap_or(after_uri);
+            state.body = if body.trim().is_empty() { String::new() } else { body.to_string() };
+        }
+    } else if first_word.starts_with('/') {
         state.method = "GET".to_string();
-        state.uri = parts[0].to_string();
-        state.body = parts.get(1..).map(|p| p.join(" ")).unwrap_or_default();
+        state.uri = first_word.to_string();
+        // Body is everything after URI, preserving newlines
+        let after_uri = &trimmed[first_end..];
+        let body = after_uri.strip_prefix(' ').unwrap_or(after_uri);
+        state.body = if body.trim().is_empty() { String::new() } else { body.to_string() };
     }
 }
 
@@ -4018,8 +4521,38 @@ fn render_input_content(state: &mut AppState, width: usize) -> (String, u16, Str
         String::new()
     };
 
+    // Apply JSON syntax highlighting to body portions
+    let body_start = find_body_start(&state.input);
+    let hl_before = if let Some(bs) = body_start {
+        if cursor_byte > bs {
+            // Cursor is inside body — highlight prefix (non-body) + highlighted body
+            let prefix = &state.input[..bs];
+            let body_part = &state.input[bs..cursor_byte];
+            format!("{}{}", prefix, highlight_json(body_part))
+        } else {
+            before_cursor.to_string()
+        }
+    } else {
+        before_cursor.to_string()
+    };
+
+    let hl_after = if let Some(bs) = body_start {
+        if state.cursor_pos < input_char_len {
+            let next_byte = char_to_byte_idx(&state.input, state.cursor_pos + 1);
+            if next_byte > bs {
+                highlight_json(&state.input[next_byte..])
+            } else {
+                after_cursor.to_string()
+            }
+        } else {
+            String::new()
+        }
+    } else {
+        after_cursor.to_string()
+    };
+
     let mut rendered = String::new();
-    rendered.push_str(before_cursor);
+    rendered.push_str(&hl_before);
 
     if !ghost.is_empty() {
         if cursor_at_end {
@@ -4037,20 +4570,20 @@ fn render_input_content(state: &mut AppState, width: usize) -> (String, u16, Str
             if at_cursor == '\n' {
                 rendered.push_str("\x1b[48;5;247m\x1b[38;5;0m \x1b[0m");
                 rendered.push('\n');
-                rendered.push_str(after_cursor.trim_start_matches('\n'));
+                rendered.push_str(&hl_after.trim_start_matches('\n'));
             } else {
                 rendered.push_str(&format!("\x1b[48;5;247m\x1b[38;5;0m{}\x1b[0m", at_cursor));
-                rendered.push_str(after_cursor);
+                rendered.push_str(&hl_after);
             }
         }
     } else {
         if at_cursor == '\n' {
             rendered.push_str("\x1b[48;5;247m\x1b[38;5;0m \x1b[0m");
             rendered.push('\n');
-            rendered.push_str(after_cursor.trim_start_matches('\n'));
+            rendered.push_str(&hl_after.trim_start_matches('\n'));
         } else {
             rendered.push_str(&format!("\x1b[48;5;247m\x1b[38;5;0m{}\x1b[0m", at_cursor));
-            rendered.push_str(after_cursor);
+            rendered.push_str(&hl_after);
         }
     }
 
@@ -4441,6 +4974,9 @@ fn background_load(config: &Config, op_selector: Option<String>) -> BackgroundLo
                     additional_props_key: HashMap::new(),
                     array_schemas: std::collections::HashSet::new(),
                     array_endpoints: std::collections::HashSet::new(),
+                    enum_values: HashMap::new(),
+                    subtypes: HashMap::new(),
+            parent_types: HashMap::new(),
                     mapped_types: Vec::new(),
                     spec: None,
                 };
@@ -4473,6 +5009,9 @@ fn background_load(config: &Config, op_selector: Option<String>) -> BackgroundLo
                 additional_props_key: HashMap::new(),
                 array_schemas: std::collections::HashSet::new(),
                 array_endpoints: std::collections::HashSet::new(),
+                enum_values: HashMap::new(),
+                subtypes: HashMap::new(),
+            parent_types: HashMap::new(),
                 spec: None,
                 mapped_types: Vec::new(),
             };
@@ -4498,6 +5037,9 @@ fn background_load(config: &Config, op_selector: Option<String>) -> BackgroundLo
         additional_props_key: HashMap::new(),
         array_schemas: std::collections::HashSet::new(),
         array_endpoints: std::collections::HashSet::new(),
+        enum_values: HashMap::new(),
+        subtypes: HashMap::new(),
+        parent_types: HashMap::new(),
         mapped_types: Vec::new(),
         spec: None,
     };
@@ -4578,6 +5120,9 @@ fn apply_background_result(state: &mut AppState, result: BackgroundLoadResult) {
     state.additional_props_key = result.additional_props_key;
     state.array_schemas = result.array_schemas;
     state.array_endpoints = result.array_endpoints;
+    state.enum_values = result.enum_values;
+    state.subtypes = result.subtypes;
+    state.parent_types = result.parent_types;
     state.spec = result.spec;
     state.mapped_types = result.mapped_types;
 }
@@ -4618,6 +5163,12 @@ fn load_openapi_spec_into(config: &Config, result: &mut BackgroundLoadResult) {
                                 if let Some(type_name) = ref_path.strip_prefix("#/components/schemas/") {
                                     prop_type_map.insert(prop_name.clone(), type_name.to_string());
                                 }
+                            } else if prop_ref.examples.as_ref()
+                                .and_then(|ex| ex.first())
+                                .map_or(false, |v| v.is_object())
+                            {
+                                // Property has object examples — mark as object-typed
+                                prop_type_map.insert(prop_name.clone(), String::new());
                             }
                         }
                         if !prop_type_map.is_empty() {
@@ -4675,6 +5226,52 @@ fn load_openapi_spec_into(config: &Config, result: &mut BackgroundLoadResult) {
                                 result.additional_props_key.insert(name.clone(), key_type);
                             }
                         }
+                    }
+
+                    // Extract enum values from properties
+                    if let Some(props) = &schema.properties {
+                        let mut enum_map: HashMap<String, Vec<String>> = HashMap::new();
+                        for (prop_name, prop_ref) in props {
+                            if let Some(ev) = &prop_ref.enum_values {
+                                let values: Vec<String> = ev.iter().filter_map(|v| {
+                                    match v {
+                                        serde_json::Value::String(s) => Some(s.clone()),
+                                        _ => Some(v.to_string()),
+                                    }
+                                }).collect();
+                                if !values.is_empty() {
+                                    enum_map.insert(prop_name.clone(), values);
+                                }
+                            }
+                            // Boolean properties get true/false as enum values
+                            if prop_ref.schema_type.as_deref() == Some("boolean") {
+                                enum_map.insert(prop_name.clone(), vec!["true".to_string(), "false".to_string()]);
+                            }
+                        }
+                        if !enum_map.is_empty() {
+                            result.enum_values.insert(name.clone(), enum_map);
+                        }
+                    }
+
+                    // Extract subtypes from x-child-types (metadata v1.2+) or allOf fallback
+                    if let Some(children) = &schema.x_child_types {
+                        result.subtypes.entry(name.clone())
+                            .or_insert_with(Vec::new)
+                            .extend(children.iter().cloned());
+                    } else if let Some(all_of) = &schema.all_of {
+                        for ref_item in all_of {
+                            if let Some(ref_path) = &ref_item.ref_path {
+                                if let Some(base_name) = ref_path.strip_prefix("#/components/schemas/") {
+                                    result.subtypes
+                                        .entry(base_name.to_string())
+                                        .or_insert_with(Vec::new)
+                                        .push(name.clone());
+                                }
+                            }
+                        }
+                    }
+                    if let Some(parent) = &schema.x_parent_type {
+                        result.parent_types.insert(name.clone(), parent.clone());
                     }
                 }
             }
@@ -4746,12 +5343,490 @@ fn load_openapi_spec_into(config: &Config, result: &mut BackgroundLoadResult) {
     }
 }
 
+/// Check if a schema is or inherits from a given ancestor (via x-parent-type chain).
+fn schema_inherits_from(parent_types: &HashMap<String, String>, schema: &str, ancestor: &str) -> bool {
+    if schema == ancestor { return true; }
+    let mut current = schema;
+    for _ in 0..10 { // guard against cycles
+        match parent_types.get(current) {
+            Some(parent) if parent == ancestor => return true,
+            Some(parent) => current = parent,
+            None => return false,
+        }
+    }
+    false
+}
+
 fn extract_schema_name(ref_path: &str) -> Option<String> {
     const PREFIX: &str = "#/components/schemas/";
     if ref_path.starts_with(PREFIX) {
         Some(ref_path[PREFIX.len()..].to_string())
     } else {
         None
+    }
+}
+
+/// Determine JSON context at cursor: which schema we're in, existing keys, key/value position.
+/// Returns (schema_name, partial_text, is_value_position, current_key, existing_keys_in_current_obj)
+fn json_context_at_cursor(state: &AppState) -> Option<(String, String, bool, String, Vec<String>)> {
+    // Extract URI from input
+    let trimmed = state.input.trim_start();
+    let methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+    let first_end = trimmed.find(|c: char| c.is_whitespace()).unwrap_or(trimmed.len());
+    let first_word = &trimmed[..first_end];
+    let uri = if methods.contains(&first_word.to_uppercase().as_str()) {
+        let after = trimmed[first_end..].trim_start();
+        let uri_end = after.find(|c: char| c.is_whitespace()).unwrap_or(after.len());
+        &after[..uri_end]
+    } else if first_word.starts_with('/') {
+        first_word
+    } else {
+        return None;
+    };
+
+    // Resolve schema from URI
+    let resolve_uri = format!("{}/", uri.trim_end_matches('/'));
+    let (base_schema, _, _) = resolve_type_at_path(state, &resolve_uri);
+    let mut base_schema = base_schema?;
+
+    // If the resolved schema has an indexer with a return type, the body likely
+    // describes the item type (e.g., PUT /people body is a Person, not a collection)
+    if let Some(indexer) = state.indexer_info.get(&base_schema) {
+        if let Some(return_type) = &indexer.return_type {
+            base_schema = return_type.trim_end_matches('?').to_string();
+        }
+    }
+
+    // Parse JSON body up to cursor to understand context
+    let body_start = find_body_start(&state.input)?;
+    let cursor_byte = char_to_byte_idx(&state.input, state.cursor_pos);
+    if cursor_byte < body_start {
+        return None;
+    }
+    let json_before = &state.input[body_start..cursor_byte];
+
+    // Walk through JSON tracking schema stack, key/value state, existing keys
+    let mut schema_stack: Vec<String> = vec![base_schema.clone()];
+    let mut key_stack: Vec<String> = Vec::new(); // property names leading to current nesting
+    let mut existing_keys: Vec<Vec<String>> = vec![Vec::new()]; // per nesting level
+    let mut in_string = false;
+    let mut escape = false;
+    let mut current_string = String::new();
+    let mut is_key = true;
+    let mut last_key = String::new();
+    let mut partial = String::new();
+    let mut in_array = Vec::new(); // track whether each nesting level is array or object
+
+    for ch in json_before.chars() {
+        if escape {
+            escape = false;
+            if in_string { current_string.push(ch); }
+            continue;
+        }
+        if ch == '\\' && in_string {
+            escape = true;
+            current_string.push(ch);
+            continue;
+        }
+
+        if in_string {
+            if ch == '"' {
+                in_string = false;
+                if is_key {
+                    last_key = current_string.clone();
+                    partial = current_string.clone();
+                }
+                current_string.clear();
+            } else {
+                current_string.push(ch);
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => {
+                in_string = true;
+                current_string.clear();
+                partial.clear();
+            }
+            '{' => {
+                in_array.push(false);
+                // Entering a new object — resolve the schema for the current key
+                let new_schema = if let Some(current_schema) = schema_stack.last() {
+                    if let Some(ptypes) = state.prop_types.get(current_schema) {
+                        ptypes.get(&last_key).cloned()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(s) = new_schema {
+                    schema_stack.push(s);
+                } else if last_key.is_empty() {
+                    // Top-level or array element object — keep the parent schema
+                    schema_stack.push(schema_stack.last().cloned().unwrap_or_default());
+                } else {
+                    // Nested object without a $ref schema — push empty to avoid
+                    // parent properties/subtypes leaking into child context
+                    schema_stack.push(String::new());
+                }
+                key_stack.push(last_key.clone());
+                existing_keys.push(Vec::new());
+                is_key = true;
+                partial.clear();
+            }
+            '}' => {
+                in_array.pop();
+                schema_stack.pop();
+                key_stack.pop();
+                existing_keys.pop();
+                is_key = false;
+                partial.clear();
+            }
+            '[' => {
+                in_array.push(true);
+                existing_keys.push(Vec::new());
+                // Arrays don't push a new schema level by themselves
+                // The schema stays the same until we enter an object inside the array
+                is_key = false;
+                partial.clear();
+            }
+            ']' => {
+                in_array.pop();
+                existing_keys.pop();
+                is_key = false;
+                partial.clear();
+            }
+            ':' => {
+                // After key, now expecting value
+                is_key = false;
+                // Record this key as existing in current object
+                if let Some(keys) = existing_keys.last_mut() {
+                    keys.push(last_key.clone());
+                }
+                partial.clear();
+            }
+            ',' => {
+                // After value, expecting next key (in object) or next value (in array)
+                is_key = !in_array.last().copied().unwrap_or(false);
+                partial.clear();
+            }
+            ' ' | '\n' | '\r' | '\t' => {
+                // whitespace — don't clear partial if we're building one
+            }
+            _ => {
+                // Part of an unquoted value (number, true, false, null)
+                partial.push(ch);
+            }
+        }
+    }
+
+    // If currently inside a string, partial is what's been typed so far
+    if in_string {
+        partial = current_string.clone();
+    }
+
+    let current_schema = schema_stack.last().cloned().unwrap_or_default();
+    let current_existing = existing_keys.last().cloned().unwrap_or_default();
+
+    Some((current_schema, partial, !is_key, last_key.clone(), current_existing))
+}
+
+fn handle_json_tab_completion(state: &mut AppState, reverse: bool, apply: bool) {
+    let ctx = match json_context_at_cursor(state) {
+        Some(c) => c,
+        None => return,
+    };
+    let (schema_name, partial, is_value, current_key, existing_keys) = ctx;
+
+    // Detect @type combo cycling: after applying "@type": "value", context says value position
+    // with current_key == "@type". Treat this as key-mode combo cycling.
+    let is_combo_cycling = is_value && current_key == "@type" && partial.is_empty()
+        && !state.completions.is_empty()
+        && state.completions.first().map_or(false, |c| c.starts_with("@type\x00"));
+
+    // Build completions
+    let mut completions: Vec<String> = Vec::new();
+
+    if !is_value {
+        let is_common_identifiers = schema_inherits_from(&state.parent_types, &schema_name, "common identifiers");
+        let has_subtypes = !is_common_identifiers && state.subtypes.get(&schema_name).map_or(false, |s| !s.is_empty());
+        // Key position — offer property names from schema
+        if let Some(props) = state.schema_props.get(&schema_name) {
+            for prop in props {
+                if prop.starts_with('@') {
+                    // Only offer @type when schema has subtypes (ambiguous type)
+                    if prop != "@type" || !has_subtypes {
+                        continue;
+                    }
+                }
+                if is_common_identifiers && prop == "key" {
+                    continue;
+                }
+                if existing_keys.contains(prop) {
+                    continue; // Skip already-present keys
+                }
+                if partial.is_empty() || prop.starts_with(&partial) {
+                    completions.push(prop.clone());
+                }
+            }
+        }
+        // Priority ordering: @type first (if ambiguous), identifiers second (if object-typed)
+        // For @type, expand into full "@type\x00subtype" entries so cycling changes the value
+        if has_subtypes && !existing_keys.contains(&"@type".to_string()) && ("@type".starts_with(&partial) || partial.is_empty()) {
+            completions.retain(|c| c != "@type");
+            if let Some(subs) = state.subtypes.get(&schema_name) {
+                for sub in subs.iter().rev() {
+                    completions.insert(0, format!("@type\x00{}", sub));
+                }
+            }
+        }
+        // Prioritize identifiers first, then other object-typed properties, after @type combos
+        {
+            let type_count = completions.iter().take_while(|c| c.starts_with("@type\x00")).count();
+            // Move identifiers right after @type combos
+            if let Some(pos) = completions.iter().position(|c| c == "identifiers") {
+                if pos != type_count {
+                    completions.remove(pos);
+                    completions.insert(type_count, "identifiers".to_string());
+                }
+            }
+            // Then move other object-typed properties after identifiers
+            if let Some(pt) = state.prop_types.get(&schema_name) {
+                let skip = completions.iter().take_while(|c| c.starts_with("@type\x00") || c == &"identifiers").count();
+                let mut insert_at = skip;
+                let mut i = skip;
+                while i < completions.len() {
+                    let c = &completions[i];
+                    if pt.contains_key(c.as_str()) && i != insert_at {
+                        let moved = completions.remove(i);
+                        completions.insert(insert_at, moved);
+                        insert_at += 1;
+                    } else {
+                        if pt.contains_key(c.as_str()) { insert_at += 1; }
+                        i += 1;
+                    }
+                }
+            }
+        }
+    } else {
+        // Value position — offer enum values, booleans, and @type subtypes
+        if current_key == "@type" {
+            // Offer subtype names for the current schema
+            if let Some(subs) = state.subtypes.get(&schema_name) {
+                for sub in subs {
+                    if partial.is_empty() || sub.starts_with(&partial) {
+                        completions.push(sub.clone());
+                    }
+                }
+            }
+        }
+
+        // Check enum values for this property
+        if let Some(schema_enums) = state.enum_values.get(&schema_name) {
+            if let Some(values) = schema_enums.get(&current_key) {
+                for v in values {
+                    if partial.is_empty() || v.starts_with(&partial) {
+                        completions.push(v.clone());
+                    }
+                }
+            }
+        }
+
+        // Check if property type is boolean (from prop_types)
+        if completions.is_empty() {
+            if let Some(ptypes) = state.prop_types.get(&schema_name) {
+                if let Some(prop_type) = ptypes.get(&current_key) {
+                    if prop_type == "boolean" {
+                        completions.push("true".to_string());
+                        completions.push("false".to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // Check if cycling
+    let cursor_byte = char_to_byte_idx(&state.input, state.cursor_pos);
+    // For combo cycling, keep tab_key as "key" mode to match stored state
+    let tab_key = if is_combo_cycling {
+        format!("json:{}:key", schema_name)
+    } else {
+        format!("json:{}:{}", schema_name, if is_value { "val" } else { "key" })
+    };
+
+    if is_combo_cycling && apply {
+        // Cycle through existing combo completions
+        if reverse {
+            state.completion_idx = if state.completion_idx == 0 {
+                state.completions.len() - 1
+            } else {
+                state.completion_idx - 1
+            };
+        } else {
+            state.completion_idx = (state.completion_idx + 1) % state.completions.len();
+        }
+    } else if completions.is_empty() {
+        return;
+    } else if apply && state.last_tab_input == tab_key && !state.completions.is_empty() {
+        // Already applied once — cycle to next completion
+        if reverse {
+            state.completion_idx = if state.completion_idx == 0 {
+                state.completions.len() - 1
+            } else {
+                state.completion_idx - 1
+            };
+        } else {
+            state.completion_idx = (state.completion_idx + 1) % state.completions.len();
+        }
+    } else {
+        state.completions = completions;
+        state.completion_idx = if reverse && !state.completions.is_empty() {
+            state.completions.len() - 1
+        } else {
+            0
+        };
+        // Use tab_key for applied completions so cycling works on subsequent Tab presses
+        // Use "json_ghost:" prefix for preview-only so first Tab doesn't cycle
+        state.last_tab_input = if apply { tab_key.clone() } else { format!("json_ghost:{}:{}", schema_name, if is_value { "val" } else { "key" }) };
+    }
+
+    if state.completions.is_empty() {
+        return;
+    }
+
+    if !apply {
+        return; // Preview only — completions populated for ghost text
+    }
+
+    let completion = &state.completions[state.completion_idx].clone();
+
+    // Find what to replace: go back from cursor to find the start of current token
+    let body_start = match find_body_start(&state.input) {
+        Some(bs) => bs,
+        None => return,
+    };
+
+    // Check for @type combo completions (key\x00value format)
+    let is_type_combo = completion.contains('\x00');
+
+    // Find token start by scanning backwards from cursor
+    let before = &state.input[body_start..cursor_byte];
+    let token_start_in_body;
+    let skip_after: usize; // bytes after cursor to skip (closing quotes etc.)
+
+    if is_type_combo {
+        // For combo cycling, find the start of the entire "key": "value" block
+        // Scan back to find the opening " of the key (or insert point if first application)
+        // Check if there's already a "@type": "..." to replace
+        let prev_was_combo = state.last_tab_input == tab_key;
+        if prev_was_combo {
+            // Cycling — find @type in the CURRENT object (not a parent)
+            // Restrict search to after the last unmatched '{' (current object start)
+            let current_obj_start = {
+                let mut depth = 0i32;
+                let mut pos = before.len();
+                for (i, ch) in before.char_indices().rev() {
+                    match ch {
+                        '}' => depth += 1,
+                        '{' if depth > 0 => depth -= 1,
+                        '{' => { pos = i; break; }
+                        _ => {}
+                    }
+                }
+                pos
+            };
+            let search_region = &before[current_obj_start..];
+            if let Some(rel_pos) = search_region.rfind("\"@type\": \"") {
+                token_start_in_body = current_obj_start + rel_pos;
+                skip_after = 0;
+            } else {
+                token_start_in_body = before.len();
+                skip_after = 0;
+            }
+        } else {
+            // First application — insert at cursor
+            token_start_in_body = before.len();
+            skip_after = 0;
+        }
+    } else if !is_value {
+        if partial.is_empty() {
+            // No key string opened yet — insert at cursor
+            token_start_in_body = before.len();
+        } else if let Some(q) = before.rfind('"') {
+            token_start_in_body = q + 1; // after the opening quote of the key being typed
+        } else {
+            token_start_in_body = before.len();
+        }
+        let after = &state.input[cursor_byte..];
+        skip_after = if !partial.is_empty() && after.starts_with('"') { 1 } else { 0 };
+    } else {
+        // For values: find position after `: ` or `:` or after last `"`
+        if let Some(q) = before.rfind('"') {
+            token_start_in_body = q + 1;
+        } else if let Some(c) = before.rfind(':') {
+            let after_colon = &before[c + 1..];
+            token_start_in_body = c + 1 + after_colon.len() - after_colon.trim_start().len();
+        } else {
+            token_start_in_body = before.len();
+        }
+        skip_after = 0;
+    };
+    let replace_start = body_start + token_start_in_body;
+
+    // Build the replacement text
+    // Check if the completed key is an object-typed property (has $ref in prop_types)
+    let is_object_prop = !is_value && !is_type_combo && state.prop_types.get(&schema_name)
+        .and_then(|pt| pt.get(completion.as_str()))
+        .is_some();
+    let replacement = if is_type_combo {
+        let parts: Vec<&str> = completion.splitn(2, '\x00').collect();
+        let key = parts[0];
+        let value = parts[1];
+        let prev_was_combo = state.last_tab_input == tab_key;
+        if prev_was_combo {
+            // Cycling — replace entire "key": "value"
+            format!("\"{}\": \"{}\"", key, value)
+        } else {
+            let needs_space = !before.is_empty() && !before.ends_with(' ') && !before.ends_with('\n');
+            let prefix = if partial.is_empty() && needs_space { " " } else { "" };
+            if partial.is_empty() {
+                format!("{}\"{}\": \"{}\"", prefix, key, value)
+            } else {
+                format!("{}\": \"{}\"", &key[partial.len()..], value)
+            }
+        }
+    } else if !is_value {
+        let suffix = if is_object_prop { "\": { " } else { "\":" };
+        if partial.is_empty() {
+            // No key started — insert full "key": with leading space if needed
+            let needs_space = !before.is_empty() && !before.ends_with(' ') && !before.ends_with('\n');
+            let prefix = if needs_space { " " } else { "" };
+            format!("{}\"{}{}",  prefix, completion, suffix)
+        } else {
+            // Replace partial with completion, add closing quote and colon
+            format!("{}{}", completion, suffix)
+        }
+    } else {
+        completion.clone()
+    };
+
+    // Replace
+    let new_input = format!(
+        "{}{}{}",
+        &state.input[..replace_start],
+        replacement,
+        &state.input[cursor_byte + skip_after..]
+    );
+    state.cursor_pos = char_len(&new_input[..replace_start]) + char_len(&replacement);
+    state.input = new_input;
+
+    // After inserting an object-typed key (e.g. "identifiers": { "), clear stale completions
+    // so the ghost text can compute fresh completions for the nested schema
+    if is_object_prop {
+        state.completions.clear();
+        state.last_tab_input.clear();
     }
 }
 
@@ -4991,7 +6066,146 @@ fn handle_file_tab_completion_reverse(state: &mut AppState) {
     state.cursor_pos = char_len(&state.input);
 }
 
+fn get_json_completion_ghost(state: &AppState) -> Option<String> {
+    let ctx = json_context_at_cursor(state)?;
+    let (schema, partial, is_value, _key, existing_keys) = ctx;
+    let current_is_key = !is_value;
+
+    // If completions are populated from a json trigger, use them
+    if !state.completions.is_empty() && (state.last_tab_input.starts_with("json:") || state.last_tab_input.starts_with("json_ghost:")) {
+        let completion = &state.completions[state.completion_idx];
+        let stored_is_key = state.last_tab_input.ends_with(":key");
+        // Only show ghost when context matches (don't show key ghost in value position)
+        if stored_is_key == current_is_key {
+            if current_is_key {
+                // Handle @type combo completions (key\x00value)
+                if let Some(sep) = completion.find('\x00') {
+                    let key = &completion[..sep];
+                    let value = &completion[sep + 1..];
+                    let remaining: String = key.chars().skip(partial.chars().count()).collect();
+                    return Some(format!("{}\": \"{}\"", remaining, value));
+                }
+                let remaining: String = completion.chars().skip(partial.chars().count()).collect();
+                if !remaining.is_empty() {
+                    let is_obj = state.prop_types.get(&schema)
+                        .and_then(|pt| pt.get(completion.as_str()))
+                        .is_some();
+                    let suffix = if is_obj { "\": { " } else { "\":" };
+                    return Some(format!("{}{}", remaining, suffix));
+                }
+            } else {
+                let remaining: String = completion.chars().skip(partial.chars().count()).collect();
+                return Some(remaining);
+            }
+        }
+    }
+
+    // No pre-populated completions — compute ghost proactively in key position
+    // Only suggest on a fresh line (no existing content before cursor on this line)
+    let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
+    let line_start = state.input[..byte_idx].rfind('\n').map_or(0, |p| p + 1);
+    let line_before = &state.input[line_start..byte_idx];
+    let on_clean_line = line_before.chars().all(|c| c.is_whitespace());
+    if current_is_key && partial.is_empty() && on_clean_line {
+        let is_common_identifiers = schema_inherits_from(&state.parent_types, &schema, "common identifiers");
+        let has_subtypes = !is_common_identifiers && state.subtypes.get(&schema).map_or(false, |s| !s.is_empty());
+        // Determine the best first key suggestion
+        if has_subtypes && !existing_keys.contains(&"@type".to_string()) {
+            // Show @type with first subtype value
+            if let Some(subs) = state.subtypes.get(&schema) {
+                if let Some(first_sub) = subs.first() {
+                    return Some(format!("\"@type\": \"{}\"", first_sub));
+                }
+            }
+        }
+        let first_key = state.schema_props.get(&schema).and_then(|props| {
+            let skip = |p: &&String| -> bool {
+                p.starts_with('@') || existing_keys.contains(p)
+                    || (is_common_identifiers && p.as_str() == "key")
+            };
+            // Priority: identifiers first, then other object-typed properties
+            if props.contains(&"identifiers".to_string()) && !existing_keys.contains(&"identifiers".to_string()) {
+                return Some("identifiers".to_string());
+            }
+            let obj_key = props.iter().find(|p| {
+                !skip(p) && state.prop_types.get(&schema)
+                    .and_then(|pt| pt.get(p.as_str()))
+                    .is_some()
+            });
+            if let Some(k) = obj_key {
+                return Some(k.clone());
+            }
+            props.iter().find(|p| !skip(p)).cloned()
+        });
+        if let Some(key) = first_key {
+            let is_obj = state.prop_types.get(&schema)
+                .and_then(|pt| pt.get(key.as_str()))
+                .is_some();
+            let suffix = if is_obj { "\": { " } else { "\":" };
+            return Some(format!("\"{}{}", key, suffix));
+        }
+    }
+
+    None
+}
+
+/// Returns closing brackets ghost text (e.g. "}" or "}]") when cursor is after a complete value.
+fn get_closing_brackets_ghost(input: &str, cursor_pos: usize) -> String {
+    let byte_idx = char_to_byte_idx(input, cursor_pos);
+    let last_nws = input[..byte_idx].chars().rev()
+        .find(|c| !c.is_whitespace());
+    // After a closing quote, closing bracket — suggest all pending closers
+    if !matches!(last_nws, Some('"') | Some('}') | Some(']')) {
+        return String::new();
+    }
+    // Walk bracket stack and key/value state to determine if we're after a complete value
+    let mut stack = Vec::new();
+    let mut in_str = false;
+    let mut esc = false;
+    let mut is_key = true;
+    let mut in_array = Vec::new();
+    for ch in input[..byte_idx].chars() {
+        if esc { esc = false; continue; }
+        if ch == '\\' && in_str { esc = true; continue; }
+        if ch == '"' { in_str = !in_str; continue; }
+        if !in_str {
+            match ch {
+                '{' => { stack.push(ch); in_array.push(false); is_key = true; },
+                '[' => { stack.push(ch); in_array.push(true); is_key = false; },
+                '}' => { stack.pop(); in_array.pop(); is_key = false; },
+                ']' => { stack.pop(); in_array.pop(); is_key = false; },
+                ':' => { is_key = false; },
+                ',' => { is_key = !in_array.last().copied().unwrap_or(false); },
+                _ => {}
+            }
+        }
+    }
+    // Don't suggest closing if inside an unclosed string, after a key, or after structural chars
+    if in_str || is_key || matches!(last_nws, Some(':') | Some(',') | Some('{') | Some('[')) {
+        return String::new();
+    }
+    // Return only the innermost closing bracket (matches what Tab inserts)
+    if let Some(&open) = stack.last() {
+        if open == '{' { "}".to_string() } else { "]".to_string() }
+    } else {
+        String::new()
+    }
+}
+
 fn get_completion_ghost(state: &AppState) -> String {
+    // JSON body completion ghost text
+    if cursor_inside_brackets(&state.input, state.cursor_pos) {
+        if let Some(ghost) = get_json_completion_ghost(state) {
+            return ghost;
+        }
+        // Suggest closing brackets after a value
+        let closing = get_closing_brackets_ghost(&state.input, state.cursor_pos);
+        if !closing.is_empty() {
+            return closing;
+        }
+        return String::new();
+    }
+
     // File completion ghost text (works even without API completion)
     if let Some((_, partial)) = extract_file_path_context(&state.input) {
         // Check for ~ operator on body file argument
@@ -5017,7 +6231,14 @@ fn get_completion_ghost(state: &AppState) -> String {
                 return String::new();
             }
         }
-        let completions = get_file_completions(&partial);
+        // Reuse state.completions if populated from file Tab, else compute fresh
+        let fresh;
+        let completions = if !state.completions.is_empty() && state.last_tab_input == state.input {
+            &state.completions
+        } else {
+            fresh = get_file_completions(&partial);
+            &fresh
+        };
         if let Some(first) = completions.first() {
             if first.starts_with(&partial) {
                 let partial_chars = partial.chars().count();
@@ -5050,13 +6271,13 @@ fn get_completion_ghost(state: &AppState) -> String {
 
     // Only show ghost text if URI contains a delimiter (we're typing after /, (, or ~)
     if uri.rfind(|c| c == '/' || c == '(' || c == '~').is_none() {
-        return String::new();
+        return get_body_bracket_ghost(state, &parts, &uri);
     }
 
     // Get completions for current input
     let completions = get_completions(state, &uri);
     if completions.is_empty() {
-        return String::new();
+        return get_body_bracket_ghost(state, &parts, &uri);
     }
 
     // Get first completion
@@ -5072,10 +6293,50 @@ fn get_completion_ghost(state: &AppState) -> String {
         }
     }
 
-    String::new()
+    get_body_bracket_ghost(state, &parts, &uri)
+}
+
+/// Get ghost text for body brackets (e.g., `[{ }]` for PUT on array endpoints)
+fn get_body_bracket_ghost(state: &AppState, parts: &[&str], uri: &str) -> String {
+    // Only when input ends with trailing space after method+URI and no body yet
+    if parts.len() != 2 || !state.input.ends_with(' ') {
+        return String::new();
+    }
+    let method = parts[0].to_uppercase();
+    let is_put_patch = method == "PUT" || method == "PATCH";
+    let is_post = method == "POST";
+    if !is_put_patch && !is_post {
+        return String::new();
+    }
+
+    let is_array = state.array_endpoints.contains(uri);
+    let (schema, _, _) = resolve_type_at_path(state, &format!("{}/", uri.trim_end_matches('/')));
+    let is_object = schema.as_ref()
+        .and_then(|s| {
+            if let Some(indexer) = state.indexer_info.get(s) {
+                indexer.return_type.as_ref().map(|rt| rt.trim_end_matches('?').to_string())
+            } else {
+                Some(s.clone())
+            }
+        })
+        .map_or(false, |s| state.schema_props.contains_key(&s));
+
+    if is_put_patch && is_array && is_object {
+        "[{ ".to_string()
+    } else if is_put_patch && is_array {
+        "[ ".to_string()
+    } else if is_post && is_object {
+        "{ ".to_string()
+    } else {
+        String::new()
+    }
 }
 
 fn get_completion_ghost_at_cursor(state: &AppState) -> String {
+    if cursor_inside_brackets(&state.input, state.cursor_pos) {
+        return get_json_completion_ghost(state).unwrap_or_default();
+    }
+
     if state.endpoints.is_empty() {
         return String::new();
     }
@@ -5271,17 +6532,6 @@ fn get_completions(state: &AppState, uri: &str) -> Vec<String> {
     };
 
     let (schema_opt, expects_index, _) = resolve_type_at_path(state, &parent_uri);
-
-    // DEBUG
-    if parent_uri.contains("api-versions") {
-        let _ = std::fs::write("/tmp/api-completion-debug.txt", format!(
-            "parent_uri={}\npartial={}\nschema={:?}\nexpects_index={}\nendpoints_matching={:?}\nprop_types_api_version_info={:?}\nschema_props_api_version_info={:?}\n",
-            parent_uri, partial, schema_opt, expects_index,
-            state.endpoints.iter().filter(|e| e.contains("api-version")).collect::<Vec<_>>(),
-            state.prop_types.get("api version info"),
-            state.schema_props.get("api version info"),
-        ));
-    }
 
     let schema_name = match schema_opt {
         Some(s) => s,
@@ -5593,11 +6843,17 @@ fn complete_property_path(
 
 fn complete_endpoint(state: &AppState, prefix: &str) -> Vec<String> {
     // If typing inside a path that is itself an endpoint (after its trailing slash),
-    // don't suggest sub-endpoints — the user is navigating the resource, not looking for endpoints
+    // don't suggest sub-endpoints — unless there ARE sub-endpoints matching the prefix
     if let Some(last_slash) = prefix.rfind('/') {
         let parent = &prefix[..last_slash];
         if !parent.is_empty() && state.endpoints.contains(&parent.to_string()) {
-            return Vec::new();
+            // Only suppress if no sub-endpoints match
+            let has_sub = state.endpoints.iter().any(|e| {
+                !e.contains("{key}=") && !e.contains('{') && e.starts_with(prefix) && e != parent
+            });
+            if !has_sub {
+                return Vec::new();
+            }
         }
     }
 
@@ -5646,30 +6902,19 @@ fn resolve_type_at_path(state: &AppState, uri: &str) -> (Option<String>, bool, O
 
     // First, find the collection endpoint (e.g., /receipts, /v2/receipts)
     // Check endpoint_schemas (from tag x-type) first, then endpoint_types (from response schema)
-    let mut resolve_debug = String::new();
     for i in 1..=path_parts.len() {
         let prefix = format!("/{}", path_parts[..i].join("/"));
         if let Some(name) = state.endpoint_schemas.get(&prefix) {
-            resolve_debug.push_str(&format!("endpoint_schemas hit: {} -> {}\n", prefix, name));
             schema_name = Some(name.clone());
             start_idx = i;
         } else if let Some(name) = state.endpoint_types.get(&prefix) {
-            resolve_debug.push_str(&format!("endpoint_types hit: {} -> {}\n", prefix, name));
             schema_name = Some(name.clone());
             start_idx = i;
-        } else {
-            resolve_debug.push_str(&format!("no hit for prefix: {}\n", prefix));
         }
     }
 
     let mut current_schema = match schema_name {
         Some(ref s) => {
-            if base_uri.contains("api-version") {
-                let _ = std::fs::write("/tmp/api-resolve-debug.txt", format!(
-                    "base_uri={}\npath_parts={:?}\nresolved_schema={}\nstart_idx={}\nresolve_log:\n{}\n",
-                    base_uri, path_parts, s, start_idx, resolve_debug
-                ));
-            }
             s.clone()
         },
         None => return (None, false, None),
@@ -5843,66 +7088,6 @@ fn get_param_hint(state: &AppState, uri: &str) -> String {
     }
 
     String::new()
-}
-
-fn get_identifier_completions(state: &AppState, uri: &str) -> Vec<String> {
-    // Get completions for identifier properties followed by =
-    // e.g., for /currencies/ -> currencyCode=
-    let path_parts: Vec<&str> = uri.split('/').collect();
-    if path_parts.len() < 2 {
-        return Vec::new();
-    }
-
-    let base = format!("/{}", path_parts[1]);
-    let partial = if path_parts.len() >= 3 { path_parts[2] } else { "" };
-
-    // Check if this is a collection endpoint
-    let is_collection = state.param_types.keys().any(|ep| ep.starts_with(&format!("{}/", base)));
-    if !is_collection {
-        return Vec::new();
-    }
-
-    // Get schema name via endpoint_schemas
-    let schema_name = match state.endpoint_schemas.get(&base) {
-        Some(name) => name,
-        None => return Vec::new(),
-    };
-
-    // Get x-indexer info
-    let indexer = match state.indexer_info.get(schema_name) {
-        Some(info) => info,
-        None => return Vec::new(),
-    };
-
-    let index_type = match &indexer.index_type {
-        Some(t) => t,
-        None => return Vec::new(),
-    };
-
-    // Parse index_type to find identifier types (look for "X identifiers" patterns)
-    // e.g., "currency code or currency identifiers" -> look up "currency identifiers"
-    let mut completions = Vec::new();
-
-    for type_name in index_type.split(" or ") {
-        let type_name = type_name.trim();
-        if type_name.ends_with(" identifiers") || type_name == "common identifiers" {
-            // Look up this identifier schema's properties
-            if let Some(props) = state.schema_props.get(type_name) {
-                for prop in props {
-                    // Skip @type and key
-                    if prop.starts_with('@') || prop == "key" {
-                        continue;
-                    }
-                    let completion = format!("{}=", prop);
-                    if completion.starts_with(partial) {
-                        completions.push(format!("{}/{}", base, completion));
-                    }
-                }
-            }
-        }
-    }
-
-    completions
 }
 
 fn get_identifier_completions_for_schema(state: &AppState, schema_name: &str, base_path: &str, partial: &str) -> Vec<String> {
