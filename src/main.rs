@@ -18,7 +18,7 @@ use colored::Colorize;
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags, PopKeyboardEnhancementFlags},
-    execute,
+    execute, queue,
     style::Print,
     terminal::{self, Clear, ClearType},
 };
@@ -157,16 +157,31 @@ fn keychain_entry() -> keyring::Entry {
     keyring::Entry::new(KEYCHAIN_SERVICE, "data").expect("failed to create keyring entry")
 }
 
+thread_local! {
+    static KEYCHAIN_CACHE: std::cell::RefCell<Option<KeychainData>> = const { std::cell::RefCell::new(None) };
+}
+
 fn load_keychain_data() -> KeychainData {
-    match keychain_entry().get_password() {
-        Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
-        Err(_) => KeychainData::default(),
-    }
+    KEYCHAIN_CACHE.with(|cache| {
+        if let Some(ref data) = *cache.borrow() {
+            return data.clone();
+        }
+        let data = match keychain_entry().get_password() {
+            Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
+            Err(_) => KeychainData::default(),
+        };
+        *cache.borrow_mut() = Some(data.clone());
+        data
+    })
 }
 
 fn save_keychain_data(data: &KeychainData) -> Result<(), String> {
     let json = serde_json::to_string(data).map_err(|e| e.to_string())?;
-    keychain_entry().set_password(&json).map_err(|e| format!("keychain error: {}", e))
+    keychain_entry().set_password(&json).map_err(|e| format!("keychain error: {}", e))?;
+    KEYCHAIN_CACHE.with(|cache| {
+        *cache.borrow_mut() = Some(data.clone());
+    });
+    Ok(())
 }
 
 fn list_connections() -> Vec<String> {
@@ -659,6 +674,69 @@ fn find_body_start(input: &str) -> Option<usize> {
 }
 
 /// Apply JSON syntax highlighting to a string. Returns ANSI-colored version.
+/// If `cursor_char_pos` is Some, returns (before_cursor, char_at_cursor, after_cursor) split
+/// in the highlighted output, preserving correct highlighting state across the split.
+fn highlight_json_split(s: &str, cursor_char_pos: Option<usize>) -> (String, Option<char>, String) {
+    let full = highlight_json(s);
+    match cursor_char_pos {
+        None => (full, None, String::new()),
+        Some(pos) => {
+            // Walk the highlighted string, counting only non-ANSI characters,
+            // tracking the active ANSI color so we can restore it after the cursor
+            let mut char_count = 0usize;
+            let bytes = full.as_bytes();
+            let len = bytes.len();
+            let mut i = 0;
+            let mut split_byte = None;
+            let mut cursor_end_byte = None;
+            let mut active_color = String::new();
+            let mut color_at_split = String::new();
+            while i < len {
+                if bytes[i] == 0x1b {
+                    // Capture the full ANSI escape sequence
+                    let seq_start = i;
+                    while i < len && bytes[i] != b'm' {
+                        i += 1;
+                    }
+                    if i < len { i += 1; }
+                    let seq = &full[seq_start..i];
+                    if seq == "\x1b[0m" {
+                        active_color.clear();
+                    } else {
+                        active_color = seq.to_string();
+                    }
+                    continue;
+                }
+                if char_count == pos && split_byte.is_none() {
+                    split_byte = Some(i);
+                    color_at_split = active_color.clone();
+                    let ch_len = full[i..].chars().next().map_or(1, |c| c.len_utf8());
+                    cursor_end_byte = Some(i + ch_len);
+                }
+                let ch_len = full[i..].chars().next().map_or(1, |c| c.len_utf8());
+                i += ch_len;
+                char_count += 1;
+            }
+            match (split_byte, cursor_end_byte) {
+                (Some(sb), Some(ce)) => {
+                    let before = full[..sb].to_string();
+                    let cursor_ch = full[sb..].chars().next().unwrap_or(' ');
+                    // Restore active color after the cursor so highlighting continues
+                    let after = if !color_at_split.is_empty() {
+                        format!("{}{}", color_at_split, &full[ce..])
+                    } else {
+                        full[ce..].to_string()
+                    };
+                    (before, Some(cursor_ch), after)
+                }
+                _ => {
+                    (full, None, String::new())
+                }
+            }
+        }
+    }
+}
+
 fn highlight_json(s: &str) -> String {
     if s.is_empty() {
         return String::new();
@@ -692,6 +770,20 @@ fn highlight_json(s: &str) -> String {
         if in_string {
             if ch == '\\' {
                 escape = true;
+                i += 1;
+                continue;
+            }
+            if ch == '\n' {
+                // JSON strings are single-line — terminate unterminated string at newline
+                let string_content: String = chars[string_start..i].iter().collect();
+                let color = if is_key {
+                    if string_content.contains("@type") { c_at } else { c_key }
+                } else {
+                    c_str
+                };
+                out.push_str(&format!("{}{}{}", color, string_content, r));
+                out.push('\n');
+                in_string = false;
                 i += 1;
                 continue;
             }
@@ -2962,14 +3054,19 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
                         print!("{}", output);
                     }
 
-                    // Placeholder lines for input area
-                    println!();
-                    println!();
-                    println!();
+                    // Placeholder lines for input area (match actual input height)
+                    let input_lines = state.input.split('\n').count() as u16;
+                    let placeholder_count = 2 + input_lines; // ruler + input lines + hint
+                    for _ in 0..placeholder_count {
+                        println!();
+                    }
                     io::stdout().flush().ok();
 
                     // Re-enable raw mode
                     terminal::enable_raw_mode()?;
+
+                    // Reset prev_input_lines so render clears the right amount
+                    state.prev_input_lines = input_lines;
 
                     // Render input area
                     render(&mut stdout, &mut state)?;
@@ -3261,9 +3358,20 @@ fn handle_key_event(
                 // Try body bracket completion first (e.g., Tab after "PUT /people ")
                 let bracket_ghost = get_body_bracket_ghost(state, &parts, uri);
                 if !bracket_ghost.is_empty() {
+                    // Expand brackets to multiline block with matching closers on one line
+                    // e.g. "[{ " → "[{\n  \n}]"  or "{ " → "{\n  \n}"
+                    // Brackets on the same line count as one indent level
                     let ins_byte = char_to_byte_idx(&state.input, state.cursor_pos);
-                    state.input.insert_str(ins_byte, &bracket_ghost);
-                    state.cursor_pos += char_len(&bracket_ghost);
+                    let trimmed = bracket_ghost.trim();
+                    let bracket_count = trimmed.len();
+                    // Build closers: reverse of openers on a single line (mirrors the openers)
+                    let closers: String = trimmed.chars().rev()
+                        .map(|ch| if ch == '[' { ']' } else { '}' })
+                        .collect();
+                    let expanded = format!("{}\n  \n{}", trimmed, closers);
+                    let cursor_offset = bracket_count + 1 + 2; // brackets + \n + 2-space indent
+                    state.input.insert_str(ins_byte, &expanded);
+                    state.cursor_pos += cursor_offset;
                     render(stdout, state)?;
                 } else {
                     // Complete if URI contains a delimiter (we're typing after /, (, or ~)
@@ -3361,8 +3469,9 @@ fn handle_key_event(
             stdout.write_all(b"\x1b[3J\x1b[2J\x1b[H")?;
             stdout.flush()?;
             // Print placeholder lines and render UI fresh
-            execute!(stdout, Print("\r\n\r\n\r\n"))?;
-            state.prev_input_lines = 1;
+            let il = visual_line_count(&state.input, state.width as usize);
+            for _ in 0..(2 + il) { execute!(stdout, Print("\r\n"))?; }
+            state.prev_input_lines = il;
             render(stdout, state)?;
         }
 
@@ -3857,16 +3966,20 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
             state.input.push_str(&format!(" {}", state.body));
         }
         state.cursor_pos = char_len(&state.input);
+        // Clear stale completion state to prevent ghost text flash
+        state.completions.clear();
+        state.last_tab_input.clear();
 
-        // Clear input area, print output, render new input (same as normal flow)
+        // Clear input area, print output, render new input (stay in raw mode)
         let clear_lines = 2 + state.prev_input_lines;
-        execute!(stdout, cursor::Hide, cursor::MoveUp(clear_lines.min(state.height.saturating_sub(1))), cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
-        terminal::disable_raw_mode()?;
-        print!("{}", display_output);
-        io::stdout().flush()?;
-        terminal::enable_raw_mode()?;
-        state.prev_input_lines = 1;
-        execute!(stdout, Print("\r\n\r\n\r\n"))?;
+        queue!(stdout, cursor::Hide, cursor::MoveUp(clear_lines.min(state.height.saturating_sub(1))), cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
+        // Print output with \r\n line endings for raw mode
+        let raw_output = display_output.replace('\n', "\r\n");
+        queue!(stdout, Print(&raw_output))?;
+        let input_lines = visual_line_count(&state.input, state.width as usize);
+        for _ in 0..(2 + input_lines) { queue!(stdout, Print("\r\n"))?; }
+        state.prev_input_lines = input_lines;
+        // No flush here — render() will flush everything atomically
         render(stdout, state)?;
         return Ok(());
     }
@@ -4100,7 +4213,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
         state.output_history.remove(0);
     }
 
-    // Update input with last command (use display_outfile to keep ~ unexpanded)
+    // Update input with last command
     state.input = format!("{} {}", state.method, state.uri);
     if !state.body.is_empty() {
         state.input.push_str(&format!(" {}", state.body));
@@ -4109,10 +4222,13 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
         state.input.push_str(&format!(" > {}", state.display_outfile));
     }
     state.cursor_pos = char_len(&state.input);
+    // Clear stale completion state to prevent ghost text flash
+    state.completions.clear();
+    state.last_tab_input.clear();
 
     // Now clear input area, print output, and render new input - all at once
     let clear_lines = 2 + state.prev_input_lines;
-    execute!(
+    queue!(
         stdout,
         cursor::Hide,
         cursor::MoveUp(clear_lines.min(state.height.saturating_sub(1))),
@@ -4120,18 +4236,15 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
         Clear(ClearType::FromCursorDown)
     )?;
 
-    // Disable raw mode for clean output printing
-    terminal::disable_raw_mode()?;
-    print!("{}", display_output);
-    io::stdout().flush()?;
-
-    // Re-enable raw mode for UI
-    terminal::enable_raw_mode()?;
+    // Print output with \r\n line endings (stay in raw mode to avoid flash)
+    let raw_output = display_output.replace('\n', "\r\n");
+    queue!(stdout, Print(&raw_output))?;
 
     // Print placeholder lines and render input area
-    // Reset prev_input_lines to match the 3 placeholder lines (ruler + 1 input + hint)
-    state.prev_input_lines = 1;
-    execute!(stdout, Print("\r\n\r\n\r\n"))?;
+    let input_lines = visual_line_count(&state.input, state.width as usize);
+    for _ in 0..(2 + input_lines) { queue!(stdout, Print("\r\n"))?; }
+    state.prev_input_lines = input_lines;
+    // No flush here — render() will flush everything atomically
     render(stdout, state)?;
 
     Ok(())
@@ -4521,34 +4634,34 @@ fn render_input_content(state: &mut AppState, width: usize) -> (String, u16, Str
         String::new()
     };
 
-    // Apply JSON syntax highlighting to body portions
+    // Apply JSON syntax highlighting to the full body as one unit, then split at cursor
     let body_start = find_body_start(&state.input);
-    let hl_before = if let Some(bs) = body_start {
-        if cursor_byte > bs {
-            // Cursor is inside body — highlight prefix (non-body) + highlighted body
-            let prefix = &state.input[..bs];
-            let body_part = &state.input[bs..cursor_byte];
-            format!("{}{}", prefix, highlight_json(body_part))
-        } else {
-            before_cursor.to_string()
-        }
-    } else {
-        before_cursor.to_string()
-    };
-
-    let hl_after = if let Some(bs) = body_start {
-        if state.cursor_pos < input_char_len {
-            let next_byte = char_to_byte_idx(&state.input, state.cursor_pos + 1);
-            if next_byte > bs {
-                highlight_json(&state.input[next_byte..])
+    let (hl_before, hl_at_cursor, hl_after) = if let Some(bs) = body_start {
+        let body = &state.input[bs..];
+        let prefix = &state.input[..bs];
+        let body_start_char = char_len(&state.input[..bs]);
+        if cursor_byte >= bs && state.cursor_pos < input_char_len {
+            // Cursor is inside body
+            let cursor_in_body = state.cursor_pos - body_start_char;
+            let (hb, hc, ha) = highlight_json_split(body, Some(cursor_in_body));
+            (format!("{}{}", prefix, hb), hc.unwrap_or(' '), ha)
+        } else if cursor_byte < bs {
+            // Cursor is on URL line — highlight full body, split prefix at cursor
+            let highlighted_body = highlight_json(body);
+            let prefix_before = &state.input[..cursor_byte];
+            let prefix_after = if state.cursor_pos < input_char_len {
+                let next_byte = char_to_byte_idx(&state.input, state.cursor_pos + 1);
+                &state.input[next_byte..bs]
             } else {
-                after_cursor.to_string()
-            }
+                ""
+            };
+            (prefix_before.to_string(), at_cursor, format!("{}{}", prefix_after, highlighted_body))
         } else {
-            String::new()
+            // Cursor at end, past body
+            (format!("{}{}", prefix, highlight_json(body)), ' ', String::new())
         }
     } else {
-        after_cursor.to_string()
+        (before_cursor.to_string(), at_cursor, after_cursor.to_string())
     };
 
     let mut rendered = String::new();
@@ -4566,23 +4679,25 @@ fn render_input_content(state: &mut AppState, width: usize) -> (String, u16, Str
                 rendered.push_str(&format!("\x1b[38;5;240m{}\x1b[0m", ghost_chars[1..].iter().collect::<String>()));
             }
         } else {
-            rendered.push_str(&format!("\x1b[38;5;240m{}\x1b[0m", ghost));
-            if at_cursor == '\n' {
+            // Cursor char first, then ghost text, then rest of input
+            if hl_at_cursor == '\n' {
                 rendered.push_str("\x1b[48;5;247m\x1b[38;5;0m \x1b[0m");
+                rendered.push_str(&format!("\x1b[38;5;240m{}\x1b[0m", ghost));
                 rendered.push('\n');
                 rendered.push_str(&hl_after.trim_start_matches('\n'));
             } else {
-                rendered.push_str(&format!("\x1b[48;5;247m\x1b[38;5;0m{}\x1b[0m", at_cursor));
+                rendered.push_str(&format!("\x1b[48;5;247m\x1b[38;5;0m{}\x1b[0m", hl_at_cursor));
+                rendered.push_str(&format!("\x1b[38;5;240m{}\x1b[0m", ghost));
                 rendered.push_str(&hl_after);
             }
         }
     } else {
-        if at_cursor == '\n' {
+        if hl_at_cursor == '\n' {
             rendered.push_str("\x1b[48;5;247m\x1b[38;5;0m \x1b[0m");
             rendered.push('\n');
             rendered.push_str(&hl_after.trim_start_matches('\n'));
         } else {
-            rendered.push_str(&format!("\x1b[48;5;247m\x1b[38;5;0m{}\x1b[0m", at_cursor));
+            rendered.push_str(&format!("\x1b[48;5;247m\x1b[38;5;0m{}\x1b[0m", hl_at_cursor));
             rendered.push_str(&hl_after);
         }
     }
@@ -4632,8 +4747,8 @@ fn flash_rulers(stdout: &mut io::Stdout, state: &mut AppState, color: &str, ms: 
     let up = 2 + state.prev_input_lines;
     let r = "\x1b[0m";
 
-    // Move to top ruler, clear and redraw each line (preserve hint line)
-    execute!(
+    // Move to top ruler, redraw only rulers — skip over input content entirely
+    queue!(
         stdout,
         cursor::Hide,
         cursor::MoveUp(up.min(state.height.saturating_sub(1))),
@@ -4643,70 +4758,66 @@ fn flash_rulers(stdout: &mut io::Stdout, state: &mut AppState, color: &str, ms: 
 
     // Top ruler in color
     if !state.config.base_uri.is_empty() {
-        let host = format!(" {} ", state.config.base_uri);
-        let host_len = host.len();
+        let host_len = state.config.base_uri.len() + 2;
         let right = 7;
         let left = w.saturating_sub(host_len).saturating_sub(right);
-        execute!(stdout, Print(format!(
-            "{color}{}{r} \x1b[38;5;247m{}{r} {color}{}{r}\r\n",
+        queue!(stdout, Print(format!(
+            "{color}{}{r} \x1b[38;5;247m{}{r} {color}{}{r}",
             "─".repeat(left),
             state.config.base_uri,
             "─".repeat(right),
         )))?;
     } else {
-        execute!(stdout, Print(format!("{color}{}{r}\r\n", "─".repeat(w))))?;
+        queue!(stdout, Print(format!("{color}{}{r}", "─".repeat(w))))?;
     }
 
-    // Input text slightly lighter than rulers
-    execute!(stdout, Clear(ClearType::CurrentLine))?;
-    execute!(stdout, Print(format!("\x1b[38;5;253m{}{r}\r\n", state.input)))?;
+    // Skip over input lines, redraw bottom ruler in color
+    queue!(
+        stdout,
+        cursor::MoveDown(state.prev_input_lines + 1),
+        cursor::MoveToColumn(0),
+        Clear(ClearType::CurrentLine),
+        Print(format!("{color}{}{r}", "─".repeat(w))),
+    )?;
 
-    // Bottom ruler in color
-    execute!(stdout, Clear(ClearType::CurrentLine))?;
-    execute!(stdout, Print(format!("{color}{}{r}", "─".repeat(w))))?;
-
-    // Move past hint line without touching it
-    execute!(stdout, cursor::MoveDown(1), cursor::MoveToColumn(0))?;
-
+    // Move back down past hint line to restore cursor position
+    queue!(stdout, cursor::MoveDown(1), cursor::MoveToColumn(0))?;
     stdout.flush()?;
 
     thread::sleep(Duration::from_millis(ms));
 
-    // Restore rulers to dimmed while text stays colored
-    execute!(
+    // Restore rulers to dimmed
+    let d = "\x1b[38;5;239m";
+    queue!(
         stdout,
         cursor::MoveUp(2 + state.prev_input_lines),
         cursor::MoveToColumn(0),
         Clear(ClearType::CurrentLine),
     )?;
-    let d = "\x1b[38;5;239m";
-    let rs = "\x1b[0m";
     if !state.config.base_uri.is_empty() {
-        let host = format!(" {} ", state.config.base_uri);
-        let host_len = host.len();
+        let host_len = state.config.base_uri.len() + 2;
         let right = 7;
         let left = w.saturating_sub(host_len).saturating_sub(right);
-        execute!(stdout, Print(format!(
-            "{d}{}{rs} {}{d} {}{rs}\r\n",
+        queue!(stdout, Print(format!(
+            "{d}{}{r} {}{d} {}{r}",
             "─".repeat(left),
             state.config.base_uri.dimmed(),
             "─".repeat(right)
         )))?;
     } else {
-        execute!(stdout, Print(format!("{d}{}{rs}\r\n", "─".repeat(w))))?;
+        queue!(stdout, Print(format!("{d}{}{r}", "─".repeat(w))))?;
     }
-    execute!(
+    queue!(
         stdout,
-        cursor::MoveDown(state.prev_input_lines),
+        cursor::MoveDown(state.prev_input_lines + 1),
         cursor::MoveToColumn(0),
         Clear(ClearType::CurrentLine),
-        Print(format!("{d}{}{rs}\r\n", "─".repeat(w))),
+        Print(format!("{d}{}{r}", "─".repeat(w))),
+        cursor::MoveDown(1),
+        cursor::MoveToColumn(0),
     )?;
     stdout.flush()?;
 
-    thread::sleep(Duration::from_millis(35));
-
-    render(stdout, state)?;
     Ok(())
 }
 
@@ -4732,8 +4843,8 @@ fn render(stdout: &mut io::Stdout, state: &mut AppState) -> io::Result<()> {
     // Update prev_show_help for next render
     state.prev_show_help = state.show_help;
 
-    // Hide cursor first to prevent flicker, then move up and clear
-    execute!(
+    // Queue all render operations without flushing — single flush at end of render
+    queue!(
         stdout,
         cursor::Hide,
         cursor::MoveUp(lines_to_clear.min(state.height.saturating_sub(1))),
@@ -4751,7 +4862,7 @@ fn render(stdout: &mut io::Stdout, state: &mut AppState) -> io::Result<()> {
         let left = width.saturating_sub(host_len).saturating_sub(right);
         let d = "\x1b[38;5;239m";
         let r = "\x1b[0m";
-        execute!(
+        queue!(
             stdout,
             Print(format!(
                 "{d}{}{r} {}{d} {}{r}\r\n",
@@ -4761,7 +4872,7 @@ fn render(stdout: &mut io::Stdout, state: &mut AppState) -> io::Result<()> {
             ))
         )?;
     } else {
-        execute!(stdout, Print(format!("{}\r\n", ruler_line)))?;
+        queue!(stdout, Print(format!("{}\r\n", ruler_line)))?;
     }
 
     // Input line or help
@@ -4776,17 +4887,17 @@ fn render(stdout: &mut io::Stdout, state: &mut AppState) -> io::Result<()> {
         } else {
             format!(" {} Loading environment from 1P...", frame)
         };
-        execute!(stdout, Print(format!("{}\r\n", msg.dimmed())))?;
+        queue!(stdout, Print(format!("{}\r\n", msg.dimmed())))?;
     } else if state.show_help {
-        execute!(
+        queue!(
             stdout,
             Print("\r\n"),
             Print(format!("{}\r\n", "  enter      Send request".dimmed())),
             Print(format!("{}\r\n", "  opt+enter  New line (multiline body) [or ctrl+n]".dimmed())),
             Print(format!("{}\r\n", "  up/down    Navigate input history".dimmed()))
         )?;
-        execute!(stdout, Print(format!("{}\r\n", "  tab        Complete URI (endpoints, operators, properties)".dimmed())))?;
-        execute!(
+        queue!(stdout, Print(format!("{}\r\n", "  tab        Complete URI (endpoints, operators, properties)".dimmed())))?;
+        queue!(
             stdout,
             Print(format!("{}\r\n", "  ctrl+g     Quick GET current URI".dimmed())),
             Print(format!("{}\r\n", "  ctrl+t     Cycle method: GET → POST → PATCH → PUT".dimmed())),
@@ -4803,13 +4914,13 @@ fn render(stdout: &mut io::Stdout, state: &mut AppState) -> io::Result<()> {
         )?;
     } else {
         let (input_output, input_line_count, _ghost) = render_input_content(state, width);
-        execute!(stdout, Print(&input_output), Print("\r\n"))?;
+        queue!(stdout, Print(&input_output), Print("\r\n"))?;
         state.prev_input_lines = input_line_count;
     }
 
     // Bottom ruler and hint (only when not showing help - help has its own)
     if !state.show_help {
-        execute!(stdout, Print(format!("{}\r\n", ruler_line)))?;
+        queue!(stdout, Print(format!("{}\r\n", ruler_line)))?;
 
         // Hint line (only if terminal is wide enough - "ctrl+h for shortcuts" is 21 chars + 2 indent)
         if width >= 22 {
@@ -4843,9 +4954,9 @@ fn render(stdout: &mut io::Stdout, state: &mut AppState) -> io::Result<()> {
                 } else {
                     state.status_msg.dimmed().to_string()
                 };
-                execute!(stdout, Print(format!("  {}", msg_style)))?;
+                queue!(stdout, Print(format!("  {}", msg_style)))?;
             } else {
-                execute!(stdout, Print(format!("  {}", "ctrl+h for shortcuts".dimmed())))?;
+                queue!(stdout, Print(format!("  {}", "ctrl+h for shortcuts".dimmed())))?;
             }
         }
     }
@@ -5540,6 +5651,17 @@ fn handle_json_tab_completion(state: &mut AppState, reverse: bool, apply: bool) 
     };
     let (schema_name, partial, is_value, current_key, existing_keys) = ctx;
 
+    // Don't offer completions when cursor is on a line that already has content after cursor
+    // (e.g. cursor on the " of "identifiers": { — don't insert a new key before it)
+    if partial.is_empty() {
+        let cursor_byte = char_to_byte_idx(&state.input, state.cursor_pos);
+        let line_end = state.input[cursor_byte..].find('\n').map_or(state.input.len(), |p| cursor_byte + p);
+        let rest_of_line = state.input[cursor_byte..line_end].trim();
+        if !rest_of_line.is_empty() {
+            return;
+        }
+    }
+
     // Detect @type combo cycling: after applying "@type": "value", context says value position
     // with current_key == "@type". Treat this as key-mode combo cycling.
     let is_combo_cycling = is_value && current_key == "@type" && partial.is_empty()
@@ -5634,7 +5756,7 @@ fn handle_json_tab_completion(state: &mut AppState, reverse: bool, apply: bool) 
             }
         }
 
-        // Check if property type is boolean (from prop_types)
+        // Check if property type is boolean or object (from prop_types)
         if completions.is_empty() {
             if let Some(ptypes) = state.prop_types.get(&schema_name) {
                 if let Some(prop_type) = ptypes.get(&current_key) {
@@ -5642,6 +5764,10 @@ fn handle_json_tab_completion(state: &mut AppState, reverse: bool, apply: bool) 
                         completions.push("true".to_string());
                         completions.push("false".to_string());
                     }
+                }
+                // Object-typed property — offer { as value
+                if ptypes.contains_key(&current_key) && partial.is_empty() && completions.is_empty() {
+                    completions.push("{".to_string());
                 }
             }
         }
@@ -5798,7 +5924,7 @@ fn handle_json_tab_completion(state: &mut AppState, reverse: bool, apply: bool) 
             }
         }
     } else if !is_value {
-        let suffix = if is_object_prop { "\": { " } else { "\":" };
+        let suffix = if is_object_prop { "\": {" } else { "\":" };
         if partial.is_empty() {
             // No key started — insert full "key": with leading space if needed
             let needs_space = !before.is_empty() && !before.ends_with(' ') && !before.ends_with('\n');
@@ -5819,14 +5945,35 @@ fn handle_json_tab_completion(state: &mut AppState, reverse: bool, apply: bool) 
         replacement,
         &state.input[cursor_byte + skip_after..]
     );
-    state.cursor_pos = char_len(&new_input[..replace_start]) + char_len(&replacement);
+    let cursor_after_replacement = char_len(&new_input[..replace_start]) + char_len(&replacement);
     state.input = new_input;
 
-    // After inserting an object-typed key (e.g. "identifiers": { "), clear stale completions
-    // so the ghost text can compute fresh completions for the nested schema
-    if is_object_prop {
+    // For object-typed properties (key or value position), expand to multiline block
+    let is_object_value = is_value && completion == "{";
+    if is_object_prop || is_object_value {
+        let is_multiline = state.input.contains('\n');
+        if is_multiline {
+            // Base indent on current line's leading whitespace (not bracket depth)
+            let cursor_byte_after = char_to_byte_idx(&state.input, cursor_after_replacement);
+            let line_start = state.input[..cursor_byte_after].rfind('\n').map_or(0, |p| p + 1);
+            let line_content = &state.input[line_start..cursor_byte_after];
+            let current_indent: String = line_content.chars().take_while(|c| *c == ' ').collect();
+            let inner_indent = format!("{}  ", current_indent);
+            let expansion = format!("\n{}\n{}}}", inner_indent, current_indent);
+            let inner_len = inner_indent.len();
+            state.input.insert_str(cursor_byte_after, &expansion);
+            // Cursor on the blank inner line
+            state.cursor_pos = cursor_after_replacement + 1 + inner_len; // \n + indent
+        } else {
+            // Single-line: just add space after {
+            let cursor_byte_after = char_to_byte_idx(&state.input, cursor_after_replacement);
+            state.input.insert_str(cursor_byte_after, " ");
+            state.cursor_pos = cursor_after_replacement + 1;
+        }
         state.completions.clear();
         state.last_tab_input.clear();
+    } else {
+        state.cursor_pos = cursor_after_replacement;
     }
 }
 
@@ -6068,7 +6215,7 @@ fn handle_file_tab_completion_reverse(state: &mut AppState) {
 
 fn get_json_completion_ghost(state: &AppState) -> Option<String> {
     let ctx = json_context_at_cursor(state)?;
-    let (schema, partial, is_value, _key, existing_keys) = ctx;
+    let (schema, partial, is_value, current_key, existing_keys) = ctx;
     let current_is_key = !is_value;
 
     // If completions are populated from a json trigger, use them
@@ -6090,7 +6237,7 @@ fn get_json_completion_ghost(state: &AppState) -> Option<String> {
                     let is_obj = state.prop_types.get(&schema)
                         .and_then(|pt| pt.get(completion.as_str()))
                         .is_some();
-                    let suffix = if is_obj { "\": { " } else { "\":" };
+                    let suffix = if is_obj { "\": {" } else { "\":" };
                     return Some(format!("{}{}", remaining, suffix));
                 }
             } else {
@@ -6101,11 +6248,14 @@ fn get_json_completion_ghost(state: &AppState) -> Option<String> {
     }
 
     // No pre-populated completions — compute ghost proactively in key position
-    // Only suggest on a fresh line (no existing content before cursor on this line)
+    // Only suggest on an empty line (no existing content before or after cursor)
     let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
     let line_start = state.input[..byte_idx].rfind('\n').map_or(0, |p| p + 1);
     let line_before = &state.input[line_start..byte_idx];
-    let on_clean_line = line_before.chars().all(|c| c.is_whitespace());
+    let line_end = state.input[byte_idx..].find('\n').map_or(state.input.len(), |p| byte_idx + p);
+    let line_after = &state.input[byte_idx..line_end];
+    let on_clean_line = line_before.chars().all(|c| c.is_whitespace())
+        && line_after.chars().all(|c| c.is_whitespace());
     if current_is_key && partial.is_empty() && on_clean_line {
         let is_common_identifiers = schema_inherits_from(&state.parent_types, &schema, "common identifiers");
         let has_subtypes = !is_common_identifiers && state.subtypes.get(&schema).map_or(false, |s| !s.is_empty());
@@ -6141,8 +6291,17 @@ fn get_json_completion_ghost(state: &AppState) -> Option<String> {
             let is_obj = state.prop_types.get(&schema)
                 .and_then(|pt| pt.get(key.as_str()))
                 .is_some();
-            let suffix = if is_obj { "\": { " } else { "\":" };
+            let suffix = if is_obj { "\": {" } else { "\":" };
             return Some(format!("\"{}{}", key, suffix));
+        }
+    }
+
+    // Value position: suggest { for object-typed properties
+    if is_value && partial.is_empty() {
+        if let Some(ptypes) = state.prop_types.get(&schema) {
+            if ptypes.contains_key(&current_key) {
+                return Some("{".to_string());
+            }
         }
     }
 
@@ -6184,9 +6343,34 @@ fn get_closing_brackets_ghost(input: &str, cursor_pos: usize) -> String {
     if in_str || is_key || matches!(last_nws, Some(':') | Some(',') | Some('{') | Some('[')) {
         return String::new();
     }
-    // Return only the innermost closing bracket (matches what Tab inserts)
+    // Return only the innermost closing bracket, formatted to match what Tab inserts
     if let Some(&open) = stack.last() {
-        if open == '{' { "}".to_string() } else { "]".to_string() }
+        let bracket = if open == '{' { "}" } else { "]" };
+        let is_multiline = input[..byte_idx].contains('\n');
+        if is_multiline {
+            let depth = stack.len();
+            let dedent = depth.saturating_sub(1);
+            let indent = "  ".repeat(dedent);
+            // Check if cursor is on a blank/whitespace-only line
+            let line_start = input[..byte_idx].rfind('\n').map_or(0, |p| p + 1);
+            let line_before = &input[line_start..byte_idx];
+            if line_before.chars().all(|c| c == ' ') {
+                // Will reuse this line — ghost shows just the bracket at correct indent
+                // But we need to show what the line will look like after replacement
+                let current_indent_len = line_before.len();
+                let target = format!("{}{}", indent, bracket);
+                if target.len() > current_indent_len {
+                    // Need more chars than current position — show remaining
+                    target[current_indent_len..].to_string()
+                } else {
+                    bracket.to_string()
+                }
+            } else {
+                format!("\n{}{}", indent, bracket)
+            }
+        } else {
+            bracket.to_string()
+        }
     } else {
         String::new()
     }
@@ -6334,6 +6518,14 @@ fn get_body_bracket_ghost(state: &AppState, parts: &[&str], uri: &str) -> String
 
 fn get_completion_ghost_at_cursor(state: &AppState) -> String {
     if cursor_inside_brackets(&state.input, state.cursor_pos) {
+        // Only show JSON ghost if cursor is on a line with no content after it
+        // (prevents ghost text from overlapping with existing content and causing visual artifacts)
+        let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
+        let line_end = state.input[byte_idx..].find('\n').map_or(state.input.len(), |p| byte_idx + p);
+        let after_on_line = &state.input[byte_idx..line_end];
+        if after_on_line.chars().any(|c| !c.is_whitespace()) {
+            return String::new();
+        }
         return get_json_completion_ghost(state).unwrap_or_default();
     }
 
@@ -6365,11 +6557,16 @@ fn get_completion_ghost_at_cursor(state: &AppState) -> String {
         return String::new();
     };
     let uri_chars: Vec<char> = uri_full.chars().collect();
-    if cursor_in_uri >= uri_chars.len() {
+    // Cursor past end of URI — no ghost (cursor is in body/elsewhere)
+    if cursor_in_uri > uri_chars.len() {
         return String::new();
     }
-    let uri_before: String = uri_chars[..cursor_in_uri].iter().collect();
+    let uri_before: String = uri_chars[..cursor_in_uri.min(uri_chars.len())].iter().collect();
     if uri_before.is_empty() {
+        return String::new();
+    }
+    // Don't show ghost text when cursor is in the middle of the URI — it would splice into existing text
+    if cursor_in_uri < uri_chars.len() {
         return String::new();
     }
 
@@ -6383,14 +6580,11 @@ fn get_completion_ghost_at_cursor(state: &AppState) -> String {
         return String::new();
     }
 
-    let uri_after: String = uri_chars[cursor_in_uri..].iter().collect();
-
     let completion = &completions[0];
     if completion.starts_with(&uri_before) {
         let uri_before_chars = uri_before.chars().count();
         let ghost: String = completion.chars().skip(uri_before_chars).collect();
-        // Suppress ghost if the text after cursor already starts with it
-        if !ghost.is_empty() && !uri_after.starts_with(&ghost) {
+        if !ghost.is_empty() {
             return ghost;
         }
     }
