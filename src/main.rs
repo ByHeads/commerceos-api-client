@@ -97,6 +97,10 @@ struct Args {
     /// Use NDJSON for request and response
     #[arg(long = "ndjson")]
     ndjson: bool,
+
+    /// Enable experimental features (body completion, syntax highlighting)
+    #[arg(short = 'x', long = "experimental")]
+    experimental: bool,
 }
 
 #[derive(Clone)]
@@ -112,6 +116,7 @@ struct Config {
     complete: bool,
     outfile: String,
     streaming: bool,
+    experimental: bool,
 }
 
 impl Default for Config {
@@ -128,6 +133,7 @@ impl Default for Config {
             complete: false,
             outfile: String::new(),
             streaming: false,
+            experimental: false,
         }
     }
 }
@@ -2167,6 +2173,7 @@ fn main() {
     config.raw = args.raw;
     config.include_nulls = args.include_nulls;
     config.ndjson = args.ndjson;
+    config.experimental = args.experimental;
 
     if args.me {
         config.api_path = "/api/me/v1".to_string();
@@ -3290,7 +3297,7 @@ fn handle_key_event(
             if !state.completions.is_empty() {
                 if extract_file_path_context(&state.input).is_some() {
                     handle_file_tab_completion_reverse(state);
-                } else if cursor_inside_brackets(&state.input, state.cursor_pos) {
+                } else if state.config.experimental && cursor_inside_brackets(&state.input, state.cursor_pos) {
                     handle_json_tab_completion(state, true, true);
                 } else if state.config.complete {
                     handle_tab_completion_reverse(state);
@@ -3309,7 +3316,7 @@ fn handle_key_event(
                 state.status_msg = "completion not available on this server".to_string();
                 state.status_msg_at = Some(std::time::Instant::now());
                 render(stdout, state)?;
-            } else if cursor_inside_brackets(&state.input, state.cursor_pos) {
+            } else if state.config.experimental && cursor_inside_brackets(&state.input, state.cursor_pos) {
                 // Check for closing bracket ghost before JSON key/value completion
                 let closing = get_closing_brackets_ghost(&state.input, state.cursor_pos);
                 if !closing.is_empty() {
@@ -3356,7 +3363,7 @@ fn handle_key_event(
                 let uri = if parts.len() >= 2 { parts[1] } else if parts.len() == 1 && parts[0].starts_with('/') { parts[0] } else { "" };
 
                 // Try body bracket completion first (e.g., Tab after "PUT /people ")
-                let bracket_ghost = get_body_bracket_ghost(state, &parts, uri);
+                let bracket_ghost = if state.config.experimental { get_body_bracket_ghost(state, &parts, uri) } else { String::new() };
                 if !bracket_ghost.is_empty() {
                     // Expand brackets to multiline block with matching closers on one line
                     // e.g. "[{ " → "[{\n  \n}]"  or "{ " → "{\n  \n}"
@@ -3554,7 +3561,7 @@ fn handle_key_event(
 
         // Enter - auto-indented newline if inside brackets/braces, otherwise execute request
         (KeyModifiers::NONE, KeyCode::Enter) => {
-            if cursor_inside_brackets(&state.input, state.cursor_pos) {
+            if state.config.experimental && cursor_inside_brackets(&state.input, state.cursor_pos) {
                 // Check if body is currently single-line — if so, reformat to multi-line
                 if let Some(bs) = find_body_start(&state.input) {
                     let body = &state.input[bs..];
@@ -3717,7 +3724,7 @@ fn handle_key_event(
         // Regular character input
         (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(c)) => {
             // Smart closing bracket: remove trailing comma and fix indentation
-            if (c == '}' || c == ']') && cursor_inside_brackets(&state.input, state.cursor_pos) {
+            if (c == '}' || c == ']') && state.config.experimental && cursor_inside_brackets(&state.input, state.cursor_pos) {
                 let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
                 let before = &state.input[..byte_idx];
 
@@ -3753,7 +3760,7 @@ fn handle_key_event(
                 state.cursor_pos += 1;
 
                 // Auto-trigger JSON completion for ghost text when typing a key name
-                if inside_brackets {
+                if state.config.experimental && inside_brackets {
                     if let Some(ctx) = json_context_at_cursor(state) {
                         let (_schema, partial, is_value, _key, _existing) = ctx;
                         // Only trigger when actually in a key string: either just opened " or typing chars inside it
@@ -4636,29 +4643,33 @@ fn render_input_content(state: &mut AppState, width: usize) -> (String, u16, Str
 
     // Apply JSON syntax highlighting to the full body as one unit, then split at cursor
     let body_start = find_body_start(&state.input);
-    let (hl_before, hl_at_cursor, hl_after) = if let Some(bs) = body_start {
-        let body = &state.input[bs..];
-        let prefix = &state.input[..bs];
-        let body_start_char = char_len(&state.input[..bs]);
-        if cursor_byte >= bs && state.cursor_pos < input_char_len {
-            // Cursor is inside body
-            let cursor_in_body = state.cursor_pos - body_start_char;
-            let (hb, hc, ha) = highlight_json_split(body, Some(cursor_in_body));
-            (format!("{}{}", prefix, hb), hc.unwrap_or(' '), ha)
-        } else if cursor_byte < bs {
-            // Cursor is on URL line — highlight full body, split prefix at cursor
-            let highlighted_body = highlight_json(body);
-            let prefix_before = &state.input[..cursor_byte];
-            let prefix_after = if state.cursor_pos < input_char_len {
-                let next_byte = char_to_byte_idx(&state.input, state.cursor_pos + 1);
-                &state.input[next_byte..bs]
+    let (hl_before, hl_at_cursor, hl_after) = if state.config.experimental {
+        if let Some(bs) = body_start {
+            let body = &state.input[bs..];
+            let prefix = &state.input[..bs];
+            let body_start_char = char_len(&state.input[..bs]);
+            if cursor_byte >= bs && state.cursor_pos < input_char_len {
+                // Cursor is inside body
+                let cursor_in_body = state.cursor_pos - body_start_char;
+                let (hb, hc, ha) = highlight_json_split(body, Some(cursor_in_body));
+                (format!("{}{}", prefix, hb), hc.unwrap_or(' '), ha)
+            } else if cursor_byte < bs {
+                // Cursor is on URL line — highlight full body, split prefix at cursor
+                let highlighted_body = highlight_json(body);
+                let prefix_before = &state.input[..cursor_byte];
+                let prefix_after = if state.cursor_pos < input_char_len {
+                    let next_byte = char_to_byte_idx(&state.input, state.cursor_pos + 1);
+                    &state.input[next_byte..bs]
+                } else {
+                    ""
+                };
+                (prefix_before.to_string(), at_cursor, format!("{}{}", prefix_after, highlighted_body))
             } else {
-                ""
-            };
-            (prefix_before.to_string(), at_cursor, format!("{}{}", prefix_after, highlighted_body))
+                // Cursor at end, past body
+                (format!("{}{}", prefix, highlight_json(body)), ' ', String::new())
+            }
         } else {
-            // Cursor at end, past body
-            (format!("{}{}", prefix, highlight_json(body)), ' ', String::new())
+            (before_cursor.to_string(), at_cursor, after_cursor.to_string())
         }
     } else {
         (before_cursor.to_string(), at_cursor, after_cursor.to_string())
@@ -6377,8 +6388,8 @@ fn get_closing_brackets_ghost(input: &str, cursor_pos: usize) -> String {
 }
 
 fn get_completion_ghost(state: &AppState) -> String {
-    // JSON body completion ghost text
-    if cursor_inside_brackets(&state.input, state.cursor_pos) {
+    // JSON body completion ghost text (experimental only)
+    if state.config.experimental && cursor_inside_brackets(&state.input, state.cursor_pos) {
         if let Some(ghost) = get_json_completion_ghost(state) {
             return ghost;
         }
@@ -6455,13 +6466,13 @@ fn get_completion_ghost(state: &AppState) -> String {
 
     // Only show ghost text if URI contains a delimiter (we're typing after /, (, or ~)
     if uri.rfind(|c| c == '/' || c == '(' || c == '~').is_none() {
-        return get_body_bracket_ghost(state, &parts, &uri);
+        return if state.config.experimental { get_body_bracket_ghost(state, &parts, &uri) } else { String::new() };
     }
 
     // Get completions for current input
     let completions = get_completions(state, &uri);
     if completions.is_empty() {
-        return get_body_bracket_ghost(state, &parts, &uri);
+        return if state.config.experimental { get_body_bracket_ghost(state, &parts, &uri) } else { String::new() };
     }
 
     // Get first completion
@@ -6477,7 +6488,7 @@ fn get_completion_ghost(state: &AppState) -> String {
         }
     }
 
-    get_body_bracket_ghost(state, &parts, &uri)
+    if state.config.experimental { get_body_bracket_ghost(state, &parts, &uri) } else { String::new() }
 }
 
 /// Get ghost text for body brackets (e.g., `[{ }]` for PUT on array endpoints)
@@ -6517,7 +6528,7 @@ fn get_body_bracket_ghost(state: &AppState, parts: &[&str], uri: &str) -> String
 }
 
 fn get_completion_ghost_at_cursor(state: &AppState) -> String {
-    if cursor_inside_brackets(&state.input, state.cursor_pos) {
+    if state.config.experimental && cursor_inside_brackets(&state.input, state.cursor_pos) {
         // Only show JSON ghost if cursor is on a line with no content after it
         // (prevents ghost text from overlapping with existing content and causing visual artifacts)
         let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
