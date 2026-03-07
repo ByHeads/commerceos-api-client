@@ -1607,6 +1607,15 @@ impl ConnectionFlow {
         };
 
         let prefix = if is_active { "  › " } else { "    " };
+        // Truncate display value to fit terminal width (prefix=4 + label=14 + cursor=1 + margin=1)
+        let max_val_len = (self.width as usize).saturating_sub(20);
+        let display_val = if display_val.len() > max_val_len {
+            // Show the rightmost portion so the user sees what they just typed
+            let skip = display_val.len() - max_val_len;
+            display_val[skip..].to_string()
+        } else {
+            display_val
+        };
 
         if is_active {
             execute!(stdout, Print(format!("{}{:<14}{}\x1b[48;5;247m\x1b[38;5;0m \x1b[0m\r\n", prefix, label.dimmed(), display_val)))?;
@@ -1847,7 +1856,7 @@ impl ConnectionFlow {
                 KeyCode::Enter if !self.setup_url.is_empty() => {
                     // Add scheme if not present
                     if !self.setup_url.starts_with("http://") && !self.setup_url.starts_with("https://") {
-                        if self.setup_url.starts_with("localhost") || self.setup_url.starts_with("127.0.0.1") || self.setup_url.starts_with("[::1]") {
+                        if self.setup_url.starts_with("localhost") || self.setup_url.starts_with("127.0.0.1") || self.setup_url.starts_with("[::1]") || self.setup_url.contains(':') {
                             self.setup_url = format!("http://{}", self.setup_url);
                         } else {
                             self.setup_url = format!("https://{}", self.setup_url);
@@ -1972,7 +1981,7 @@ impl ConnectionFlow {
             SetupField::Credential => match key.code {
                 KeyCode::Enter if !self.setup_credential.is_empty() => {
                     // Test connection
-                    self.setup_status = "Testing connection...".to_string();
+                    self.setup_status = "testing connection...".dimmed().to_string();
                     self.render(stdout, false)?;
 
                     let success = self.test_connection();
@@ -2102,7 +2111,11 @@ impl ConnectionFlow {
 fn apply_connection_to_config(config: &mut Config, env: &SavedConnection) {
     config.base_uri = env.url.clone();
     if !config.base_uri.starts_with("http://") && !config.base_uri.starts_with("https://") {
-        config.base_uri = format!("https://{}", config.base_uri);
+        if config.base_uri.starts_with("localhost") || config.base_uri.starts_with("127.0.0.1") || config.base_uri.contains(':') {
+            config.base_uri = format!("http://{}", config.base_uri);
+        } else {
+            config.base_uri = format!("https://{}", config.base_uri);
+        }
     }
     match env.auth_type.as_str() {
         "token" => {
@@ -2161,8 +2174,8 @@ fn main() {
     if let Some(ref uri) = args.base_uri {
         config.base_uri = uri.clone();
         if !config.base_uri.starts_with("http://") && !config.base_uri.starts_with("https://") {
-            // Use http for localhost/127.0.0.1, https for everything else
-            if config.base_uri.starts_with("localhost") || config.base_uri.starts_with("127.0.0.1") {
+            // Use http for localhost/127.0.0.1 or URLs with a port, https for everything else
+            if config.base_uri.starts_with("localhost") || config.base_uri.starts_with("127.0.0.1") || config.base_uri.contains(':') {
                 config.base_uri = format!("http://{}", config.base_uri);
             } else {
                 config.base_uri = format!("https://{}", config.base_uri);
@@ -2253,12 +2266,11 @@ fn main() {
 
     // If -b provided without auth, go straight to setup with URL pre-filled
     if has_explicit_uri && !has_explicit_auth && uri.is_empty() && atty::is(Stream::Stdout) {
-        let url = config.base_uri.trim_start_matches("https://").trim_start_matches("http://");
         let (term_width, _) = terminal::size().unwrap_or((80, 24));
         let envs: Vec<String> = Vec::new();
         let mut flow = ConnectionFlow::for_startup(&envs, term_width, true);
         // Pre-fill URL in setup and focus on auth method
-        flow.setup_url = url.to_string();
+        flow.setup_url = config.base_uri.clone();
         flow.setup_active_field = SetupField::Auth;
 
         let mut stdout = io::stdout();
@@ -2267,11 +2279,6 @@ fn main() {
 
         match flow.run(&mut stdout) {
             Ok(ConnectionFlowResult::Connected(env, _preloaded, resolved_config)) => {
-                let total_lines = flow.last_rendered_lines + if flow.show_splash { ConnectionFlow::splash_lines() } else { 0 };
-                execute!(stdout, cursor::MoveUp(total_lines), cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown)).unwrap();
-                terminal::disable_raw_mode().unwrap();
-                execute!(stdout, cursor::Show).unwrap();
-
                 // Store OAuth2 credentials for token refresh
                 if env.auth_type == "oauth2" {
                     oauth2_creds = Some((env.client_id.clone(), env.credential.clone()));
@@ -2281,6 +2288,30 @@ fn main() {
                 } else {
                     apply_connection_to_config(&mut config, &env);
                 }
+
+                // Stay on form with animated spinner while loading
+                {
+                    let bg_config = config.clone();
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    thread::spawn(move || { let _ = tx.send(background_load(&bg_config, None)); });
+                    let mut frame = 0usize;
+                    loop {
+                        if let Ok(result) = rx.try_recv() {
+                            startup_preloaded = Some(result);
+                            break;
+                        }
+                        flow.setup_status = format!("{} loading...", SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]).dimmed().to_string();
+                        flow.render(&mut stdout, false).ok();
+                        thread::sleep(Duration::from_millis(80));
+                        frame += 1;
+                    }
+                }
+
+                // Clear the flow UI
+                let total_lines = flow.last_rendered_lines + if flow.show_splash { ConnectionFlow::splash_lines() } else { 0 };
+                execute!(stdout, cursor::MoveUp(total_lines), cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown)).unwrap();
+                terminal::disable_raw_mode().unwrap();
+                execute!(stdout, cursor::Show).unwrap();
 
                 // Print fresh splash with connected URL
                 print_splash_with_width(&config, term_width);
@@ -2330,20 +2361,10 @@ fn main() {
 
                 match flow.run(&mut stdout) {
                     Ok(ConnectionFlowResult::Connected(env, preloaded, resolved_config)) => {
-                        // Clear the flow UI
-                        let total_lines = flow.last_rendered_lines + if flow.show_splash { ConnectionFlow::splash_lines() } else { 0 };
-                        execute!(stdout, cursor::MoveUp(total_lines), cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown)).unwrap();
-                        terminal::disable_raw_mode().unwrap();
-                        execute!(stdout, cursor::Show).unwrap();
-
-                        if env.name.is_empty() {
-                            // From setup - new connection
-                            from_setup = true;
-                        } else {
-                            // From picker - existing connection
+                        if !env.name.is_empty() {
                             loaded_connection_alias = env.name.clone();
-                            from_setup = true;  // Also skip main splash print
                         }
+                        from_setup = true;
 
                         // Store OAuth2 credentials for token refresh
                         if env.auth_type == "oauth2" {
@@ -2356,8 +2377,31 @@ fn main() {
                             apply_connection_to_config(&mut config, &env);
                         }
 
-                        // Pass preloaded result to avoid duplicate requests
-                        startup_preloaded = preloaded;
+                        // Stay on form with animated spinner while loading
+                        if let Some(pre) = preloaded {
+                            startup_preloaded = Some(pre);
+                        } else {
+                            let bg_config = config.clone();
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            thread::spawn(move || { let _ = tx.send(background_load(&bg_config, None)); });
+                            let mut frame = 0usize;
+                            loop {
+                                if let Ok(result) = rx.try_recv() {
+                                    startup_preloaded = Some(result);
+                                    break;
+                                }
+                                flow.setup_status = format!("{} loading...", SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]).dimmed().to_string();
+                                flow.render(&mut stdout, false).ok();
+                                thread::sleep(Duration::from_millis(80));
+                                frame += 1;
+                            }
+                        }
+
+                        // Clear the flow UI
+                        let total_lines = flow.last_rendered_lines + if flow.show_splash { ConnectionFlow::splash_lines() } else { 0 };
+                        execute!(stdout, cursor::MoveUp(total_lines), cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown)).unwrap();
+                        terminal::disable_raw_mode().unwrap();
+                        execute!(stdout, cursor::Show).unwrap();
 
                         // Print fresh splash with connected URL
                         print_splash_with_width(&config, term_width);
@@ -2392,11 +2436,10 @@ fn main() {
 
             match flow.run(&mut stdout) {
                 Ok(ConnectionFlowResult::Connected(env, _preloaded, resolved_config)) => {
-                    // Clear flow UI including splash
-                    let total_lines = flow.last_rendered_lines + if flow.show_splash { ConnectionFlow::splash_lines() } else { 0 };
-                    execute!(stdout, cursor::MoveUp(total_lines), cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown)).unwrap();
-                    terminal::disable_raw_mode().unwrap();
-                    execute!(stdout, cursor::Show).unwrap();
+                    // Store OAuth2 credentials for token refresh
+                    if env.auth_type == "oauth2" {
+                        oauth2_creds = Some((env.client_id.clone(), env.credential.clone()));
+                    }
 
                     // Apply config first so splash shows correct URL
                     if let Some(rc) = resolved_config {
@@ -2405,11 +2448,35 @@ fn main() {
                         apply_connection_to_config(&mut config, &env);
                     }
 
+                    // Stay on form with animated spinner while loading
+                    {
+                        let bg_config = config.clone();
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        thread::spawn(move || { let _ = tx.send(background_load(&bg_config, None)); });
+                        let mut frame = 0usize;
+                        loop {
+                            if let Ok(result) = rx.try_recv() {
+                                startup_preloaded = Some(result);
+                                break;
+                            }
+                            flow.setup_status = format!("{} loading...", SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]).dimmed().to_string();
+                            flow.render(&mut stdout, false).ok();
+                            thread::sleep(Duration::from_millis(80));
+                            frame += 1;
+                        }
+                    }
+
+                    from_setup = true;
+
+                    // Clear flow UI including splash
+                    let total_lines = flow.last_rendered_lines + if flow.show_splash { ConnectionFlow::splash_lines() } else { 0 };
+                    execute!(stdout, cursor::MoveUp(total_lines), cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown)).unwrap();
+                    terminal::disable_raw_mode().unwrap();
+                    execute!(stdout, cursor::Show).unwrap();
+
                     // Print fresh splash with the connected URL
                     print_splash_with_width(&config, term_width);
                     io::stdout().flush().ok();
-
-                    from_setup = true;
                 }
                 Ok(ConnectionFlowResult::Cancelled) | Ok(ConnectionFlowResult::Quit) => {
                     let total_lines = flow.last_rendered_lines + if flow.show_splash { ConnectionFlow::splash_lines() } else { 0 };
@@ -2848,6 +2915,10 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
         // Already preloaded from connection flow - skip duplicate requests
         (Some(pre), config)
     } else if !is_1p && !is_connecting {
+        if config.base_uri.is_empty() {
+            eprintln!("{}", "Error: no base URL specified. Use -b <url> or -c <connection>.".red());
+            std::process::exit(1);
+        }
         let result = background_load(&config, None);
         if let Some(err) = &result.error {
             // Auth error (401/403)
@@ -2861,6 +2932,12 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
                 let (term_width, _) = terminal::size().unwrap_or((80, 24));
                 let envs = list_connections();
                 let mut flow = ConnectionFlow::for_startup(&envs, term_width, true);
+                // Pre-fill URL from -b arg so user only needs to provide auth
+                if !config.base_uri.is_empty() {
+                    flow.setup_url = config.base_uri.clone();
+                    flow.setup_active_field = SetupField::Auth;
+                    flow.in_setup = true;
+                }
 
                 let mut stdout = io::stdout();
                 terminal::enable_raw_mode().unwrap();
@@ -2868,11 +2945,6 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
 
                 match flow.run(&mut stdout) {
                     Ok(ConnectionFlowResult::Connected(env, preloaded, resolved_config)) => {
-                        let total_lines = flow.last_rendered_lines + if flow.show_splash { ConnectionFlow::splash_lines() } else { 0 };
-                        execute!(stdout, cursor::MoveUp(total_lines), cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown)).unwrap();
-                        terminal::disable_raw_mode().unwrap();
-                        execute!(stdout, cursor::Show).unwrap();
-
                         let new_config = if let Some(rc) = resolved_config {
                             rc
                         } else {
@@ -2880,12 +2952,34 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
                             apply_connection_to_config(&mut nc, &env);
                             nc
                         };
-                        // Use preloaded result if available, otherwise load now
-                        let new_result = preloaded.unwrap_or_else(|| background_load(&new_config, None));
+                        // Stay on form with animated spinner while loading
+                        let new_result = if let Some(pre) = preloaded {
+                            pre
+                        } else {
+                            let bg_config = new_config.clone();
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            thread::spawn(move || { let _ = tx.send(background_load(&bg_config, None)); });
+                            let mut frame = 0usize;
+                            loop {
+                                if let Ok(r) = rx.try_recv() {
+                                    break r;
+                                }
+                                flow.setup_status = format!("{} loading...", SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]).dimmed().to_string();
+                                flow.render(&mut stdout, false).ok();
+                                thread::sleep(Duration::from_millis(80));
+                                frame += 1;
+                            }
+                        };
                         if let Some(new_err) = &new_result.error {
                             eprintln!("{}", new_err);
                             std::process::exit(1);
                         }
+
+                        let total_lines = flow.last_rendered_lines + if flow.show_splash { ConnectionFlow::splash_lines() } else { 0 };
+                        execute!(stdout, cursor::MoveUp(total_lines), cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown)).unwrap();
+                        terminal::disable_raw_mode().unwrap();
+                        execute!(stdout, cursor::Show).unwrap();
+
                         (Some(new_result), new_config)
                     }
                     Ok(ConnectionFlowResult::Cancelled) | Ok(ConnectionFlowResult::Quit) => {
@@ -4394,8 +4488,9 @@ fn handle_save_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io::
     let prompt = "› Save connection as: ".to_string();
 
     // Print placeholder lines for bottom ruler + hint so terminal doesn't scroll
+    let ruler_line = format!("\x1b[38;5;239m{}\x1b[0m", ruler);
     execute!(stdout, Print("\r\n"))?; // placeholder for prompt line
-    execute!(stdout, Print(format!("{}\r\n", ruler.dimmed())))?; // bottom ruler
+    execute!(stdout, Print(format!("{}\r\n", ruler_line)))?; // bottom ruler
     execute!(stdout, Print(format!("  {}", "enter to save, esc to cancel".dimmed())))?; // hint
     // Move back up to prompt line
     execute!(stdout, cursor::MoveUp(2), cursor::MoveToColumn(0))?;
@@ -7441,10 +7536,37 @@ fn complete_inside_operator(
     }
 
     // Get schema for the endpoint path
-    let root_schema = get_schema_for_path(state, base_path);
-    if root_schema.is_empty() {
-        return Vec::new();
-    }
+    // For nested operators like /people~with(addresses, resolve through the outer operator:
+    // 1. Get the root endpoint schema (/people → Person)
+    // 2. Resolve the selector within the outer operator (addresses → Address type)
+    let root_schema = if let Some(outer_tilde) = base_path.find('~') {
+        let endpoint = &base_path[..outer_tilde];
+        let outer_after = &base_path[outer_tilde + 1..];
+        let ep_schema = get_schema_for_path(state, endpoint);
+        if ep_schema.is_empty() {
+            return Vec::new();
+        }
+        // Extract the selector inside the outer operator's parens
+        if let Some(outer_paren) = outer_after.find('(') {
+            let selector = &outer_after[outer_paren + 1..];
+            if selector.is_empty() {
+                ep_schema
+            } else {
+                // Resolve the selector path to get the nested schema
+                let segments: Vec<&str> = selector.split('/').collect();
+                match resolve_selector_schema(state, &ep_schema, &segments) {
+                    Some(s) => s,
+                    None => return Vec::new(),
+                }
+            }
+        } else {
+            ep_schema
+        }
+    } else {
+        let s = get_schema_for_path(state, base_path);
+        if s.is_empty() { return Vec::new(); }
+        s
+    };
 
     let inside_paren = &after_tilde[paren_idx + 1..];
 
