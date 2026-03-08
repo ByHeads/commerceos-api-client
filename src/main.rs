@@ -1321,37 +1321,81 @@ impl ConnectionFlow {
     fn render_splash(&self, stdout: &mut io::Stdout) -> io::Result<()> {
         let w = self.width as usize;
         let box_width = 60usize.min(w);
-        let title = "CommerceOS API Client";
-        let version = format!("v{}", VERSION);
-        let title_len = title.len() + version.len() + 3;
-        let top_padding = box_width.saturating_sub(4 + title_len + 1);
 
-        execute!(stdout, Print("\r\n"))?;
-        execute!(stdout, Print(format!("{}{}{}{}\r\n",
-            "╭───".dimmed(),
-            format!(" {} {} ", title.bold(), version.dimmed()),
-            "─".repeat(top_padding.max(1)).dimmed(),
-            "╮".dimmed()
-        )))?;
-
-        let hint_text = "ctrl+b for docs";
-        let host_space = box_width - 7 - hint_text.len();
-        let display_url = if self.in_setup && !self.setup_url.is_empty() {
-            self.setup_url.as_str()
+        if box_width < 37 {
+            // Narrow splash: just app name and hint
+            let narrow_title = " CommerceOS API ";
+            let narrow_title_len = narrow_title.len();
+            let inner = box_width.saturating_sub(2);
+            let top_pad = inner.saturating_sub(narrow_title_len);
+            let top_left = top_pad / 2;
+            let top_right = top_pad - top_left;
+            execute!(stdout, Print("\r\n"))?;
+            execute!(stdout, Print(format!("{}{}{}{}{}\r\n",
+                "╭".dimmed(),
+                "─".repeat(top_left).dimmed(),
+                format!(" {} ", "CommerceOS API".bold()),
+                "─".repeat(top_right).dimmed(),
+                "╮".dimmed()
+            )))?;
+            let hint = "ctrl+b for docs";
+            let hint_space = inner.saturating_sub(hint.len());
+            let hint_left = hint_space / 2;
+            let hint_right = hint_space - hint_left;
+            execute!(stdout, Print(format!("{}{}{}{}{}\r\n",
+                "│".dimmed(),
+                " ".repeat(hint_left),
+                hint.dimmed(),
+                " ".repeat(hint_right),
+                "│".dimmed()
+            )))?;
+            execute!(stdout, Print(format!("{}\r\n", format!("╰{}╯", "─".repeat(inner)).dimmed())))?;
+            execute!(stdout, Print("\r\n"))?;
         } else {
-            " "
-        };
-        let host_display = if display_url.len() > host_space { &display_url[..host_space] } else { display_url };
-        execute!(stdout, Print(format!("{}{:width$}{}{}{}\r\n",
-            "│ ".dimmed(),
-            host_display.dimmed(),
-            " │ ".dimmed(),
-            hint_text.dimmed(),
-            " │".dimmed(),
-            width = host_space
-        )))?;
-        execute!(stdout, Print(format!("{}\r\n", format!("╰{}╯", "─".repeat(box_width - 2)).dimmed())))?;
-        execute!(stdout, Print("\r\n"))?;
+            let title = "CommerceOS API Client";
+            let version = format!("v{}", VERSION);
+            let title_len = title.len() + version.len() + 3;
+            let top_padding = box_width.saturating_sub(4 + title_len + 1);
+
+            execute!(stdout, Print("\r\n"))?;
+            execute!(stdout, Print(format!("{}{}{}{}\r\n",
+                "╭───".dimmed(),
+                format!(" {} {} ", title.bold(), version.dimmed()),
+                "─".repeat(top_padding.max(1)).dimmed(),
+                "╮".dimmed()
+            )))?;
+
+            let hint_text = "ctrl+b for docs";
+            let hint_section = 7 + hint_text.len();
+            let display_url = if self.in_setup && !self.setup_url.is_empty() {
+                self.setup_url.as_str()
+            } else {
+                " "
+            };
+            if box_width > hint_section {
+                let host_space = box_width - hint_section;
+                let host_display = if display_url.len() > host_space { &display_url[display_url.len() - host_space..] } else { display_url };
+                execute!(stdout, Print(format!("{}{:width$}{}{}{}\r\n",
+                    "│ ".dimmed(),
+                    host_display.dimmed(),
+                    " │ ".dimmed(),
+                    hint_text.dimmed(),
+                    " │".dimmed(),
+                    width = host_space
+                )))?;
+            } else {
+                let host_space = box_width.saturating_sub(4);
+                let host_display = if display_url.len() > host_space { &display_url[display_url.len() - host_space..] } else { display_url };
+                execute!(stdout, Print(format!("{}{:width$}{}\r\n",
+                    "│ ".dimmed(),
+                    host_display.dimmed(),
+                    " │".dimmed(),
+                    width = host_space
+                )))?;
+            }
+            execute!(stdout, Print(format!("{}\r\n", format!("╰{}╯", "─".repeat(box_width.saturating_sub(2))).dimmed())))?;
+            execute!(stdout, Print("\r\n"))?;
+        }
 
         Ok(())
     }
@@ -1359,11 +1403,18 @@ impl ConnectionFlow {
     fn render_picker(&self, stdout: &mut io::Stdout, ruler: &str, _first: bool) -> io::Result<()> {
         let w = self.width as usize;
 
-        // Top ruler with embedded title (always "Choose a connection"), right-aligned
+        // Top ruler with embedded title (always "Choose a connection")
         let title = "  Choose a connection  ";
         let title_len = title.len();
-        let right = 7;
-        let left = w.saturating_sub(title_len).saturating_sub(right);
+        let (left, right) = if w < 37 {
+            // Centered for narrow terminals
+            let total = w.saturating_sub(title_len);
+            (total / 2, total - total / 2)
+        } else {
+            // Right-aligned
+            let r = 7;
+            (w.saturating_sub(title_len).saturating_sub(r), r)
+        };
         execute!(stdout, Print(format!(
             "{}{}{}\r\n",
             "─".repeat(left).dimmed(),
@@ -1480,11 +1531,18 @@ impl ConnectionFlow {
         let auth_options = ["API key", "Bearer token", "OAuth2 Client Credentials"];
         let w = self.width as usize;
 
-        // Top ruler with embedded title, right-aligned (matching picker style)
+        // Top ruler with embedded title
         let title = "  New connection  ";
         let title_len = title.len();
-        let right = 7;
-        let left = w.saturating_sub(title_len).saturating_sub(right);
+        let (left, right) = if w < 37 {
+            // Centered for narrow terminals
+            let total = w.saturating_sub(title_len);
+            (total / 2, total - total / 2)
+        } else {
+            // Right-aligned
+            let r = 7;
+            (w.saturating_sub(title_len).saturating_sub(r), r)
+        };
         execute!(stdout, Print(format!(
             "{}{}{}\r\n",
             "─".repeat(left).dimmed(),
@@ -1569,14 +1627,28 @@ impl ConnectionFlow {
         };
 
         let prefix = if is_active { "  › " } else { "    " };
+        // Truncate URL to fit terminal width (prefix=4 + label=14 + cursor/check=2)
+        let max_url_len = (self.width as usize).saturating_sub(21);
 
         if is_active {
+            let display_url = if url.len() > max_url_len {
+                &url[url.len() - max_url_len..]
+            } else {
+                url.as_str()
+            };
+            let ghost_budget = max_url_len.saturating_sub(display_url.len());
+            let display_ghost = if ghost.len() > ghost_budget { &ghost[..ghost_budget] } else { ghost.as_str() };
             execute!(stdout, Print(format!("{}{:<14}{}\x1b[2m{}\x1b[0m\x1b[48;5;247m\x1b[38;5;0m \x1b[0m\r\n",
-                prefix, "URL:".dimmed(), url, ghost)))?;
+                prefix, "URL:".dimmed(), display_url, display_ghost)))?;
         } else if url.is_empty() {
             execute!(stdout, Print(format!("{}{:<14}\r\n", prefix, "URL:".dimmed())))?;
         } else {
-            execute!(stdout, Print(format!("{}{:<14}{} ✓\r\n", prefix, "URL:".dimmed(), url)))?;
+            let display_url = if url.len() > max_url_len {
+                &url[url.len() - max_url_len..]
+            } else {
+                url.as_str()
+            };
+            execute!(stdout, Print(format!("{}{:<14}{} ✓\r\n", prefix, "URL:".dimmed(), display_url)))?;
         }
 
         Ok(())
@@ -1601,7 +1673,7 @@ impl ConnectionFlow {
 
     fn render_text_field(&self, stdout: &mut io::Stdout, label: &str, value: &str, is_active: bool, mask: bool, confirmed: bool) -> io::Result<()> {
         let display_val = if mask && !value.is_empty() {
-            "•".repeat(value.len())
+            "•".repeat(value.chars().count())
         } else {
             value.to_string()
         };
@@ -1609,10 +1681,11 @@ impl ConnectionFlow {
         let prefix = if is_active { "  › " } else { "    " };
         // Truncate display value to fit terminal width (prefix=4 + label=14 + cursor=1 + margin=1)
         let max_val_len = (self.width as usize).saturating_sub(20);
-        let display_val = if display_val.len() > max_val_len {
+        let char_count = display_val.chars().count();
+        let display_val = if char_count > max_val_len {
             // Show the rightmost portion so the user sees what they just typed
-            let skip = display_val.len() - max_val_len;
-            display_val[skip..].to_string()
+            let skip = char_count - max_val_len;
+            display_val.chars().skip(skip).collect::<String>()
         } else {
             display_val
         };
@@ -4863,7 +4936,7 @@ fn flash_rulers(stdout: &mut io::Stdout, state: &mut AppState, color: &str, ms: 
     )?;
 
     // Top ruler in color
-    if !state.config.base_uri.is_empty() {
+    if !state.config.base_uri.is_empty() && state.config.base_uri.len() + 11 <= w {
         let host_len = state.config.base_uri.len() + 2;
         let right = 7;
         let left = w.saturating_sub(host_len).saturating_sub(right);
@@ -4900,7 +4973,7 @@ fn flash_rulers(stdout: &mut io::Stdout, state: &mut AppState, color: &str, ms: 
         cursor::MoveToColumn(0),
         Clear(ClearType::CurrentLine),
     )?;
-    if !state.config.base_uri.is_empty() {
+    if !state.config.base_uri.is_empty() && state.config.base_uri.len() + 11 <= w {
         let host_len = state.config.base_uri.len() + 2;
         let right = 7;
         let left = w.saturating_sub(host_len).saturating_sub(right);
@@ -4960,7 +5033,7 @@ fn render(stdout: &mut io::Stdout, state: &mut AppState) -> io::Result<()> {
 
     // Top ruler
     let ruler_line = format!("\x1b[38;5;239m{}\x1b[0m", "─".repeat(width));
-    if !state.config.base_uri.is_empty() {
+    if !state.config.base_uri.is_empty() && state.config.base_uri.len() + 11 <= width {
         let host_text = &state.config.base_uri;
         let host = format!(" {} ", host_text);
         let host_len = host.len();
