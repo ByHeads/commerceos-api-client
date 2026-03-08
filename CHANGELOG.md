@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.5.6
+
+- Animated spinner during connection setup loading (threaded background load with 80ms frame updates)
+- Loading/status text lowercase and dimmed (`loading...`, `testing connection...`)
+- Fixed ruler styling inconsistency in save-connection prompt (matched `\x1b[38;5;239m` gray)
+- Fixed crash on Ghostty with narrow terminals: UTF-8 multi-byte character slicing in masked password fields (`•` is 3 bytes)
+- Fixed narrow terminal rendering: URL overflow in connection form causing repeated titles
+- Fixed subtraction overflow crash in `render_splash` at very narrow widths
+- Compact splash layout for terminals narrower than 37 columns (centered title only)
+- Centered ruler titles in picker/setup at narrow widths (< 37)
+- Top ruler URL text omitted when terminal is narrower than the URL + 11 characters
+- Release script updated to link to CHANGELOG in GitHub release notes
+
 ## 2.5.5
 
 - **JSON body editing**: multiline reformatting, auto-indent on Enter, smart bracket insertion/closing on Tab, ghost text for suggesting opening brackets
