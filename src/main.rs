@@ -2889,6 +2889,8 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
             accept = "application/x-ndjson".to_string();
         } else if outfile.ends_with(".csv") {
             accept = "text/csv".to_string();
+        } else if outfile.ends_with(".sql") {
+            accept = "application/sql".to_string();
         }
     }
 
@@ -2996,8 +2998,11 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
         if let Some(err) = &result.error {
             // Auth error (401/403)
             if err.contains("401") || err.contains("403") {
-                // If explicit -b and -k were provided, show standard response and exit
-                if from_cli_auth {
+                // If explicit -b and -k were provided, or localhost, show error and exit
+                let is_localhost = config.base_uri.contains("localhost")
+                    || config.base_uri.contains("127.0.0.1")
+                    || config.base_uri.contains("[::1]");
+                if from_cli_auth || is_localhost {
                     eprintln!("{}", err);
                     std::process::exit(1);
                 }
@@ -4105,6 +4110,8 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
             accept = "application/x-ndjson".to_string();
         } else if state.config.outfile.ends_with(".csv") {
             accept = "text/csv".to_string();
+        } else if state.config.outfile.ends_with(".sql") {
+            accept = "application/sql".to_string();
         }
     }
 
