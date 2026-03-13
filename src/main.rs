@@ -3480,8 +3480,11 @@ fn handle_key_event(
 
         // Tab: autocomplete only
         (_, KeyCode::Tab) => {
-            // Check if we're in file completion mode (after > or @)
-            if extract_file_path_context(&state.input).is_some() {
+            // Check if we're in file completion mode (after > or @) and cursor is in the file path region
+            if extract_file_path_context(&state.input).map_or(false, |(path_start, _)| {
+                let path_char_start = state.input[..path_start].chars().count();
+                state.cursor_pos >= path_char_start
+            }) {
                 handle_file_tab_completion(state);
                 render(stdout, state)?;
             } else if !state.config.complete {
