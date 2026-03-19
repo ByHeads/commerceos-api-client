@@ -453,6 +453,11 @@ struct AppState {
     completion_uri_suffix: String,  // URI text after cursor for mid-URI completion
     connection_alias: String,  // Current connection alias (for Ctrl+S pre-fill)
     last_was_splash: bool,  // True if last output was a splash (for consecutive env switches)
+    // Body input mode (for POST/PUT/PATCH without body)
+    body_input_mode: bool,
+    body_input_buffer: String,
+    body_input_method: String,
+    body_input_uri: String,
     // OAuth2 credentials for token refresh
     oauth2_client_id: String,
     oauth2_client_secret: String,
@@ -514,6 +519,10 @@ impl AppState {
             completion_uri_suffix: String::new(),
             connection_alias: String::new(),
             last_was_splash: false,
+            body_input_mode: false,
+            body_input_buffer: String::new(),
+            body_input_method: String::new(),
+            body_input_uri: String::new(),
             oauth2_client_id: String::new(),
             oauth2_client_secret: String::new(),
         }
@@ -2297,6 +2306,19 @@ fn main() {
         }
     }
 
+    // If method expects a body but none provided, read interactively from stdin
+    if body.is_empty()
+        && atty::is(Stream::Stdin)
+        && ["POST", "PUT", "PATCH"].contains(&method.as_str())
+        && !uri.is_empty()
+    {
+        eprintln!("Reading body from stdin (ctrl+d to finish):");
+        let mut stdin_content = String::new();
+        if io::stdin().read_to_string(&mut stdin_content).is_ok() {
+            body = stdin_content.trim().to_string();
+        }
+    }
+
     // Handle -c flag: load saved connection by alias or URL
     if let Some(ref connection_selector) = args.connection {
         let envs = list_connections();
@@ -3396,6 +3418,67 @@ fn handle_key_event(
     key: KeyEvent,
     stdout: &mut io::Stdout,
 ) -> io::Result<(bool, Option<std::sync::mpsc::Receiver<BackgroundLoadResult>>)> {
+    // Body input mode: intercept all keys
+    if state.body_input_mode {
+        match (key.modifiers, key.code) {
+            // Ctrl+D: finish body input and execute request
+            (KeyModifiers::CONTROL, KeyCode::Char('d')) => {
+                let body = state.body_input_buffer.trim().to_string();
+                let method = state.body_input_method.clone();
+                let uri = state.body_input_uri.clone();
+                state.body_input_mode = false;
+                state.body_input_buffer.clear();
+                state.body_input_method.clear();
+                state.body_input_uri.clear();
+
+                let input = if body.is_empty() {
+                    format!("{} {}", method, uri)
+                } else {
+                    format!("{} {} {}", method, uri, body)
+                };
+                parse_input(state, &input);
+                state.history.push(input.clone());
+                append_history(&input);
+                state.history_idx = -1;
+                state.prev_method = state.method.clone();
+                state.prev_uri = state.uri.clone();
+                state.prev_body = state.body.clone();
+                state.prev_outfile = state.config.outfile.clone();
+
+                execute_request(state, stdout)?;
+
+                state.input = format!("{} {}", state.method, state.uri);
+                state.cursor_pos = char_len(&state.input);
+                render(stdout, state)?;
+            }
+            // Esc or Ctrl+C: cancel body input
+            (_, KeyCode::Esc) | (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
+                state.body_input_mode = false;
+                state.body_input_buffer.clear();
+                state.body_input_method.clear();
+                state.body_input_uri.clear();
+                render(stdout, state)?;
+            }
+            // Enter: newline in body buffer
+            (KeyModifiers::NONE, KeyCode::Enter) => {
+                state.body_input_buffer.push('\n');
+                render(stdout, state)?;
+            }
+            // Backspace
+            (_, KeyCode::Backspace) => {
+                state.body_input_buffer.pop();
+                render(stdout, state)?;
+            }
+            // Regular character input
+            (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(c)) => {
+                state.body_input_buffer.push(c);
+                render(stdout, state)?;
+            }
+            _ => {}
+        }
+        return Ok((false, None));
+    }
+
     // Reset completion state on any key except Tab, BackTab, Esc
     let dominated_by_completions = key.code == KeyCode::Tab
         || key.code == KeyCode::BackTab
@@ -3835,15 +3918,28 @@ fn handle_key_event(
                 let input = if input.is_empty() { "GET /".to_string() } else { input };
 
                 parse_input(state, &input);
-                state.history.push(input.clone());
-                append_history(&input);
-                state.history_idx = -1;
-                state.prev_method = state.method.clone();
-                state.prev_uri = state.uri.clone();
-                state.prev_body = state.body.clone();
-                state.prev_outfile = state.config.outfile.clone();
 
-                execute_request(state, stdout)?;
+                // If method expects a body but none provided and no infile, enter body input mode
+                if state.body.is_empty()
+                    && state.config.outfile.is_empty()
+                    && ["POST", "PUT", "PATCH"].contains(&state.method.as_str())
+                {
+                    state.body_input_mode = true;
+                    state.body_input_buffer.clear();
+                    state.body_input_method = state.method.clone();
+                    state.body_input_uri = state.uri.clone();
+                    render(stdout, state)?;
+                } else {
+                    state.history.push(input.clone());
+                    append_history(&input);
+                    state.history_idx = -1;
+                    state.prev_method = state.method.clone();
+                    state.prev_uri = state.uri.clone();
+                    state.prev_body = state.body.clone();
+                    state.prev_outfile = state.config.outfile.clone();
+
+                    execute_request(state, stdout)?;
+                }
             }
         }
 
@@ -4766,7 +4862,7 @@ fn copy_curl(state: &AppState) -> bool {
     }
 
     let mut cmd = format!(
-        "curl -gfsSL -X {} \"{}{}{}\"\n",
+        "curl -gfsSL -X {} \"{}{}{}\"",
         state.prev_method, state.config.base_uri, state.config.api_path, state.prev_uri
     );
 
@@ -5101,6 +5197,27 @@ fn render(stdout: &mut io::Stdout, state: &mut AppState) -> io::Result<()> {
             Print("\r\n"),
             Print(format!("{}\r\n", "  ctrl+h or esc to close".dimmed()))
         )?;
+    } else if state.body_input_mode {
+        // Show method + URI on first line, prompt on second, buffer with cursor below
+        let header = format!("{} {}", state.body_input_method, state.body_input_uri);
+        queue!(stdout, Print(format!("{}\r\n", header)))?;
+        queue!(stdout, Print(format!("{}\r\n", "Enter body, ctrl+d when done (esc to cancel)".dimmed())))?;
+        let buf_lines: Vec<&str> = if state.body_input_buffer.is_empty() {
+            vec![""]
+        } else {
+            state.body_input_buffer.split('\n').collect()
+        };
+        let last_idx = buf_lines.len() - 1;
+        for (i, line) in buf_lines.iter().enumerate() {
+            if i == last_idx {
+                // Append block cursor on the last line
+                queue!(stdout, Print(format!("{}\x1b[48;5;247m\x1b[38;5;0m \x1b[0m\r\n", line)))?;
+            } else {
+                queue!(stdout, Print(format!("{}\r\n", line)))?;
+            }
+        }
+        // +2 for header + prompt, +buf_lines for body content
+        state.prev_input_lines = 2 + buf_lines.len() as u16;
     } else {
         let (input_output, input_line_count, _ghost) = render_input_content(state, width);
         queue!(stdout, Print(&input_output), Print("\r\n"))?;
