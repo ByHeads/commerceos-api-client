@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.5.10
+
+- **Body input mode**: `PATCH`, `POST`, and `PUT` without a body now prompt for body input with a cursor, instead of sending an empty request. `ctrl+d` to submit, `esc` to cancel.
+- **CLI stdin body**: non-interactive mode reads body from stdin for body-methods when no body argument is given (e.g. `echo '{}' | api PATCH /people`)
+- Fixed `ctrl+y` curl copy: removed stray line break before `-u`/`-H` flags
+
 ## 2.5.6
 
 - Animated spinner during connection setup loading (threaded background load with 80ms frame updates)
