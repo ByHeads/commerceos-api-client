@@ -7811,6 +7811,13 @@ fn complete_inside_operator(
         current_selector
     };
 
+    // Strip negation prefix for property matching (e.g., "!com.heads.synced" -> "com.heads.synced")
+    let (negation_prefix, selector_path) = if let Some(stripped) = selector_path.strip_prefix('!') {
+        ("!", stripped)
+    } else {
+        ("", selector_path)
+    };
+
     // Check if we're inside a nested operator: "customerRelations~just(na"
     // Find the last unmatched `~op(` in the selector
     if let Some(nested_tilde) = find_last_unmatched_operator(selector_path) {
@@ -7844,7 +7851,7 @@ fn complete_inside_operator(
                 continue;
             }
             if name.starts_with(current_prefix) {
-                completions.push(format!("{}{}", prefix_part, current_selector.replace(current_prefix, name)));
+                completions.push(format!("{}{}{}", prefix_part, negation_prefix, current_selector.strip_prefix('!').unwrap_or(current_selector).replace(current_prefix, name)));
             }
         }
         if completions.is_empty() && current_prefix.is_empty() {
@@ -7852,7 +7859,7 @@ fn complete_inside_operator(
                 if used.contains(name.as_str()) {
                     continue;
                 }
-                completions.push(format!("{}{}", prefix_part, name));
+                completions.push(format!("{}{}{}", prefix_part, negation_prefix, name));
             }
         }
         return completions;
@@ -7908,6 +7915,13 @@ fn complete_inside_operator_with_schema(
         &nested_current[colon + 1..]
     } else {
         nested_current
+    };
+
+    // Strip negation prefix for property matching
+    let (_nested_negation, nested_path) = if let Some(stripped) = nested_path.strip_prefix('!') {
+        ("!", stripped)
+    } else {
+        ("", nested_path)
     };
 
     // Check for further nesting
