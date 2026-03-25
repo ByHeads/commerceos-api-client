@@ -456,6 +456,7 @@ struct AppState {
     connection_alias: String,  // Current connection alias (for Ctrl+S pre-fill)
     last_was_splash: bool,  // True if last output was a splash (for consecutive env switches)
     last_method_cycle: Option<std::time::Instant>,  // For ctrl+space reset-to-GET-after-5s logic
+    stashed_body: String,  // Body hidden when switching to GET, restored when switching back
     // Body input mode (for POST/PUT/PATCH without body)
     body_input_mode: bool,
     body_input_buffer: String,
@@ -525,6 +526,7 @@ impl AppState {
             connection_alias: String::new(),
             last_was_splash: false,
             last_method_cycle: None,
+            stashed_body: String::new(),
             body_input_mode: false,
             body_input_buffer: String::new(),
             body_input_method: String::new(),
@@ -4181,6 +4183,8 @@ fn parse_input(state: &mut AppState, input: &str) {
 }
 
 fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<()> {
+    // Clear stashed body since a request was sent
+    state.stashed_body.clear();
     // Clear splash tracking since we're printing output
     state.last_was_splash = false;
 
@@ -4632,12 +4636,27 @@ fn cycle_method(state: &mut AppState) {
         }
     };
 
+    // Extract URI and body from current input
+    let uri = if parts.len() > 1 { parts[1] } else { "/" };
+    let body_part = if parts.len() > 2 { parts[2..].join(" ") } else { String::new() };
+
+    // Switching TO GET: stash the body and hide it
+    if new_method == "GET" && current != "GET" {
+        if !body_part.is_empty() {
+            state.stashed_body = body_part;
+        }
+        state.input = format!("{} {}", new_method, uri);
+    }
+    // Switching FROM GET: restore stashed body if available
+    else if current == "GET" && !state.stashed_body.is_empty() {
+        state.input = format!("{} {} {}", new_method, uri, state.stashed_body);
+    }
+    // Normal case
+    else {
+        state.input = format!("{} {}", new_method, if parts.len() > 1 { parts[1..].join(" ") } else { "/".to_string() });
+    }
+
     state.last_method_cycle = Some(std::time::Instant::now());
-    state.input = if parts.len() > 1 {
-        format!("{} {}", new_method, parts[1..].join(" "))
-    } else {
-        format!("{} /", new_method)
-    };
     state.cursor_pos = char_len(&state.input);
     state.method = new_method.to_string();
 }
@@ -4656,11 +4675,20 @@ fn cycle_method_reverse(state: &mut AppState) {
         _ => "GET",
     };
 
-    state.input = if parts.len() > 1 {
-        format!("{} {}", new_method, parts[1..].join(" "))
+    let uri = if parts.len() > 1 { parts[1] } else { "/" };
+    let body_part = if parts.len() > 2 { parts[2..].join(" ") } else { String::new() };
+
+    if new_method == "GET" && current != "GET" {
+        if !body_part.is_empty() {
+            state.stashed_body = body_part;
+        }
+        state.input = format!("{} {}", new_method, uri);
+    } else if current == "GET" && !state.stashed_body.is_empty() {
+        state.input = format!("{} {} {}", new_method, uri, state.stashed_body);
     } else {
-        format!("{} /", new_method)
-    };
+        state.input = format!("{} {}", new_method, if parts.len() > 1 { parts[1..].join(" ") } else { "/".to_string() });
+    }
+
     state.cursor_pos = char_len(&state.input);
     state.method = new_method.to_string();
 }
