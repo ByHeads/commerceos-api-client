@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.5.11
+
+- **Output erase commands**: `ctrl+w` erases last request+response, `ctrl+j` erases last response body only, `ctrl+l` erases all output
+- **Keyboard shortcut changes**: `ctrl+space` cycles method (replaces `ctrl+t`), `ctrl+q` switches connection (replaces `ctrl+l`), `ctrl+l` clears all output
+- **Smart method cycling**: `ctrl+space` resets to GET if >5 seconds since last cycle and not already on GET
+- Tab completion now works after `!` negation prefix in operators (e.g. `~where(!prop`)
+- Fixed `ctrl+k` clear not sticking when followed by other keys
+
 ## 2.5.10
 
 - **Body input mode**: `PATCH`, `POST`, and `PUT` without a body now prompt for body input with a cursor, instead of sending an empty request. `ctrl+d` to submit, `esc` to cancel.
