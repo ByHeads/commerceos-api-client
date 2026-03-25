@@ -429,6 +429,8 @@ struct AppState {
     height: u16,
     prev_width: u16,
     output_history: Vec<String>,  // Store all output for redraw on resize
+    output_line_counts: Vec<u16>,  // Terminal line count per output block (parallel to output_history)
+    output_header_line_counts: Vec<u16>,  // Terminal line count of just request+status lines per output
     // Tab completion
     spec: Option<ApiSpec>,
     endpoints: Vec<String>,
@@ -453,6 +455,7 @@ struct AppState {
     completion_uri_suffix: String,  // URI text after cursor for mid-URI completion
     connection_alias: String,  // Current connection alias (for Ctrl+S pre-fill)
     last_was_splash: bool,  // True if last output was a splash (for consecutive env switches)
+    last_method_cycle: Option<std::time::Instant>,  // For ctrl+space reset-to-GET-after-5s logic
     // Body input mode (for POST/PUT/PATCH without body)
     body_input_mode: bool,
     body_input_buffer: String,
@@ -496,6 +499,8 @@ impl AppState {
             height: 24,
             prev_width: 80,
             output_history: Vec::new(),
+            output_line_counts: Vec::new(),
+            output_header_line_counts: Vec::new(),
             spec: None,
             endpoints: Vec::new(),
             schema_props: HashMap::new(),
@@ -519,6 +524,7 @@ impl AppState {
             completion_uri_suffix: String::new(),
             connection_alias: String::new(),
             last_was_splash: false,
+            last_method_cycle: None,
             body_input_mode: false,
             body_input_buffer: String::new(),
             body_input_method: String::new(),
@@ -3394,7 +3400,7 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
     }
 
     // Clear input area before exiting (move up and clear to end)
-    let help_lines: u16 = 18;
+    let help_lines: u16 = 21;
     let lines_to_clear: u16 = if state.show_help { help_lines } else { 2 + state.prev_input_lines };
     execute!(
         stdout,
@@ -3652,9 +3658,8 @@ fn handle_key_event(
             }
         }
 
-        // Cycle method (ctrl+t or ctrl+z)
-        (KeyModifiers::CONTROL, KeyCode::Char('t')) |
-        (KeyModifiers::CONTROL, KeyCode::Char('z')) => {
+        // Cycle method (ctrl+space)
+        (KeyModifiers::CONTROL, KeyCode::Char(' ')) => {
             cycle_method(state);
             render(stdout, state)?;
         }
@@ -3727,21 +3732,84 @@ fn handle_key_event(
             handle_save_connection(state, stdout)?;
         }
 
-        // Clear scrollback (ctrl+k)
-        (KeyModifiers::CONTROL, KeyCode::Char('k')) => {
-            state.output_history.clear();
-            // Write escape bytes directly to stdout to clear scrollback + screen
-            stdout.write_all(b"\x1b[3J\x1b[2J\x1b[H")?;
-            stdout.flush()?;
-            // Print placeholder lines and render UI fresh
-            let il = visual_line_count(&state.input, state.width as usize);
-            for _ in 0..(2 + il) { execute!(stdout, Print("\r\n"))?; }
-            state.prev_input_lines = il;
-            render(stdout, state)?;
+        // Clear all output (ctrl+l)
+        (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
+            if !state.output_line_counts.is_empty() {
+                state.output_history.clear();
+                state.output_line_counts.clear();
+                state.output_header_line_counts.clear();
+
+                terminal::disable_raw_mode()?;
+                print!("\x1b[2J\x1b[3J\x1b[H");
+                io::stdout().flush().ok();
+                print_splash_with_width(&state.config, state.width);
+                let input_lines = state.input.split('\n').count() as u16;
+                for _ in 0..(2 + input_lines) { println!(); }
+                io::stdout().flush().ok();
+                terminal::enable_raw_mode()?;
+                state.prev_input_lines = input_lines;
+                render(stdout, state)?;
+            }
         }
 
-        // Switch connection (ctrl+l)
-        (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
+        // Erase last output block entirely (ctrl+w) — full redraw
+        (KeyModifiers::CONTROL, KeyCode::Char('w')) => {
+            if !state.output_line_counts.is_empty() {
+                state.output_history.pop();
+                state.output_line_counts.pop();
+                state.output_header_line_counts.pop();
+
+                terminal::disable_raw_mode()?;
+                print!("\x1b[2J\x1b[3J\x1b[H");
+                io::stdout().flush().ok();
+                print_splash_with_width(&state.config, state.width);
+                for output in &state.output_history {
+                    print!("{}", output);
+                }
+                let input_lines = state.input.split('\n').count() as u16;
+                for _ in 0..(2 + input_lines) { println!(); }
+                io::stdout().flush().ok();
+                terminal::enable_raw_mode()?;
+                state.prev_input_lines = input_lines;
+                render(stdout, state)?;
+            }
+        }
+
+        // Erase last response body only, keep request+status headers (ctrl+j) — full redraw
+        (KeyModifiers::CONTROL, KeyCode::Char('j')) => {
+            if !state.output_line_counts.is_empty() {
+                let last_total = *state.output_line_counts.last().unwrap();
+                let last_header = *state.output_header_line_counts.last().unwrap();
+
+                if last_total > last_header {
+                    // Strip body, keep headers
+                    let last_output = state.output_history.last().cloned().unwrap_or_default();
+                    let header_output: String = last_output.split('\n')
+                        .take(last_header as usize)
+                        .collect::<Vec<&str>>()
+                        .join("\n") + "\n";
+                    *state.output_history.last_mut().unwrap() = header_output;
+                    *state.output_line_counts.last_mut().unwrap() = last_header;
+
+                    terminal::disable_raw_mode()?;
+                    print!("\x1b[2J\x1b[3J\x1b[H");
+                    io::stdout().flush().ok();
+                    print_splash_with_width(&state.config, state.width);
+                    for output in &state.output_history {
+                        print!("{}", output);
+                    }
+                    let input_lines = state.input.split('\n').count() as u16;
+                    for _ in 0..(2 + input_lines) { println!(); }
+                    io::stdout().flush().ok();
+                    terminal::enable_raw_mode()?;
+                    state.prev_input_lines = input_lines;
+                    render(stdout, state)?;
+                }
+            }
+        }
+
+        // Switch connection (ctrl+q)
+        (KeyModifiers::CONTROL, KeyCode::Char('q')) => {
             if let Some(rx) = handle_switch_connection(state, stdout)? {
                 return Ok((false, Some(rx)));
             }
@@ -4232,13 +4300,17 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     // Buffer for display output (will print all at once)
     let mut display_output = request_line.clone();
     display_output.push('\n');
+    let mut header_lines: u16 = 1; // At minimum, the request line
 
     // If file error, show it and return
     if let Some(err) = file_error {
         display_output.push_str(&format!("\n{}\n\n", err));
         output_lines.push_str(&format!("\n{}\n\n", err));
+        let line_count = visual_line_count(&display_output, state.width as usize).saturating_sub(1);
         state.output_history.push(display_output.clone());
-        if state.output_history.len() > 5 { state.output_history.remove(0); }
+        state.output_line_counts.push(line_count);
+        state.output_header_line_counts.push(header_lines);
+        if state.output_history.len() > 5 { state.output_history.remove(0); state.output_line_counts.remove(0); state.output_header_line_counts.remove(0); }
 
         // Update input with last command
         state.input = format!("{} {}", state.method, state.uri);
@@ -4444,6 +4516,9 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
                     output_lines.push('\n');
                 }
 
+                // Capture header line count (request line + status line) before body
+                header_lines = visual_line_count(&display_output, state.width as usize);
+
                 // Build body
                 if !body_text.is_empty() {
                     let output = if state.config.raw || state.config.ndjson {
@@ -4488,9 +4563,14 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     }
 
     // Store output for resize redraw (keep last 5)
+    let output_rendered_lines = visual_line_count(&display_output, state.width as usize).saturating_sub(1);
     state.output_history.push(output_lines);
+    state.output_line_counts.push(output_rendered_lines);
+    state.output_header_line_counts.push(header_lines);
     if state.output_history.len() > 5 {
         state.output_history.remove(0);
+        state.output_line_counts.remove(0);
+        state.output_header_line_counts.remove(0);
     }
 
     // Update input with last command
@@ -4537,13 +4617,22 @@ fn cycle_method(state: &mut AppState) {
     }
 
     let current = parts[0].to_uppercase();
-    let new_method = match current.as_str() {
-        "GET" => "PUT",
-        "PUT" => "PATCH",
-        "PATCH" => "POST",
-        _ => "GET",
+
+    // If not on GET and >5s since last cycle, reset to GET instead of cycling
+    let stale = state.last_method_cycle
+        .map_or(true, |t| t.elapsed() > Duration::from_secs(5));
+    let new_method = if stale && current != "GET" {
+        "GET"
+    } else {
+        match current.as_str() {
+            "GET" => "PUT",
+            "PUT" => "PATCH",
+            "PATCH" => "POST",
+            _ => "GET",
+        }
     };
 
+    state.last_method_cycle = Some(std::time::Instant::now());
     state.input = if parts.len() > 1 {
         format!("{} {}", new_method, parts[1..].join(" "))
     } else {
@@ -4804,6 +4893,8 @@ fn handle_switch_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io
 
             // Full screen clear and fresh start for new connection
             state.output_history.clear();
+            state.output_line_counts.clear();
+            state.output_header_line_counts.clear();
             terminal::disable_raw_mode()?;
             print!("\x1b[2J\x1b[3J\x1b[H");
             io::stdout().flush().ok();
@@ -5113,7 +5204,7 @@ fn render(stdout: &mut io::Stdout, state: &mut AppState) -> io::Result<()> {
     // Determine how many lines to clear:
     // - Normal input area: 2 + input_lines (ruler + input line(s) + hint)
     // - Help menu: 14 lines (15 with tab completion)
-    let help_lines: u16 = 18;
+    let help_lines: u16 = 21;
     let normal_lines: u16 = 2 + state.prev_input_lines; // ruler + input line(s) + hint
     let lines_to_clear: u16 = if state.prev_show_help && !state.show_help {
         help_lines  // Closing help - clear all help lines
@@ -5184,13 +5275,16 @@ fn render(stdout: &mut io::Stdout, state: &mut AppState) -> io::Result<()> {
         queue!(stdout, Print(format!("{}\r\n", "  tab        Complete URI (endpoints, operators, properties)".dimmed())))?;
         queue!(
             stdout,
+            Print(format!("{}\r\n", "  ctrl+space Cycle method: GET → POST → PATCH → PUT".dimmed())),
             Print(format!("{}\r\n", "  ctrl+g     Quick GET current URI".dimmed())),
-            Print(format!("{}\r\n", "  ctrl+t     Cycle method: GET → POST → PATCH → PUT".dimmed())),
             Print(format!("{}\r\n", "  ctrl+x     Clear body (keep method and URI)".dimmed())),
             Print(format!("{}\r\n", "  ctrl+f     Clear all (reset to GET /)".dimmed())),
             Print(format!("{}\r\n", "  ctrl+y     Copy last request as curl command".dimmed())),
-            Print(format!("{}\r\n", "  ctrl+s     Save the current connection for easy access later".dimmed())),
-            Print(format!("{}\r\n", "  ctrl+l     Switch connection".dimmed())),
+            Print(format!("{}\r\n", "  ctrl+w     Erase last request+response".dimmed())),
+            Print(format!("{}\r\n", "  ctrl+j     Erase last response body".dimmed())),
+            Print(format!("{}\r\n", "  ctrl+l     Erase all output".dimmed())),
+            Print(format!("{}\r\n", "  ctrl+s     Save connection".dimmed())),
+            Print(format!("{}\r\n", "  ctrl+q     Switch connection".dimmed())),
             Print(format!("{}\r\n", "  ctrl+b     Open API docs in browser".dimmed())),
             Print(format!("{}\r\n", "  ctrl+o     Open last saved file".dimmed())),
             Print(format!("{}\r\n", "  ctrl+c     Quit".dimmed())),
