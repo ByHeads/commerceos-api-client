@@ -4971,6 +4971,35 @@ fn copy_curl(state: &AppState) -> bool {
         accept = "application/x-ndjson".to_string();
     }
 
+    // Parse file body info early so we can detect content-type from extension
+    let mut file_path_clean = String::new();
+    let mut body_extra_headers: Vec<(String, String)> = Vec::new();
+    let is_file_body = state.prev_body.starts_with("@") || state.prev_body.starts_with("@ ");
+    if is_file_body {
+        let (clean_body, extra_headers) = parse_body_functions(&state.prev_body);
+        file_path_clean = clean_body.trim_start_matches("@ ").trim_start_matches('@').trim().to_string();
+        body_extra_headers = extra_headers;
+
+        // Auto-detect content type from input file extension
+        if file_path_clean.ends_with(".ndjson") || file_path_clean.ends_with(".njson") {
+            content_type = "application/x-ndjson".to_string();
+            accept = "application/x-ndjson".to_string();
+        } else if file_path_clean.ends_with(".csv") {
+            content_type = "text/csv".to_string();
+        }
+    }
+
+    // Override accept based on outfile extension
+    if !state.prev_outfile.is_empty() {
+        if state.prev_outfile.ends_with(".ndjson") {
+            accept = "application/x-ndjson".to_string();
+        } else if state.prev_outfile.ends_with(".csv") {
+            accept = "text/csv".to_string();
+        } else if state.prev_outfile.ends_with(".sql") {
+            accept = "application/sql".to_string();
+        }
+    }
+
     if state.config.streaming {
         content_type.push_str(";stream=true");
         accept.push_str(";stream=true");
@@ -4998,7 +5027,14 @@ fn copy_curl(state: &AppState) -> bool {
     }
 
     if !state.prev_body.is_empty() {
-        cmd.push_str(&format!(" --data-binary '{}'", state.prev_body));
+        if is_file_body {
+            for (name, value) in &body_extra_headers {
+                cmd.push_str(&format!(" -H \"{}: {}\"", name, value));
+            }
+            cmd.push_str(&format!(" --data-binary @{}", file_path_clean));
+        } else {
+            cmd.push_str(&format!(" --data-binary '{}'", state.prev_body));
+        }
     }
 
     // Copy to clipboard
