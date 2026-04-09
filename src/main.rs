@@ -5037,6 +5037,11 @@ fn copy_curl(state: &AppState) -> bool {
         }
     }
 
+    // Output file
+    if !state.prev_outfile.is_empty() {
+        cmd.push_str(&format!(" -o '{}'", state.prev_outfile));
+    }
+
     // Copy to clipboard
     if cli_clipboard::set_contents(cmd.clone()).is_ok() {
         return true;
