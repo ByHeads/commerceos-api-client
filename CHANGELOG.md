@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.5.12
+
+- **Body stash on GET**: switching to GET via `ctrl+space` hides the body from the input; switching back restores it. Cleared on request send.
+- **curl copy improvements** (`ctrl+y`):
+  - `@file~map(type)` bodies now emit `X-Request-Map` header and clean file path instead of passing `~map()` in `--data-binary`
+  - Content-Type auto-detected from input file extension (`.csv` → `text/csv`, `.ndjson` → `application/x-ndjson`)
+  - Accept auto-detected from outfile extension (`.csv`, `.ndjson`, `.sql`)
+  - Outfile included as `-o` flag
+
 ## 2.5.11
 
 - **Output erase commands**: `ctrl+w` erases last request+response, `ctrl+j` erases last response body only, `ctrl+l` erases all output
