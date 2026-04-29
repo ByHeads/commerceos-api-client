@@ -4167,17 +4167,17 @@ fn parse_input(state: &mut AppState, input: &str) {
         } else {
             let uri_end = after_method_trimmed.find(|c: char| c.is_whitespace()).unwrap_or(after_method_trimmed.len());
             state.uri = after_method_trimmed[..uri_end].to_string();
-            // Body is everything after URI, preserving newlines (just trim leading whitespace)
+            // Body is everything after URI; trim leading spaces/tabs but preserve newlines
             let after_uri = &after_method_trimmed[uri_end..];
-            let body = after_uri.strip_prefix(' ').unwrap_or(after_uri);
+            let body = after_uri.trim_start_matches(|c: char| c == ' ' || c == '\t');
             state.body = if body.trim().is_empty() { String::new() } else { body.to_string() };
         }
     } else if first_word.starts_with('/') {
         state.method = "GET".to_string();
         state.uri = first_word.to_string();
-        // Body is everything after URI, preserving newlines
+        // Body is everything after URI; trim leading spaces/tabs but preserve newlines
         let after_uri = &trimmed[first_end..];
-        let body = after_uri.strip_prefix(' ').unwrap_or(after_uri);
+        let body = after_uri.trim_start_matches(|c: char| c == ' ' || c == '\t');
         state.body = if body.trim().is_empty() { String::new() } else { body.to_string() };
     }
 }
@@ -5363,24 +5363,33 @@ fn render(stdout: &mut io::Stdout, state: &mut AppState) -> io::Result<()> {
     } else if state.body_input_mode {
         // Show method + URI on first line, prompt on second, buffer with cursor below
         let header = format!("{} {}", state.body_input_method, state.body_input_uri);
+        let header_lines = visual_line_count(&header, width);
         queue!(stdout, Print(format!("{}\r\n", header)))?;
-        queue!(stdout, Print(format!("{}\r\n", "Enter body, ctrl+d when done (esc to cancel)".dimmed())))?;
+        let prompt = "Enter body, ctrl+d when done (esc to cancel)";
+        let prompt_lines = visual_line_count(prompt, width);
+        queue!(stdout, Print(format!("{}\r\n", prompt.dimmed())))?;
         let buf_lines: Vec<&str> = if state.body_input_buffer.is_empty() {
             vec![""]
         } else {
             state.body_input_buffer.split('\n').collect()
         };
         let last_idx = buf_lines.len() - 1;
+        let mut total_buf_visual_lines: u16 = 0;
         for (i, line) in buf_lines.iter().enumerate() {
             if i == last_idx {
-                // Append block cursor on the last line
+                // Account for the cursor character (1 column)
+                let line_with_cursor_width = visible_len(line) + 1;
+                let lines_for_this = if width == 0 { 1 } else {
+                    ((line_with_cursor_width + width - 1) / width).max(1) as u16
+                };
+                total_buf_visual_lines += lines_for_this;
                 queue!(stdout, Print(format!("{}\x1b[48;5;247m\x1b[38;5;0m \x1b[0m\r\n", line)))?;
             } else {
+                total_buf_visual_lines += visual_line_count(line, width);
                 queue!(stdout, Print(format!("{}\r\n", line)))?;
             }
         }
-        // +2 for header + prompt, +buf_lines for body content
-        state.prev_input_lines = 2 + buf_lines.len() as u16;
+        state.prev_input_lines = header_lines + prompt_lines + total_buf_visual_lines;
     } else {
         let (input_output, input_line_count, _ghost) = render_input_content(state, width);
         queue!(stdout, Print(&input_output), Print("\r\n"))?;
@@ -6664,7 +6673,7 @@ fn handle_file_tab_completion_reverse(state: &mut AppState) {
         return;
     }
 
-    let (path_start, _) = match extract_file_path_context(&state.input) {
+    let (path_start, partial) = match extract_file_path_context(&state.input) {
         Some(ctx) => ctx,
         None => return,
     };
@@ -6678,6 +6687,18 @@ fn handle_file_tab_completion_reverse(state: &mut AppState) {
     }
 
     let completion = &state.completions[state.completion_idx];
+
+    // Handle ~map() completions: reconstruct with file path prefix
+    if let Some(tilde_idx) = partial.rfind('~') {
+        let file_part = &partial[..tilde_idx];
+        let after_tilde = &partial[tilde_idx + 1..];
+        if after_tilde.starts_with("map(") {
+            state.input = format!("{}{}~map({}", prefix, file_part, completion);
+            state.cursor_pos = char_len(&state.input);
+            return;
+        }
+    }
+
     state.input = format!("{}{}", prefix, completion);
     state.cursor_pos = char_len(&state.input);
 }
