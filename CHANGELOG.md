@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.5.13
+
+- Fixed Shift+Tab clearing input when cycling `~map(type)` completions (now mirrors forward Tab behavior)
+- Fixed parser treating extra spaces between URI and body as part of the body (e.g. `PUT /foo  @file.json` now correctly recognizes `@file.json` as a file body)
+- Fixed body input mode rendering when text wraps beyond terminal width (used line-count that ignored wrapping, causing screen artifacts)
+
 ## 2.5.12
 
 - **Body stash on GET**: switching to GET via `ctrl+space` hides the body from the input; switching back restores it. Cleared on request send.
