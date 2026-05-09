@@ -101,6 +101,10 @@ struct Args {
     /// Enable experimental features (body completion, syntax highlighting)
     #[arg(short = 'x', long = "experimental")]
     experimental: bool,
+
+    /// Bulk mode: execute requests from a file (one per line). Use without value or with `-` to read from stdin.
+    #[arg(short = 'a', long = "all", value_name = "FILE", num_args = 0..=1, default_missing_value = "-")]
+    all: Option<String>,
 }
 
 #[derive(Clone)]
@@ -2306,8 +2310,8 @@ fn main() {
     // Parse positional args like bash client
     let (method, uri, mut body) = parse_positional_args(args.method, args.uri, args.body);
 
-    // Read from stdin if available and no body provided
-    if body.is_empty() && !atty::is(Stream::Stdin) {
+    // Read from stdin if available and no body provided (and not bulk mode)
+    if body.is_empty() && args.all.is_none() && !atty::is(Stream::Stdin) {
         let mut stdin_content = String::new();
         if io::stdin().read_to_string(&mut stdin_content).is_ok() {
             body = stdin_content.trim().to_string();
@@ -2600,6 +2604,34 @@ fn main() {
         }
     }
 
+    // Bulk mode: execute requests from a file or stdin
+    if let Some(ref bulk_arg) = args.all {
+        // Resolve 1Password credentials before running
+        if let Some(selector) = &op_selector {
+            match get_1password_credentials(selector) {
+                Ok((base_uri, api_key)) => {
+                    config.base_uri = base_uri;
+                    config.api_key = api_key;
+                }
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        if bulk_arg == "-" {
+            let mut stdin_content = String::new();
+            if io::stdin().read_to_string(&mut stdin_content).is_err() {
+                eprintln!("error: could not read stdin");
+                std::process::exit(1);
+            }
+            run_bulk_from_str(&mut config, &stdin_content);
+        } else {
+            run_bulk(&mut config, bulk_arg);
+        }
+        return;
+    }
+
     // Non-interactive mode if URI provided
     if !uri.is_empty() {
         // Non-interactive still blocks on 1Password (needs creds before request)
@@ -2813,6 +2845,87 @@ fn fetch_feature_flags(config: &Config) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// Parse a single request line — same semantics as the interactive client's `parse_input`.
+/// Returns (method, uri_with_outfile_suffix, body) where the URI includes ` > outfile`
+/// if present, so run_non_interactive parses it the same way.
+fn parse_request_line(line: &str) -> Option<(String, String, String)> {
+    let mut working = line.trim().to_string();
+    if working.is_empty() || working.starts_with('#') {
+        return None;
+    }
+
+    // Strip ` > outfile` from the end (matches parse_input)
+    let outfile_suffix: String = if let Some(idx) = working.rfind(" >") {
+        let after_gt = working[idx + 2..].trim().to_string();
+        if !after_gt.is_empty() {
+            let suffix = format!(" > {}", after_gt);
+            working = working[..idx].trim().to_string();
+            suffix
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    let methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+    let first_end = working.find(|c: char| c.is_whitespace()).unwrap_or(working.len());
+    let first_word = &working[..first_end];
+    let first_upper = first_word.to_uppercase();
+
+    let (method, uri, body) = if methods.contains(&first_upper.as_str()) {
+        let after_method = working[first_end..].trim_start();
+        if after_method.is_empty() {
+            (first_upper, "/".to_string(), String::new())
+        } else {
+            let uri_end = after_method.find(|c: char| c.is_whitespace()).unwrap_or(after_method.len());
+            let uri = after_method[..uri_end].to_string();
+            let body = after_method[uri_end..].trim_start_matches(|c: char| c == ' ' || c == '\t').to_string();
+            (first_upper, uri, body)
+        }
+    } else if first_word.starts_with('/') {
+        let uri = first_word.to_string();
+        let body = working[first_end..].trim_start_matches(|c: char| c == ' ' || c == '\t').to_string();
+        ("GET".to_string(), uri, body)
+    } else {
+        return None;
+    };
+
+    // Append outfile suffix to URI so run_non_interactive's `uri.find(" >")` picks it up
+    Some((method, format!("{}{}", uri, outfile_suffix), body))
+}
+
+fn run_bulk_from_str(config: &mut Config, contents: &str) {
+    for line in contents.lines() {
+        let Some((method, uri, body)) = parse_request_line(line) else {
+            continue;
+        };
+        run_non_interactive(config, &method, &uri, &body);
+    }
+}
+
+fn run_bulk(config: &mut Config, file_path: &str) {
+    let path = if file_path.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            format!("{}{}", home.display(), &file_path[1..])
+        } else {
+            file_path.to_string()
+        }
+    } else {
+        file_path.to_string()
+    };
+
+    let contents = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: could not read {}: {}", path, e);
+            std::process::exit(1);
+        }
+    };
+
+    run_bulk_from_str(config, &contents);
 }
 
 fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str) {

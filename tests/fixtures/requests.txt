@@ -1,0 +1,6 @@
+# comment line — skipped
+GET /echo-all
+
+PUT /echo-all {"first": true}
+PATCH /echo-all {"second": true}
+# blank line above also skipped
