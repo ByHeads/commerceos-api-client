@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.5.14
+
+- **Bulk mode (`-a` / `--all`)**: execute multiple requests from a file, one per line. Supports `#` comments, blank lines, `@file` bodies, and `> outfile` per line. Same parsing as interactive client.
+- **Bulk from stdin**: `cat requests.txt | api -a` (or `api -a -`) reads request lines from stdin instead of a file.
+- **Integration test suite**: 25 end-to-end tests in `tests/cli.rs` covering all methods, body modes (inline/stdin/`@file`), output flags (`--silent`, `--raw`, `--ndjson`), outfile (`>`), URL operators, and bulk mode. Runs against a local COS via the default connection (`cargo test --test cli`).
+
 ## 2.5.13
 
 - Fixed Shift+Tab clearing input when cycling `~map(type)` completions (now mirrors forward Tab behavior)

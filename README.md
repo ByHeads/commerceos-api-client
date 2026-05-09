@@ -61,6 +61,64 @@ api /users                    # GET is the default method
 api PUT /people/123 '{"name":"Updated"}'
 ```
 
+### Body input
+
+A request body can be supplied four ways:
+
+```sh
+# Inline argument
+api PUT /people/123 '{"name":"Updated"}'
+
+# From a file (the `@` prefix)
+api PUT /people/123 @body.json
+
+# From stdin (when the body argument is omitted)
+echo '{"name":"Updated"}' | api PUT /people/123
+
+# Interactive prompt (terminal-attached stdin, no inline body)
+api PATCH /people/123          # prompts: "Reading body from stdin (ctrl+d to finish):"
+```
+
+The `@file` form auto-detects content type from the extension (`.csv`, `.ndjson`).
+Append `~map(typeName)` to a file body to send the type name as an `X-Request-Map`
+header (used for streamed transformations):
+
+```sh
+api PUT /sync-webhooks @data.csv~map(com.heads.csv-product)
+```
+
+### Output to file
+
+Append `> path` to write the response body to a file:
+
+```sh
+api GET /products > products.json
+api GET /products~map(com.heads.sql-product) > products.sql
+```
+
+The output extension also drives the `Accept` header (`.csv` → `text/csv`,
+`.ndjson` → `application/x-ndjson`, `.sql` → `application/sql`).
+
+### Bulk mode
+
+Run a sequence of requests from a text file with `-a`:
+
+```sh
+api -a requests.txt
+cat requests.txt | api -a       # stdin
+api -a -                        # explicit stdin
+```
+
+Each non-empty line is a full request, parsed exactly like interactive input.
+Lines starting with `#` are comments; blank lines are skipped.
+
+```
+# requests.txt
+GET /people
+PUT /people/com.heads.seedID=joe {"name":"Joe"} > ~/Downloads/joe.json
+PATCH /sync-webhooks @webhooks/foo.json
+```
+
 ### Interactive mode
 
 Start `api` without a URI to enter interactive mode. The prompt accepts input in the format:
@@ -78,28 +136,40 @@ GET /orders > orders.json
 PATCH /people/123 {"name":"Updated"}
 ```
 
+For `PATCH`, `POST`, and `PUT` without a body, pressing `enter` opens an inline
+body editor: type the body (multiline supported), `ctrl+d` to send, `esc` to
+cancel.
+
+Switching to GET via `ctrl+space` hides the current body from the input and
+stashes it. Switching back to a body method restores it. Sending a request
+clears the stash.
+
 Press `ctrl+h` for the full list of key bindings:
 
 | Key | Action |
 |---|---|
 | `enter` | Send request |
 | `opt+enter` | New line (multiline body) \[or `ctrl+n`\] |
-| `tab` | Auto-complete endpoints, operators, and properties |
+| `tab` | Auto-complete endpoints, operators, properties |
 | `up` / `down` | Browse request history |
-| `ctrl+g` | Quick GET current URI |
-| `ctrl+t` | Cycle method: GET, POST, PATCH, PUT |
+| `ctrl+space` | Cycle method (GET → PUT → PATCH → POST). Resets to GET if >5s since last cycle. |
+| `ctrl+g` | Quick GET on current URI |
 | `ctrl+x` | Clear body (keep method and URI) |
-| `ctrl+f` | Clear all (reset to GET /) |
+| `ctrl+f` | Clear all (reset to `GET /`) |
 | `ctrl+y` | Copy last request as curl command |
+| `ctrl+w` | Erase last request+response from output |
+| `ctrl+j` | Erase last response body (keep request+status headers) |
+| `ctrl+l` | Erase all output back to splash |
 | `ctrl+s` | Save the current connection |
-| `ctrl+l` | Switch connection |
-| `ctrl+d` | Open API docs in browser |
+| `ctrl+q` | Switch connection |
+| `ctrl+b` | Open API docs in browser |
 | `ctrl+o` | Open last saved file |
+| `ctrl+h` | Toggle help |
 | `ctrl+c` | Quit (double-press) |
 
 ### Saved connections
 
-Save a connection with `ctrl+s` during interactive mode. Switch between saved connections with `ctrl+l`, or use the `-c` flag:
+Save a connection with `ctrl+s` during interactive mode. Switch between saved connections with `ctrl+q`, or use the `-c` flag:
 
 ```sh
 api -c my-connection
@@ -124,13 +194,25 @@ Options:
   -k, --key <KEY>                 API key (Basic auth)
   -t, --token <TOKEN>             Bearer token
   -c, --connection <ALIAS_OR_URL> Use a saved connection
+  -a, --all [FILE]                Bulk mode: run requests from FILE (or stdin if omitted/`-`)
   -s, --silent                    Do not print status info
   -r, --raw                       Output raw JSON (no pretty printing)
   -i, --include-nulls             Include null values in response
+  -x, --experimental              Enable experimental body completion / syntax highlighting
       --me                        Use /api/me/v1 instead of /api/v1
       --ndjson                    Use NDJSON for request and response
   -v, --version                   Print version
   -h, --help                      Print help
+```
+
+## Tests
+
+Integration tests in `tests/cli.rs` exercise the binary against a running local
+CommerceOS instance via the `/echo-all` endpoint (which round-trips request
+bodies, so nothing is persisted). They use the saved default connection.
+
+```sh
+cargo test --test cli
 ```
 
 ## License
