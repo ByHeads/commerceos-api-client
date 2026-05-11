@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "api-rust"
-version = "2.6.1"
+version = "2.6.2"
 dependencies = [
  "assert_cmd",
  "atty",
