@@ -121,6 +121,8 @@ struct Config {
     outfile: String,
     streaming: bool,
     experimental: bool,
+    /// In silent bulk mode: print status line (with `|-` prefix) but suppress body output
+    bulk_silent: bool,
 }
 
 impl Default for Config {
@@ -138,6 +140,7 @@ impl Default for Config {
             outfile: String::new(),
             streaming: false,
             experimental: false,
+            bulk_silent: false,
         }
     }
 }
@@ -2898,10 +2901,32 @@ fn parse_request_line(line: &str) -> Option<(String, String, String)> {
 }
 
 fn run_bulk_from_str(config: &mut Config, contents: &str) {
+    // Silent + bulk: enable "silent bulk mode" — show request line + status, skip body.
+    // We clear silent so status line still prints; bulk_silent suppresses body output.
+    if config.silent {
+        config.silent = false;
+        config.bulk_silent = true;
+    }
+
+    if config.bulk_silent && !config.base_uri.is_empty() {
+        // Ensure colors work even when stdout is piped
+        if atty::is(Stream::Stderr) {
+            colored::control::set_override(true);
+        }
+        println!("{}", format!("[{}]", config.base_uri).dimmed());
+    }
+
     for line in contents.lines() {
         let Some((method, uri, body)) = parse_request_line(line) else {
             continue;
         };
+        if config.bulk_silent {
+            // Print the original request line (trimmed) before sending
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                println!("{}", trimmed);
+            }
+        }
         run_non_interactive(config, &method, &uri, &body);
     }
 }
@@ -2937,16 +2962,20 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
     }
 
     // Parse > outfile from URI (space required before >, optional after)
-    let (actual_uri, outfile) = if let Some(idx) = uri.find(" >") {
-        let mut outfile_path = uri[idx + 2..].trim().to_string();
-        if outfile_path.starts_with("~/") {
+    let (actual_uri, outfile, display_outfile) = if let Some(idx) = uri.find(" >") {
+        let display_path = uri[idx + 2..].trim().to_string();
+        let outfile_path = if display_path.starts_with("~/") {
             if let Some(home) = dirs::home_dir() {
-                outfile_path = format!("{}{}", home.display(), &outfile_path[1..]);
+                format!("{}{}", home.display(), &display_path[1..])
+            } else {
+                display_path.clone()
             }
-        }
-        (uri[..idx].trim(), Some(outfile_path))
+        } else {
+            display_path.clone()
+        };
+        (uri[..idx].trim(), Some(outfile_path), Some(display_path))
     } else {
-        (uri, None)
+        (uri, None, None)
     };
 
     // Fetch feature flags
@@ -3057,7 +3086,7 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
             let status = resp.status();
             let elapsed = start.elapsed();
 
-            // Print status to stderr
+            // Print status
             if !config.silent {
                 let status_str = if status.is_success() {
                     format!("{} {}", status.as_u16(), status.canonical_reason().unwrap_or(""))
@@ -3069,16 +3098,31 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                         .to_string()
                 };
 
-                eprintln!(
-                    "HTTP/1.1 {} {}",
-                    status_str,
-                    format!("{:.2}s", elapsed.as_secs_f64()).dimmed()
-                );
-                eprintln!();
+                if config.bulk_silent {
+                    // Bulk silent mode: print compact status to stdout with box-draw prefix
+                    println!(
+                        "{}HTTP/1.1 {} {}",
+                        "└─".dimmed(),
+                        status_str,
+                        format!("{:.2}s", elapsed.as_secs_f64()).dimmed()
+                    );
+                } else {
+                    eprintln!(
+                        "HTTP/1.1 {} {}",
+                        status_str,
+                        format!("{:.2}s", elapsed.as_secs_f64()).dimmed()
+                    );
+                    // No blank line before "> outfile" — that line itself acts as the separator
+                    if outfile.is_none() {
+                        eprintln!();
+                    }
+                }
             }
 
-            // Get response body
-            if let Ok(body_text) = resp.text() {
+            // Get response body — but skip output entirely in bulk_silent mode
+            if config.bulk_silent {
+                let _ = resp.text(); // drain body to free connection
+            } else if let Ok(body_text) = resp.text() {
                 let output = if config.raw || config.ndjson {
                     body_text
                 } else if is_tty || outfile.is_some() {
@@ -3097,8 +3141,11 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                 if let Some(ref file_path) = outfile {
                     if let Err(e) = fs::write(file_path, &output) {
                         eprintln!("Error writing to {}: {}", file_path, e);
-                    } else {
-                        eprintln!("Wrote to {}", file_path);
+                    } else if !config.silent {
+                        // Match interactive output: status line already printed,
+                        // now print "> outfile" (dimmed) on the next line.
+                        let display = display_outfile.as_deref().unwrap_or(file_path);
+                        eprintln!("{}", format!("> {}", display).dimmed());
                     }
                 } else {
                     print!("{}", output);

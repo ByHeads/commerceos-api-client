@@ -17,9 +17,18 @@ fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
-/// Run the api binary. Uses default connection (no -c/-b/-k flags).
+/// Run the api binary. If `API_TEST_BASE_URI` and `API_TEST_KEY` are set,
+/// passes them via `-b`/`-k` to skip keychain access; otherwise uses the
+/// saved default connection.
 fn api() -> Command {
-    Command::cargo_bin("api").expect("api binary built")
+    let mut cmd = Command::cargo_bin("api").expect("api binary built");
+    if let (Ok(base), Ok(key)) = (
+        std::env::var("API_TEST_BASE_URI"),
+        std::env::var("API_TEST_KEY"),
+    ) {
+        cmd.args(["-b", &base, "-k", &key]);
+    }
+    cmd
 }
 
 /// Pre-flight check: the server must respond on /echo-all.
@@ -379,6 +388,39 @@ fn bulk_mode_supports_outfile_per_line() {
 
     let written = std::fs::read_to_string(&outfile).expect("outfile written");
     assert!(written.contains("bulk"), "outfile content: {written}");
+}
+
+#[test]
+fn silent_bulk_mode_prints_request_and_compact_status_only() {
+    require_local_cos();
+    let dir = tempdir().unwrap();
+    let req_file = dir.path().join("silent-bulk.txt");
+    let content = "PUT /echo-all [{\"name\":\"Joe\"}]\nGET /echo-all\n";
+    std::fs::write(&req_file, content).unwrap();
+
+    let assert = api()
+        .args(["-sa"])
+        .arg(&req_file)
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+
+    // Each request line should appear in output, each followed by a |-HTTP/1.1 status
+    assert!(
+        stdout.contains("PUT /echo-all [{\"name\":\"Joe\"}]"),
+        "expected request line in stdout: {stdout}"
+    );
+    assert!(stdout.contains("GET /echo-all"));
+    assert_eq!(
+        stdout.matches("└─HTTP/1.1").count(),
+        2,
+        "expected 2 compact status lines; got: {stdout}"
+    );
+    // No bodies should appear
+    assert!(
+        !stdout.contains("\"name\":\"Joe\"") || stdout.matches("\"name\"").count() == 1,
+        "body should not be echoed back in silent bulk mode (only in request line): {stdout}"
+    );
 }
 
 #[test]

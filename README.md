@@ -119,6 +119,24 @@ PUT /people/com.heads.seedID=joe {"name":"Joe"} > ~/Downloads/joe.json
 PATCH /sync-webhooks @webhooks/foo.json
 ```
 
+### Silent bulk mode
+
+Combine `-s` with `-a` for compact progress-style output: each request line is
+echoed, followed by an indented status line. Response bodies are suppressed.
+
+```sh
+api -sa requests.txt
+```
+
+```
+PUT /people [{"name": "Joe"}]
+└─HTTP/1.1 200 OK 0.08s
+GET /people
+└─HTTP/1.1 200 OK 0.07s
+```
+
+Useful for running large batches where you only care about status codes.
+
 ### Interactive mode
 
 Start `api` without a URI to enter interactive mode. The prompt accepts input in the format:
@@ -209,11 +227,22 @@ Options:
 
 Integration tests in `tests/cli.rs` exercise the binary against a running local
 CommerceOS instance via the `/echo-all` endpoint (which round-trips request
-bodies, so nothing is persisted). They use the saved default connection.
+bodies, so nothing is persisted).
 
 ```sh
 cargo test --test cli
 ```
+
+By default the tests use the saved default connection, which means every test
+invocation prompts for keychain access. To skip the keychain entirely, pass
+credentials via environment variables:
+
+```sh
+API_TEST_BASE_URI=http://localhost:5000 API_TEST_KEY=your-local-key cargo test --test cli
+```
+
+When both env vars are set, the test harness adds `-b` and `-k` flags to every
+`api` invocation so no keychain lookup happens.
 
 ## License
 

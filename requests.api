@@ -1,0 +1,4 @@
+GET /people
+POST /people { "name": "Joe" }
+GET /about > about.json
+

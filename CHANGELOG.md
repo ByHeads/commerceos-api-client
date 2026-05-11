@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.6.1
+
+- **Silent bulk mode** (`-sa` / `--silent --all`): compact progress-style output. Prints the env URL in gray brackets at the top, then each request line followed by an indented `└─HTTP/1.1 <status> <time>s` line (gray box-draw, status colored). Response bodies are suppressed.
+- Non-interactive outfile output now matches interactive format: `> path` (dimmed, with `~/` preserved) instead of `Wrote to /full/expanded/path`
+- Tests can now bypass keychain prompts by setting `API_TEST_BASE_URI` + `API_TEST_KEY` env vars
+
 ## 2.5.14
 
 - **Bulk mode (`-a` / `--all`)**: execute multiple requests from a file, one per line. Supports `#` comments, blank lines, `@file` bodies, and `> outfile` per line. Same parsing as interactive client.
