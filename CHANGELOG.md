@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.6.1
+## 2.6.2
 
 - **Silent bulk mode** (`-sa` / `--silent --all`): compact progress-style output. Prints the env URL in gray brackets at the top, then each request line followed by an indented `└─HTTP/1.1 <status> <time>s` line (gray box-draw, status colored). Response bodies are suppressed.
 - Non-interactive outfile output now matches interactive format: `> path` (dimmed, with `~/` preserved) instead of `Wrote to /full/expanded/path`
