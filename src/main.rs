@@ -3119,9 +3119,24 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                 }
             }
 
-            // Get response body — but skip output entirely in bulk_silent mode
+            // Get response body — in bulk_silent mode, only write to outfile (no stdout)
             if config.bulk_silent {
-                let _ = resp.text(); // drain body to free connection
+                if let Some(ref file_path) = outfile {
+                    if let Ok(body_text) = resp.text() {
+                        let output = if config.raw || config.ndjson {
+                            body_text
+                        } else if let Ok(json) = serde_json::from_str::<Value>(&body_text) {
+                            serde_json::to_string_pretty(&json).unwrap_or(body_text)
+                        } else {
+                            body_text
+                        };
+                        if let Err(e) = fs::write(file_path, &output) {
+                            eprintln!("Error writing to {}: {}", file_path, e);
+                        }
+                    }
+                } else {
+                    let _ = resp.text(); // drain body to free connection
+                }
             } else if let Ok(body_text) = resp.text() {
                 let output = if config.raw || config.ndjson {
                     body_text
