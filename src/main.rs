@@ -3167,27 +3167,18 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
             request = request.header(name.as_str(), value.as_str());
         }
         let file_path_raw = file_body.trim_start_matches("@ ").trim_start_matches('@').trim();
-        let file_path = if file_path_raw.starts_with("~/") {
-            if let Some(home) = dirs::home_dir() {
-                format!("{}{}", home.display(), &file_path_raw[1..])
-            } else {
-                file_path_raw.to_string()
-            }
-        } else {
-            file_path_raw.to_string()
-        };
-        match fs::read(&file_path) {
-            Ok(contents) => {
-                if file_path.ends_with(".ndjson") || file_path.ends_with(".njson") {
-                    content_type = "application/x-ndjson".to_string();
-                    accept = "application/x-ndjson".to_string();
-                } else if file_path.ends_with(".csv") {
-                    content_type = "text/csv".to_string();
+        match resolve_at_file_body(file_path_raw) {
+            Ok(res) => {
+                if let Some(ct) = res.content_type {
+                    content_type = ct;
                 }
-                request = request.body(contents);
+                if let Some(ac) = res.accept_type {
+                    accept = ac;
+                }
+                request = request.body(res.contents);
             }
-            Err(_) => {
-                eprintln!("File not found: {}", file_path_raw);
+            Err(e) => {
+                eprintln!("{}", e);
                 std::process::exit(1);
             }
         }
@@ -4542,8 +4533,12 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     // Build output string to store for resize redraw
     let mut output_lines = String::new();
 
-    // Prepare request line
-    let request_line = format!("{} {}", state.method, state.uri);
+    // Prepare request line — include @file/glob body in the log
+    let request_line = if state.body.starts_with('@') {
+        format!("{} {} {}", state.method, state.uri, state.body)
+    } else {
+        format!("{} {}", state.method, state.uri)
+    };
     output_lines.push_str(&request_line);
     output_lines.push('\n');
 
@@ -4595,28 +4590,18 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
             request = request.header(name.as_str(), value.as_str());
         }
         let file_path_raw = file_body.trim_start_matches("@ ").trim_start_matches('@').trim();
-        let file_path = if file_path_raw.starts_with("~/") {
-            if let Some(home) = dirs::home_dir() {
-                format!("{}{}", home.display(), &file_path_raw[1..])
-            } else {
-                file_path_raw.to_string()
-            }
-        } else {
-            file_path_raw.to_string()
-        };
-        match fs::read(&file_path) {
-            Ok(contents) => {
-                // Auto-detect content type from extension
-                if file_path.ends_with(".ndjson") || file_path.ends_with(".njson") {
-                    content_type = "application/x-ndjson".to_string();
-                    accept = "application/x-ndjson".to_string();
-                } else if file_path.ends_with(".csv") {
-                    content_type = "text/csv".to_string();
+        match resolve_at_file_body(file_path_raw) {
+            Ok(res) => {
+                if let Some(ct) = res.content_type {
+                    content_type = ct;
                 }
-                request = request.body(contents);
+                if let Some(ac) = res.accept_type {
+                    accept = ac;
+                }
+                request = request.body(res.contents);
             }
-            Err(_) => {
-                file_error = Some(format!("File not found: {}", file_path_raw));
+            Err(e) => {
+                file_error = Some(e);
             }
         }
     } else if !state.body.is_empty() {
@@ -7721,6 +7706,111 @@ fn parse_body_functions(body: &str) -> (String, Vec<(String, String)>) {
         remaining = remaining[..tilde_pos].to_string();
     }
     (remaining, headers)
+}
+
+/// Result of resolving an `@file` (possibly glob) body argument.
+struct AtFileResult {
+    contents: Vec<u8>,
+    content_type: Option<String>,
+    accept_type: Option<String>,
+}
+
+/// Resolve an `@<path>` body argument into request bytes.
+/// Supports single files and glob patterns (`*`, `?`, `[`). Multiple matched files
+/// are combined: `.ndjson`/`.njson` files concatenate as a single NDJSON stream;
+/// everything else parses as JSON and combines into a flat JSON array.
+fn resolve_at_file_body(path_raw: &str) -> Result<AtFileResult, String> {
+    let expanded = if path_raw.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            format!("{}{}", home.display(), &path_raw[1..])
+        } else {
+            path_raw.to_string()
+        }
+    } else {
+        path_raw.to_string()
+    };
+
+    let is_glob = expanded.chars().any(|c| c == '*' || c == '?' || c == '[');
+
+    if !is_glob {
+        // Single file — preserve existing behavior
+        match fs::read(&expanded) {
+            Ok(contents) => {
+                let (content_type, accept_type) =
+                    if expanded.ends_with(".ndjson") || expanded.ends_with(".njson") {
+                        (
+                            Some("application/x-ndjson".to_string()),
+                            Some("application/x-ndjson".to_string()),
+                        )
+                    } else if expanded.ends_with(".csv") {
+                        (Some("text/csv".to_string()), None)
+                    } else {
+                        (None, None)
+                    };
+                Ok(AtFileResult {
+                    contents,
+                    content_type,
+                    accept_type,
+                })
+            }
+            Err(_) => Err(format!("File not found: {}", path_raw)),
+        }
+    } else {
+        // Glob — expand and combine
+        let mut paths: Vec<std::path::PathBuf> = glob::glob(&expanded)
+            .map_err(|e| format!("invalid glob pattern '{}': {}", path_raw, e))?
+            .filter_map(|r| r.ok())
+            .filter(|p| p.is_file())
+            .collect();
+        if paths.is_empty() {
+            return Err(format!("no files match: {}", path_raw));
+        }
+        paths.sort();
+
+        let all_ndjson = paths.iter().all(|p| {
+            let s = p.to_string_lossy();
+            s.ends_with(".ndjson") || s.ends_with(".njson")
+        });
+
+        if all_ndjson {
+            // NDJSON: concatenate file contents (ensure trailing newline between files)
+            let mut combined: Vec<u8> = Vec::new();
+            for path in &paths {
+                let bytes = fs::read(path)
+                    .map_err(|e| format!("could not read {}: {}", path.display(), e))?;
+                combined.extend_from_slice(&bytes);
+                if !combined.ends_with(b"\n") {
+                    combined.push(b'\n');
+                }
+            }
+            Ok(AtFileResult {
+                contents: combined,
+                content_type: Some("application/x-ndjson".to_string()),
+                accept_type: Some("application/x-ndjson".to_string()),
+            })
+        } else {
+            // JSON: parse each file, flatten arrays, push objects/values; emit single array
+            let mut combined: Vec<Value> = Vec::new();
+            for path in &paths {
+                let bytes = fs::read(path)
+                    .map_err(|e| format!("could not read {}: {}", path.display(), e))?;
+                let v: Value = serde_json::from_slice(&bytes).map_err(|e| {
+                    format!("invalid JSON in {}: {}", path.display(), e)
+                })?;
+                match v {
+                    Value::Array(items) => combined.extend(items),
+                    other => combined.push(other),
+                }
+            }
+            let body_bytes = serde_json::to_vec(&combined)
+                .map_err(|e| format!("could not serialize combined JSON: {}", e))?;
+            Ok(AtFileResult {
+                contents: body_bytes,
+                content_type: Some("application/json".to_string()),
+                accept_type: Some("application/json".to_string()),
+            })
+        }
+    }
 }
 
 fn looks_like_id(s: &str) -> bool {

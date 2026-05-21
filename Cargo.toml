@@ -36,6 +36,9 @@ dirs = "5"
 # TTY detection
 atty = "0.2"
 
+# File globbing for @file bodies
+glob = "0.3"
+
 # Colored output for non-TUI mode
 colored = "2"
 

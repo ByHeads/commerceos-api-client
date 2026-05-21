@@ -166,6 +166,62 @@ fn multi_space_between_uri_and_at_file_is_handled() {
 }
 
 #[test]
+fn glob_at_file_combines_json_files_into_array() {
+    require_local_cos();
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("a.json"), r#"{"id":1,"name":"Alice"}"#).unwrap();
+    std::fs::write(dir.path().join("b.json"), r#"{"id":2,"name":"Bob"}"#).unwrap();
+    std::fs::write(dir.path().join("c.json"), r#"[{"id":3,"name":"Carol"},{"id":4,"name":"Dan"}]"#).unwrap();
+
+    let pattern = format!("@{}/*.json", dir.path().display());
+    let assert = api()
+        .args(["PUT", "/echo-all", &pattern])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+
+    // All four items should be present in the echoed array
+    for name in &["Alice", "Bob", "Carol", "Dan"] {
+        assert!(stdout.contains(name), "expected {name} in: {stdout}");
+    }
+}
+
+#[test]
+fn glob_at_file_combines_ndjson_streams() {
+    require_local_cos();
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("a.ndjson"), "{\"row\":1}\n{\"row\":2}\n").unwrap();
+    std::fs::write(dir.path().join("b.ndjson"), "{\"row\":3}\n{\"row\":4}\n").unwrap();
+
+    let pattern = format!("@{}/*.ndjson", dir.path().display());
+    let assert = api()
+        .args(["PUT", "/echo-all", &pattern, "--ndjson"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+
+    // Server may echo a different shape; we just check the request succeeded.
+    // (The server-side handler determines the response.)
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("HTTP/1.1 200"),
+        "expected 200, stderr={stderr} stdout={stdout}"
+    );
+}
+
+#[test]
+fn glob_with_no_matches_errors() {
+    require_local_cos();
+    let dir = tempdir().unwrap();
+    let pattern = format!("@{}/nothing-*.json", dir.path().display());
+    api()
+        .args(["PUT", "/echo-all", &pattern])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no files match"));
+}
+
+#[test]
 fn array_file_body_round_trips() {
     require_local_cos();
     let path = fixtures_dir().join("array.json");
