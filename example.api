@@ -9,6 +9,10 @@ PUT /people [{
 	"name": "Alec Trevelyan"
 }]
 
+GET /people~with(com.heads.*) > ~/my-file.json
+
+PUT /people @people.json
+
 PUT /people/com.mi6.id=006/addresses/main {
 	"line1": "Janus Syndicate HQ",
 	"line2": "
