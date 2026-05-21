@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.6.5
+
+- **Multi-line request bodies in bulk files (`.api`)**: a request body with unbalanced `{}` / `[]` brackets continues onto subsequent lines until balanced. Arrays and nested objects supported. Raw newlines, tabs, and carriage returns inside JSON strings are auto-escaped to `\n` / `\t` / `\r` so the body stays valid JSON (useful for PEM contents, multi-line descriptions, etc.).
+- **Compact body display in silent bulk mode** (`-sa`): JSON bodies are minified for display (no extra whitespace or indentation), making per-request output a single tidy line. Non-JSON bodies (e.g. `@file`) pass through unchanged.
+- Unclosed body at EOF of a bulk file now errors with a clear message instead of silently dropping the request.
+- Suppressed URI tab-completion ghost text when the input already contains content after the URI (was leaking property suggestions past the body).
+
 ## 2.6.4
 
 - **Standard readline shortcuts** added to the input line:
