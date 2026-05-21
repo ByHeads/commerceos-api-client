@@ -1,0 +1,20 @@
+# This is a comment
+
+PUT /people/com.mi6.id=007 { "name": "James Bond" }
+
+PUT /people [{
+	"identifiers": {
+		"com.mi6.id": "006"
+	},
+	"name": "Alec Trevelyan"
+}]
+
+PUT /people/com.mi6.id=006/addresses/main {
+	"line1": "Janus Syndicate HQ",
+	"line2": "
+		Entrance through black door between the two demonic face symbols
+",
+	"postalCode": "40502",
+	"cityName": "St. Petersburg",
+	"countryCode": "RU"
+}

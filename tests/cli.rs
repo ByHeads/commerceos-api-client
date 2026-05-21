@@ -403,6 +403,59 @@ fn bulk_mode_supports_outfile_per_line() {
 }
 
 #[test]
+fn bulk_mode_supports_multiline_bodies() {
+    require_local_cos();
+    let dir = tempdir().unwrap();
+    let req_file = dir.path().join("multiline.api");
+    let content = "\
+PUT /echo-all {
+  \"name\": \"Joe\",
+  \"tags\": [
+    \"a\",
+    \"b\"
+  ]
+}
+
+PUT /echo-all [
+  {\"a\": 1},
+  {\"b\": 2}
+]
+";
+    std::fs::write(&req_file, content).unwrap();
+
+    let assert = api().args(["-a"]).arg(&req_file).assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+
+    assert_eq!(
+        stderr.matches("HTTP/1.1 200").count(),
+        2,
+        "expected 2 successful requests, stderr: {stderr}"
+    );
+    assert!(stdout.contains("Joe"), "first body echoed: {stdout}");
+    assert!(stdout.contains("\"a\":1"), "second body echoed: {stdout}");
+}
+
+#[test]
+fn bulk_mode_escapes_raw_newlines_in_strings() {
+    require_local_cos();
+    let dir = tempdir().unwrap();
+    let req_file = dir.path().join("multiline-string.api");
+    let content = "PUT /echo-all {\n  \"bio\": \"line1\nline2\"\n}\n";
+    std::fs::write(&req_file, content).unwrap();
+
+    let assert = api().args(["-a"]).arg(&req_file).assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+
+    // Server should have parsed the JSON successfully (newline escaped to \n)
+    // and echo back the bio with the escaped newline preserved as a real one in JSON output
+    assert!(
+        stdout.contains("line1\\nline2") || stdout.contains("line1\nline2"),
+        "expected escaped newline in echoed body: {stdout}"
+    );
+}
+
+#[test]
 fn silent_bulk_mode_prints_request_and_compact_status_only() {
     require_local_cos();
     let dir = tempdir().unwrap();

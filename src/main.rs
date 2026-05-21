@@ -2945,6 +2945,79 @@ fn parse_request_line(line: &str) -> Option<(String, String, String)> {
     Some((method, format!("{}{}", uri, outfile_suffix), body))
 }
 
+/// Replace raw newlines, tabs, and carriage returns inside JSON string literals
+/// with their escape sequences (`\n`, `\t`, `\r`) so the body is valid JSON.
+fn escape_newlines_in_strings(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_string = false;
+    let mut escape = false;
+    for ch in s.chars() {
+        if escape {
+            out.push(ch);
+            escape = false;
+            continue;
+        }
+        if in_string && ch == '\\' {
+            out.push(ch);
+            escape = true;
+            continue;
+        }
+        if ch == '"' {
+            in_string = !in_string;
+            out.push(ch);
+            continue;
+        }
+        if in_string {
+            match ch {
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                _ => out.push(ch),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Split a multi-line bulk file into logical requests. Each request can span
+/// multiple lines when its body has unbalanced `{}` / `[]` brackets (string-aware).
+/// Returns one entry per request, with lines joined by `\n` and raw newlines in
+/// JSON strings escaped.
+fn split_bulk_requests(contents: &str) -> Result<Vec<String>, String> {
+    let mut requests: Vec<String> = Vec::new();
+    let mut current = String::new();
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if current.is_empty() {
+            // Between requests: skip blank lines and comments
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            current.push_str(line);
+        } else {
+            current.push('\n');
+            current.push_str(line);
+        }
+        // If brackets are balanced at the end of accumulated content, request is complete
+        if bracket_depth_at(&current, current.chars().count()) <= 0 {
+            requests.push(escape_newlines_in_strings(&current));
+            current.clear();
+        }
+    }
+
+    if !current.trim().is_empty() {
+        return Err(format!(
+            "unclosed body at end of bulk file (depth {})",
+            bracket_depth_at(&current, current.chars().count())
+        ));
+    }
+
+    Ok(requests)
+}
+
 fn run_bulk_from_str(config: &mut Config, contents: &str) {
     // Silent + bulk: enable "silent bulk mode" — show request line + status, skip body.
     // We clear silent so status line still prints; bulk_silent suppresses body output.
@@ -2961,15 +3034,33 @@ fn run_bulk_from_str(config: &mut Config, contents: &str) {
         println!("{}", format!("[{}]", config.base_uri).dimmed());
     }
 
-    for line in contents.lines() {
-        let Some((method, uri, body)) = parse_request_line(line) else {
+    let requests = match split_bulk_requests(contents) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    for request in requests {
+        let Some((method, uri, body)) = parse_request_line(&request) else {
             continue;
         };
         if config.bulk_silent {
-            // Print the original request line (trimmed) before sending
-            let trimmed = line.trim();
-            if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                println!("{}", trimmed);
+            // Compact the body for display: parse as JSON and re-serialize without whitespace,
+            // falling back to the raw body if it's not JSON (e.g., @file references).
+            let display_body = if body.trim_start().starts_with('{') || body.trim_start().starts_with('[') {
+                serde_json::from_str::<Value>(&body)
+                    .ok()
+                    .and_then(|v| serde_json::to_string(&v).ok())
+                    .unwrap_or_else(|| body.clone())
+            } else {
+                body.clone()
+            };
+            if display_body.is_empty() {
+                println!("{} {}", method, uri);
+            } else {
+                println!("{} {} {}", method, uri, display_body);
             }
         }
         run_non_interactive(config, &method, &uri, &body);
@@ -7203,6 +7294,12 @@ fn get_completion_ghost(state: &AppState) -> String {
     } else {
         parts[1].to_string()
     };
+
+    // Don't suggest URI completions when there's already content after the URI
+    // (body, outfile, etc.) — the cursor is past the URI in that case.
+    if parts.len() > 2 {
+        return String::new();
+    }
 
     // Only show ghost text if URI contains a delimiter (we're typing after /, (, or ~)
     if uri.rfind(|c| c == '/' || c == '(' || c == '~').is_none() {
