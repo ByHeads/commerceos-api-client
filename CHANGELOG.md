@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.6.6
+
+- **Glob support in `@file` bodies**: `@dir/*.json` matches multiple files and combines them. Objects/values from each file are flattened into a single JSON array; arrays are concatenated. Files matching `*.ndjson`/`*.njson` are concatenated as a single NDJSON stream instead. Files processed in sorted order.
+- Errors clearly: `no files match: ...` for empty globs, `invalid JSON in <path>: ...` for malformed files.
+- Request log line now includes the original `@file` / glob expression (e.g. `PUT /people @j*.json`) so it's visible alongside the response.
+
 ## 2.6.5
 
 - **Multi-line request bodies in bulk files (`.api`)**: a request body with unbalanced `{}` / `[]` brackets continues onto subsequent lines until balanced. Arrays and nested objects supported. Raw newlines, tabs, and carriage returns inside JSON strings are auto-escaped to `\n` / `\t` / `\r` so the body stays valid JSON (useful for PEM contents, multi-line descriptions, etc.).
