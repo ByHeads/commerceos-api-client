@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.6.4
+
+- **Standard readline shortcuts** added to the input line:
+  - `ctrl+k` — kill from cursor to end of line
+  - `ctrl+w` / `alt+backspace` — delete word backward
+  - `alt+d` — delete word forward
+  - `ctrl+←` / `alt+b` — move cursor backward by word
+  - `ctrl+→` / `alt+f` — move cursor forward by word
+- `ctrl+u` now clears the entire input line (was unbound). `ctrl+f` still resets to `GET /`.
+- `--no-streaming` flag forces non-streaming Accept/Content-Type headers even when the server advertises streaming
+- Silent bulk mode (`-sa`) now writes response bodies to outfiles (`> path`) instead of dropping them
+
 ## 2.6.2
 
 - **Silent bulk mode** (`-sa` / `--silent --all`): compact progress-style output. Prints the env URL in gray brackets at the top, then each request line followed by an indented `└─HTTP/1.1 <status> <time>s` line (gray box-draw, status colored). Response bodies are suppressed.
