@@ -10,6 +10,14 @@ or in the companion reference repo:
 
 https://github.com/ByHeads/commerceos-api-reference
 
+## Quick-install
+
+You can install the latest version of the API client using the `api-client-install.sh` bundled with each instance of COS. Use `dev.heads.com` for global access.
+
+```
+curl -fsSL https://dev.heads.com/api-client-install.sh | bash
+```
+
 ## Install
 
 Download the binary for your platform from the [latest release](https://github.com/byheads/commerceos-api-client/releases/latest):
