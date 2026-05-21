@@ -219,6 +219,18 @@ fn raw_disables_pretty_printing() {
 }
 
 #[test]
+fn no_streaming_flag_disables_streaming() {
+    require_local_cos();
+    // With --no-streaming, the request should succeed without ;stream=true
+    // (server still responds; the flag just changes the Accept/Content-Type headers).
+    api()
+        .args(["GET", "/echo-all", "--no-streaming"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("HTTP/1.1 200 OK"));
+}
+
+#[test]
 fn ndjson_returns_line_delimited() {
     require_local_cos();
     let assert = api()

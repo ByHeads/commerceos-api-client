@@ -105,6 +105,10 @@ struct Args {
     /// Bulk mode: execute requests from a file (one per line). Use without value or with `-` to read from stdin.
     #[arg(short = 'a', long = "all", value_name = "FILE", num_args = 0..=1, default_missing_value = "-")]
     all: Option<String>,
+
+    /// Disable streaming even when the server supports it
+    #[arg(long = "no-streaming")]
+    no_streaming: bool,
 }
 
 #[derive(Clone)]
@@ -120,6 +124,7 @@ struct Config {
     complete: bool,
     outfile: String,
     streaming: bool,
+    no_streaming: bool,
     experimental: bool,
     /// In silent bulk mode: print status line (with `|-` prefix) but suppress body output
     bulk_silent: bool,
@@ -139,6 +144,7 @@ impl Default for Config {
             complete: false,
             outfile: String::new(),
             streaming: false,
+            no_streaming: false,
             experimental: false,
             bulk_silent: false,
         }
@@ -909,6 +915,44 @@ fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {
         .nth(char_idx)
         .map(|(i, _)| i)
         .unwrap_or(s.len())
+}
+
+/// A "word character" for readline-style word navigation: alphanumeric + underscore.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Find the start of the previous word from `cursor_pos` (char index).
+/// Skips trailing non-word chars, then skips the word itself.
+fn word_boundary_back(s: &str, cursor_pos: usize) -> usize {
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = cursor_pos;
+    // Skip non-word chars immediately before cursor
+    while i > 0 && !is_word_char(chars[i - 1]) {
+        i -= 1;
+    }
+    // Skip word chars
+    while i > 0 && is_word_char(chars[i - 1]) {
+        i -= 1;
+    }
+    i
+}
+
+/// Find the start of the next word from `cursor_pos` (char index).
+/// Skips current word (if any), then skips non-word chars.
+fn word_boundary_forward(s: &str, cursor_pos: usize) -> usize {
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    let mut i = cursor_pos;
+    // Skip word chars at cursor
+    while i < len && is_word_char(chars[i]) {
+        i += 1;
+    }
+    // Skip non-word chars
+    while i < len && !is_word_char(chars[i]) {
+        i += 1;
+    }
+    i
 }
 
 // Get character count (not byte length)
@@ -2283,6 +2327,7 @@ fn main() {
     config.raw = args.raw;
     config.include_nulls = args.include_nulls;
     config.ndjson = args.ndjson;
+    config.no_streaming = args.no_streaming;
     config.experimental = args.experimental;
 
     if args.me {
@@ -2978,8 +3023,12 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
         (uri, None, None)
     };
 
-    // Fetch feature flags
-    config.streaming = fetch_feature_flags(config);
+    // Fetch feature flags (unless explicitly disabled)
+    config.streaming = if config.no_streaming {
+        false
+    } else {
+        fetch_feature_flags(config)
+    };
 
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
@@ -3577,7 +3626,7 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
     }
 
     // Clear input area before exiting (move up and clear to end)
-    let help_lines: u16 = 21;
+    let help_lines: u16 = 25;
     let lines_to_clear: u16 = if state.show_help { help_lines } else { 2 + state.prev_input_lines };
     execute!(
         stdout,
@@ -3873,6 +3922,16 @@ fn handle_key_event(
             render(stdout, state)?;
         }
 
+        // Clear entire input line (ctrl+u)
+        (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
+            state.input.clear();
+            state.cursor_pos = 0;
+            state.method.clear();
+            state.uri.clear();
+            state.body.clear();
+            render(stdout, state)?;
+        }
+
         // Open docs
         (KeyModifiers::CONTROL, KeyCode::Char('b')) => {
             // Use current base_uri, fallback to dev.heads.com only if no base_uri
@@ -3920,29 +3979,6 @@ fn handle_key_event(
                 print!("\x1b[2J\x1b[3J\x1b[H");
                 io::stdout().flush().ok();
                 print_splash_with_width(&state.config, state.width);
-                let input_lines = state.input.split('\n').count() as u16;
-                for _ in 0..(2 + input_lines) { println!(); }
-                io::stdout().flush().ok();
-                terminal::enable_raw_mode()?;
-                state.prev_input_lines = input_lines;
-                render(stdout, state)?;
-            }
-        }
-
-        // Erase last output block entirely (ctrl+w) — full redraw
-        (KeyModifiers::CONTROL, KeyCode::Char('w')) => {
-            if !state.output_line_counts.is_empty() {
-                state.output_history.pop();
-                state.output_line_counts.pop();
-                state.output_header_line_counts.pop();
-
-                terminal::disable_raw_mode()?;
-                print!("\x1b[2J\x1b[3J\x1b[H");
-                io::stdout().flush().ok();
-                print_splash_with_width(&state.config, state.width);
-                for output in &state.output_history {
-                    print!("{}", output);
-                }
                 let input_lines = state.input.split('\n').count() as u16;
                 for _ in 0..(2 + input_lines) { println!(); }
                 io::stdout().flush().ok();
@@ -4189,11 +4225,35 @@ fn handle_key_event(
         }
 
         // Backspace
+        // Delete word backward (alt+backspace or ctrl+w)
+        (KeyModifiers::ALT, KeyCode::Backspace) | (KeyModifiers::CONTROL, KeyCode::Char('w')) => {
+            if state.cursor_pos > 0 {
+                let new_pos = word_boundary_back(&state.input, state.cursor_pos);
+                let start_byte = char_to_byte_idx(&state.input, new_pos);
+                let end_byte = char_to_byte_idx(&state.input, state.cursor_pos);
+                state.input.drain(start_byte..end_byte);
+                state.cursor_pos = new_pos;
+                render(stdout, state)?;
+            }
+        }
+
         (_, KeyCode::Backspace) => {
             if state.cursor_pos > 0 {
                 let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos - 1);
                 state.input.remove(byte_idx);
                 state.cursor_pos -= 1;
+                render(stdout, state)?;
+            }
+        }
+
+        // Delete word forward (alt+d)
+        (KeyModifiers::ALT, KeyCode::Char('d')) => {
+            let input_char_len = char_len(&state.input);
+            if state.cursor_pos < input_char_len {
+                let new_pos = word_boundary_forward(&state.input, state.cursor_pos);
+                let start_byte = char_to_byte_idx(&state.input, state.cursor_pos);
+                let end_byte = char_to_byte_idx(&state.input, new_pos);
+                state.input.drain(start_byte..end_byte);
                 render(stdout, state)?;
             }
         }
@@ -4206,6 +4266,28 @@ fn handle_key_event(
                 state.input.remove(byte_idx);
                 render(stdout, state)?;
             }
+        }
+
+        // Kill to end of line (ctrl+k)
+        (KeyModifiers::CONTROL, KeyCode::Char('k')) => {
+            let input_char_len = char_len(&state.input);
+            if state.cursor_pos < input_char_len {
+                let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
+                state.input.truncate(byte_idx);
+                render(stdout, state)?;
+            }
+        }
+
+        // Word navigation back (ctrl+left or alt+b)
+        (KeyModifiers::CONTROL, KeyCode::Left) | (KeyModifiers::ALT, KeyCode::Char('b')) => {
+            state.cursor_pos = word_boundary_back(&state.input, state.cursor_pos);
+            render(stdout, state)?;
+        }
+
+        // Word navigation forward (ctrl+right or alt+f)
+        (KeyModifiers::CONTROL, KeyCode::Right) | (KeyModifiers::ALT, KeyCode::Char('f')) => {
+            state.cursor_pos = word_boundary_forward(&state.input, state.cursor_pos);
+            render(stdout, state)?;
         }
 
         // Left arrow
@@ -5448,7 +5530,7 @@ fn render(stdout: &mut io::Stdout, state: &mut AppState) -> io::Result<()> {
     // Determine how many lines to clear:
     // - Normal input area: 2 + input_lines (ruler + input line(s) + hint)
     // - Help menu: 14 lines (15 with tab completion)
-    let help_lines: u16 = 21;
+    let help_lines: u16 = 25;
     let normal_lines: u16 = 2 + state.prev_input_lines; // ruler + input line(s) + hint
     let lines_to_clear: u16 = if state.prev_show_help && !state.show_help {
         help_lines  // Closing help - clear all help lines
@@ -5523,8 +5605,12 @@ fn render(stdout: &mut io::Stdout, state: &mut AppState) -> io::Result<()> {
             Print(format!("{}\r\n", "  ctrl+g     Quick GET current URI".dimmed())),
             Print(format!("{}\r\n", "  ctrl+x     Clear body (keep method and URI)".dimmed())),
             Print(format!("{}\r\n", "  ctrl+f     Clear all (reset to GET /)".dimmed())),
+            Print(format!("{}\r\n", "  ctrl+u     Clear entire input line (empty)".dimmed())),
+            Print(format!("{}\r\n", "  ctrl+k     Kill from cursor to end of line".dimmed())),
+            Print(format!("{}\r\n", "  alt+←/→    Move by word (or ctrl+←/→, alt+b/f)".dimmed())),
+            Print(format!("{}\r\n", "  alt+bksp   Delete word backward (or ctrl+w)".dimmed())),
+            Print(format!("{}\r\n", "  alt+d      Delete word forward".dimmed())),
             Print(format!("{}\r\n", "  ctrl+y     Copy last request as curl command".dimmed())),
-            Print(format!("{}\r\n", "  ctrl+w     Erase last request+response".dimmed())),
             Print(format!("{}\r\n", "  ctrl+j     Erase last response body".dimmed())),
             Print(format!("{}\r\n", "  ctrl+l     Erase all output".dimmed())),
             Print(format!("{}\r\n", "  ctrl+s     Save connection".dimmed())),
@@ -5870,7 +5956,7 @@ fn apply_background_result(state: &mut AppState, result: BackgroundLoadResult) {
     if let Some(key) = result.api_key {
         state.config.api_key = key;
     }
-    state.config.streaming = result.streaming;
+    state.config.streaming = result.streaming && !state.config.no_streaming;
     state.config.complete = result.complete;
     state.endpoints = result.endpoints;
     state.schema_props = result.schema_props;
