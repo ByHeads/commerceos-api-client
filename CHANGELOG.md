@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.6.7
+
+- **Include directives in `.api` batch files**: a bare line that isn't a comment, blank, or HTTP request is treated as an include — the named file is loaded and its requests inlined at that point. Paths resolve relative to the parent `.api` file. Supports `~/`, absolute paths, and globs (`example*.api`). Recursive includes work; loops are detected and reported.
+
 ## 2.6.6
 
 - **Glob support in `@file` bodies**: `@dir/*.json` matches multiple files and combines them. Objects/values from each file are flattened into a single JSON array; arrays are concatenated. Files matching `*.ndjson`/`*.njson` are concatenated as a single NDJSON stream instead. Files processed in sorted order.
