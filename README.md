@@ -1,6 +1,6 @@
 # CommerceOS API Client
 
-An interactive command-line client for the CommerceOS API built on Rust. Supports interactive REPL mode with tab completion, one-shot commands for scripting, saved connections with OS keychain integration, and cross-platform binaries for macOS, Linux, and Windows.
+An interactive command-line client for the CommerceOS API built on Rust. Supports interactive REPL mode with tab completion, one-shot commands for scripting, batch request files, saved connections with OS keychain integration, and cross-platform binaries for macOS, Linux, and Windows.
 
 You can find more information about the CommerceOS API in the global API documentation:
 
