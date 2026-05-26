@@ -1,0 +1,9 @@
+PUT /people/com.mi6.id=006/addresses/invoice {
+	"line1": "Janus Syndicate HQ Incoice Service",
+	"line2": "
+		Toss the envelope over the lava pit
+",
+	"postalCode": "40502",
+	"cityName": "St. Petersburg",
+	"countryCode": "RU"
+}

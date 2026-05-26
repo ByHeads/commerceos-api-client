@@ -459,6 +459,58 @@ fn bulk_mode_supports_outfile_per_line() {
 }
 
 #[test]
+fn bulk_mode_supports_include_directives() {
+    require_local_cos();
+    let dir = tempdir().unwrap();
+    let main_file = dir.path().join("main.api");
+    let included = dir.path().join("included.api");
+    std::fs::write(&main_file, "GET /echo-all\nincluded.api\nGET /echo-all\n").unwrap();
+    std::fs::write(&included, "PUT /echo-all {\"from\":\"included\"}\n").unwrap();
+
+    let assert = api().args(["-a"]).arg(&main_file).assert().success();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    assert_eq!(
+        stderr.matches("HTTP/1.1").count(),
+        3,
+        "expected 3 requests (2 in main + 1 included), stderr={stderr}"
+    );
+    assert!(stdout.contains("included"));
+}
+
+#[test]
+fn bulk_mode_include_loop_detected() {
+    require_local_cos();
+    let dir = tempdir().unwrap();
+    let a = dir.path().join("a.api");
+    let b = dir.path().join("b.api");
+    std::fs::write(&a, "b.api\n").unwrap();
+    std::fs::write(&b, "a.api\n").unwrap();
+
+    api()
+        .args(["-a"])
+        .arg(&a)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("include loop"));
+}
+
+#[test]
+fn bulk_mode_include_not_found() {
+    require_local_cos();
+    let dir = tempdir().unwrap();
+    let main = dir.path().join("main.api");
+    std::fs::write(&main, "missing.api\n").unwrap();
+
+    api()
+        .args(["-a"])
+        .arg(&main)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("include not found"));
+}
+
+#[test]
 fn bulk_mode_supports_multiline_bodies() {
     require_local_cos();
     let dir = tempdir().unwrap();

@@ -2673,7 +2673,8 @@ fn main() {
                 eprintln!("error: could not read stdin");
                 std::process::exit(1);
             }
-            run_bulk_from_str(&mut config, &stdin_content);
+            // No base_dir for stdin — includes can still use absolute paths
+            run_bulk_from_str(&mut config, &stdin_content, None);
         } else {
             run_bulk(&mut config, bulk_arg);
         }
@@ -2981,12 +2982,60 @@ fn escape_newlines_in_strings(s: &str) -> String {
     out
 }
 
-/// Split a multi-line bulk file into logical requests. Each request can span
-/// multiple lines when its body has unbalanced `{}` / `[]` brackets (string-aware).
-/// Returns one entry per request, with lines joined by `\n` and raw newlines in
-/// JSON strings escaped.
-fn split_bulk_requests(contents: &str) -> Result<Vec<String>, String> {
-    let mut requests: Vec<String> = Vec::new();
+/// Resolve an include directive into the actual file paths to load.
+fn resolve_include_paths(
+    include_spec: &str,
+    base_dir: Option<&std::path::Path>,
+) -> Result<Vec<std::path::PathBuf>, String> {
+    let expanded = if include_spec.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            format!("{}{}", home.display(), &include_spec[1..])
+        } else {
+            include_spec.to_string()
+        }
+    } else {
+        include_spec.to_string()
+    };
+
+    let path_buf = std::path::PathBuf::from(&expanded);
+    let resolved = if path_buf.is_absolute() {
+        path_buf
+    } else if let Some(base) = base_dir {
+        base.join(&path_buf)
+    } else {
+        path_buf
+    };
+
+    let is_glob = expanded.chars().any(|c| c == '*' || c == '?' || c == '[');
+    if is_glob {
+        let pattern = resolved.to_string_lossy().to_string();
+        let mut matches: Vec<std::path::PathBuf> = glob::glob(&pattern)
+            .map_err(|e| format!("invalid include glob '{}': {}", include_spec, e))?
+            .filter_map(|r| r.ok())
+            .filter(|p| p.is_file())
+            .collect();
+        if matches.is_empty() {
+            return Err(format!("no files match include glob: {}", include_spec));
+        }
+        matches.sort();
+        Ok(matches)
+    } else {
+        if !resolved.is_file() {
+            return Err(format!("include not found: {}", include_spec));
+        }
+        Ok(vec![resolved])
+    }
+}
+
+/// Internal recursive worker for `split_bulk_requests`. Tracks the current chain
+/// of included files to detect loops.
+fn split_bulk_requests_inner(
+    contents: &str,
+    base_dir: Option<&std::path::Path>,
+    chain: &mut std::collections::HashSet<std::path::PathBuf>,
+    requests: &mut Vec<String>,
+) -> Result<(), String> {
+    let methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
     let mut current = String::new();
 
     for line in contents.lines() {
@@ -2994,6 +3043,34 @@ fn split_bulk_requests(contents: &str) -> Result<Vec<String>, String> {
         if current.is_empty() {
             // Between requests: skip blank lines and comments
             if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            // Decide: request line or include?
+            let first_word = trimmed.split_whitespace().next().unwrap_or("");
+            let first_upper = first_word.to_uppercase();
+            let is_request =
+                methods.contains(&first_upper.as_str()) || first_word.starts_with('/');
+
+            if !is_request {
+                // Treat as include directive (load and inline another file's requests)
+                let paths = resolve_include_paths(trimmed, base_dir)?;
+                for path in paths {
+                    let canonical = path.canonicalize().unwrap_or(path.clone());
+                    if chain.contains(&canonical) {
+                        return Err(format!("include loop detected: {}", path.display()));
+                    }
+                    let included = fs::read_to_string(&canonical)
+                        .map_err(|e| format!("could not read include {}: {}", path.display(), e))?;
+                    chain.insert(canonical.clone());
+                    let new_base = canonical.parent().map(|p| p.to_path_buf());
+                    split_bulk_requests_inner(
+                        &included,
+                        new_base.as_deref(),
+                        chain,
+                        requests,
+                    )?;
+                    chain.remove(&canonical);
+                }
                 continue;
             }
             current.push_str(line);
@@ -3015,10 +3092,24 @@ fn split_bulk_requests(contents: &str) -> Result<Vec<String>, String> {
         ));
     }
 
+    Ok(())
+}
+
+/// Split a multi-line bulk file into logical requests. Each request can span
+/// multiple lines when its body has unbalanced `{}` / `[]` brackets (string-aware).
+/// Lines that aren't requests (and aren't comments/blank) are treated as include
+/// directives — the named file (or glob) is loaded and its requests inlined here.
+fn split_bulk_requests(
+    contents: &str,
+    base_dir: Option<&std::path::Path>,
+) -> Result<Vec<String>, String> {
+    let mut requests = Vec::new();
+    let mut chain = std::collections::HashSet::new();
+    split_bulk_requests_inner(contents, base_dir, &mut chain, &mut requests)?;
     Ok(requests)
 }
 
-fn run_bulk_from_str(config: &mut Config, contents: &str) {
+fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std::path::Path>) {
     // Silent + bulk: enable "silent bulk mode" — show request line + status, skip body.
     // We clear silent so status line still prints; bulk_silent suppresses body output.
     if config.silent {
@@ -3034,7 +3125,7 @@ fn run_bulk_from_str(config: &mut Config, contents: &str) {
         println!("{}", format!("[{}]", config.base_uri).dimmed());
     }
 
-    let requests = match split_bulk_requests(contents) {
+    let requests = match split_bulk_requests(contents, base_dir) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("error: {}", e);
@@ -3086,7 +3177,8 @@ fn run_bulk(config: &mut Config, file_path: &str) {
         }
     };
 
-    run_bulk_from_str(config, &contents);
+    let base_dir = std::path::Path::new(&path).parent().map(|p| p.to_path_buf());
+    run_bulk_from_str(config, &contents, base_dir.as_deref());
 }
 
 fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str) {
