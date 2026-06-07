@@ -2792,9 +2792,36 @@ fn get_1password_credentials(selector: &str) -> Result<(String, String), String>
                 .output()
                 .map_err(|e| format!("could not read API key from 1Password: {}", e))?;
 
+            if !key_output.status.success() {
+                let stderr_msg = String::from_utf8_lossy(&key_output.stderr).trim().to_string();
+                let hint = if stderr_msg.to_lowercase().contains("access")
+                    || stderr_msg.to_lowercase().contains("permission")
+                    || stderr_msg.to_lowercase().contains("not found")
+                {
+                    format!(
+                        "no access to the API key for '{}' in 1Password.\n\
+                         Ask the environment owner to grant you access.",
+                        selector
+                    )
+                } else {
+                    format!(
+                        "could not read API key for '{}' from 1Password.",
+                        selector
+                    )
+                };
+                return Err(hint);
+            }
+
             let api_key = String::from_utf8_lossy(&key_output.stdout)
                 .trim()
                 .to_string();
+
+            if api_key.is_empty() {
+                return Err(format!(
+                    "1Password returned an empty key for '{}'.",
+                    selector
+                ));
+            }
 
             return Ok((url.to_string(), api_key));
         } else {
@@ -2982,6 +3009,87 @@ fn escape_newlines_in_strings(s: &str) -> String {
     out
 }
 
+/// Strip JSONC-style comments from JSON bodies (depth > 0) and return the
+/// final bracket depth. Comments outside bodies (in the URI portion) are kept.
+/// String-aware: comment markers inside `"..."` are preserved.
+///
+/// Supports: `// line`, `# line`, `/* block */`.
+fn strip_body_comments_and_count(s: &str) -> (String, i32) {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escape = false;
+
+    while i < chars.len() {
+        let ch = chars[i];
+
+        if in_string {
+            out.push(ch);
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        // Strip comments only inside JSON bodies (depth > 0)
+        if depth > 0 {
+            // `// ...` line comment
+            if ch == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            // `# ...` line comment
+            if ch == '#' {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            // `/* ... */` block comment (lenient: consumes to EOF if unclosed)
+            if ch == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
+                i += 2;
+                while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                    i += 1;
+                }
+                if i + 1 < chars.len() {
+                    i += 2; // skip closing */
+                } else {
+                    i = chars.len();
+                }
+                continue;
+            }
+        }
+
+        match ch {
+            '"' => {
+                in_string = true;
+                out.push(ch);
+            }
+            '{' | '[' => {
+                depth += 1;
+                out.push(ch);
+            }
+            '}' | ']' => {
+                depth -= 1;
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+        i += 1;
+    }
+
+    (out, depth)
+}
+
 /// Resolve an include directive into the actual file paths to load.
 fn resolve_include_paths(
     include_spec: &str,
@@ -3078,17 +3186,19 @@ fn split_bulk_requests_inner(
             current.push('\n');
             current.push_str(line);
         }
-        // If brackets are balanced at the end of accumulated content, request is complete
-        if bracket_depth_at(&current, current.chars().count()) <= 0 {
-            requests.push(escape_newlines_in_strings(&current));
+        // Strip JSONC comments inside bodies and check bracket balance
+        let (cleaned, depth) = strip_body_comments_and_count(&current);
+        if depth <= 0 {
+            requests.push(escape_newlines_in_strings(&cleaned));
             current.clear();
         }
     }
 
     if !current.trim().is_empty() {
+        let (_, depth) = strip_body_comments_and_count(&current);
         return Err(format!(
             "unclosed body at end of bulk file (depth {})",
-            bracket_depth_at(&current, current.chars().count())
+            depth
         ));
     }
 

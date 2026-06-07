@@ -21,15 +21,39 @@ GET /about
 
 ## 2. Comments and blank lines
 
+### Top-level (between requests)
+
 ```
 # Lines starting with # are comments.
 # Blank lines between requests are ignored.
 
 GET /people~take(5)
+```
 
-# Comments inside an open body are kept as body content — JSON doesn't have
-# comments, so don't put `#` lines inside an unclosed `{}` or `[]` unless you
-# want them sent literally.
+### Inside JSON bodies
+
+Three comment styles are supported inside `{}` / `[]` bodies and stripped before
+the request is sent. They are string-aware — markers inside `"..."` are kept verbatim.
+
+```
+PUT /things {
+  // JS-style line comment
+  "name": "Alice",
+  # shell-style line comment
+  "url": "https://heads.com",   // tail comment
+  /* block comment
+     spanning lines */
+  "keep": "// not a comment, inside string"
+}
+```
+
+Commented-out brackets are correctly ignored by the body parser, so this works:
+
+```
+PUT /things {
+  "a": 1
+  // }       ← does NOT end the body
+}
 ```
 
 ## 3. Bodies

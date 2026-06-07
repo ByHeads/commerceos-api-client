@@ -459,6 +459,64 @@ fn bulk_mode_supports_outfile_per_line() {
 }
 
 #[test]
+fn bulk_mode_strips_jsonc_comments_in_bodies() {
+    require_local_cos();
+    let dir = tempdir().unwrap();
+    let req_file = dir.path().join("comments.api");
+    let content = "\
+PUT /echo-all {
+  // line comment
+  \"name\": \"Alice\",
+  # shell-style comment
+  /* block
+     comment */
+  \"url\": \"https://heads.com\",
+  \"keep\": \"// not a comment\"
+}
+";
+    std::fs::write(&req_file, content).unwrap();
+
+    let assert = api().args(["-a"]).arg(&req_file).assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+
+    assert!(stdout.contains("Alice"), "expected name field: {stdout}");
+    assert!(
+        stdout.contains("https://heads.com"),
+        "URLs in strings preserved: {stdout}"
+    );
+    assert!(
+        stdout.contains("// not a comment"),
+        "comment-like content inside strings preserved: {stdout}"
+    );
+    // Comments themselves should not appear in echoed body
+    assert!(!stdout.contains("line comment"), "comment stripped: {stdout}");
+    assert!(!stdout.contains("block"), "block comment stripped: {stdout}");
+}
+
+#[test]
+fn bulk_mode_handles_commented_brackets_correctly() {
+    require_local_cos();
+    let dir = tempdir().unwrap();
+    let req_file = dir.path().join("comment-brackets.api");
+    let content = "\
+PUT /echo-all {
+  \"a\": 1
+  // }
+}
+PUT /echo-all { \"second\": true }
+";
+    std::fs::write(&req_file, content).unwrap();
+
+    let assert = api().args(["-a"]).arg(&req_file).assert().success();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert_eq!(
+        stderr.matches("HTTP/1.1").count(),
+        2,
+        "expected 2 requests; commented `}}` should not end body: {stderr}"
+    );
+}
+
+#[test]
 fn bulk_mode_supports_include_directives() {
     require_local_cos();
     let dir = tempdir().unwrap();
