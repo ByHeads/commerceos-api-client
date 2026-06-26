@@ -222,6 +222,81 @@ fn glob_with_no_matches_errors() {
 }
 
 #[test]
+fn glob_at_file_skips_os_junk_files() {
+    require_local_cos();
+    let dir = tempdir().unwrap();
+    // Two real JSON files plus typical OS junk that should all be skipped.
+    std::fs::write(dir.path().join("a.json"), r#"{"id":1,"name":"Alice"}"#).unwrap();
+    std::fs::write(dir.path().join("b.json"), r#"{"id":2,"name":"Bob"}"#).unwrap();
+    // .DS_Store contains a binary header that would fail JSON parsing if included.
+    std::fs::write(dir.path().join(".DS_Store"), b"\x00\x00\x00\x01junk").unwrap();
+    // AppleDouble metadata — also dot-prefixed.
+    std::fs::write(dir.path().join("._a.json"), b"\x00binary").unwrap();
+    // Windows junk that doesn't start with `.` — caught by the explicit name filter.
+    std::fs::write(dir.path().join("Thumbs.db"), b"not json").unwrap();
+    std::fs::write(dir.path().join("desktop.ini"), b"[.ShellClassInfo]").unwrap();
+
+    let pattern = format!("@{}/*", dir.path().display());
+    let assert = api()
+        .args(["PUT", "/echo-all", &pattern])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+
+    for name in &["Alice", "Bob"] {
+        assert!(stdout.contains(name), "expected {name} in: {stdout}");
+    }
+}
+
+#[test]
+fn clipboard_outfile_suppresses_stdout_and_logs_target() {
+    require_local_cos();
+    // `> clipboard` should route the response away from stdout (same as `> file`)
+    // and emit the dimmed `> clipboard` marker on stderr in non-silent mode.
+    // We don't read the clipboard back — CI runners are headless and that would
+    // be flaky; the routing behavior is what we assert.
+    let assert = api()
+        .args(["GET", "/echo-all > clipboard"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("> clipboard"),
+        "expected `> clipboard` marker on stderr, got stderr={stderr}"
+    );
+    // No file named `clipboard` should have been written into cwd as a side effect.
+    assert!(
+        !std::path::Path::new("clipboard").exists(),
+        "writing to `> clipboard` must NOT create a file named `clipboard`"
+    );
+    // The dimmed marker is on stderr; stdout should not contain the JSON body.
+    // (The body went to the clipboard, not stdout.)
+    assert!(
+        !stdout.contains('{'),
+        "stdout should be empty when output goes to clipboard, got stdout={stdout}"
+    );
+}
+
+#[test]
+fn clipboard_outfile_is_case_insensitive() {
+    require_local_cos();
+    let assert = api()
+        .args(["GET", "/echo-all > CLIPBOARD"])
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("> clipboard"),
+        "expected `> clipboard` marker even when user typed `> CLIPBOARD`, stderr={stderr}"
+    );
+    assert!(
+        !std::path::Path::new("CLIPBOARD").exists(),
+        "writing to `> CLIPBOARD` must NOT create a file"
+    );
+}
+
+#[test]
 fn array_file_body_round_trips() {
     require_local_cos();
     let path = fixtures_dir().join("array.json");
@@ -345,6 +420,40 @@ fn outfile_csv_extension_sets_csv_accept() {
 // ---------------------------------------------------------------------------
 // Operators
 // ---------------------------------------------------------------------------
+
+#[test]
+fn version_prefix_v1_resolves_to_full_path() {
+    require_local_cos();
+    api()
+        .args(["GET", "/v1/echo-all"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("HTTP/1.1 200 OK"));
+}
+
+#[test]
+fn explicit_api_prefix_is_used_as_is() {
+    require_local_cos();
+    api()
+        .args(["GET", "/api/v1/echo-all"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("HTTP/1.1 200 OK"));
+}
+
+#[test]
+fn version_like_prefix_that_is_not_a_version_uses_default() {
+    require_local_cos();
+    // `/version/foo` is NOT a version prefix — should resolve to /api/v1/version/foo
+    // which is a 404 (no such endpoint), but the request itself reaches the server
+    // and gets a structured response.
+    let assert = api().args(["GET", "/version/foo"]).assert();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("HTTP/1.1"),
+        "request should reach the server, stderr={stderr}"
+    );
+}
 
 #[test]
 fn url_with_operators_succeeds() {
@@ -696,4 +805,24 @@ fn version_flag_prints_version() {
         .assert()
         .success()
         .stdout(predicate::str::starts_with("v"));
+}
+
+#[test]
+fn timeout_flag_appears_in_help() {
+    Command::cargo_bin("api")
+        .expect("api binary built")
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--timeout"))
+        .stdout(predicate::str::contains("SECONDS"));
+}
+
+#[test]
+fn timeout_flag_accepts_seconds_value() {
+    require_local_cos();
+    api()
+        .args(["GET", "/echo-all", "--timeout", "30", "--silent"])
+        .assert()
+        .success();
 }

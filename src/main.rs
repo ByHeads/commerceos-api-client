@@ -17,7 +17,7 @@ use clap::Parser;
 use colored::Colorize;
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags, PopKeyboardEnhancementFlags},
+    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags, PopKeyboardEnhancementFlags},
     execute, queue,
     style::Print,
     terminal::{self, Clear, ClearType},
@@ -109,6 +109,10 @@ struct Args {
     /// Disable streaming even when the server supports it
     #[arg(long = "no-streaming")]
     no_streaming: bool,
+
+    /// Request timeout in seconds (default: no timeout)
+    #[arg(long = "timeout", value_name = "SECONDS")]
+    timeout: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -128,6 +132,8 @@ struct Config {
     experimental: bool,
     /// In silent bulk mode: print status line (with `|-` prefix) but suppress body output
     bulk_silent: bool,
+    /// Request timeout in seconds. None = no timeout (indefinite).
+    timeout_secs: Option<u64>,
 }
 
 impl Default for Config {
@@ -147,8 +153,17 @@ impl Default for Config {
             no_streaming: false,
             experimental: false,
             bulk_silent: false,
+            timeout_secs: None,
         }
     }
+}
+
+fn build_request_client(timeout_secs: Option<u64>) -> Client {
+    let mut builder = Client::builder();
+    if let Some(secs) = timeout_secs {
+        builder = builder.timeout(Duration::from_secs(secs));
+    }
+    builder.build().unwrap_or_else(|_| Client::new())
 }
 
 // Saved connection for keychain credential storage
@@ -478,6 +493,11 @@ struct AppState {
     // OAuth2 credentials for token refresh
     oauth2_client_id: String,
     oauth2_client_secret: String,
+    // Bracketed-paste identifier-expansion state
+    // Cycles through identifiers when the same JSON is re-pasted within 10s.
+    last_paste_raw: String,
+    last_paste_cycle_idx: usize,
+    last_paste_at: Option<std::time::Instant>,
 }
 
 impl AppState {
@@ -546,6 +566,9 @@ impl AppState {
             body_input_uri: String::new(),
             oauth2_client_id: String::new(),
             oauth2_client_secret: String::new(),
+            last_paste_raw: String::new(),
+            last_paste_cycle_idx: 0,
+            last_paste_at: None,
         }
     }
 }
@@ -2329,6 +2352,7 @@ fn main() {
     config.ndjson = args.ndjson;
     config.no_streaming = args.no_streaming;
     config.experimental = args.experimental;
+    config.timeout_secs = args.timeout;
 
     if args.me {
         config.api_path = "/api/me/v1".to_string();
@@ -3009,6 +3033,31 @@ fn escape_newlines_in_strings(s: &str) -> String {
     out
 }
 
+/// Resolve a user-provided URI into the full request path, applying the
+/// default `api_path` prefix only when the URI doesn't already specify one.
+///
+/// - `/api/...` or `/api` → used as-is
+/// - `/v<N>` or `/v<N>/...` → prepend `/api` (so it becomes `/api/v<N>/...`)
+/// - anything else → prepend `api_path` (typically `/api/v1`)
+fn resolve_request_path(api_path: &str, uri: &str) -> String {
+    // Already absolute under /api
+    if uri == "/api" || uri.starts_with("/api/") {
+        return uri.to_string();
+    }
+    // Version-only prefix: /v<digits> followed by `/` or end-of-string
+    if let Some(rest) = uri.strip_prefix("/v") {
+        let digit_count = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+        if digit_count > 0 {
+            let after_digits = &rest[digit_count..];
+            if after_digits.is_empty() || after_digits.starts_with('/') {
+                return format!("/api{}", uri);
+            }
+        }
+    }
+    // Default: prepend configured api_path
+    format!("{}{}", api_path, uri)
+}
+
 /// Strip JSONC-style comments from JSON bodies (depth > 0) and return the
 /// final bracket depth. Comments outside bodies (in the URI portion) are kept.
 /// String-aware: comment markers inside `"..."` are preserved.
@@ -3090,6 +3139,40 @@ fn strip_body_comments_and_count(s: &str) -> (String, i32) {
     (out, depth)
 }
 
+/// Special `> outfile` sentinel: when the outfile is the bare token "clipboard"
+/// (any casing, surrounding whitespace tolerated) the response body is copied
+/// to the system clipboard instead of written to disk.
+fn is_clipboard_target(s: &str) -> bool {
+    s.trim().eq_ignore_ascii_case("clipboard")
+}
+
+/// `MatchOptions` for glob expansion: behave like a shell — `*` does NOT match
+/// path segments beginning with `.`, so `mapped-types/*` skips `.DS_Store` etc.
+fn glob_match_options() -> glob::MatchOptions {
+    glob::MatchOptions {
+        require_literal_leading_dot: true,
+        ..Default::default()
+    }
+}
+
+/// OS-junk basenames that don't start with `.` and so wouldn't be caught by the
+/// leading-dot rule. Matched case-insensitively.
+fn is_os_junk(path: &std::path::Path) -> bool {
+    const JUNK: &[&str] = &[
+        "thumbs.db",
+        "thumbs.db:encryptable",
+        "desktop.ini",
+        "$recycle.bin",
+    ];
+    match path.file_name().and_then(|n| n.to_str()) {
+        Some(name) => {
+            let lower = name.to_ascii_lowercase();
+            JUNK.iter().any(|j| *j == lower.as_str())
+        }
+        None => false,
+    }
+}
+
 /// Resolve an include directive into the actual file paths to load.
 fn resolve_include_paths(
     include_spec: &str,
@@ -3117,10 +3200,10 @@ fn resolve_include_paths(
     let is_glob = expanded.chars().any(|c| c == '*' || c == '?' || c == '[');
     if is_glob {
         let pattern = resolved.to_string_lossy().to_string();
-        let mut matches: Vec<std::path::PathBuf> = glob::glob(&pattern)
+        let mut matches: Vec<std::path::PathBuf> = glob::glob_with(&pattern, glob_match_options())
             .map_err(|e| format!("invalid include glob '{}': {}", include_spec, e))?
             .filter_map(|r| r.ok())
-            .filter(|p| p.is_file())
+            .filter(|p| p.is_file() && !is_os_junk(p))
             .collect();
         if matches.is_empty() {
             return Err(format!("no files match include glob: {}", include_spec));
@@ -3323,12 +3406,9 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
         fetch_feature_flags(config)
     };
 
-    let client = Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .unwrap_or_else(|_| Client::new());
+    let client = build_request_client(config.timeout_secs);
 
-    let url = format!("{}{}{}", config.base_uri, config.api_path, actual_uri);
+    let url = format!("{}{}", config.base_uri, resolve_request_path(&config.api_path, actual_uri));
 
     let mut request = match method {
         "GET" => client.get(&url),
@@ -3452,6 +3532,12 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                 }
             }
 
+            // `> clipboard` is a special outfile target — route to system clipboard.
+            let is_clipboard = display_outfile
+                .as_deref()
+                .map(is_clipboard_target)
+                .unwrap_or(false);
+
             // Get response body — in bulk_silent mode, only write to outfile (no stdout)
             if config.bulk_silent {
                 if let Some(ref file_path) = outfile {
@@ -3463,7 +3549,11 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                         } else {
                             body_text
                         };
-                        if let Err(e) = fs::write(file_path, &output) {
+                        if is_clipboard {
+                            if let Err(e) = cli_clipboard::set_contents(output) {
+                                eprintln!("Error copying to clipboard: {}", e);
+                            }
+                        } else if let Err(e) = fs::write(file_path, &output) {
                             eprintln!("Error writing to {}: {}", file_path, e);
                         }
                     }
@@ -3485,8 +3575,20 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                     body_text
                 };
 
-                // Write to file or stdout
-                if let Some(ref file_path) = outfile {
+                // Write to file, clipboard, or stdout
+                if is_clipboard {
+                    match cli_clipboard::set_contents(output) {
+                        Ok(()) => {
+                            if !config.silent {
+                                eprintln!("{}", "> clipboard".dimmed());
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("error: clipboard unavailable: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                } else if let Some(ref file_path) = outfile {
                     if let Err(e) = fs::write(file_path, &output) {
                         eprintln!("Error writing to {}: {}", file_path, e);
                     } else if !config.silent {
@@ -3657,6 +3759,10 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
         );
     }
 
+    // Enable bracketed paste so multi-character pastes arrive as one Event::Paste —
+    // lets us recognize and expand pasted JSON identifier structures.
+    let _ = execute!(stdout, EnableBracketedPaste);
+
     let mut state = AppState::new(config.clone());
     state.width = width;
     state.height = height;
@@ -3752,6 +3858,9 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
                         }
                     }
                 }
+                Event::Paste(s) if !state.loading => {
+                    handle_paste(&mut state, &s, &mut stdout)?;
+                }
                 Event::Resize(w, h) => {
                     state.width = w;
                     state.height = h;
@@ -3819,6 +3928,7 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
                     if enhanced_keyboard {
                         let _ = execute!(stdout, PopKeyboardEnhancementFlags);
                     }
+                    let _ = execute!(stdout, DisableBracketedPaste);
                     // Move up to top of splash and clear from there down
                     let total_up = state.prev_input_lines + 7;
                     execute!(
@@ -3924,6 +4034,7 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
     if enhanced_keyboard {
         let _ = execute!(stdout, PopKeyboardEnhancementFlags);
     }
+    let _ = execute!(stdout, DisableBracketedPaste);
     terminal::disable_raw_mode()?;
 
     Ok(())
@@ -4663,6 +4774,120 @@ fn handle_key_event(
     Ok((false, None))
 }
 
+/// Cycling window for re-pasting the same JSON to advance through its identifiers.
+const PASTE_CYCLE_WINDOW: Duration = Duration::from_secs(10);
+
+/// Pull `(key, value)` pairs out of pasted JSON, in insertion order.
+///
+/// Recognizes two shapes:
+/// 1. An object with an `"identifiers"` field that is itself an object — uses
+///    every string-valued key inside it (no dot requirement, because the user
+///    has explicitly nested them under `identifiers`).
+/// 2. A flat object where every value is a string — uses every key.
+///
+/// Returns an empty vec when the paste isn't JSON, isn't an object, or doesn't
+/// match either shape. Order follows the source JSON because `serde_json` is
+/// built with the `preserve_order` feature.
+fn extract_identifier_pairs(s: &str) -> Vec<(String, String)> {
+    let trimmed = s.trim();
+    let v: Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let obj = match v.as_object() {
+        Some(o) => o,
+        None => return Vec::new(),
+    };
+
+    // Case 1: object has an "identifiers" child object — use its string-valued keys.
+    if let Some(idents) = obj.get("identifiers").and_then(|v| v.as_object()) {
+        let pairs: Vec<(String, String)> = idents
+            .iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .collect();
+        if !pairs.is_empty() {
+            return pairs;
+        }
+    }
+
+    // Case 2: flat object, every value is a string.
+    if !obj.is_empty() && obj.values().all(|v| v.is_string()) {
+        return obj
+            .iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .collect();
+    }
+
+    Vec::new()
+}
+
+/// Handle a bracketed-paste event into the URL/input field.
+///
+/// When the cursor sits outside any open `{}`/`[]` body, we try to expand the
+/// paste into an `identifier=value` form so users can paste API JSON straight
+/// into a URL. Re-pasting the same JSON within `PASTE_CYCLE_WINDOW` cycles
+/// through multiple identifiers (first → last, wrapping).
+///
+/// In every other case the paste is inserted verbatim — so writing real JSON
+/// request bodies still works exactly as before.
+fn handle_paste(
+    state: &mut AppState,
+    paste: &str,
+    stdout: &mut io::Stdout,
+) -> io::Result<()> {
+    let inside_body = cursor_inside_brackets(&state.input, state.cursor_pos);
+
+    let (insert_text, status_note) = if inside_body {
+        (paste.to_string(), None)
+    } else {
+        let pairs = extract_identifier_pairs(paste);
+        if pairs.is_empty() {
+            (paste.to_string(), None)
+        } else {
+            let same_as_last = state.last_paste_raw == paste;
+            let within_window = state
+                .last_paste_at
+                .map(|t| t.elapsed() < PASTE_CYCLE_WINDOW)
+                .unwrap_or(false);
+
+            let idx = if same_as_last && within_window {
+                (state.last_paste_cycle_idx + 1) % pairs.len()
+            } else {
+                0
+            };
+
+            let (k, v) = &pairs[idx];
+            let replacement = format!("{}={}", k, v);
+            let note = if pairs.len() > 1 {
+                format!("paste: {} ({}/{})", replacement, idx + 1, pairs.len())
+            } else {
+                format!("paste: {}", replacement)
+            };
+
+            state.last_paste_raw = paste.to_string();
+            state.last_paste_cycle_idx = idx;
+            state.last_paste_at = Some(Instant::now());
+
+            (replacement, Some(note))
+        }
+    };
+
+    let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
+    state.input.insert_str(byte_idx, &insert_text);
+    state.cursor_pos += char_len(&insert_text);
+
+    if let Some(note) = status_note {
+        state.status_msg = note;
+        state.status_msg_at = Some(Instant::now());
+    } else {
+        state.status_msg.clear();
+        state.status_msg_at = None;
+    }
+
+    render(stdout, state)?;
+    Ok(())
+}
+
 fn parse_input(state: &mut AppState, input: &str) {
     let mut input = input.to_string();
 
@@ -4745,12 +4970,9 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     output_lines.push('\n');
 
     // Build request
-    let client = Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .unwrap_or_else(|_| Client::new());
+    let client = build_request_client(state.config.timeout_secs);
 
-    let url = format!("{}{}{}", state.config.base_uri, state.config.api_path, state.uri);
+    let url = format!("{}{}", state.config.base_uri, resolve_request_path(&state.config.api_path, &state.uri));
 
     let mut request = match state.method.as_str() {
         "GET" => client.get(&url),
@@ -4972,12 +5194,9 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
                 state.config.token = new_token.clone();
 
                 // Retry the request with new token
-                let client = Client::builder()
-                    .timeout(Duration::from_secs(30))
-                    .build()
-                    .unwrap_or_else(|_| Client::new());
+                let client = build_request_client(state.config.timeout_secs);
 
-                let url = format!("{}{}{}", state.config.base_uri, state.config.api_path, state.uri);
+                let url = format!("{}{}", state.config.base_uri, resolve_request_path(&state.config.api_path, &state.uri));
                 let mut retry_request = match state.method.as_str() {
                     "GET" => client.get(&url),
                     "POST" => client.post(&url),
@@ -5022,8 +5241,34 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
                     .to_string()
             };
 
-            // Handle outfile
-            if !state.config.outfile.is_empty() {
+            // Handle outfile — including the `> clipboard` special target.
+            if is_clipboard_target(&state.display_outfile) {
+                // Pretty-print JSON for clipboard so it's pasteable as-is.
+                let clipboard_text = if state.config.raw || state.config.ndjson {
+                    body_text.clone()
+                } else if let Ok(json) = serde_json::from_str::<Value>(&body_text) {
+                    serde_json::to_string_pretty(&json).unwrap_or_else(|_| body_text.clone())
+                } else {
+                    body_text.clone()
+                };
+                match cli_clipboard::set_contents(clipboard_text) {
+                    Ok(()) => {
+                        if !state.config.silent {
+                            display_output.push_str(&format!(
+                                "HTTP/1.1 {} {}\n{}\n\n",
+                                status_str,
+                                format!("{:.2}s", elapsed.as_secs_f64()).dimmed(),
+                                "> clipboard".dimmed()
+                            ));
+                        }
+                        state.status_msg = "copied to clipboard".to_string();
+                        state.status_msg_at = Some(Instant::now());
+                    }
+                    Err(e) => {
+                        display_output.push_str(&format!("clipboard unavailable: {}\n", e));
+                    }
+                }
+            } else if !state.config.outfile.is_empty() {
                 if let Err(e) = fs::write(&state.config.outfile, &body_text) {
                     display_output.push_str(&format!("Error writing to {}: {}\n", state.config.outfile, e));
                 } else {
@@ -5545,8 +5790,10 @@ fn copy_curl(state: &AppState) -> bool {
     }
 
     let mut cmd = format!(
-        "curl -gfsSL -X {} \"{}{}{}\"",
-        state.prev_method, state.config.base_uri, state.config.api_path, state.prev_uri
+        "curl -gfsSL -X {} \"{}{}\"",
+        state.prev_method,
+        state.config.base_uri,
+        resolve_request_path(&state.config.api_path, &state.prev_uri)
     );
 
     if !state.config.token.is_empty() {
@@ -7959,10 +8206,10 @@ fn resolve_at_file_body(path_raw: &str) -> Result<AtFileResult, String> {
         }
     } else {
         // Glob — expand and combine
-        let mut paths: Vec<std::path::PathBuf> = glob::glob(&expanded)
+        let mut paths: Vec<std::path::PathBuf> = glob::glob_with(&expanded, glob_match_options())
             .map_err(|e| format!("invalid glob pattern '{}': {}", path_raw, e))?
             .filter_map(|r| r.ok())
-            .filter(|p| p.is_file())
+            .filter(|p| p.is_file() && !is_os_junk(p))
             .collect();
         if paths.is_empty() {
             return Err(format!("no files match: {}", path_raw));
@@ -8874,4 +9121,203 @@ fn get_schema_for_path(state: &AppState, path: &str) -> String {
     }
 
     String::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_request_path_default_prefix() {
+        assert_eq!(resolve_request_path("/api/v1", "/people"), "/api/v1/people");
+        assert_eq!(resolve_request_path("/api/me/v1", "/people"), "/api/me/v1/people");
+    }
+
+    #[test]
+    fn resolve_request_path_version_prefix() {
+        assert_eq!(resolve_request_path("/api/v1", "/v1/people"), "/api/v1/people");
+        assert_eq!(resolve_request_path("/api/v1", "/v2/people"), "/api/v2/people");
+        assert_eq!(resolve_request_path("/api/v1", "/v42/foo"), "/api/v42/foo");
+        // Bare /v2 (no trailing path) also works
+        assert_eq!(resolve_request_path("/api/v1", "/v2"), "/api/v2");
+    }
+
+    #[test]
+    fn resolve_request_path_explicit_api_prefix() {
+        assert_eq!(resolve_request_path("/api/v1", "/api/v1/people"), "/api/v1/people");
+        assert_eq!(resolve_request_path("/api/v1", "/api/v2/people"), "/api/v2/people");
+        assert_eq!(resolve_request_path("/api/v1", "/api/me/v1/people"), "/api/me/v1/people");
+        assert_eq!(resolve_request_path("/api/v1", "/api"), "/api");
+    }
+
+    #[test]
+    fn resolve_request_path_versionlike_is_not_a_version() {
+        // /version is NOT a version prefix
+        assert_eq!(resolve_request_path("/api/v1", "/version/foo"), "/api/v1/version/foo");
+        // /v alone (no digits)
+        assert_eq!(resolve_request_path("/api/v1", "/v/foo"), "/api/v1/v/foo");
+        // /v2foo — digits not followed by /
+        assert_eq!(resolve_request_path("/api/v1", "/v2foo"), "/api/v1/v2foo");
+    }
+
+    #[test]
+    fn resolve_request_path_me_skipped_with_explicit_version() {
+        // --me sets api_path to /api/me/v1. An explicit /v2/ should bypass it.
+        assert_eq!(resolve_request_path("/api/me/v1", "/v2/people"), "/api/v2/people");
+        assert_eq!(resolve_request_path("/api/me/v1", "/api/v2/people"), "/api/v2/people");
+    }
+
+    #[test]
+    fn extract_identifier_pairs_nested_identifiers() {
+        let s = r#"{ "identifiers": { "com.heads.seedID": "someid" }, "name": "Bob" }"#;
+        assert_eq!(
+            extract_identifier_pairs(s),
+            vec![("com.heads.seedID".to_string(), "someid".to_string())]
+        );
+    }
+
+    #[test]
+    fn extract_identifier_pairs_nested_identifiers_multiple() {
+        let s = r#"{ "identifiers": { "com.heads.seedID": "a", "com.foo.other": "b" } }"#;
+        let pairs = extract_identifier_pairs(s);
+        assert_eq!(pairs.len(), 2);
+        // Insertion order is preserved thanks to serde_json's preserve_order feature.
+        assert_eq!(pairs[0], ("com.heads.seedID".to_string(), "a".to_string()));
+        assert_eq!(pairs[1], ("com.foo.other".to_string(), "b".to_string()));
+    }
+
+    #[test]
+    fn extract_identifier_pairs_flat_object() {
+        let s = r#"{ "com.heads.seedID": "someid" }"#;
+        assert_eq!(
+            extract_identifier_pairs(s),
+            vec![("com.heads.seedID".to_string(), "someid".to_string())]
+        );
+    }
+
+    #[test]
+    fn extract_identifier_pairs_flat_object_multiple() {
+        let s = r#"{ "com.heads.seedID": "someid", "com.foo.other": "otherid" }"#;
+        let pairs = extract_identifier_pairs(s);
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0], ("com.heads.seedID".to_string(), "someid".to_string()));
+        assert_eq!(pairs[1], ("com.foo.other".to_string(), "otherid".to_string()));
+    }
+
+    #[test]
+    fn extract_identifier_pairs_skips_non_string_values_in_flat() {
+        // Mixed types in a flat object → not identifier-shaped, no expansion.
+        let s = r#"{ "name": "Bob", "age": 30 }"#;
+        assert_eq!(extract_identifier_pairs(s), Vec::<(String, String)>::new());
+    }
+
+    #[test]
+    fn extract_identifier_pairs_nested_takes_precedence() {
+        // Both shapes present — the explicit "identifiers" wrapper wins.
+        let s = r#"{ "identifiers": { "com.heads.id": "x" }, "com.other.id": "y" }"#;
+        let pairs = extract_identifier_pairs(s);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0], ("com.heads.id".to_string(), "x".to_string()));
+    }
+
+    #[test]
+    fn extract_identifier_pairs_non_json_returns_empty() {
+        assert_eq!(
+            extract_identifier_pairs("not json at all"),
+            Vec::<(String, String)>::new()
+        );
+    }
+
+    #[test]
+    fn extract_identifier_pairs_array_returns_empty() {
+        // Top-level array isn't identifier-shaped.
+        assert_eq!(
+            extract_identifier_pairs(r#"[{"com.heads.id": "x"}]"#),
+            Vec::<(String, String)>::new()
+        );
+    }
+
+    #[test]
+    fn extract_identifier_pairs_handles_surrounding_whitespace() {
+        let s = "  \n  { \"com.heads.id\": \"abc\" }  \n  ";
+        assert_eq!(
+            extract_identifier_pairs(s),
+            vec![("com.heads.id".to_string(), "abc".to_string())]
+        );
+    }
+
+    #[test]
+    fn resolve_at_file_body_glob_skips_os_junk() {
+        // End-to-end: a temp dir with two real JSON files plus typical OS junk —
+        // resolve_at_file_body should return only the real files, combined into
+        // a JSON array of length 2.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.json"), r#"{"id":1,"name":"Alice"}"#).unwrap();
+        fs::write(dir.path().join("b.json"), r#"{"id":2,"name":"Bob"}"#).unwrap();
+        // .DS_Store would crash JSON parsing if it got through (binary header).
+        fs::write(dir.path().join(".DS_Store"), b"\x00\x00\x00\x01junk").unwrap();
+        fs::write(dir.path().join("._a.json"), b"\x00binary").unwrap();
+        fs::write(dir.path().join("Thumbs.db"), b"not json").unwrap();
+        fs::write(dir.path().join("desktop.ini"), b"[.ShellClassInfo]").unwrap();
+
+        let pattern = format!("{}/*", dir.path().display());
+        let result = resolve_at_file_body(&pattern).expect("glob should succeed");
+        let parsed: Value = serde_json::from_slice(&result.contents)
+            .expect("combined body should be valid JSON");
+        let arr = parsed.as_array().expect("body should be an array");
+        assert_eq!(arr.len(), 2, "only real JSON files should be included, got: {parsed}");
+        let names: Vec<&str> = arr
+            .iter()
+            .map(|v| v.get("name").and_then(|n| n.as_str()).unwrap_or(""))
+            .collect();
+        assert!(names.contains(&"Alice"), "Alice missing in {names:?}");
+        assert!(names.contains(&"Bob"), "Bob missing in {names:?}");
+    }
+
+    #[test]
+    fn is_clipboard_target_matches_case_insensitive_bare_token() {
+        assert!(is_clipboard_target("clipboard"));
+        assert!(is_clipboard_target("Clipboard"));
+        assert!(is_clipboard_target("CLIPBOARD"));
+        assert!(is_clipboard_target("  clipboard  "));
+        assert!(is_clipboard_target("\tclipboard\n"));
+    }
+
+    #[test]
+    fn is_clipboard_target_rejects_anything_path_like() {
+        // Real filenames must not be treated as the special target.
+        assert!(!is_clipboard_target("clipboard.json"));
+        assert!(!is_clipboard_target("./clipboard"));
+        assert!(!is_clipboard_target("/tmp/clipboard"));
+        assert!(!is_clipboard_target("~/clipboard"));
+        assert!(!is_clipboard_target("my-clipboard"));
+        // Empty / unrelated.
+        assert!(!is_clipboard_target(""));
+        assert!(!is_clipboard_target("clipper"));
+    }
+
+    #[test]
+    fn is_os_junk_recognizes_windows_junk_case_insensitively() {
+        use std::path::Path;
+        assert!(is_os_junk(Path::new("Thumbs.db")));
+        assert!(is_os_junk(Path::new("/some/where/Thumbs.db")));
+        assert!(is_os_junk(Path::new("THUMBS.DB")));
+        assert!(is_os_junk(Path::new("desktop.ini")));
+        assert!(is_os_junk(Path::new("Desktop.INI")));
+        assert!(is_os_junk(Path::new("$RECYCLE.BIN")));
+        // Real files are not junk.
+        assert!(!is_os_junk(Path::new("people.json")));
+        assert!(!is_os_junk(Path::new("/data/main.ndjson")));
+        // .DS_Store is handled by the leading-dot glob rule, not this filter —
+        // but if a glob ever did surface it, this filter wouldn't claim it.
+        assert!(!is_os_junk(Path::new(".DS_Store")));
+    }
+
+    #[test]
+    fn extract_identifier_pairs_empty_identifiers_falls_through() {
+        // Empty "identifiers" object — case 1 yields nothing, case 2 then sees the
+        // outer object whose other values aren't all strings, so nothing returned.
+        let s = r#"{ "identifiers": {}, "name": "Bob" }"#;
+        assert_eq!(extract_identifier_pairs(s), Vec::<(String, String)>::new());
+    }
 }
