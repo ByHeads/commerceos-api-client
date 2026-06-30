@@ -1,5 +1,9 @@
 # Changelog
 
+## 3.0.1
+
+- **`sleep` and `url` gate directives in `.api` batch files**: `sleep N` pauses between requests (accepts `5`, `2s`, `500ms`, fractional). `url has <value>` (substring, `*value*`) and `url is <value>` (literal) declare allowed target environments — collected from anywhere in the file (and includes) and validated once, before any request, against the configured base URI. Multiple conditions form an allowlist (proceed if at least one matches); a non-matching base aborts the whole batch before sending, so test data can't reach production. `sleep` lines appear in the `-p` preview but don't count toward the request total.
+
 ## 3.0.0
 
 New major version 🥳
