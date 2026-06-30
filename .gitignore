@@ -4,3 +4,4 @@
 /dist
 spec.json
 .DS_Store
+.api-credentials.json

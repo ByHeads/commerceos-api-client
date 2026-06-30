@@ -1,7 +1,10 @@
 //! End-to-end CLI tests against a running local CommerceOS instance.
 //!
 //! Requirements:
-//!   - A default connection saved (`api -c <alias>` once with `ctrl+s`, or env vars below)
+//!   - Credentials on disk: copy `.api-credentials-sample.json` to
+//!     `.api-credentials.json` in the repo root and fill in the key for
+//!     http://localhost:5000. (Or set `API_TEST_BASE_URI` + `API_TEST_KEY`.)
+//!     Tests run with `--no-keychain`, so the OS keychain is never unlocked.
 //!   - The local server must respond to `/echo-all`, which echoes back whatever it receives
 //!     (either as a single-element array or the array itself).
 //!
@@ -17,11 +20,20 @@ fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
-/// Run the api binary. If `API_TEST_BASE_URI` and `API_TEST_KEY` are set,
-/// passes them via `-b`/`-k` to skip keychain access; otherwise uses the
-/// saved default connection.
+/// Absolute path to the developer's local credentials file (repo root).
+/// Gitignored; created by each developer from `.api-credentials-sample.json`.
+fn credentials_file() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".api-credentials.json")
+}
+
+/// Run the api binary with `--no-keychain` so tests never unlock the OS keychain.
+/// Credentials come from the repo-root `.api-credentials.json` (via
+/// `API_CREDENTIALS_FILE`), unless `API_TEST_BASE_URI` and `API_TEST_KEY` are set,
+/// in which case those are passed via `-b`/`-k` as a higher-precedence override.
 fn api() -> Command {
     let mut cmd = Command::cargo_bin("api").expect("api binary built");
+    cmd.arg("--no-keychain");
+    cmd.env("API_CREDENTIALS_FILE", credentials_file());
     if let (Ok(base), Ok(key)) = (
         std::env::var("API_TEST_BASE_URI"),
         std::env::var("API_TEST_KEY"),
@@ -31,16 +43,36 @@ fn api() -> Command {
     cmd
 }
 
-/// Pre-flight check: the server must respond on /echo-all.
+/// Fail with an instructive message if no test credentials are available.
+fn require_credentials() {
+    let has_env = std::env::var("API_TEST_BASE_URI").is_ok()
+        && std::env::var("API_TEST_KEY").is_ok();
+    if has_env || credentials_file().exists() {
+        return;
+    }
+    let path = credentials_file();
+    panic!(
+        "No test credentials found.\n\n\
+         Create {path} pointing at your local CommerceOS (http://localhost:5000)\n\
+         and its API key. Copy the sample and fill in the key:\n\n    \
+         cp .api-credentials-sample.json .api-credentials.json\n\n\
+         then edit the `credential` field for localhost:5000.\n\
+         (Alternatively, set the API_TEST_BASE_URI and API_TEST_KEY env vars.)",
+        path = path.display(),
+    );
+}
+
+/// Pre-flight check: credentials exist and the server responds on /echo-all.
 fn require_local_cos() {
+    require_credentials();
     let out = api()
         .args(["GET", "/echo-all", "--silent"])
         .output()
         .expect("spawn api");
     if !out.status.success() {
         panic!(
-            "local COS not reachable via default connection. \
-             Set up a default connection with `ctrl+s` in interactive mode first.\n\
+            "local COS not reachable. Ensure your local CommerceOS is running and\n\
+             that .api-credentials.json points at it with a valid key.\n\
              stderr: {}",
             String::from_utf8_lossy(&out.stderr)
         );
