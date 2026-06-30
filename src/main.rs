@@ -78,6 +78,11 @@ struct Args {
     #[arg(long = "1p", value_name = "SELECTOR", hide = true)]
     one_password: Option<String>,
 
+    /// Skip the OS keychain; read/write connections from a plaintext JSON file
+    /// (path from API_CREDENTIALS_FILE, else ./.api-credentials.json)
+    #[arg(long = "no-keychain")]
+    no_keychain: bool,
+
     /// Use /api/me/v1 instead of /api/v1
     #[arg(long = "me")]
     me: bool,
@@ -105,6 +110,10 @@ struct Args {
     /// Bulk mode: execute requests from a file (one per line). Use without value or with `-` to read from stdin.
     #[arg(short = 'a', long = "all", value_name = "FILE", num_args = 0..=1, default_missing_value = "-")]
     all: Option<String>,
+
+    /// Preview the request(s) and confirm before sending (default: yes)
+    #[arg(short = 'p', long = "preview")]
+    preview: bool,
 
     /// Disable streaming even when the server supports it
     #[arg(long = "no-streaming")]
@@ -134,6 +143,8 @@ struct Config {
     bulk_silent: bool,
     /// Request timeout in seconds. None = no timeout (indefinite).
     timeout_secs: Option<u64>,
+    /// Preview request(s) and confirm before sending
+    preview: bool,
 }
 
 impl Default for Config {
@@ -154,6 +165,7 @@ impl Default for Config {
             experimental: false,
             bulk_silent: false,
             timeout_secs: None,
+            preview: false,
         }
     }
 }
@@ -191,6 +203,22 @@ fn keychain_entry() -> keyring::Entry {
     keyring::Entry::new(KEYCHAIN_SERVICE, "data").expect("failed to create keyring entry")
 }
 
+// When set, all credential I/O goes to this plaintext JSON file instead of the
+// OS keychain (enabled by `--no-keychain`). Set once at the top of main() before
+// any keychain access, so the background-load thread observes it too.
+static NO_KEYCHAIN_FILE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+/// Enable file-backed credential storage (no keychain). `path` is the JSON file
+/// to use. Call once at startup before any keychain access.
+fn enable_no_keychain(path: PathBuf) {
+    let _ = NO_KEYCHAIN_FILE.set(Some(path));
+}
+
+/// Returns the credentials file path when `--no-keychain` is active, else None.
+fn no_keychain_file() -> Option<PathBuf> {
+    NO_KEYCHAIN_FILE.get().cloned().flatten()
+}
+
 thread_local! {
     static KEYCHAIN_CACHE: std::cell::RefCell<Option<KeychainData>> = const { std::cell::RefCell::new(None) };
 }
@@ -200,9 +228,17 @@ fn load_keychain_data() -> KeychainData {
         if let Some(ref data) = *cache.borrow() {
             return data.clone();
         }
-        let data = match keychain_entry().get_password() {
-            Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
-            Err(_) => KeychainData::default(),
+        let data = if let Some(path) = no_keychain_file() {
+            // File-backed mode: missing/unreadable file is treated as empty.
+            match fs::read_to_string(&path) {
+                Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
+                Err(_) => KeychainData::default(),
+            }
+        } else {
+            match keychain_entry().get_password() {
+                Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
+                Err(_) => KeychainData::default(),
+            }
         };
         *cache.borrow_mut() = Some(data.clone());
         data
@@ -211,7 +247,11 @@ fn load_keychain_data() -> KeychainData {
 
 fn save_keychain_data(data: &KeychainData) -> Result<(), String> {
     let json = serde_json::to_string(data).map_err(|e| e.to_string())?;
-    keychain_entry().set_password(&json).map_err(|e| format!("keychain error: {}", e))?;
+    if let Some(path) = no_keychain_file() {
+        fs::write(&path, &json).map_err(|e| format!("credentials file error: {}", e))?;
+    } else {
+        keychain_entry().set_password(&json).map_err(|e| format!("keychain error: {}", e))?;
+    }
     KEYCHAIN_CACHE.with(|cache| {
         *cache.borrow_mut() = Some(data.clone());
     });
@@ -1019,6 +1059,125 @@ fn visual_line_count(rendered: &str, width: usize) -> u16 {
         total_lines += lines_for_this;
     }
     total_lines
+}
+
+/// Clamp a rendered multi-line input to a viewport of at most `max_lines` visual
+/// lines, keeping the cursor's logical line visible. Returns the (possibly
+/// windowed) text and its visual line count. Clipped content above/below is shown
+/// as a dimmed `⋯` marker line.
+///
+/// This keeps the printed input block from ever exceeding the screen, which would
+/// otherwise scroll the terminal and desync `render()`'s relative cursor math —
+/// the cause of the input area jumping upward after a multi-line paste.
+fn clamp_input_viewport(rendered: &str, width: usize, max_lines: u16, cursor_line: usize) -> (String, u16) {
+    let total = visual_line_count(rendered, width);
+    if total <= max_lines {
+        return (rendered.to_string(), total);
+    }
+    let logical: Vec<&str> = rendered.split('\n').collect();
+    let n = logical.len();
+    if n == 0 {
+        return (rendered.to_string(), total);
+    }
+    let line_h = |l: &str| -> u16 {
+        let v = visible_len(l);
+        if width == 0 || v == 0 { 1 } else { ((v + width - 1) / width) as u16 }
+    };
+
+    let cursor_line = cursor_line.min(n - 1);
+    // Greedy window containing the cursor line. Expand downward first (so a paste
+    // with the cursor at the end keeps its most recent lines), then upward,
+    // reserving a line for each `⋯` marker that will be shown.
+    let mut start = cursor_line;
+    let mut end = cursor_line + 1; // exclusive
+    let mut used: u16 = line_h(logical[cursor_line]);
+    loop {
+        let mut grew = false;
+        if end < n {
+            let h = line_h(logical[end]);
+            let markers_after = (start > 0) as u16 + ((end + 1) < n) as u16;
+            if used + h + markers_after <= max_lines {
+                used += h;
+                end += 1;
+                grew = true;
+            }
+        }
+        if start > 0 {
+            let h = line_h(logical[start - 1]);
+            let markers_after = ((start - 1) > 0) as u16 + (end < n) as u16;
+            if used + h + markers_after <= max_lines {
+                used += h;
+                start -= 1;
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    let marker = "\x1b[38;5;240m⋯\x1b[0m";
+    let mut out = String::new();
+    let mut count: u16 = 0;
+    if start > 0 {
+        out.push_str(marker);
+        out.push('\n');
+        count += 1;
+    }
+    for idx in start..end {
+        out.push_str(logical[idx]);
+        count += line_h(logical[idx]);
+        if idx + 1 < end {
+            out.push('\n');
+        }
+    }
+    if end < n {
+        out.push('\n');
+        out.push_str(marker);
+        count += 1;
+    }
+    (out, count)
+}
+
+/// Hard-wrap a possibly-ANSI string to `width` visible columns, inserting `\r\n`
+/// at each wrap point. ANSI escape sequences (`\x1b…m`) contribute zero width and
+/// are copied verbatim. Existing `\n` are treated as hard breaks and reset the
+/// column counter. With terminal auto-wrap disabled, the rows printed equal the
+/// rows counted here exactly — no right-margin "pending wrap" phantom rows — which
+/// keeps render()'s relative clear math correct on every terminal.
+fn hard_wrap_ansi(s: &str, width: usize) -> String {
+    if width == 0 {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    let mut col = 0usize;
+    let mut in_escape = false;
+    for c in s.chars() {
+        if in_escape {
+            out.push(c);
+            if c == 'm' {
+                in_escape = false;
+            }
+            continue;
+        }
+        if c == '\x1b' {
+            in_escape = true;
+            out.push(c);
+            continue;
+        }
+        if c == '\n' {
+            out.push(c);
+            col = 0;
+            continue;
+        }
+        if col == width {
+            out.push_str("\r\n");
+            col = 0;
+        }
+        out.push(c);
+        col += 1;
+    }
+    out
 }
 
 fn get_history_path() -> Option<PathBuf> {
@@ -2332,6 +2491,15 @@ fn main() {
         std::process::exit(0);
     }
 
+    // Route all credential I/O to a file instead of the OS keychain.
+    // Must happen before any keychain access below.
+    if args.no_keychain {
+        let path = std::env::var("API_CREDENTIALS_FILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(".api-credentials.json"));
+        enable_no_keychain(path);
+    }
+
     let mut config = Config::default();
 
     // Apply CLI args to config
@@ -2353,6 +2521,7 @@ fn main() {
     config.no_streaming = args.no_streaming;
     config.experimental = args.experimental;
     config.timeout_secs = args.timeout;
+    config.preview = args.preview;
 
     if args.me {
         config.api_path = "/api/me/v1".to_string();
@@ -3302,20 +3471,96 @@ fn split_bulk_requests(
     Ok(requests)
 }
 
+/// Format a single request as `METHOD URI [body]` for preview display.
+/// The body is compacted (JSON re-serialized without whitespace) when possible,
+/// matching the bulk-silent status-line format.
+fn format_request_preview(method: &str, uri: &str, body: &str) -> String {
+    let display_body = if body.trim_start().starts_with('{') || body.trim_start().starts_with('[') {
+        serde_json::from_str::<Value>(body)
+            .ok()
+            .and_then(|v| serde_json::to_string(&v).ok())
+            .unwrap_or_else(|| body.to_string())
+    } else {
+        body.to_string()
+    };
+    if display_body.is_empty() {
+        format!("{} {}", method, uri)
+    } else {
+        format!("{} {} {}", method, uri, display_body)
+    }
+}
+
+/// Show a preview of the request line(s) and ask the user to confirm before
+/// sending. Output and prompt go to stderr so piped stdout stays clean. Reads
+/// the answer from /dev/tty (falling back to stdin) so it works even when stdin
+/// is a piped bulk file. Defaults to yes: an empty line (Enter) accepts.
+/// Returns true to proceed, false to abort.
+fn confirm_preview(lines: &[String], base_uri: &str) -> bool {
+    if atty::is(Stream::Stderr) {
+        colored::control::set_override(true);
+    }
+    let count_text = if lines.len() == 1 {
+        "Preview — 1 request".to_string()
+    } else {
+        format!("Preview — {} requests", lines.len())
+    };
+
+    // Summary of the distinct methods used, in first-appearance order. Each
+    // preview line is "METHOD URI [body]", so the first token is the method.
+    let mut methods: Vec<String> = Vec::new();
+    for line in lines {
+        if let Some(m) = line.split_whitespace().next() {
+            if !methods.iter().any(|x| x == m) {
+                methods.push(m.to_string());
+            }
+        }
+    }
+    let header = if methods.is_empty() {
+        count_text
+    } else {
+        format!("{} | {}", count_text, methods.join(" "))
+    };
+
+    if base_uri.is_empty() {
+        eprintln!("{}", header.bold());
+    } else {
+        eprintln!("{} {}", header.bold(), format!("[{}]", base_uri).dimmed());
+    }
+    for line in lines {
+        eprintln!("  {}", line);
+    }
+    eprint!("{} ", "Run? [Y/n]".bold());
+    let _ = io::stderr().flush();
+
+    // Read a single line of input, preferring /dev/tty so a piped stdin
+    // (e.g. `-a -`) does not consume the request data as the answer.
+    let mut answer = String::new();
+    let read_ok = match fs::File::open("/dev/tty") {
+        Ok(tty) => {
+            let mut reader = io::BufReader::new(tty);
+            reader.read_line(&mut answer).is_ok()
+        }
+        Err(_) => io::stdin().read_line(&mut answer).is_ok(),
+    };
+    if !read_ok {
+        // No way to ask — treat as decline to be safe.
+        eprintln!("aborted (could not read confirmation)");
+        return false;
+    }
+    let a = answer.trim().to_lowercase();
+    let proceed = a.is_empty() || a == "y" || a == "yes";
+    if !proceed {
+        eprintln!("aborted");
+    }
+    proceed
+}
+
 fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std::path::Path>) {
     // Silent + bulk: enable "silent bulk mode" — show request line + status, skip body.
     // We clear silent so status line still prints; bulk_silent suppresses body output.
     if config.silent {
         config.silent = false;
         config.bulk_silent = true;
-    }
-
-    if config.bulk_silent && !config.base_uri.is_empty() {
-        // Ensure colors work even when stdout is piped
-        if atty::is(Stream::Stderr) {
-            colored::control::set_override(true);
-        }
-        println!("{}", format!("[{}]", config.base_uri).dimmed());
     }
 
     let requests = match split_bulk_requests(contents, base_dir) {
@@ -3325,6 +3570,29 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
             std::process::exit(1);
         }
     };
+
+    // Preview: show all resolved requests and confirm once before sending.
+    // Done before any stdout output so a declined run leaves stdout clean.
+    if config.preview {
+        let preview_lines: Vec<String> = requests
+            .iter()
+            .filter_map(|r| parse_request_line(r))
+            .map(|(method, uri, body)| format_request_preview(&method, &uri, &body))
+            .collect();
+        if !confirm_preview(&preview_lines, &config.base_uri) {
+            return;
+        }
+        // Confirmed for the whole batch — avoid re-prompting per request.
+        config.preview = false;
+    }
+
+    if config.bulk_silent && !config.base_uri.is_empty() {
+        // Ensure colors work even when stdout is piped
+        if atty::is(Stream::Stderr) {
+            colored::control::set_override(true);
+        }
+        println!("{}", format!("[{}]", config.base_uri).dimmed());
+    }
 
     for request in requests {
         let Some((method, uri, body)) = parse_request_line(&request) else {
@@ -3380,6 +3648,16 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
     // Ensure colors work on stderr even when stdout is piped
     if atty::is(Stream::Stderr) {
         colored::control::set_override(true);
+    }
+
+    // Preview: show the request and confirm before sending (and before any
+    // network call such as the feature-flag fetch below).
+    if config.preview {
+        let line = format_request_preview(method, uri, body);
+        if !confirm_preview(&[line], &config.base_uri) {
+            return;
+        }
+        config.preview = false;
     }
 
     // Parse > outfile from URI (space required before >, optional after)
@@ -4763,6 +5041,10 @@ fn handle_key_event(
                     }
                 }
             }
+            // Typing a body promotes GET to PUT (a body implies a write).
+            auto_promote_method_on_body_start(state, c);
+            // On an array endpoint, prepend `[` so the body matches the array shape.
+            auto_wrap_array_body(state, c);
             state.status_msg.clear();
             state.status_msg_at = None;
             render(stdout, state)?;
@@ -4799,10 +5081,14 @@ fn extract_identifier_pairs(s: &str) -> Vec<(String, String)> {
         None => return Vec::new(),
     };
 
+    // `@`-prefixed keys are JSON-LD metadata (e.g. `@type`), never identifiers.
+    let is_identifier_key = |k: &str| !k.starts_with('@');
+
     // Case 1: object has an "identifiers" child object — use its string-valued keys.
     if let Some(idents) = obj.get("identifiers").and_then(|v| v.as_object()) {
         let pairs: Vec<(String, String)> = idents
             .iter()
+            .filter(|(k, _)| is_identifier_key(k))
             .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
             .collect();
         if !pairs.is_empty() {
@@ -4810,15 +5096,56 @@ fn extract_identifier_pairs(s: &str) -> Vec<(String, String)> {
         }
     }
 
-    // Case 2: flat object, every value is a string.
-    if !obj.is_empty() && obj.values().all(|v| v.is_string()) {
-        return obj
+    // Case 2: flat object, every (non-metadata) value is a string.
+    let non_meta: Vec<(&String, &Value)> = obj.iter().filter(|(k, _)| is_identifier_key(k)).collect();
+    if !non_meta.is_empty() && non_meta.iter().all(|(_, v)| v.is_string()) {
+        return non_meta
             .iter()
-            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .filter_map(|(k, v)| v.as_str().map(|s| ((*k).clone(), s.to_string())))
             .collect();
     }
 
     Vec::new()
+}
+
+/// Place an expanded `identifier=value` (`kv`) into the URI's index slot — the
+/// last path segment of `before` (the text up to the cursor) — replacing or
+/// appending so repeated identifier pastes never accumulate:
+/// - segment empty (`before` ends with `/`)        → append:  `before + kv`
+/// - segment is already an identifier (has `=`)     → replace: drop it, keep the `/`, add `kv`
+/// - segment is a collection / other (no `=`)       → append:  `before + "/" + kv`
+///
+/// Examples (kv = `com.foo=1`):
+/// - `GET /people`                  → `GET /people/com.foo=1`     (enter indexing)
+/// - `GET /people/`                 → `GET /people/com.foo=1`     (no double slash)
+/// - `GET /people/com.bar=9`        → `GET /people/com.foo=1`     (replace the slot)
+fn apply_identifier_index(before: &str, kv: &str) -> String {
+    match before.rfind('/') {
+        Some(p) => {
+            let segment = &before[p + 1..];
+            if segment.is_empty() {
+                format!("{}{}", before, kv)
+            } else if segment.contains('=') {
+                format!("{}{}", &before[..=p], kv)
+            } else {
+                format!("{}/{}", before, kv)
+            }
+        }
+        // No slash before the cursor (unusual for a URI) — add a separating one.
+        None => format!("{}/{}", before, kv),
+    }
+}
+
+/// True if `paste` begins with an HTTP method token followed by whitespace
+/// (e.g. "GET /people..."), meaning it's a full request line that should replace
+/// the current input rather than be inserted at the cursor.
+fn paste_starts_with_method(paste: &str) -> bool {
+    let trimmed = paste.trim_start();
+    let methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+    match trimmed.split_once(|c: char| c.is_whitespace()) {
+        Some((first, _rest)) => methods.contains(&first.to_uppercase().as_str()),
+        None => false,
+    }
 }
 
 /// Handle a bracketed-paste event into the URL/input field.
@@ -4837,19 +5164,39 @@ fn handle_paste(
 ) -> io::Result<()> {
     let inside_body = cursor_inside_brackets(&state.input, state.cursor_pos);
 
-    let (insert_text, status_note) = if inside_body {
-        (paste.to_string(), None)
-    } else {
+    // Pasting a full request line (starts with an HTTP method) outside a JSON body
+    // replaces the entire input rather than inserting at the cursor — so pasting
+    // "GET /people..." over a "GET /" prompt yields the pasted line, not a
+    // duplicated method. Method detection is skipped inside a body so a JSON
+    // string beginning with "GET " is pasted verbatim.
+    if !inside_body && paste_starts_with_method(paste) {
+        state.input = paste.trim_end().to_string();
+        state.cursor_pos = char_len(&state.input);
+        state.status_msg.clear();
+        state.status_msg_at = None;
+        render(stdout, state)?;
+        return Ok(());
+    }
+
+    let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
+    let before_cursor = &state.input[..byte_idx];
+
+    // Identifier expansion only applies in "indexing mode": cursor in the URI path
+    // region (not in a JSON body, and with a `/` somewhere before it). Pasting an
+    // `identifiers` JSON then replaces/appends the URI's index slot rather than
+    // inserting at the cursor, so it never accumulates duplicate segments.
+    let in_index_mode = !inside_body && before_cursor.contains('/');
+    if in_index_mode {
         let pairs = extract_identifier_pairs(paste);
-        if pairs.is_empty() {
-            (paste.to_string(), None)
-        } else {
+        if !pairs.is_empty() {
             let same_as_last = state.last_paste_raw == paste;
             let within_window = state
                 .last_paste_at
                 .map(|t| t.elapsed() < PASTE_CYCLE_WINDOW)
                 .unwrap_or(false);
 
+            // Re-pasting the same JSON within the window cycles to the next
+            // identifier; a fresh paste starts at the first.
             let idx = if same_as_last && within_window {
                 (state.last_paste_cycle_idx + 1) % pairs.len()
             } else {
@@ -4857,32 +5204,44 @@ fn handle_paste(
             };
 
             let (k, v) = &pairs[idx];
-            let replacement = format!("{}={}", k, v);
+            let kv = format!("{}={}", k, v);
             let note = if pairs.len() > 1 {
-                format!("paste: {} ({}/{})", replacement, idx + 1, pairs.len())
+                format!("paste: {} ({}/{})", kv, idx + 1, pairs.len())
             } else {
-                format!("paste: {}", replacement)
+                format!("paste: {}", kv)
             };
 
             state.last_paste_raw = paste.to_string();
             state.last_paste_cycle_idx = idx;
             state.last_paste_at = Some(Instant::now());
 
-            (replacement, Some(note))
+            // Replace/append the index slot in the text before the cursor; keep
+            // whatever followed the cursor intact.
+            let after_cursor = &state.input[byte_idx..];
+            let new_before = apply_identifier_index(before_cursor, &kv);
+            state.cursor_pos = char_len(&new_before);
+            state.input = format!("{}{}", new_before, after_cursor);
+
+            state.status_msg = note;
+            state.status_msg_at = Some(Instant::now());
+            render(stdout, state)?;
+            return Ok(());
         }
+    }
+
+    // Verbatim insert (non-identifier paste, or paste inside a JSON body).
+    let insert_text = if !inside_body && paste.starts_with('/') && before_cursor.ends_with('/') {
+        // Avoid a double slash when pasting "/products/..." right after an
+        // existing trailing "/" (e.g. prompt "GET /"). JSON bodies are untouched.
+        paste[1..].to_string()
+    } else {
+        paste.to_string()
     };
 
-    let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
     state.input.insert_str(byte_idx, &insert_text);
     state.cursor_pos += char_len(&insert_text);
-
-    if let Some(note) = status_note {
-        state.status_msg = note;
-        state.status_msg_at = Some(Instant::now());
-    } else {
-        state.status_msg.clear();
-        state.status_msg_at = None;
-    }
+    state.status_msg.clear();
+    state.status_msg_at = None;
 
     render(stdout, state)?;
     Ok(())
@@ -5392,6 +5751,79 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     render(stdout, state)?;
 
     Ok(())
+}
+
+/// When the user starts typing a request body, automatically promote the method
+/// from GET to PUT, since a body implies a write. Fires when `typed` is the first
+/// non-whitespace character of the body section — i.e. the text before it is
+/// exactly `GET <uri> ` (method + URI + a separating space). The `>` outfile
+/// redirect operator is excluded, as it begins an output redirect, not a body.
+fn auto_promote_method_on_body_start(state: &mut AppState, typed: char) {
+    if typed.is_whitespace() || typed == '>' {
+        return;
+    }
+    if state.cursor_pos == 0 {
+        return;
+    }
+    let typed_byte = char_to_byte_idx(&state.input, state.cursor_pos - 1);
+    let before = &state.input[..typed_byte];
+    // There must be a separating space between the URI and the body char.
+    if !before.ends_with(char::is_whitespace) {
+        return;
+    }
+    // Before the body, exactly METHOD + URI must be present, with method == GET.
+    let tokens: Vec<&str> = before.split_whitespace().collect();
+    if tokens.len() != 2 || tokens[0].to_uppercase() != "GET" {
+        return;
+    }
+    // Replace the leading method token (preserving its position) with PUT.
+    let trimmed_start = state.input.len() - state.input.trim_start().len();
+    let method_len = tokens[0].len();
+    state.input.replace_range(trimmed_start..trimmed_start + method_len, "PUT");
+    // Keep the cursor aligned if the method length changed (e.g. lowercase input).
+    let delta = 3i64 - method_len as i64;
+    state.cursor_pos = (state.cursor_pos as i64 + delta).max(0) as usize;
+    state.method = "PUT".to_string();
+}
+
+/// When the user starts typing a body on a PUT/PATCH to an array endpoint, and
+/// the first body character isn't already `[`, prepend an opening `[` so the
+/// body matches the expected array shape (e.g. `PUT /people {` → `PUT /people [{`).
+/// Fires when `typed` is the first non-whitespace character of the body section —
+/// i.e. the text before it is exactly `METHOD URI ` (method + URI + a separating
+/// space). Inserting only `[` is intentional; the matching `]` is left to tab
+/// completion. Runs after `auto_promote_method_on_body_start`, so a `GET` that was
+/// just promoted to `PUT` is handled in the same keystroke.
+fn auto_wrap_array_body(state: &mut AppState, typed: char) {
+    if typed.is_whitespace() || typed == '[' {
+        return;
+    }
+    if state.cursor_pos == 0 {
+        return;
+    }
+    // The just-typed character must be the first non-whitespace char of the body:
+    // exactly METHOD + URI before it, with a separating space.
+    let typed_byte = char_to_byte_idx(&state.input, state.cursor_pos - 1);
+    let before = &state.input[..typed_byte];
+    if !before.ends_with(char::is_whitespace) {
+        return;
+    }
+    let tokens: Vec<&str> = before.split_whitespace().collect();
+    if tokens.len() != 2 {
+        return;
+    }
+    let method = tokens[0].to_uppercase();
+    if method != "PUT" && method != "PATCH" {
+        return;
+    }
+    // Only when the target endpoint returns an array (per the loaded OpenAPI spec).
+    if !state.array_endpoints.contains(tokens[1]) {
+        return;
+    }
+    // Prepend `[` immediately before the typed body character, keeping the cursor
+    // just after what was typed.
+    state.input.insert(typed_byte, '[');
+    state.cursor_pos += 1;
 }
 
 fn cycle_method(state: &mut AppState) {
@@ -5911,7 +6343,11 @@ fn render_input_content(state: &mut AppState, width: usize) -> (String, u16, Str
                 rendered.push_str("\x1b[48;5;247m\x1b[38;5;0m \x1b[0m");
                 rendered.push_str(&format!("\x1b[38;5;240m{}\x1b[0m", ghost));
                 rendered.push('\n');
-                rendered.push_str(&hl_after.trim_start_matches('\n'));
+                // hl_after must be verbatim: the cursor cell + the '\n' above
+                // already represent the at-cursor newline. Trimming leading '\n'
+                // here would swallow a following blank line, undercounting input
+                // rows and making the block shift on redraw.
+                rendered.push_str(&hl_after);
             } else {
                 rendered.push_str(&format!("\x1b[48;5;247m\x1b[38;5;0m{}\x1b[0m", hl_at_cursor));
                 rendered.push_str(&format!("\x1b[38;5;240m{}\x1b[0m", ghost));
@@ -5922,14 +6358,22 @@ fn render_input_content(state: &mut AppState, width: usize) -> (String, u16, Str
         if hl_at_cursor == '\n' {
             rendered.push_str("\x1b[48;5;247m\x1b[38;5;0m \x1b[0m");
             rendered.push('\n');
-            rendered.push_str(&hl_after.trim_start_matches('\n'));
+            // Verbatim — see note above; trimming would collapse a following
+            // blank line and desync the rendered row count.
+            rendered.push_str(&hl_after);
         } else {
             rendered.push_str(&format!("\x1b[48;5;247m\x1b[38;5;0m{}\x1b[0m", hl_at_cursor));
             rendered.push_str(&hl_after);
         }
     }
 
-    let input_line_count = visual_line_count(&rendered, width);
+    // Cap the input viewport so the printed block never exceeds the screen (which
+    // would scroll the terminal and desync render()'s relative cursor math). Window
+    // around the cursor's logical line, leaving room for both rulers, the hint, and
+    // some output above.
+    let cursor_line = state.input[..cursor_byte].matches('\n').count();
+    let max_input_lines = state.height.saturating_sub(5).max(3);
+    let (rendered, input_line_count) = clamp_input_viewport(&rendered, width, max_input_lines, cursor_line);
 
     // Build the final output lines with hints appended to the last line
     let lines: Vec<&str> = rendered.split('\n').collect();
@@ -6070,10 +6514,19 @@ fn render(stdout: &mut io::Stdout, state: &mut AppState) -> io::Result<()> {
     // Update prev_show_help for next render
     state.prev_show_help = state.show_help;
 
-    // Queue all render operations without flushing — single flush at end of render
+    // Queue all render operations without flushing — single flush at end of render.
+    //
+    // Auto-wrap (DECAWM) is disabled for the whole block draw below. The block's
+    // lines are pre-wrapped to the terminal width by `hard_wrap_ansi`, so the rows
+    // we print exactly equal the rows we count in `prev_input_lines`. With auto-wrap
+    // left on, a line that reaches the right margin leaves some terminals in a
+    // "pending wrap" state that materializes as a phantom extra row — making the
+    // printed height disagree with our count, so the relative clear below moves up
+    // the wrong amount and the block creeps into the splash after a wrapped paste.
     queue!(
         stdout,
         cursor::Hide,
+        Print("\x1b[?7l"), // disable auto-wrap for deterministic block height
         cursor::MoveUp(lines_to_clear.min(state.height.saturating_sub(1))),
         cursor::MoveToColumn(0),
         Clear(ClearType::FromCursorDown)
@@ -6115,6 +6568,7 @@ fn render(stdout: &mut io::Stdout, state: &mut AppState) -> io::Result<()> {
             format!(" {} Loading environment from 1P...", frame)
         };
         queue!(stdout, Print(format!("{}\r\n", msg.dimmed())))?;
+        state.prev_input_lines = 1; // single spinner line — keep the span exact
     } else if state.show_help {
         queue!(
             stdout,
@@ -6150,10 +6604,10 @@ fn render(stdout: &mut io::Stdout, state: &mut AppState) -> io::Result<()> {
         // Show method + URI on first line, prompt on second, buffer with cursor below
         let header = format!("{} {}", state.body_input_method, state.body_input_uri);
         let header_lines = visual_line_count(&header, width);
-        queue!(stdout, Print(format!("{}\r\n", header)))?;
+        queue!(stdout, Print(format!("{}\r\n", hard_wrap_ansi(&header, width))))?;
         let prompt = "Enter body, ctrl+d when done (esc to cancel)";
         let prompt_lines = visual_line_count(prompt, width);
-        queue!(stdout, Print(format!("{}\r\n", prompt.dimmed())))?;
+        queue!(stdout, Print(format!("{}\r\n", hard_wrap_ansi(&prompt.dimmed().to_string(), width))))?;
         let buf_lines: Vec<&str> = if state.body_input_buffer.is_empty() {
             vec![""]
         } else {
@@ -6169,16 +6623,20 @@ fn render(stdout: &mut io::Stdout, state: &mut AppState) -> io::Result<()> {
                     ((line_with_cursor_width + width - 1) / width).max(1) as u16
                 };
                 total_buf_visual_lines += lines_for_this;
-                queue!(stdout, Print(format!("{}\x1b[48;5;247m\x1b[38;5;0m \x1b[0m\r\n", line)))?;
+                let line_with_cursor = format!("{}\x1b[48;5;247m\x1b[38;5;0m \x1b[0m", line);
+                queue!(stdout, Print(format!("{}\r\n", hard_wrap_ansi(&line_with_cursor, width))))?;
             } else {
                 total_buf_visual_lines += visual_line_count(line, width);
-                queue!(stdout, Print(format!("{}\r\n", line)))?;
+                queue!(stdout, Print(format!("{}\r\n", hard_wrap_ansi(line, width))))?;
             }
         }
         state.prev_input_lines = header_lines + prompt_lines + total_buf_visual_lines;
     } else {
         let (input_output, input_line_count, _ghost) = render_input_content(state, width);
-        queue!(stdout, Print(&input_output), Print("\r\n"))?;
+        // Pre-wrap to the terminal width and print with auto-wrap disabled (set at
+        // the top of render) so the rows printed exactly match `input_line_count`.
+        let wrapped = hard_wrap_ansi(&input_output, width);
+        queue!(stdout, Print(&wrapped), Print("\r\n"))?;
         state.prev_input_lines = input_line_count;
     }
 
@@ -6225,7 +6683,10 @@ fn render(stdout: &mut io::Stdout, state: &mut AppState) -> io::Result<()> {
         }
     }
 
+    // Re-enable auto-wrap now that the fixed-height block has been drawn.
+    queue!(stdout, Print("\x1b[?7h"))?;
     stdout.flush()?;
+
     Ok(())
 }
 
@@ -7442,7 +7903,11 @@ fn handle_file_tab_completion(state: &mut AppState) {
     };
 
     if !is_cycling {
-        state.completions = get_file_completions(&partial);
+        state.completions = if is_outfile_context(&state.input) {
+            get_outfile_completions(&partial)
+        } else {
+            get_file_completions(&partial)
+        };
         state.completion_idx = 0;
         state.last_tab_input = state.input.clone();
     }
@@ -7696,7 +8161,11 @@ fn get_completion_ghost(state: &AppState) -> String {
         let completions = if !state.completions.is_empty() && state.last_tab_input == state.input {
             &state.completions
         } else {
-            fresh = get_file_completions(&partial);
+            fresh = if is_outfile_context(&state.input) {
+                get_outfile_completions(&partial)
+            } else {
+                get_file_completions(&partial)
+            };
             &fresh
         };
         if let Some(first) = completions.first() {
@@ -7877,6 +8346,13 @@ fn get_completion_ghost_at_cursor(state: &AppState) -> String {
 /// Extract the file path portion being typed after ">" or "@" in the input.
 /// Returns Some((prefix_before_path, partial_path)) if in file completion mode.
 /// Triggers directly after " >" or " @" (space not required after the symbol).
+/// True when the active file-path context is the `>` outfile redirect (as opposed
+/// to a `@` body-file). Mirrors `extract_file_path_context`, which checks `" >"`
+/// first and uses it whenever present.
+fn is_outfile_context(input: &str) -> bool {
+    input.rfind(" >").is_some()
+}
+
 fn extract_file_path_context(input: &str) -> Option<(usize, String)> {
     // Check for " >" (outfile) - must have space before > but not necessarily after
     if let Some(idx) = input.rfind(" >") {
@@ -7969,6 +8445,24 @@ fn get_file_completions(partial: &str) -> Vec<String> {
         b_dir.cmp(&a_dir).then(a.cmp(b))
     });
 
+    results
+}
+
+/// Completions for an outfile context (`> …`). Returns the normal file/dir
+/// completions plus a virtual `clipboard` target when the partial is a prefix of
+/// "clipboard". The virtual entry is purely additive: real files/folders (even
+/// ones beginning with "clip"/"clipboard") are always kept, and `clipboard` is
+/// not added if a real entry by that name already exists (no duplication). Used
+/// only for the `>` redirect, never for `@` body-file completion.
+fn get_outfile_completions(partial: &str) -> Vec<String> {
+    let mut results = get_file_completions(partial);
+    let want_clipboard = !partial.is_empty()
+        && "clipboard".starts_with(partial)
+        && partial != "clipboard"
+        && !results.iter().any(|c| c.trim_end_matches('/') == "clipboard");
+    if want_clipboard {
+        results.insert(0, "clipboard".to_string());
+    }
     results
 }
 
@@ -9126,6 +9620,189 @@ fn get_schema_for_path(state: &AppState, path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hard_wrap_row_count_matches_visual_line_count() {
+        // The whole point: with auto-wrap off, printed rows must equal what the
+        // clear math counts. hard_wrap inserts a break per wrap boundary, so the
+        // number of resulting lines must equal visual_line_count of the original.
+        for len in [0usize, 1, 79, 80, 81, 159, 160, 161, 214, 240, 320] {
+            let s = "X".repeat(len);
+            let wrapped = hard_wrap_ansi(&s, 80);
+            let rows = wrapped.split('\n').count() as u16;
+            assert_eq!(rows, visual_line_count(&s, 80), "len {} mismatch", len);
+        }
+    }
+
+    #[test]
+    fn hard_wrap_preserves_ansi_and_zero_width() {
+        // ANSI escapes don't count toward width; a styled 80-char run stays one row.
+        let s = format!("\x1b[38;5;240m{}\x1b[0m", "Y".repeat(80));
+        let wrapped = hard_wrap_ansi(&s, 80);
+        assert!(!wrapped.contains("\r\n"), "80 visible cols must not wrap");
+        assert!(wrapped.contains("\x1b[38;5;240m") && wrapped.contains("\x1b[0m"), "escapes preserved");
+        // 81 visible cols → exactly one wrap.
+        let s2 = format!("\x1b[1m{}\x1b[0m", "Z".repeat(81));
+        assert_eq!(hard_wrap_ansi(&s2, 80).matches("\r\n").count(), 1);
+    }
+
+    #[test]
+    fn render_input_line_count_stable_across_cursor_on_blank_lines() {
+        // Regression: moving the cursor onto a blank line (consecutive newlines)
+        // must not change the rendered input's line count, or the block shifts on
+        // redraw. Build a minimal AppState with a multi-line input and check the
+        // line count is identical with the cursor at the end vs. on each blank line.
+        let mut state = AppState::new(Config::default());
+        state.width = 80;
+        state.input = "PUT /\n\n\nasd".to_string(); // 4 logical lines, 2 blank
+        let counts: Vec<u16> = (0..=char_len(&state.input))
+            .map(|pos| {
+                state.cursor_pos = pos;
+                let (_o, n, _g) = render_input_content(&mut state, 80);
+                n
+            })
+            .collect();
+        // Every cursor position must yield the same 4-line count.
+        assert!(counts.iter().all(|&c| c == 4), "line counts varied by cursor pos: {:?}", counts);
+    }
+
+    #[test]
+    fn extract_identifier_pairs_skips_at_type() {
+        // Case 1: identifiers child with @type metadata mixed in — @type excluded.
+        let json = r#"{"identifiers":{"@type":"common identifiers","com.foo.example":"123"}}"#;
+        assert_eq!(
+            extract_identifier_pairs(json),
+            vec![("com.foo.example".to_string(), "123".to_string())]
+        );
+
+        // Full person-shaped object (has identifiers child) — only the real id.
+        let person = r#"{"@type":"person","identifiers":{"@type":"common identifiers","key":"eea"},"fullName":"Joe"}"#;
+        assert_eq!(
+            extract_identifier_pairs(person),
+            vec![("key".to_string(), "eea".to_string())]
+        );
+
+        // Case 2: flat object with @type plus a real string key — @type excluded.
+        let flat = r#"{"@type":"thing","com.bar":"9"}"#;
+        assert_eq!(
+            extract_identifier_pairs(flat),
+            vec![("com.bar".to_string(), "9".to_string())]
+        );
+    }
+
+    #[test]
+    fn is_outfile_context_distinguishes_redirect_from_body() {
+        assert!(is_outfile_context("GET /foo > cl"));
+        assert!(is_outfile_context("GET /foo >"));
+        assert!(!is_outfile_context("PUT /foo @cl"));
+        assert!(!is_outfile_context("GET /foo"));
+    }
+
+    #[test]
+    fn get_outfile_completions_adds_virtual_clipboard() {
+        // Prefix of "clipboard" → virtual entry present and first.
+        let r = get_outfile_completions("cl");
+        assert!(r.first().map(|s| s == "clipboard").unwrap_or(false), "got {:?}", r);
+        let r2 = get_outfile_completions("clip");
+        assert!(r2.contains(&"clipboard".to_string()));
+        // Non-prefix → no virtual entry.
+        assert!(!get_outfile_completions("xyz").contains(&"clipboard".to_string()));
+        // Full word already typed → no duplicate virtual entry.
+        assert!(!get_outfile_completions("clipboard").contains(&"clipboard".to_string()));
+        // Empty partial → no virtual entry (don't mask local files at the bare `>`).
+        assert!(!get_outfile_completions("").contains(&"clipboard".to_string()));
+    }
+
+    #[test]
+    fn get_outfile_completions_keeps_real_files_named_clip() {
+        // Real files/folders beginning with "clip" must survive unchanged. With a
+        // directory-qualified partial, the bare "clipboard" sentinel never applies
+        // (it's a bare token, not a path), so only real entries are returned.
+        let dir = std::env::temp_dir().join(format!("api_clip_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("clipboard-backup.json"), b"{}").unwrap();
+        std::fs::create_dir(dir.join("clipboard")).unwrap();
+        let partial = format!("{}/clip", dir.display());
+        let r = get_outfile_completions(&partial);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(r.iter().any(|c| c.ends_with("clipboard-backup.json")), "missing real file: {:?}", r);
+        assert!(r.iter().any(|c| c.ends_with("clipboard/")), "missing real dir: {:?}", r);
+        // No bare virtual entry injected mid-path.
+        assert!(!r.iter().any(|c| c == "clipboard"), "virtual clipboard wrongly added mid-path: {:?}", r);
+    }
+
+    #[test]
+    fn apply_identifier_index_replace_or_append() {
+        // Collection segment → append a new index slot.
+        assert_eq!(apply_identifier_index("GET /people", "com.foo=1"), "GET /people/com.foo=1");
+        // Trailing slash → append, no double slash.
+        assert_eq!(apply_identifier_index("GET /people/", "com.foo=1"), "GET /people/com.foo=1");
+        assert_eq!(apply_identifier_index("GET /", "com.foo=1"), "GET /com.foo=1");
+        // Existing identifier slot → replace it (idempotent / cycling in place).
+        assert_eq!(apply_identifier_index("GET /people/com.bar=9", "com.foo=1"), "GET /people/com.foo=1");
+        assert_eq!(apply_identifier_index("GET /people/com.foo=1", "com.foo=1"), "GET /people/com.foo=1");
+        // Only the last segment is the index slot; earlier ones are preserved.
+        assert_eq!(
+            apply_identifier_index("GET /people/com.a=1/things/com.b=2", "com.c=3"),
+            "GET /people/com.a=1/things/com.c=3"
+        );
+    }
+
+    #[test]
+    fn paste_starts_with_method_detection() {
+        assert!(paste_starts_with_method("GET /people/com.test.example=123"));
+        assert!(paste_starts_with_method("put /foo"));        // case-insensitive
+        assert!(paste_starts_with_method("  POST /bar"));     // leading whitespace
+        assert!(paste_starts_with_method("DELETE /x\n"));     // trailing newline
+        // Not a method-prefixed line:
+        assert!(!paste_starts_with_method("/people/com.test=1")); // bare path
+        assert!(!paste_starts_with_method("GETTER /x"));          // not a real method
+        assert!(!paste_starts_with_method("GET"));               // no following space/URI
+        assert!(!paste_starts_with_method("{\"a\":1}"));         // JSON body
+        assert!(!paste_starts_with_method(""));
+    }
+
+    #[test]
+    fn hard_wrap_respects_existing_newlines() {
+        // Existing \n resets the column counter (hard break).
+        let s = "ab\ncd";
+        assert_eq!(hard_wrap_ansi(s, 80), "ab\ncd");
+    }
+
+    #[test]
+    fn clamp_input_viewport_short_input_unchanged() {
+        let input = "GET /people\n[\n  {}\n]";
+        let (out, count) = clamp_input_viewport(input, 80, 20, 0);
+        assert_eq!(out, input);
+        assert_eq!(count, 4);
+    }
+
+    #[test]
+    fn clamp_input_viewport_never_exceeds_cap() {
+        // 50 short logical lines, cap at 10 visual lines.
+        let input: String = (0..50).map(|i| format!("line{}", i)).collect::<Vec<_>>().join("\n");
+        for cursor_line in [0usize, 7, 25, 49] {
+            let (out, count) = clamp_input_viewport(&input, 80, 10, cursor_line);
+            assert!(count <= 10, "count {} exceeded cap for cursor_line {}", count, cursor_line);
+            // The cursor's logical line must be present in the window.
+            assert!(
+                out.contains(&format!("line{}", cursor_line)),
+                "cursor line{} not visible (cursor_line {})", cursor_line, cursor_line
+            );
+        }
+    }
+
+    #[test]
+    fn clamp_input_viewport_marks_clipped_regions() {
+        let input: String = (0..50).map(|i| format!("line{}", i)).collect::<Vec<_>>().join("\n");
+        // Cursor in the middle → both top and bottom should be clipped/marked.
+        let (out, _) = clamp_input_viewport(&input, 80, 10, 25);
+        assert!(out.contains('⋯'), "expected an ellipsis marker when content is clipped");
+        // Cursor at the very end → no bottom marker, last real line stays last.
+        let (out_end, _) = clamp_input_viewport(&input, 80, 10, 49);
+        assert!(out_end.trim_end().ends_with("line49"), "cursor-at-end window must end at the last line");
+    }
 
     #[test]
     fn resolve_request_path_default_prefix() {
