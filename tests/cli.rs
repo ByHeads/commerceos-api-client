@@ -581,6 +581,83 @@ fn bulk_mode_reads_from_stdin_when_no_value() {
     assert_eq!(stderr.matches("HTTP/1.1").count(), 2);
 }
 
+/// A bare api binary with --no-keychain and an explicit base/key, for tests that
+/// need a deterministic base URL (the URL gate) without touching saved creds.
+fn api_with_base(base: &str) -> Command {
+    let mut cmd = Command::cargo_bin("api").expect("api binary built");
+    cmd.arg("--no-keychain");
+    cmd.env("API_CREDENTIALS_FILE", credentials_file());
+    cmd.args(["-b", base, "-k", "testkey"]);
+    cmd
+}
+
+#[test]
+fn url_gate_blocks_non_matching_base() {
+    // No live server needed: the gate must fail before any request is attempted.
+    let dir = tempdir().unwrap();
+    let req_file = dir.path().join("gated.api");
+    std::fs::write(
+        &req_file,
+        "url has test.app.heads.com\nurl has localhost:5000\nGET /echo-all\n",
+    )
+    .unwrap();
+
+    api_with_base("https://api.heads.com")
+        .args(["-a"])
+        .arg(&req_file)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("URL gate failed"));
+}
+
+#[test]
+fn url_gate_allows_matching_base() {
+    require_local_cos();
+    let dir = tempdir().unwrap();
+    let req_file = dir.path().join("gated-ok.api");
+    std::fs::write(
+        &req_file,
+        "url has localhost:5000\nGET /echo-all\n",
+    )
+    .unwrap();
+
+    let assert = api().args(["-a"]).arg(&req_file).assert().success();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert_eq!(stderr.matches("HTTP/1.1").count(), 1, "stderr: {stderr}");
+}
+
+#[test]
+fn bulk_sleep_directive_delays_execution() {
+    require_local_cos();
+    let dir = tempdir().unwrap();
+    let req_file = dir.path().join("sleepy.api");
+    std::fs::write(&req_file, "GET /echo-all\nsleep 1\nGET /echo-all\n").unwrap();
+
+    let start = std::time::Instant::now();
+    let assert = api().args(["-a"]).arg(&req_file).assert().success();
+    let elapsed = start.elapsed();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert_eq!(stderr.matches("HTTP/1.1").count(), 2, "stderr: {stderr}");
+    assert!(
+        elapsed >= std::time::Duration::from_millis(900),
+        "expected at least ~1s from `sleep 1`, took {elapsed:?}"
+    );
+}
+
+#[test]
+fn bulk_sleep_invalid_value_errors() {
+    let dir = tempdir().unwrap();
+    let req_file = dir.path().join("badsleep.api");
+    std::fs::write(&req_file, "GET /echo-all\nsleep abc\n").unwrap();
+
+    api_with_base("http://localhost:5000")
+        .args(["-a"])
+        .arg(&req_file)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid sleep duration"));
+}
+
 #[test]
 fn bulk_mode_supports_outfile_per_line() {
     require_local_cos();

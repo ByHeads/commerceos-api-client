@@ -3342,6 +3342,113 @@ fn is_os_junk(path: &std::path::Path) -> bool {
     }
 }
 
+/// One executable step in a parsed `.api` bulk program, in file order.
+#[derive(Debug, Clone, PartialEq)]
+enum BulkStep {
+    Request(String),
+    Sleep(Duration),
+}
+
+/// A URL gate condition collected from `url has` / `url is` lines anywhere in the
+/// file (and its includes). Validated once, before any request runs.
+#[derive(Debug, Clone, PartialEq)]
+enum UrlCondition {
+    /// `url has X` — substring match (`*X*`).
+    Has(String),
+    /// `url is X` — literal equality.
+    Is(String),
+}
+
+impl UrlCondition {
+    fn matches(&self, url: &str) -> bool {
+        match self {
+            UrlCondition::Has(s) => url.contains(s.as_str()),
+            UrlCondition::Is(s) => url == s,
+        }
+    }
+    /// The original directive text, for error messages.
+    fn directive(&self) -> String {
+        match self {
+            UrlCondition::Has(s) => format!("url has {}", s),
+            UrlCondition::Is(s) => format!("url is {}", s),
+        }
+    }
+}
+
+/// A parsed bulk program: ordered steps plus all URL gate conditions.
+#[derive(Debug, Default)]
+struct BulkProgram {
+    steps: Vec<BulkStep>,
+    url_conditions: Vec<UrlCondition>,
+}
+
+/// Parse a `sleep <value>` directive into a Duration. Accepts a bare number
+/// (seconds), or a `ms`/`s` suffix (`500ms`, `2s`, `0.5s`). Fractional seconds
+/// allowed. Returns an error string for missing/invalid/negative values.
+fn parse_sleep_directive(rest: &str) -> Result<Duration, String> {
+    let v = rest.trim();
+    if v.is_empty() {
+        return Err("sleep requires a duration (e.g. `sleep 5`, `sleep 500ms`)".to_string());
+    }
+    let (num_str, is_ms) = if let Some(n) = v.strip_suffix("ms") {
+        (n.trim(), true)
+    } else if let Some(n) = v.strip_suffix('s') {
+        (n.trim(), false)
+    } else {
+        (v, false)
+    };
+    let num: f64 = num_str
+        .parse()
+        .map_err(|_| format!("invalid sleep duration: `{}`", v))?;
+    if !num.is_finite() || num < 0.0 {
+        return Err(format!("invalid sleep duration: `{}`", v));
+    }
+    let secs = if is_ms { num / 1000.0 } else { num };
+    Ok(Duration::from_secs_f64(secs))
+}
+
+/// If `line` (already trimmed, known not to be a request) is a `url has`/`url is`
+/// gate directive, parse it. Returns `Ok(Some(cond))` for a url directive,
+/// `Ok(None)` if it isn't one (so the caller falls through to include handling),
+/// or `Err` for a malformed `url` directive.
+fn parse_url_condition(trimmed: &str) -> Result<Option<UrlCondition>, String> {
+    let mut it = trimmed.splitn(3, char::is_whitespace);
+    if it.next() != Some("url") {
+        return Ok(None);
+    }
+    let op = it.next().unwrap_or("");
+    let value = it.next().unwrap_or("").trim();
+    match op {
+        "has" | "is" if !value.is_empty() => Ok(Some(if op == "has" {
+            UrlCondition::Has(value.to_string())
+        } else {
+            UrlCondition::Is(value.to_string())
+        })),
+        "has" | "is" => Err(format!("`url {}` requires a value", op)),
+        _ => Err(format!(
+            "invalid url directive: `{}` (expected `url has <value>` or `url is <value>`)",
+            trimmed
+        )),
+    }
+}
+
+/// Evaluate collected URL conditions against `url` (an OR allowlist): passes when
+/// there are no conditions, or at least one matches. Returns an error string
+/// describing the gate when none match.
+fn evaluate_url_gate(conditions: &[UrlCondition], url: &str) -> Result<(), String> {
+    if conditions.is_empty() || conditions.iter().any(|c| c.matches(url)) {
+        return Ok(());
+    }
+    let mut msg = format!(
+        "URL gate failed — {} matches none of the allowed conditions:",
+        if url.is_empty() { "(no base URL)" } else { url }
+    );
+    for c in conditions {
+        msg.push_str(&format!("\n  {}", c.directive()));
+    }
+    Err(msg)
+}
+
 /// Resolve an include directive into the actual file paths to load.
 fn resolve_include_paths(
     include_spec: &str,
@@ -3393,7 +3500,7 @@ fn split_bulk_requests_inner(
     contents: &str,
     base_dir: Option<&std::path::Path>,
     chain: &mut std::collections::HashSet<std::path::PathBuf>,
-    requests: &mut Vec<String>,
+    program: &mut BulkProgram,
 ) -> Result<(), String> {
     let methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
     let mut current = String::new();
@@ -3405,14 +3512,28 @@ fn split_bulk_requests_inner(
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }
-            // Decide: request line or include?
+            // Decide: request line, directive (sleep/url), or include?
             let first_word = trimmed.split_whitespace().next().unwrap_or("");
             let first_upper = first_word.to_uppercase();
             let is_request =
                 methods.contains(&first_upper.as_str()) || first_word.starts_with('/');
 
             if !is_request {
-                // Treat as include directive (load and inline another file's requests)
+                // `sleep N` — timing directive.
+                if first_word.eq_ignore_ascii_case("sleep") {
+                    let rest = trimmed["sleep".len()..].trim();
+                    let dur = parse_sleep_directive(rest)?;
+                    program.steps.push(BulkStep::Sleep(dur));
+                    continue;
+                }
+                // `url has`/`url is` — environment gate, collected globally.
+                if first_word.eq_ignore_ascii_case("url") {
+                    if let Some(cond) = parse_url_condition(trimmed)? {
+                        program.url_conditions.push(cond);
+                        continue;
+                    }
+                }
+                // Otherwise treat as include directive (load and inline another file).
                 let paths = resolve_include_paths(trimmed, base_dir)?;
                 for path in paths {
                     let canonical = path.canonicalize().unwrap_or(path.clone());
@@ -3427,7 +3548,7 @@ fn split_bulk_requests_inner(
                         &included,
                         new_base.as_deref(),
                         chain,
-                        requests,
+                        program,
                     )?;
                     chain.remove(&canonical);
                 }
@@ -3441,7 +3562,7 @@ fn split_bulk_requests_inner(
         // Strip JSONC comments inside bodies and check bracket balance
         let (cleaned, depth) = strip_body_comments_and_count(&current);
         if depth <= 0 {
-            requests.push(escape_newlines_in_strings(&cleaned));
+            program.steps.push(BulkStep::Request(escape_newlines_in_strings(&cleaned)));
             current.clear();
         }
     }
@@ -3457,18 +3578,19 @@ fn split_bulk_requests_inner(
     Ok(())
 }
 
-/// Split a multi-line bulk file into logical requests. Each request can span
-/// multiple lines when its body has unbalanced `{}` / `[]` brackets (string-aware).
-/// Lines that aren't requests (and aren't comments/blank) are treated as include
-/// directives — the named file (or glob) is loaded and its requests inlined here.
+/// Split a multi-line bulk file into an ordered program of requests and `sleep`
+/// steps, plus globally-collected `url has`/`url is` gate conditions. Each request
+/// can span multiple lines when its body has unbalanced `{}` / `[]` brackets
+/// (string-aware). Lines that aren't requests, directives, comments, or blank are
+/// treated as include directives — the named file (or glob) is loaded and inlined.
 fn split_bulk_requests(
     contents: &str,
     base_dir: Option<&std::path::Path>,
-) -> Result<Vec<String>, String> {
-    let mut requests = Vec::new();
+) -> Result<BulkProgram, String> {
+    let mut program = BulkProgram::default();
     let mut chain = std::collections::HashSet::new();
-    split_bulk_requests_inner(contents, base_dir, &mut chain, &mut requests)?;
-    Ok(requests)
+    split_bulk_requests_inner(contents, base_dir, &mut chain, &mut program)?;
+    Ok(program)
 }
 
 /// Format a single request as `METHOD URI [body]` for preview display.
@@ -3499,22 +3621,27 @@ fn confirm_preview(lines: &[String], base_uri: &str) -> bool {
     if atty::is(Stream::Stderr) {
         colored::control::set_override(true);
     }
-    let count_text = if lines.len() == 1 {
-        "Preview — 1 request".to_string()
-    } else {
-        format!("Preview — {} requests", lines.len())
-    };
-
-    // Summary of the distinct methods used, in first-appearance order. Each
-    // preview line is "METHOD URI [body]", so the first token is the method.
+    // Count and summarize only actual request lines (first token is an HTTP
+    // method). Non-request preview lines like `sleep 2s` are still displayed but
+    // don't inflate the count or appear in the method summary.
+    let http_methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
     let mut methods: Vec<String> = Vec::new();
+    let mut request_count = 0usize;
     for line in lines {
         if let Some(m) = line.split_whitespace().next() {
-            if !methods.iter().any(|x| x == m) {
-                methods.push(m.to_string());
+            if http_methods.contains(&m.to_uppercase().as_str()) {
+                request_count += 1;
+                if !methods.iter().any(|x| x == m) {
+                    methods.push(m.to_string());
+                }
             }
         }
     }
+    let count_text = if request_count == 1 {
+        "Preview — 1 request".to_string()
+    } else {
+        format!("Preview — {} requests", request_count)
+    };
     let header = if methods.is_empty() {
         count_text
     } else {
@@ -3563,21 +3690,32 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
         config.bulk_silent = true;
     }
 
-    let requests = match split_bulk_requests(contents, base_dir) {
-        Ok(r) => r,
+    let program = match split_bulk_requests(contents, base_dir) {
+        Ok(p) => p,
         Err(e) => {
             eprintln!("error: {}", e);
             std::process::exit(1);
         }
     };
 
-    // Preview: show all resolved requests and confirm once before sending.
-    // Done before any stdout output so a declined run leaves stdout clean.
+    // URL gate: validate the configured base URI against all collected conditions
+    // before any output or requests, so test data can't reach the wrong environment.
+    if let Err(e) = evaluate_url_gate(&program.url_conditions, &config.base_uri) {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
+    }
+
+    // Preview: show all resolved requests (and sleeps) and confirm once before
+    // sending. Done before any stdout output so a declined run leaves stdout clean.
     if config.preview {
-        let preview_lines: Vec<String> = requests
+        let preview_lines: Vec<String> = program
+            .steps
             .iter()
-            .filter_map(|r| parse_request_line(r))
-            .map(|(method, uri, body)| format_request_preview(&method, &uri, &body))
+            .filter_map(|step| match step {
+                BulkStep::Request(r) => parse_request_line(r)
+                    .map(|(method, uri, body)| format_request_preview(&method, &uri, &body)),
+                BulkStep::Sleep(d) => Some(format!("sleep {}", format_duration(*d))),
+            })
             .collect();
         if !confirm_preview(&preview_lines, &config.base_uri) {
             return;
@@ -3594,28 +3732,48 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
         println!("{}", format!("[{}]", config.base_uri).dimmed());
     }
 
-    for request in requests {
-        let Some((method, uri, body)) = parse_request_line(&request) else {
-            continue;
-        };
-        if config.bulk_silent {
-            // Compact the body for display: parse as JSON and re-serialize without whitespace,
-            // falling back to the raw body if it's not JSON (e.g., @file references).
-            let display_body = if body.trim_start().starts_with('{') || body.trim_start().starts_with('[') {
-                serde_json::from_str::<Value>(&body)
-                    .ok()
-                    .and_then(|v| serde_json::to_string(&v).ok())
-                    .unwrap_or_else(|| body.clone())
-            } else {
-                body.clone()
-            };
-            if display_body.is_empty() {
-                println!("{} {}", method, uri);
-            } else {
-                println!("{} {} {}", method, uri, display_body);
+    for step in &program.steps {
+        match step {
+            BulkStep::Sleep(d) => {
+                if config.bulk_silent {
+                    println!("{}", format!("sleep {}", format_duration(*d)).dimmed());
+                }
+                thread::sleep(*d);
+            }
+            BulkStep::Request(request) => {
+                let Some((method, uri, body)) = parse_request_line(request) else {
+                    continue;
+                };
+                if config.bulk_silent {
+                    // Compact the body for display: parse as JSON and re-serialize without whitespace,
+                    // falling back to the raw body if it's not JSON (e.g., @file references).
+                    let display_body = if body.trim_start().starts_with('{') || body.trim_start().starts_with('[') {
+                        serde_json::from_str::<Value>(&body)
+                            .ok()
+                            .and_then(|v| serde_json::to_string(&v).ok())
+                            .unwrap_or_else(|| body.clone())
+                    } else {
+                        body.clone()
+                    };
+                    if display_body.is_empty() {
+                        println!("{} {}", method, uri);
+                    } else {
+                        println!("{} {} {}", method, uri, display_body);
+                    }
+                }
+                run_non_interactive(config, &method, &uri, &body);
             }
         }
-        run_non_interactive(config, &method, &uri, &body);
+    }
+}
+
+/// Format a Duration for display: whole seconds as `Ns`, sub-second as `Nms`.
+fn format_duration(d: Duration) -> String {
+    let ms = d.as_millis();
+    if ms % 1000 == 0 {
+        format!("{}s", ms / 1000)
+    } else {
+        format!("{}ms", ms)
     }
 }
 
@@ -9688,6 +9846,61 @@ mod tests {
             extract_identifier_pairs(flat),
             vec![("com.bar".to_string(), "9".to_string())]
         );
+    }
+
+    #[test]
+    fn parse_sleep_directive_forms() {
+        assert_eq!(parse_sleep_directive("5").unwrap(), Duration::from_secs(5));
+        assert_eq!(parse_sleep_directive("2s").unwrap(), Duration::from_secs(2));
+        assert_eq!(parse_sleep_directive("500ms").unwrap(), Duration::from_millis(500));
+        assert_eq!(parse_sleep_directive("0.5").unwrap(), Duration::from_millis(500));
+        assert_eq!(parse_sleep_directive(" 1.5s ").unwrap(), Duration::from_millis(1500));
+        assert!(parse_sleep_directive("").is_err());
+        assert!(parse_sleep_directive("abc").is_err());
+        assert!(parse_sleep_directive("-3").is_err());
+    }
+
+    #[test]
+    fn parse_url_condition_forms() {
+        assert_eq!(parse_url_condition("url has localhost:5000").unwrap(),
+            Some(UrlCondition::Has("localhost:5000".to_string())));
+        assert_eq!(parse_url_condition("url is http://localhost:5000").unwrap(),
+            Some(UrlCondition::Is("http://localhost:5000".to_string())));
+        // Not a url directive → None (falls through to include handling).
+        assert_eq!(parse_url_condition("other.api").unwrap(), None);
+        // Malformed url directives → error.
+        assert!(parse_url_condition("url has").is_err());
+        assert!(parse_url_condition("url foo bar").is_err());
+    }
+
+    #[test]
+    fn evaluate_url_gate_or_allowlist() {
+        let conds = vec![
+            UrlCondition::Has("test.app.heads.com".to_string()),
+            UrlCondition::Has("localhost:5000".to_string()),
+        ];
+        // Matches at least one → ok.
+        assert!(evaluate_url_gate(&conds, "http://localhost:5000").is_ok());
+        assert!(evaluate_url_gate(&conds, "https://test.app.heads.com").is_ok());
+        // Matches none → blocked.
+        assert!(evaluate_url_gate(&conds, "https://api.heads.com").is_err());
+        // No conditions → always ok.
+        assert!(evaluate_url_gate(&[], "https://api.heads.com").is_ok());
+        // `is` is literal, not substring.
+        let lit = vec![UrlCondition::Is("http://localhost:5000".to_string())];
+        assert!(evaluate_url_gate(&lit, "http://localhost:5000").is_ok());
+        assert!(evaluate_url_gate(&lit, "http://localhost:5000/api").is_err());
+    }
+
+    #[test]
+    fn split_bulk_requests_collects_steps_and_conditions() {
+        let src = "url has localhost:5000\nGET /a\nsleep 2\nPUT /b {\"x\":1}\n";
+        let prog = split_bulk_requests(src, None).unwrap();
+        assert_eq!(prog.url_conditions, vec![UrlCondition::Has("localhost:5000".to_string())]);
+        assert_eq!(prog.steps.len(), 3);
+        assert_eq!(prog.steps[1], BulkStep::Sleep(Duration::from_secs(2)));
+        assert!(matches!(&prog.steps[0], BulkStep::Request(r) if r.starts_with("GET /a")));
+        assert!(matches!(&prog.steps[2], BulkStep::Request(r) if r.starts_with("PUT /b")));
     }
 
     #[test]
