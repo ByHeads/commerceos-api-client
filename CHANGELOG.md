@@ -1,6 +1,8 @@
 # Changelog
 
-## 2.6.8
+## 3.0.0
+
+New major version 🥳
 
 - **Smart method switching while typing a body** (interactive): starting to type a request body on a `GET` auto-promotes it to `PUT` (a body implies a write). The trigger is the first non-whitespace body character (`{`, `[`, `"`, `@`, numbers, `true`/`false`/`null`, etc.); the `>` outfile operator is excluded. `ctrl+space` still cycles `PUT → PATCH → POST → GET`.
 - **Auto-wrap array bodies**: on a `PUT`/`PATCH` to an array endpoint, typing the first body character prepends an opening `[` (e.g. `PUT /people {` → `PUT /people [{`). Type `[` yourself and nothing is added; the closing `]` is left to tab completion.
