@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.6.8
+
+- **Smart method switching while typing a body** (interactive): starting to type a request body on a `GET` auto-promotes it to `PUT` (a body implies a write). The trigger is the first non-whitespace body character (`{`, `[`, `"`, `@`, numbers, `true`/`false`/`null`, etc.); the `>` outfile operator is excluded. `ctrl+space` still cycles `PUT → PATCH → POST → GET`.
+- **Auto-wrap array bodies**: on a `PUT`/`PATCH` to an array endpoint, typing the first body character prepends an opening `[` (e.g. `PUT /people {` → `PUT /people [{`). Type `[` yourself and nothing is added; the closing `]` is left to tab completion.
+- **Paste a full request line to replace the input**: pasting text that starts with an HTTP method (outside a JSON body) replaces the whole line instead of inserting at the cursor — so pasting `GET /people/...` over a `GET /` prompt no longer duplicates the method.
+- **Smarter identifier paste**: pasting an `identifiers` JSON object now targets the URI's index slot — appending `/key=value` on a collection, or replacing the current `key=value` in place — so repeated pastes never accumulate duplicate segments. Re-pasting the same JSON within 10s cycles through multiple identifiers in place. A separating `/` is always added when missing, and JSON-LD metadata keys (`@type`, `@id`, ...) are never treated as identifiers.
+- **`-p` / `--preview` flag**: preview the resolved request(s) and confirm (`Run? [Y/n]`, default yes) before sending. Intended for bulk runs (`api -spa file.api`). The header summarizes the methods used (e.g. `Preview — 5 requests | PUT GET`); preview output and prompt go to stderr (piped stdout stays clean) and the answer is read from `/dev/tty`.
+- **`--no-keychain` flag**: route all credential I/O to a plaintext JSON file (`API_CREDENTIALS_FILE`, else `./.api-credentials.json`) instead of the OS keychain — so automated runs and tests never trigger a keychain unlock prompt. A `.api-credentials-sample.json` template is included; the real file is gitignored.
+- **Tab completion for `> clipboard`**: in an outfile redirect, typing a prefix of `clipboard` suggests/completes the `clipboard` target. Purely additive — real files and folders beginning with `clip` are preserved and still cycle-reachable.
+- Fixed the input area drifting upward when navigating history (up/down) after a multi-line or wrapping paste: the renderer now hard-wraps the input itself with terminal auto-wrap disabled, and no longer miscounts blank lines, so the block stays anchored.
+- **Paste-expand identifiers in the URL field**: pasting JSON like `{"identifiers":{"com.heads.seedID":"x"}}` auto-expands to `com.heads.seedID=x`; repeated pastes within 10s cycle through multiple identifiers.
+- **`@glob` bodies skip OS junk**: `.DS_Store`, `Thumbs.db`, `desktop.ini`, `._*` are ignored so `@dir/*` doesn't choke on macOS/Windows metadata files.
+- **`> clipboard` outfile target** (case-insensitive): copies the response to the system clipboard instead of writing a file.
+- **`--timeout <SECONDS>` flag**: request timeout is now indefinite by default (was 30s); ancillary calls (env discovery, feature flags) keep their short caps.
+
 ## 2.6.7
 
 - **Include directives in `.api` batch files**: a bare line that isn't a comment, blank, or HTTP request is treated as an include — the named file is loaded and its requests inlined at that point. Paths resolve relative to the parent `.api` file. Supports `~/`, absolute paths, and globs (`example*.api`). Recursive includes work; loops are detected and reported.
