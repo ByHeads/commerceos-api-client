@@ -5294,6 +5294,21 @@ fn apply_identifier_index(before: &str, kv: &str) -> String {
     }
 }
 
+/// True when a paste at `cursor_pos` should expand identifier JSON into the
+/// URI's index slot: the cursor is not inside a JSON body and is attached to a
+/// URI path token (the current whitespace-delimited token contains a `/`).
+/// A cursor past the URI's separating space (body position, e.g. `PUT /people |`)
+/// is NOT index mode — the paste is then a request body and inserted verbatim.
+fn paste_in_index_mode(input: &str, cursor_pos: usize) -> bool {
+    if cursor_inside_brackets(input, cursor_pos) {
+        return false;
+    }
+    let byte_idx = char_to_byte_idx(input, cursor_pos);
+    let before_cursor = &input[..byte_idx];
+    let current_token = before_cursor.rsplit(char::is_whitespace).next().unwrap_or("");
+    current_token.contains('/')
+}
+
 /// True if `paste` begins with an HTTP method token followed by whitespace
 /// (e.g. "GET /people..."), meaning it's a full request line that should replace
 /// the current input rather than be inserted at the cursor.
@@ -5339,11 +5354,10 @@ fn handle_paste(
     let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
     let before_cursor = &state.input[..byte_idx];
 
-    // Identifier expansion only applies in "indexing mode": cursor in the URI path
-    // region (not in a JSON body, and with a `/` somewhere before it). Pasting an
+    // Identifier expansion only applies in "indexing mode"; pasting an
     // `identifiers` JSON then replaces/appends the URI's index slot rather than
     // inserting at the cursor, so it never accumulates duplicate segments.
-    let in_index_mode = !inside_body && before_cursor.contains('/');
+    let in_index_mode = paste_in_index_mode(&state.input, state.cursor_pos);
     if in_index_mode {
         let pairs = extract_identifier_pairs(paste);
         if !pairs.is_empty() {
@@ -9890,6 +9904,30 @@ mod tests {
         state.cursor_pos = char_len(&state.input);
         auto_wrap_array_body(&mut state, '{');
         assert_eq!(state.input, "PUT /elements/properties [{");
+    }
+
+    #[test]
+    fn paste_in_index_mode_requires_cursor_on_uri_token() {
+        // Cursor attached to the URI token → index mode (identifier expansion).
+        let s = "GET /people";
+        assert!(paste_in_index_mode(s, char_len(s)));
+        let s = "GET /people/";
+        assert!(paste_in_index_mode(s, char_len(s)));
+        let s = "GET /people/com.bar=9";
+        assert!(paste_in_index_mode(s, char_len(s)));
+
+        // Cursor past the URI's separating space (body position) → NOT index
+        // mode; the paste is a request body and must insert verbatim.
+        let s = "PUT /people ";
+        assert!(!paste_in_index_mode(s, char_len(s)));
+
+        // Cursor inside an open JSON body → never index mode.
+        let s = "PUT /people {\"a\":";
+        assert!(!paste_in_index_mode(s, char_len(s)));
+
+        // No URI yet (bare method) → not index mode.
+        let s = "GET ";
+        assert!(!paste_in_index_mode(s, char_len(s)));
     }
 
     #[test]
