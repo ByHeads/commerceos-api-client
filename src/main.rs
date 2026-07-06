@@ -5916,8 +5916,9 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
 /// non-whitespace character of the body section — i.e. the text before it is
 /// exactly `GET <uri> ` (method + URI + a separating space). The `>` outfile
 /// redirect operator is excluded, as it begins an output redirect, not a body.
+/// The `@` infile prefix is also excluded, as it begins a file reference.
 fn auto_promote_method_on_body_start(state: &mut AppState, typed: char) {
-    if typed.is_whitespace() || typed == '>' {
+    if typed.is_whitespace() || typed == '>' || typed == '@' {
         return;
     }
     if state.cursor_pos == 0 {
@@ -5951,9 +5952,10 @@ fn auto_promote_method_on_body_start(state: &mut AppState, typed: char) {
 /// i.e. the text before it is exactly `METHOD URI ` (method + URI + a separating
 /// space). Inserting only `[` is intentional; the matching `]` is left to tab
 /// completion. Runs after `auto_promote_method_on_body_start`, so a `GET` that was
-/// just promoted to `PUT` is handled in the same keystroke.
+/// just promoted to `PUT` is handled in the same keystroke. The `@` infile prefix
+/// is excluded, as a file reference already provides the full body shape.
 fn auto_wrap_array_body(state: &mut AppState, typed: char) {
-    if typed.is_whitespace() || typed == '[' {
+    if typed.is_whitespace() || typed == '[' || typed == '@' {
         return;
     }
     if state.cursor_pos == 0 {
