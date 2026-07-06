@@ -9851,6 +9851,48 @@ mod tests {
     }
 
     #[test]
+    fn auto_promote_skips_at_infile_prefix() {
+        // Typing `@` as the first body char starts a file reference, not a
+        // literal body — the method must stay GET.
+        let mut state = AppState::new(Config::default());
+        state.input = "GET /elements/properties @".to_string();
+        state.cursor_pos = char_len(&state.input);
+        state.method = "GET".to_string();
+        auto_promote_method_on_body_start(&mut state, '@');
+        assert_eq!(state.input, "GET /elements/properties @");
+        assert_eq!(state.method, "GET");
+
+        // Sanity: a `{` body char still promotes GET → PUT.
+        let mut state = AppState::new(Config::default());
+        state.input = "GET /elements/properties {".to_string();
+        state.cursor_pos = char_len(&state.input);
+        state.method = "GET".to_string();
+        auto_promote_method_on_body_start(&mut state, '{');
+        assert_eq!(state.input, "PUT /elements/properties {");
+        assert_eq!(state.method, "PUT");
+    }
+
+    #[test]
+    fn auto_wrap_array_body_skips_at_infile_prefix() {
+        // A `@` file reference already provides the full body shape — no `[`
+        // must be prepended, even on an array endpoint with explicit PUT.
+        let mut state = AppState::new(Config::default());
+        state.array_endpoints.insert("/elements/properties".to_string());
+        state.input = "PUT /elements/properties @".to_string();
+        state.cursor_pos = char_len(&state.input);
+        auto_wrap_array_body(&mut state, '@');
+        assert_eq!(state.input, "PUT /elements/properties @");
+
+        // Sanity: a `{` body char on an array endpoint still gets `[` prepended.
+        let mut state = AppState::new(Config::default());
+        state.array_endpoints.insert("/elements/properties".to_string());
+        state.input = "PUT /elements/properties {".to_string();
+        state.cursor_pos = char_len(&state.input);
+        auto_wrap_array_body(&mut state, '{');
+        assert_eq!(state.input, "PUT /elements/properties [{");
+    }
+
+    #[test]
     fn parse_sleep_directive_forms() {
         assert_eq!(parse_sleep_directive("5").unwrap(), Duration::from_secs(5));
         assert_eq!(parse_sleep_directive("2s").unwrap(), Duration::from_secs(2));
