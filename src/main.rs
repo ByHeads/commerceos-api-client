@@ -525,6 +525,7 @@ struct AppState {
     last_was_splash: bool,  // True if last output was a splash (for consecutive env switches)
     last_method_cycle: Option<std::time::Instant>,  // For ctrl+space reset-to-GET-after-5s logic
     stashed_body: String,  // Body hidden when switching to GET, restored when switching back
+    method_auto_promoted: bool,  // True while the current PUT came from body auto-promotion (reverts to GET if the body is cleared)
     // Body input mode (for POST/PUT/PATCH without body)
     body_input_mode: bool,
     body_input_buffer: String,
@@ -600,6 +601,7 @@ impl AppState {
             last_was_splash: false,
             last_method_cycle: None,
             stashed_body: String::new(),
+            method_auto_promoted: false,
             body_input_mode: false,
             body_input_buffer: String::new(),
             body_input_method: String::new(),
@@ -4729,6 +4731,7 @@ fn handle_key_event(
             state.prev_outfile = state.config.outfile.clone();
             state.method = "GET".to_string();
             state.body.clear();
+            state.method_auto_promoted = false;
 
             execute_request(state, stdout)?;
         }
@@ -4740,6 +4743,7 @@ fn handle_key_event(
                 state.input = format!("{} {}", parts[0], parts[1]);
                 state.cursor_pos = char_len(&state.input);
             }
+            auto_revert_method_on_body_clear(state);
             render(stdout, state)?;
         }
 
@@ -4750,6 +4754,7 @@ fn handle_key_event(
             state.method = "GET".to_string();
             state.uri = "/".to_string();
             state.body.clear();
+            state.method_auto_promoted = false;
             render(stdout, state)?;
         }
 
@@ -4760,6 +4765,7 @@ fn handle_key_event(
             state.method.clear();
             state.uri.clear();
             state.body.clear();
+            state.method_auto_promoted = false;
             render(stdout, state)?;
         }
 
@@ -5064,6 +5070,7 @@ fn handle_key_event(
                 let end_byte = char_to_byte_idx(&state.input, state.cursor_pos);
                 state.input.drain(start_byte..end_byte);
                 state.cursor_pos = new_pos;
+                auto_revert_method_on_body_clear(state);
                 render(stdout, state)?;
             }
         }
@@ -5073,6 +5080,7 @@ fn handle_key_event(
                 let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos - 1);
                 state.input.remove(byte_idx);
                 state.cursor_pos -= 1;
+                auto_revert_method_on_body_clear(state);
                 render(stdout, state)?;
             }
         }
@@ -5085,6 +5093,7 @@ fn handle_key_event(
                 let start_byte = char_to_byte_idx(&state.input, state.cursor_pos);
                 let end_byte = char_to_byte_idx(&state.input, new_pos);
                 state.input.drain(start_byte..end_byte);
+                auto_revert_method_on_body_clear(state);
                 render(stdout, state)?;
             }
         }
@@ -5095,6 +5104,7 @@ fn handle_key_event(
             if state.cursor_pos < input_char_len {
                 let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
                 state.input.remove(byte_idx);
+                auto_revert_method_on_body_clear(state);
                 render(stdout, state)?;
             }
         }
@@ -5105,6 +5115,7 @@ fn handle_key_event(
             if state.cursor_pos < input_char_len {
                 let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
                 state.input.truncate(byte_idx);
+                auto_revert_method_on_body_clear(state);
                 render(stdout, state)?;
             }
         }
@@ -5281,9 +5292,14 @@ fn apply_identifier_index(before: &str, kv: &str) -> String {
     match before.rfind('/') {
         Some(p) => {
             let segment = &before[p + 1..];
+            // A segment counts as a replaceable identifier slot only when it's a
+            // plain `key=value` — an `=` inside an operator expression (e.g.
+            // `people~where(name=Joe)`) must not be replaced, only appended to.
+            let is_identifier_slot =
+                segment.contains('=') && !segment.contains('~') && !segment.contains('(');
             if segment.is_empty() {
                 format!("{}{}", before, kv)
-            } else if segment.contains('=') {
+            } else if is_identifier_slot {
                 format!("{}{}", &before[..=p], kv)
             } else {
                 format!("{}/{}", before, kv)
@@ -5304,6 +5320,11 @@ fn paste_in_index_mode(input: &str, cursor_pos: usize) -> bool {
         return false;
     }
     let byte_idx = char_to_byte_idx(input, cursor_pos);
+    // The cursor must sit at the END of its token (next char is whitespace or
+    // end of input) — expanding mid-token would splice text into the URI.
+    if !input[byte_idx..].chars().next().map_or(true, |c| c.is_whitespace()) {
+        return false;
+    }
     let before_cursor = &input[..byte_idx];
     let current_token = before_cursor.rsplit(char::is_whitespace).next().unwrap_or("");
     current_token.contains('/')
@@ -5321,6 +5342,18 @@ fn paste_starts_with_method(paste: &str) -> bool {
     }
 }
 
+/// Uppercase the leading method token of a request line (e.g. `get /x` →
+/// `GET /x`), matching how typed promotion always writes uppercase methods.
+fn uppercase_method_token(line: &str) -> String {
+    let mut out = line.to_string();
+    let trimmed = out.trim_start();
+    let offset = out.len() - trimmed.len();
+    let end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+    let upper = trimmed[..end].to_uppercase();
+    out.replace_range(offset..offset + end, &upper);
+    out
+}
+
 /// Handle a bracketed-paste event into the URL/input field.
 ///
 /// When the cursor sits outside any open `{}`/`[]` body, we try to expand the
@@ -5330,10 +5363,10 @@ fn paste_starts_with_method(paste: &str) -> bool {
 ///
 /// In every other case the paste is inserted verbatim — so writing real JSON
 /// request bodies still works exactly as before.
-fn handle_paste(
+fn handle_paste<W: Write>(
     state: &mut AppState,
     paste: &str,
-    stdout: &mut io::Stdout,
+    stdout: &mut W,
 ) -> io::Result<()> {
     let inside_body = cursor_inside_brackets(&state.input, state.cursor_pos);
 
@@ -5343,8 +5376,11 @@ fn handle_paste(
     // duplicated method. Method detection is skipped inside a body so a JSON
     // string beginning with "GET " is pasted verbatim.
     if !inside_body && paste_starts_with_method(paste) {
-        state.input = paste.trim_end().to_string();
+        // Normalize the method to uppercase, like typed promotion does.
+        state.input = uppercase_method_token(paste.trim_end());
         state.cursor_pos = char_len(&state.input);
+        // Pasting a full request line is an explicit method choice.
+        state.method_auto_promoted = false;
         state.status_msg.clear();
         state.status_msg_at = None;
         render(stdout, state)?;
@@ -5412,6 +5448,21 @@ fn handle_paste(
 
     state.input.insert_str(byte_idx, &insert_text);
     state.cursor_pos += char_len(&insert_text);
+
+    // Pasting a body at the first-body position promotes GET → PUT, matching the
+    // typing behavior (`>` redirects excluded). The paste's own leading whitespace
+    // can serve as the URI/body separator. No array `[` auto-wrap on paste — a
+    // pasted body is already complete.
+    if !inside_body {
+        let lead_ws = insert_text.len() - insert_text.trim_start().len();
+        if let Some(first) = insert_text.trim_start().chars().next() {
+            if first != '>' {
+                let delta = promote_method_prefix(state, byte_idx + lead_ws);
+                state.cursor_pos = (state.cursor_pos as i64 + delta).max(0) as usize;
+            }
+        }
+    }
+
     state.status_msg.clear();
     state.status_msg_at = None;
 
@@ -5482,6 +5533,8 @@ fn parse_input(state: &mut AppState, input: &str) {
 fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<()> {
     // Clear stashed body since a request was sent
     state.stashed_body.clear();
+    // A sent request finalizes the method choice — no auto-revert afterwards.
+    state.method_auto_promoted = false;
     // Clear splash tracking since we're printing output
     state.last_was_splash = false;
 
@@ -5925,38 +5978,90 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     Ok(())
 }
 
+/// Core of body auto-promotion. If the text before byte offset `body_start` is
+/// exactly `GET <uri> ` (method + URI + separating whitespace) or `<uri> `
+/// (URI-only line, implicit GET), rewrite the method to PUT — replacing the GET
+/// token or prepending `PUT ` — since a body implies a write. Also arms the
+/// ctrl+space cycle window (so an immediate cycle goes PUT → PATCH instead of
+/// resetting to GET) and marks the promotion as automatic (so clearing the body
+/// reverts to GET). Returns the change in the input's char length (0 = no
+/// promotion).
+fn promote_method_prefix(state: &mut AppState, body_start: usize) -> i64 {
+    let before = &state.input[..body_start];
+    // There must be separating whitespace between the URI and the body.
+    if !before.ends_with(char::is_whitespace) {
+        return 0;
+    }
+    let tokens: Vec<&str> = before.split_whitespace().collect();
+    let trimmed_start = state.input.len() - state.input.trim_start().len();
+    let delta: i64 = match tokens.len() {
+        2 if tokens[0].to_uppercase() == "GET" => {
+            // Replace the leading method token (preserving its position) with PUT.
+            let method_len = tokens[0].len();
+            state.input.replace_range(trimmed_start..trimmed_start + method_len, "PUT");
+            3 - method_len as i64
+        }
+        1 if tokens[0].starts_with('/') => {
+            // URI-only line (implicit GET): prepend an explicit PUT.
+            state.input.insert_str(trimmed_start, "PUT ");
+            4
+        }
+        _ => return 0,
+    };
+    state.method = "PUT".to_string();
+    state.method_auto_promoted = true;
+    state.last_method_cycle = Some(std::time::Instant::now());
+    delta
+}
+
 /// When the user starts typing a request body, automatically promote the method
 /// from GET to PUT, since a body implies a write. Fires when `typed` is the first
 /// non-whitespace character of the body section — i.e. the text before it is
-/// exactly `GET <uri> ` (method + URI + a separating space). The `>` outfile
+/// exactly `GET <uri> ` (or `<uri> ` for a URI-only line). The `>` outfile
 /// redirect operator is excluded, as it begins an output redirect, not a body.
-/// The `@` infile prefix is also excluded, as it begins a file reference.
+/// The `@` infile prefix DOES promote: at the body position it always denotes a
+/// file-reference request body (`PUT /people @data.json`), which implies a write
+/// just like a literal JSON body.
 fn auto_promote_method_on_body_start(state: &mut AppState, typed: char) {
-    if typed.is_whitespace() || typed == '>' || typed == '@' {
+    if typed.is_whitespace() || typed == '>' {
         return;
     }
     if state.cursor_pos == 0 {
         return;
     }
     let typed_byte = char_to_byte_idx(&state.input, state.cursor_pos - 1);
-    let before = &state.input[..typed_byte];
-    // There must be a separating space between the URI and the body char.
-    if !before.ends_with(char::is_whitespace) {
-        return;
-    }
-    // Before the body, exactly METHOD + URI must be present, with method == GET.
-    let tokens: Vec<&str> = before.split_whitespace().collect();
-    if tokens.len() != 2 || tokens[0].to_uppercase() != "GET" {
-        return;
-    }
-    // Replace the leading method token (preserving its position) with PUT.
-    let trimmed_start = state.input.len() - state.input.trim_start().len();
-    let method_len = tokens[0].len();
-    state.input.replace_range(trimmed_start..trimmed_start + method_len, "PUT");
-    // Keep the cursor aligned if the method length changed (e.g. lowercase input).
-    let delta = 3i64 - method_len as i64;
+    let delta = promote_method_prefix(state, typed_byte);
     state.cursor_pos = (state.cursor_pos as i64 + delta).max(0) as usize;
-    state.method = "PUT".to_string();
+}
+
+/// Revert an automatic GET→PUT promotion once the body is gone again: if the
+/// current PUT came from auto-promotion and nothing follows the URI anymore,
+/// rewrite the method back to GET. Called after deletion/clear operations. A
+/// manual method change (ctrl+space, ctrl+g, paste-replace, …) clears the flag,
+/// so explicitly chosen methods are never reverted.
+fn auto_revert_method_on_body_clear(state: &mut AppState) {
+    if !state.method_auto_promoted {
+        return;
+    }
+    let tokens: Vec<&str> = state.input.split_whitespace().collect();
+    if tokens.is_empty() {
+        state.method_auto_promoted = false;
+        return;
+    }
+    if tokens[0].to_uppercase() != "PUT" {
+        // The method changed some other way; the promotion no longer applies.
+        state.method_auto_promoted = false;
+        return;
+    }
+    if tokens.len() > 2 {
+        return; // body still present
+    }
+    // Replace the leading PUT with GET (same length — cursor stays aligned).
+    let trimmed_start = state.input.len() - state.input.trim_start().len();
+    let put_len = tokens[0].len();
+    state.input.replace_range(trimmed_start..trimmed_start + put_len, "GET");
+    state.method = "GET".to_string();
+    state.method_auto_promoted = false;
 }
 
 /// When the user starts typing a body on a PUT/PATCH to an array endpoint, and
@@ -6001,12 +6106,40 @@ fn auto_wrap_array_body(state: &mut AppState, typed: char) {
 }
 
 fn cycle_method(state: &mut AppState) {
-    let parts: Vec<&str> = state.input.split_whitespace().collect();
-    if parts.is_empty() {
+    // Split into (method, uri, raw body) preserving the body verbatim — a
+    // token-join here would flatten multi-line JSON bodies into one line.
+    let methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+    let trimmed = state.input.trim_start();
+    if trimmed.trim().is_empty() {
         return;
     }
+    let first_end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+    let first = &trimmed[..first_end];
+    let first_upper = first.to_uppercase();
 
-    let current = parts[0].to_uppercase();
+    let (current, uri, body) = if methods.contains(&first_upper.as_str()) {
+        let after_method = trimmed[first_end..].trim_start();
+        if after_method.is_empty() {
+            (first_upper, "/".to_string(), String::new())
+        } else {
+            let uri_end = after_method.find(char::is_whitespace).unwrap_or(after_method.len());
+            let uri = after_method[..uri_end].to_string();
+            // Preserve the body verbatim; trim only the separating spaces/tabs.
+            let body = after_method[uri_end..]
+                .trim_start_matches(|c: char| c == ' ' || c == '\t')
+                .to_string();
+            (first_upper, uri, body)
+        }
+    } else if first.starts_with('/') {
+        // URI-only line: implicit GET.
+        let body = trimmed[first_end..]
+            .trim_start_matches(|c: char| c == ' ' || c == '\t')
+            .to_string();
+        ("GET".to_string(), first.to_string(), body)
+    } else {
+        return;
+    };
+    let body = if body.trim().is_empty() { String::new() } else { body };
 
     // If not on GET and >5s since last cycle, reset to GET instead of cycling
     let stale = state.last_method_cycle
@@ -6022,14 +6155,10 @@ fn cycle_method(state: &mut AppState) {
         }
     };
 
-    // Extract URI and body from current input
-    let uri = if parts.len() > 1 { parts[1] } else { "/" };
-    let body_part = if parts.len() > 2 { parts[2..].join(" ") } else { String::new() };
-
-    // Switching TO GET: stash the body and hide it
+    // Switching TO GET: stash the body (verbatim) and hide it
     if new_method == "GET" && current != "GET" {
-        if !body_part.is_empty() {
-            state.stashed_body = body_part;
+        if !body.is_empty() {
+            state.stashed_body = body;
         }
         state.input = format!("{} {}", new_method, uri);
     }
@@ -6037,46 +6166,18 @@ fn cycle_method(state: &mut AppState) {
     else if current == "GET" && !state.stashed_body.is_empty() {
         state.input = format!("{} {} {}", new_method, uri, state.stashed_body);
     }
-    // Normal case
-    else {
-        state.input = format!("{} {}", new_method, if parts.len() > 1 { parts[1..].join(" ") } else { "/".to_string() });
+    // Normal case: carry the body over verbatim
+    else if body.is_empty() {
+        state.input = format!("{} {}", new_method, uri);
+    } else {
+        state.input = format!("{} {} {}", new_method, uri, body);
     }
 
     state.last_method_cycle = Some(std::time::Instant::now());
     state.cursor_pos = char_len(&state.input);
     state.method = new_method.to_string();
-}
-
-fn cycle_method_reverse(state: &mut AppState) {
-    let parts: Vec<&str> = state.input.split_whitespace().collect();
-    if parts.is_empty() {
-        return;
-    }
-
-    let current = parts[0].to_uppercase();
-    let new_method = match current.as_str() {
-        "GET" => "POST",
-        "POST" => "PATCH",
-        "PATCH" => "PUT",
-        _ => "GET",
-    };
-
-    let uri = if parts.len() > 1 { parts[1] } else { "/" };
-    let body_part = if parts.len() > 2 { parts[2..].join(" ") } else { String::new() };
-
-    if new_method == "GET" && current != "GET" {
-        if !body_part.is_empty() {
-            state.stashed_body = body_part;
-        }
-        state.input = format!("{} {}", new_method, uri);
-    } else if current == "GET" && !state.stashed_body.is_empty() {
-        state.input = format!("{} {} {}", new_method, uri, state.stashed_body);
-    } else {
-        state.input = format!("{} {}", new_method, if parts.len() > 1 { parts[1..].join(" ") } else { "/".to_string() });
-    }
-
-    state.cursor_pos = char_len(&state.input);
-    state.method = new_method.to_string();
+    // Cycling is an explicit method choice — never auto-revert it.
+    state.method_auto_promoted = false;
 }
 
 // Read a line of input in raw mode (already in raw mode when called from interactive)
@@ -6666,7 +6767,7 @@ fn flash_rulers(stdout: &mut io::Stdout, state: &mut AppState, color: &str, ms: 
     Ok(())
 }
 
-fn render(stdout: &mut io::Stdout, state: &mut AppState) -> io::Result<()> {
+fn render<W: Write>(stdout: &mut W, state: &mut AppState) -> io::Result<()> {
     let width = state.width as usize;
     state.prev_width = state.width;
 
@@ -9865,16 +9966,17 @@ mod tests {
     }
 
     #[test]
-    fn auto_promote_skips_at_infile_prefix() {
-        // Typing `@` as the first body char starts a file reference, not a
-        // literal body — the method must stay GET.
+    fn auto_promote_fires_on_at_infile_prefix() {
+        // `@` at the body position is a file-reference request body
+        // (`@data.json`), which implies a write — it must promote GET → PUT
+        // exactly like a literal body character.
         let mut state = AppState::new(Config::default());
         state.input = "GET /elements/properties @".to_string();
         state.cursor_pos = char_len(&state.input);
         state.method = "GET".to_string();
         auto_promote_method_on_body_start(&mut state, '@');
-        assert_eq!(state.input, "GET /elements/properties @");
-        assert_eq!(state.method, "GET");
+        assert_eq!(state.input, "PUT /elements/properties @");
+        assert_eq!(state.method, "PUT");
 
         // Sanity: a `{` body char still promotes GET → PUT.
         let mut state = AppState::new(Config::default());
@@ -9884,6 +9986,431 @@ mod tests {
         auto_promote_method_on_body_start(&mut state, '{');
         assert_eq!(state.input, "PUT /elements/properties {");
         assert_eq!(state.method, "PUT");
+
+        // The `>` outfile redirect must still NOT promote.
+        let mut state = AppState::new(Config::default());
+        state.input = "GET /elements/properties >".to_string();
+        state.cursor_pos = char_len(&state.input);
+        state.method = "GET".to_string();
+        auto_promote_method_on_body_start(&mut state, '>');
+        assert_eq!(state.input, "GET /elements/properties >");
+        assert_eq!(state.method, "GET");
+    }
+
+    #[test]
+    fn auto_promote_uri_only_prepends_put() {
+        // A URI-only line (implicit GET) gets an explicit `PUT ` prepended when a
+        // body is started.
+        let mut state = AppState::new(Config::default());
+        state.input = "/people {".to_string();
+        state.cursor_pos = char_len(&state.input);
+        state.method = "GET".to_string();
+        auto_promote_method_on_body_start(&mut state, '{');
+        assert_eq!(state.input, "PUT /people {");
+        assert_eq!(state.method, "PUT");
+        assert_eq!(state.cursor_pos, char_len("PUT /people {"));
+        assert!(state.method_auto_promoted);
+    }
+
+    #[test]
+    fn auto_promote_arms_cycle_window() {
+        // Immediately cycling after an auto-promotion must go PUT → PATCH (the
+        // promotion arms the ctrl+space window), not reset to GET and stash the
+        // just-typed body.
+        let mut state = AppState::new(Config::default());
+        state.input = "GET /people {".to_string();
+        state.cursor_pos = char_len(&state.input);
+        state.method = "GET".to_string();
+        auto_promote_method_on_body_start(&mut state, '{');
+        assert_eq!(state.input, "PUT /people {");
+        assert!(state.last_method_cycle.is_some());
+        cycle_method(&mut state);
+        assert_eq!(state.input, "PATCH /people {");
+        assert_eq!(state.method, "PATCH");
+    }
+
+    #[test]
+    fn auto_revert_on_body_clear() {
+        // Auto-promoted PUT reverts to GET when the body is deleted again.
+        let mut state = AppState::new(Config::default());
+        state.input = "GET /people {".to_string();
+        state.cursor_pos = char_len(&state.input);
+        state.method = "GET".to_string();
+        auto_promote_method_on_body_start(&mut state, '{');
+        assert_eq!(state.input, "PUT /people {");
+        // Simulate backspace deleting the `{`.
+        state.input = "PUT /people ".to_string();
+        state.cursor_pos = char_len(&state.input);
+        auto_revert_method_on_body_clear(&mut state);
+        assert_eq!(state.input, "GET /people ");
+        assert_eq!(state.method, "GET");
+        assert!(!state.method_auto_promoted);
+
+        // A manually chosen PUT (flag not set) is never reverted.
+        let mut state = AppState::new(Config::default());
+        state.input = "PUT /people ".to_string();
+        state.cursor_pos = char_len(&state.input);
+        state.method = "PUT".to_string();
+        auto_revert_method_on_body_clear(&mut state);
+        assert_eq!(state.input, "PUT /people ");
+        assert_eq!(state.method, "PUT");
+
+        // Body still present → no revert yet.
+        let mut state = AppState::new(Config::default());
+        state.input = "GET /people {".to_string();
+        state.cursor_pos = char_len(&state.input);
+        state.method = "GET".to_string();
+        auto_promote_method_on_body_start(&mut state, '{');
+        state.input = "PUT /people {\"a\"".to_string();
+        auto_revert_method_on_body_clear(&mut state);
+        assert_eq!(state.method, "PUT");
+        assert!(state.method_auto_promoted);
+    }
+
+    #[test]
+    fn promote_method_prefix_for_paste_positions() {
+        // Paste of a body at the first-body position promotes (same rule as
+        // typing): before-text is `GET <uri> `.
+        let mut state = AppState::new(Config::default());
+        state.input = "GET /people {\"name\":\"Joe\"}".to_string();
+        let body_start = "GET /people ".len();
+        let delta = promote_method_prefix(&mut state, body_start);
+        assert_eq!(state.input, "PUT /people {\"name\":\"Joe\"}");
+        assert_eq!(delta, 0); // GET→PUT, same length
+
+        // URI-only + pasted body → prepend PUT (delta +4 chars).
+        let mut state = AppState::new(Config::default());
+        state.input = "/people {\"a\":1}".to_string();
+        let delta = promote_method_prefix(&mut state, "/people ".len());
+        assert_eq!(state.input, "PUT /people {\"a\":1}");
+        assert_eq!(delta, 4);
+
+        // Mid-URI position (no separating whitespace) must NOT promote.
+        let mut state = AppState::new(Config::default());
+        state.input = "GET /people".to_string();
+        assert_eq!(promote_method_prefix(&mut state, "GET /peo".len()), 0);
+        assert_eq!(state.input, "GET /people");
+
+        // Non-GET methods are never touched.
+        let mut state = AppState::new(Config::default());
+        state.input = "POST /people {".to_string();
+        assert_eq!(promote_method_prefix(&mut state, "POST /people ".len()), 0);
+        assert_eq!(state.input, "POST /people {");
+    }
+
+    #[test]
+    fn cycle_method_preserves_multiline_body() {
+        // Cycling methods must not flatten a multi-line body into one line.
+        let mut state = AppState::new(Config::default());
+        let body = "{\n  \"name\": \"Joe\"\n}";
+        state.input = format!("PUT /people {}", body);
+        state.method = "PUT".to_string();
+        state.last_method_cycle = Some(std::time::Instant::now()); // within window
+        cycle_method(&mut state);
+        assert_eq!(state.input, format!("PATCH /people {}", body));
+
+        // Stash on switch to GET keeps the body verbatim, and restore brings the
+        // newlines back.
+        state.last_method_cycle = Some(std::time::Instant::now());
+        cycle_method(&mut state); // PATCH → POST
+        state.last_method_cycle = Some(std::time::Instant::now());
+        cycle_method(&mut state); // POST → GET (stash)
+        assert_eq!(state.input, "GET /people");
+        assert_eq!(state.stashed_body, body);
+        state.last_method_cycle = Some(std::time::Instant::now());
+        cycle_method(&mut state); // GET → PUT (restore)
+        assert_eq!(state.input, format!("PUT /people {}", body));
+    }
+
+    #[test]
+    fn cycle_method_uri_only_keeps_uri() {
+        // A URI-only line cycles as implicit GET and must not lose the URI.
+        let mut state = AppState::new(Config::default());
+        state.input = "/people".to_string();
+        cycle_method(&mut state);
+        assert_eq!(state.input, "PUT /people");
+    }
+
+    #[test]
+    fn uppercase_method_token_normalizes() {
+        assert_eq!(uppercase_method_token("get /x"), "GET /x");
+        assert_eq!(uppercase_method_token("Put /people {\"a\":1}"), "PUT /people {\"a\":1}");
+        assert_eq!(uppercase_method_token("  delete /y"), "  DELETE /y");
+        assert_eq!(uppercase_method_token("GET /x"), "GET /x");
+    }
+
+    /// Test state with a fixed width so render (used by handle_paste) is happy.
+    fn test_state() -> AppState {
+        let mut state = AppState::new(Config::default());
+        state.width = 80;
+        state
+    }
+
+    /// A write sink for handle_paste tests — keeps ANSI render output out of the
+    /// test terminal.
+    fn sink() -> Vec<u8> {
+        Vec::new()
+    }
+
+    #[test]
+    fn auto_wrap_array_body_guards() {
+        // Self-typed `[` → no extra bracket.
+        let mut state = test_state();
+        state.array_endpoints.insert("/people".to_string());
+        state.input = "PUT /people [".to_string();
+        state.cursor_pos = char_len(&state.input);
+        auto_wrap_array_body(&mut state, '[');
+        assert_eq!(state.input, "PUT /people [");
+
+        // Non-array endpoint → no wrap.
+        let mut state = test_state();
+        state.input = "PUT /thing {".to_string();
+        state.cursor_pos = char_len(&state.input);
+        auto_wrap_array_body(&mut state, '{');
+        assert_eq!(state.input, "PUT /thing {");
+
+        // POST → no wrap (matches the `{ ` object ghost semantics, not array).
+        let mut state = test_state();
+        state.array_endpoints.insert("/people".to_string());
+        state.input = "POST /people {".to_string();
+        state.cursor_pos = char_len(&state.input);
+        auto_wrap_array_body(&mut state, '{');
+        assert_eq!(state.input, "POST /people {");
+
+        // Second body character → no wrap (only the first body char triggers).
+        let mut state = test_state();
+        state.array_endpoints.insert("/people".to_string());
+        state.input = "PUT /people {a".to_string();
+        state.cursor_pos = char_len(&state.input);
+        auto_wrap_array_body(&mut state, 'a');
+        assert_eq!(state.input, "PUT /people {a");
+
+        // PATCH on an array endpoint wraps like PUT.
+        let mut state = test_state();
+        state.array_endpoints.insert("/people".to_string());
+        state.input = "PATCH /people {".to_string();
+        state.cursor_pos = char_len(&state.input);
+        auto_wrap_array_body(&mut state, '{');
+        assert_eq!(state.input, "PATCH /people [{");
+    }
+
+    #[test]
+    fn auto_promote_then_wrap_chain_on_uri_only() {
+        // The key handler calls promote then wrap on the same keystroke: a
+        // URI-only line typed `{` on an array endpoint gets both.
+        let mut state = test_state();
+        state.array_endpoints.insert("/people".to_string());
+        state.input = "/people {".to_string();
+        state.cursor_pos = char_len(&state.input);
+        state.method = "GET".to_string();
+        auto_promote_method_on_body_start(&mut state, '{');
+        auto_wrap_array_body(&mut state, '{');
+        assert_eq!(state.input, "PUT /people [{");
+        assert_eq!(state.method, "PUT");
+        assert_eq!(state.cursor_pos, char_len("PUT /people [{"));
+    }
+
+    #[test]
+    fn promote_method_prefix_edge_cases() {
+        // Lowercase `get` is recognized and replaced with uppercase PUT.
+        let mut state = test_state();
+        state.input = "get /x {".to_string();
+        let delta = promote_method_prefix(&mut state, "get /x ".len());
+        assert_eq!(state.input, "PUT /x {");
+        assert_eq!(delta, 0);
+
+        // Bare method with no URI → nothing to promote.
+        let mut state = test_state();
+        state.input = "GET {".to_string();
+        assert_eq!(promote_method_prefix(&mut state, "GET ".len()), 0);
+        assert_eq!(state.input, "GET {");
+
+        // Body already present (three tokens before the position) → no promote.
+        let mut state = test_state();
+        state.input = "GET /x { a".to_string();
+        assert_eq!(promote_method_prefix(&mut state, "GET /x { ".len()), 0);
+        assert_eq!(state.input, "GET /x { a");
+    }
+
+    #[test]
+    fn auto_revert_flag_hygiene() {
+        // Fully cleared input drops the flag without touching anything.
+        let mut state = test_state();
+        state.method_auto_promoted = true;
+        state.input = String::new();
+        auto_revert_method_on_body_clear(&mut state);
+        assert!(!state.method_auto_promoted);
+        assert_eq!(state.input, "");
+
+        // Method no longer PUT (e.g. user cycled onward) → flag drops, method
+        // and input stay as the user chose.
+        let mut state = test_state();
+        state.method_auto_promoted = true;
+        state.method = "PATCH".to_string();
+        state.input = "PATCH /people ".to_string();
+        auto_revert_method_on_body_clear(&mut state);
+        assert!(!state.method_auto_promoted);
+        assert_eq!(state.input, "PATCH /people ");
+        assert_eq!(state.method, "PATCH");
+    }
+
+    #[test]
+    fn cycle_method_stale_resets_to_get() {
+        // >5s since the last cycle on a non-GET → reset to GET, stashing the body.
+        let mut state = test_state();
+        state.input = "PUT /people {\"a\":1}".to_string();
+        state.method = "PUT".to_string();
+        state.last_method_cycle = std::time::Instant::now().checked_sub(Duration::from_secs(6));
+        cycle_method(&mut state);
+        assert_eq!(state.input, "GET /people");
+        assert_eq!(state.method, "GET");
+        assert_eq!(state.stashed_body, "{\"a\":1}");
+
+        // No prior cycle timestamp at all behaves the same (stale).
+        let mut state = test_state();
+        state.input = "PUT /people {\"a\":1}".to_string();
+        state.method = "PUT".to_string();
+        state.last_method_cycle = None;
+        cycle_method(&mut state);
+        assert_eq!(state.input, "GET /people");
+        assert_eq!(state.stashed_body, "{\"a\":1}");
+    }
+
+    #[test]
+    fn cycle_method_clears_flag_and_handles_other_methods() {
+        // Cycling is an explicit choice — it must clear the auto-promotion flag.
+        let mut state = test_state();
+        state.input = "PUT /people {".to_string();
+        state.method = "PUT".to_string();
+        state.method_auto_promoted = true;
+        state.last_method_cycle = Some(std::time::Instant::now());
+        cycle_method(&mut state);
+        assert_eq!(state.method, "PATCH");
+        assert!(!state.method_auto_promoted);
+
+        // DELETE (not in the cycle set) falls back to GET, stashing the body.
+        let mut state = test_state();
+        state.input = "DELETE /x {\"a\":1}".to_string();
+        state.method = "DELETE".to_string();
+        state.last_method_cycle = Some(std::time::Instant::now());
+        cycle_method(&mut state);
+        assert_eq!(state.input, "GET /x");
+        assert_eq!(state.stashed_body, "{\"a\":1}");
+
+        // Garbage input (no method, no URI) is a no-op.
+        let mut state = test_state();
+        state.input = "hello world".to_string();
+        cycle_method(&mut state);
+        assert_eq!(state.input, "hello world");
+    }
+
+    #[test]
+    fn handle_paste_method_line_replaces_uppercase_and_clears_flag() {
+        let mut state = test_state();
+        state.input = "GET /".to_string();
+        state.cursor_pos = char_len(&state.input);
+        state.method_auto_promoted = true;
+        let mut out = sink();
+        handle_paste(&mut state, "get /people/com.test=1", &mut out).unwrap();
+        assert_eq!(state.input, "GET /people/com.test=1");
+        assert_eq!(state.cursor_pos, char_len(&state.input));
+        assert!(!state.method_auto_promoted);
+    }
+
+    #[test]
+    fn handle_paste_body_paste_promotes_get() {
+        // Pasting a JSON body at the body position promotes GET → PUT.
+        let mut state = test_state();
+        state.input = "GET /people ".to_string();
+        state.cursor_pos = char_len(&state.input);
+        let mut out = sink();
+        handle_paste(&mut state, "{\"a\":1}", &mut out).unwrap();
+        assert_eq!(state.input, "PUT /people {\"a\":1}");
+        assert_eq!(state.method, "PUT");
+        assert!(state.method_auto_promoted);
+        assert_eq!(state.cursor_pos, char_len(&state.input));
+
+        // Pasting an @file reference promotes the same way.
+        let mut state = test_state();
+        state.input = "GET /people ".to_string();
+        state.cursor_pos = char_len(&state.input);
+        let mut out = sink();
+        handle_paste(&mut state, "@data.json", &mut out).unwrap();
+        assert_eq!(state.input, "PUT /people @data.json");
+        assert_eq!(state.method, "PUT");
+
+        // A pasted `>` redirect is not a body — no promotion.
+        let mut state = test_state();
+        state.input = "GET /people ".to_string();
+        state.cursor_pos = char_len(&state.input);
+        let mut out = sink();
+        handle_paste(&mut state, "> out.json", &mut out).unwrap();
+        assert_eq!(state.input, "GET /people > out.json");
+        assert_eq!(state.method, "GET");
+    }
+
+    #[test]
+    fn handle_paste_double_slash_guard() {
+        let mut state = test_state();
+        state.input = "GET /".to_string();
+        state.cursor_pos = char_len(&state.input);
+        let mut out = sink();
+        handle_paste(&mut state, "/products/x", &mut out).unwrap();
+        assert_eq!(state.input, "GET /products/x");
+        assert_eq!(state.method, "GET"); // path paste is not a body — no promote
+    }
+
+    #[test]
+    fn handle_paste_identifier_cycle_window() {
+        let multi = r#"{"identifiers":{"com.a":"1","com.b":"2"}}"#;
+
+        // First paste expands to the first identifier; re-pasting the same JSON
+        // cycles the slot in place — never accumulates segments.
+        let mut state = test_state();
+        state.input = "GET /people".to_string();
+        state.cursor_pos = char_len(&state.input);
+        let mut out = sink();
+        handle_paste(&mut state, multi, &mut out).unwrap();
+        assert_eq!(state.input, "GET /people/com.a=1");
+        handle_paste(&mut state, multi, &mut out).unwrap();
+        assert_eq!(state.input, "GET /people/com.b=2");
+        handle_paste(&mut state, multi, &mut out).unwrap();
+        assert_eq!(state.input, "GET /people/com.a=1"); // wraps around
+
+        // Inside an open JSON body the same paste inserts verbatim (no expansion).
+        let mut state = test_state();
+        state.input = "PUT /x {\"a\":".to_string();
+        state.cursor_pos = char_len(&state.input);
+        let mut out = sink();
+        handle_paste(&mut state, multi, &mut out).unwrap();
+        assert!(state.input.contains("identifiers"), "got {:?}", state.input);
+        assert!(!state.input.contains("com.a=1"));
+    }
+
+    #[test]
+    fn find_body_start_basics() {
+        // Method + URI + body → offset of the body.
+        assert_eq!(find_body_start("GET /people {\"a\":1}"), Some(12));
+        // Lowercase method is recognized too.
+        assert_eq!(find_body_start("get /x {\"a\":1}"), Some(7));
+        // URI-only line with a body.
+        assert_eq!(find_body_start("/people {"), Some(8));
+        // No body → None.
+        assert_eq!(find_body_start("GET /people"), None);
+    }
+
+    #[test]
+    fn apply_identifier_index_without_slash_adds_separator() {
+        // Fallback branch: no `/` anywhere before the cursor.
+        assert_eq!(apply_identifier_index("GET", "com.a=1"), "GET/com.a=1");
+    }
+
+    #[test]
+    fn evaluate_url_gate_reports_empty_base_url() {
+        let conds = vec![UrlCondition::Has("localhost".to_string())];
+        let err = evaluate_url_gate(&conds, "").unwrap_err();
+        assert!(err.contains("(no base URL)"), "got: {err}");
+        assert!(err.contains("url has localhost"), "got: {err}");
     }
 
     #[test]
@@ -9928,6 +10455,15 @@ mod tests {
         // No URI yet (bare method) → not index mode.
         let s = "GET ";
         assert!(!paste_in_index_mode(s, char_len(s)));
+
+        // Cursor MID-token (inside the URI) → not index mode; expanding there
+        // would splice text into the URI (`/peo|ple` → `/peo/key=valple`).
+        let s = "GET /people";
+        assert!(!paste_in_index_mode(s, char_len("GET /peo")));
+        // Cursor at end of URI token but followed by more input (body) is fine —
+        // the char right after the cursor is whitespace.
+        let s = "GET /people {\"a\":1}";
+        assert!(paste_in_index_mode(s, char_len("GET /people")));
     }
 
     #[test]
@@ -10041,6 +10577,21 @@ mod tests {
         assert_eq!(
             apply_identifier_index("GET /people/com.a=1/things/com.b=2", "com.c=3"),
             "GET /people/com.a=1/things/com.c=3"
+        );
+    }
+
+    #[test]
+    fn apply_identifier_index_preserves_operator_segments() {
+        // An `=` inside an operator expression is NOT an identifier slot — the
+        // segment must be preserved and the identifier appended after it.
+        assert_eq!(
+            apply_identifier_index("GET /people~where(name=Joe)", "com.foo=1"),
+            "GET /people~where(name=Joe)/com.foo=1"
+        );
+        // Operator chained onto an identifier segment: also append, never replace.
+        assert_eq!(
+            apply_identifier_index("GET /people/com.a=1~take(5)", "com.foo=1"),
+            "GET /people/com.a=1~take(5)/com.foo=1"
         );
     }
 

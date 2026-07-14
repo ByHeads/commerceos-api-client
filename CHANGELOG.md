@@ -1,5 +1,23 @@
 # Changelog
 
+## 3.0.3
+
+- **`@` file references at the body position promote `GET` → `PUT` again** (reverts half of 3.0.2): `@` at the body slot always denotes a file-reference request body (`GET /people @data.json` sends the file), which implies a write — so it now promotes exactly like `{`, `[`, or `"`. The other half stands: no `[` is auto-prepended before `@` on array endpoints, since the file already provides the full body shape.
+- **Auto-promotion now arms the ctrl+space cycle**: pressing ctrl+space right after a body auto-promotion cycles `PUT → PATCH` as specified, instead of resetting to GET and stashing the just-typed body.
+- **Auto-revert on body clear**: deleting the body after an automatic `GET → PUT` promotion reverts the method to GET (backspace, delete, word-delete, kill-to-end, and ctrl+x clear-body all trigger it). Manually chosen methods (ctrl+space, ctrl+g, pasted request lines) are never reverted.
+- **Pasting a body promotes too**: pasting a request body (JSON, `@file`, etc.) at the body position now promotes `GET → PUT`, matching the typing behavior. No `[` array auto-wrap on paste — a pasted body is already complete.
+- **URI-only lines promote**: starting a body on a URI-only line (`/people {`) prepends an explicit `PUT `.
+- **Identifier paste no longer destroys operator URIs**: an `=` inside an operator expression (e.g. `/people~where(name=Joe)`) is not treated as a replaceable identifier slot — the expanded identifier is appended as a new segment instead.
+- **Identifier paste requires the cursor at the end of the URI token**: pasting mid-token no longer splices `key=value` into the middle of the URI.
+- **ctrl+space preserves multi-line bodies**: cycling methods no longer flattens a multi-line JSON body into one line (stash/restore keeps it verbatim too), and cycling a URI-only line no longer loses the URI.
+- **Pasted request lines normalize the method to uppercase** (`get /x` → `GET /x`).
+- Removed the unused reverse method-cycle code path.
+
+## 3.0.2
+
+- **`@` file references are excluded from body auto-behaviors**: typing `@` as the first body character no longer promotes `GET` to `PUT` or prepends `[` on array endpoints, since `@` starts a file reference rather than a literal JSON body (e.g. `GET /elements/properties @file`).
+- **Paste at a body position inserts verbatim**: identifier expansion on paste now requires the cursor to be attached to the URI token (the current whitespace-delimited token contains `/`), not just any `/` earlier in the line. Pasting an object after `PUT /people ` now inserts it as the request body instead of mangling the URI.
+
 ## 3.0.1
 
 - **`sleep` and `url` gate directives in `.api` batch files**: `sleep N` pauses between requests (accepts `5`, `2s`, `500ms`, fractional). `url has <value>` (substring, `*value*`) and `url is <value>` (literal) declare allowed target environments — collected from anywhere in the file (and includes) and validated once, before any request, against the configured base URI. Multiple conditions form an allowlist (proceed if at least one matches); a non-matching base aborts the whole batch before sending, so test data can't reach production. `sleep` lines appear in the `-p` preview but don't count toward the request total.
