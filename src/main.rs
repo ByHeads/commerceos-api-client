@@ -5451,14 +5451,22 @@ fn handle_paste<W: Write>(
 
     // Pasting a body at the first-body position promotes GET → PUT, matching the
     // typing behavior (`>` redirects excluded). The paste's own leading whitespace
-    // can serve as the URI/body separator. No array `[` auto-wrap on paste — a
-    // pasted body is already complete.
+    // can serve as the URI/body separator. On an array endpoint, a complete pasted
+    // JSON body is then wrapped in `[` … `]` (both brackets — unlike typing, a
+    // pasted body isn't still being composed).
     if !inside_body {
         let lead_ws = insert_text.len() - insert_text.trim_start().len();
         if let Some(first) = insert_text.trim_start().chars().next() {
             if first != '>' {
                 let delta = promote_method_prefix(state, byte_idx + lead_ws);
                 state.cursor_pos = (state.cursor_pos as i64 + delta).max(0) as usize;
+                // Method tokens are ASCII, so the char delta equals the byte
+                // delta — shift the pasted span by it and try the array wrap.
+                let body_start = (byte_idx + lead_ws) as i64 + delta;
+                let body_end = (byte_idx + insert_text.len()) as i64 + delta;
+                if body_start >= 0 && body_end > body_start {
+                    wrap_pasted_array_body(state, body_start as usize, body_end as usize);
+                }
             }
         }
     }
@@ -6103,6 +6111,54 @@ fn auto_wrap_array_body(state: &mut AppState, typed: char) {
     // just after what was typed.
     state.input.insert(typed_byte, '[');
     state.cursor_pos += 1;
+}
+
+/// After a body has been PASTED at the first-body position of a PUT/PATCH to an
+/// array endpoint, wrap the pasted body in `[` … `]`. Unlike the typing variant
+/// (which inserts only the opening `[` because the user is still composing), a
+/// pasted body is complete, so both brackets are added:
+/// `GET /people ` + paste `{ "name": "Joe" }` → `PUT /people [{ "name": "Joe" }]`.
+///
+/// `body_start..body_end` is the byte span of the pasted text in `state.input`.
+/// Wraps only when the span is the whole body (exactly `METHOD URI ` before it),
+/// the method is PUT/PATCH, the URI is a known array endpoint, and the pasted
+/// text parses as a complete non-array JSON value — so already-array pastes stay
+/// untouched, and partial JSON or `@file` references are left alone.
+/// The cursor ends just after the inserted `]`.
+fn wrap_pasted_array_body(state: &mut AppState, body_start: usize, body_end: usize) {
+    if body_start >= body_end || body_end > state.input.len() {
+        return;
+    }
+    let before = &state.input[..body_start];
+    if !before.ends_with(char::is_whitespace) {
+        return;
+    }
+    let tokens: Vec<&str> = before.split_whitespace().collect();
+    if tokens.len() != 2 {
+        return;
+    }
+    let method = tokens[0].to_uppercase();
+    if method != "PUT" && method != "PATCH" {
+        return;
+    }
+    if !state.array_endpoints.contains(tokens[1]) {
+        return;
+    }
+    let body_trimmed = state.input[body_start..body_end].trim_end();
+    if body_trimmed.is_empty() {
+        return;
+    }
+    // Complete JSON only, and not already an array (covers `@file` too — it
+    // doesn't parse as JSON).
+    match serde_json::from_str::<Value>(body_trimmed) {
+        Ok(v) if !v.is_array() => {}
+        _ => return,
+    }
+    let close_at = body_start + body_trimmed.len();
+    state.input.insert(close_at, ']');
+    state.input.insert(body_start, '[');
+    // `[` insertion shifted the `]` one byte right; place the cursor after it.
+    state.cursor_pos = char_len(&state.input[..close_at + 2]);
 }
 
 fn cycle_method(state: &mut AppState) {
@@ -10347,6 +10403,102 @@ mod tests {
         handle_paste(&mut state, "> out.json", &mut out).unwrap();
         assert_eq!(state.input, "GET /people > out.json");
         assert_eq!(state.method, "GET");
+    }
+
+    #[test]
+    fn handle_paste_wraps_array_body_on_array_endpoint() {
+        // GET + pasted object on an array endpoint → promote AND full wrap.
+        let mut state = test_state();
+        state.array_endpoints.insert("/people".to_string());
+        state.input = "GET /people ".to_string();
+        state.cursor_pos = char_len(&state.input);
+        let mut out = sink();
+        handle_paste(&mut state, "{ \"name\": \"Joe\" }", &mut out).unwrap();
+        assert_eq!(state.input, "PUT /people [{ \"name\": \"Joe\" }]");
+        assert_eq!(state.method, "PUT");
+        assert_eq!(state.cursor_pos, char_len(&state.input)); // after `]`
+
+        // Manual PUT paste wraps the same way.
+        let mut state = test_state();
+        state.array_endpoints.insert("/people".to_string());
+        state.input = "PUT /people ".to_string();
+        state.cursor_pos = char_len(&state.input);
+        let mut out = sink();
+        handle_paste(&mut state, "{\"a\":1}", &mut out).unwrap();
+        assert_eq!(state.input, "PUT /people [{\"a\":1}]");
+
+        // PATCH wraps too.
+        let mut state = test_state();
+        state.array_endpoints.insert("/people".to_string());
+        state.input = "PATCH /people ".to_string();
+        state.cursor_pos = char_len(&state.input);
+        let mut out = sink();
+        handle_paste(&mut state, "{\"a\":1}", &mut out).unwrap();
+        assert_eq!(state.input, "PATCH /people [{\"a\":1}]");
+    }
+
+    #[test]
+    fn handle_paste_array_wrap_guards() {
+        // Already an array → promote only, no double wrap.
+        let mut state = test_state();
+        state.array_endpoints.insert("/people".to_string());
+        state.input = "GET /people ".to_string();
+        state.cursor_pos = char_len(&state.input);
+        let mut out = sink();
+        handle_paste(&mut state, "[{\"a\":1}]", &mut out).unwrap();
+        assert_eq!(state.input, "PUT /people [{\"a\":1}]");
+
+        // @file reference → promote only, never wrapped.
+        let mut state = test_state();
+        state.array_endpoints.insert("/people".to_string());
+        state.input = "GET /people ".to_string();
+        state.cursor_pos = char_len(&state.input);
+        let mut out = sink();
+        handle_paste(&mut state, "@data.json", &mut out).unwrap();
+        assert_eq!(state.input, "PUT /people @data.json");
+
+        // Non-array endpoint → promote only.
+        let mut state = test_state();
+        state.input = "GET /thing ".to_string();
+        state.cursor_pos = char_len(&state.input);
+        let mut out = sink();
+        handle_paste(&mut state, "{\"a\":1}", &mut out).unwrap();
+        assert_eq!(state.input, "PUT /thing {\"a\":1}");
+
+        // Partial JSON (still composing) → promote only, no wrap.
+        let mut state = test_state();
+        state.array_endpoints.insert("/people".to_string());
+        state.input = "GET /people ".to_string();
+        state.cursor_pos = char_len(&state.input);
+        let mut out = sink();
+        handle_paste(&mut state, "{\"a\":", &mut out).unwrap();
+        assert_eq!(state.input, "PUT /people {\"a\":");
+
+        // POST is never array-wrapped (object endpoints take a single object).
+        let mut state = test_state();
+        state.array_endpoints.insert("/people".to_string());
+        state.input = "POST /people ".to_string();
+        state.cursor_pos = char_len(&state.input);
+        let mut out = sink();
+        handle_paste(&mut state, "{\"a\":1}", &mut out).unwrap();
+        assert_eq!(state.input, "POST /people {\"a\":1}");
+    }
+
+    #[test]
+    fn handle_paste_array_wrap_multiline_and_trailing_ws() {
+        // Multi-line pasted JSON wraps around the whole block; a trailing
+        // newline stays outside the `]`. Non-ASCII content keeps the cursor math
+        // correct (char vs byte).
+        let mut state = test_state();
+        state.array_endpoints.insert("/people".to_string());
+        state.input = "GET /people ".to_string();
+        state.cursor_pos = char_len(&state.input);
+        let mut out = sink();
+        handle_paste(&mut state, "{\n  \"name\": \"Zoë\"\n}\n", &mut out).unwrap();
+        assert_eq!(state.input, "PUT /people [{\n  \"name\": \"Zoë\"\n}]\n");
+        // Cursor sits right after the `]`.
+        let after_bracket = state.input.rfind(']').unwrap() + 1;
+        assert_eq!(state.cursor_pos, char_len(&state.input[..after_bracket]));
     }
 
     #[test]
