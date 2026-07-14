@@ -1,11 +1,15 @@
 # Changelog
 
+## 3.0.4
+
+- **Pasted bodies are array-wrapped on array endpoints**: pasting a complete JSON body at the body position of a PUT/PATCH to an array endpoint wraps it in `[` … `]` (both brackets — unlike typing, a pasted body isn't still being composed): `GET /people ` + paste `{ "name": "Joe" }` → `PUT /people [{ "name": "Joe" }]` (the GET → PUT promotion from 3.0.3 applies first). Already-array pastes, partial JSON, and `@file` references are never wrapped.
+
 ## 3.0.3
 
 - **`@` file references at the body position promote `GET` → `PUT` again** (reverts half of 3.0.2): `@` at the body slot always denotes a file-reference request body (`GET /people @data.json` sends the file), which implies a write — so it now promotes exactly like `{`, `[`, or `"`. The other half stands: no `[` is auto-prepended before `@` on array endpoints, since the file already provides the full body shape.
 - **Auto-promotion now arms the ctrl+space cycle**: pressing ctrl+space right after a body auto-promotion cycles `PUT → PATCH` as specified, instead of resetting to GET and stashing the just-typed body.
 - **Auto-revert on body clear**: deleting the body after an automatic `GET → PUT` promotion reverts the method to GET (backspace, delete, word-delete, kill-to-end, and ctrl+x clear-body all trigger it). Manually chosen methods (ctrl+space, ctrl+g, pasted request lines) are never reverted.
-- **Pasting a body promotes too**: pasting a request body (JSON, `@file`, etc.) at the body position now promotes `GET → PUT`, matching the typing behavior. On an array endpoint, a complete pasted JSON body is also wrapped in `[` … `]` (both brackets, since a pasted body isn't still being composed): `GET /people ` + paste `{ "name": "Joe" }` → `PUT /people [{ "name": "Joe" }]`. Already-array pastes, partial JSON, and `@file` references are never wrapped.
+- **Pasting a body promotes too**: pasting a request body (JSON, `@file`, etc.) at the body position now promotes `GET → PUT`, matching the typing behavior. No `[` array auto-wrap on paste — a pasted body is already complete.
 - **URI-only lines promote**: starting a body on a URI-only line (`/people {`) prepends an explicit `PUT `.
 - **Identifier paste no longer destroys operator URIs**: an `=` inside an operator expression (e.g. `/people~where(name=Joe)`) is not treated as a replaceable identifier slot — the expanded identifier is appended as a new segment instead.
 - **Identifier paste requires the cursor at the end of the URI token**: pasting mid-token no longer splices `key=value` into the middle of the URI.
