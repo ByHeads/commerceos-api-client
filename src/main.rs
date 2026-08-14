@@ -23,7 +23,7 @@ use crossterm::{
     terminal::{self, Clear, ClearType},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -496,9 +496,7 @@ struct AppState {
     width: u16,
     height: u16,
     prev_width: u16,
-    output_history: Vec<String>,  // Store all output for redraw on resize
-    output_line_counts: Vec<u16>,  // Terminal line count per output block (parallel to output_history)
-    output_header_line_counts: Vec<u16>,  // Terminal line count of just request+status lines per output
+    output_history: Vec<OutputBlock>,  // Logged requests, re-rendered on resize
     // Tab completion
     spec: Option<ApiSpec>,
     endpoints: Vec<String>,
@@ -574,8 +572,6 @@ impl AppState {
             height: 24,
             prev_width: 80,
             output_history: Vec::new(),
-            output_line_counts: Vec::new(),
-            output_header_line_counts: Vec::new(),
             spec: None,
             endpoints: Vec::new(),
             schema_props: HashMap::new(),
@@ -1023,6 +1019,74 @@ fn word_boundary_forward(s: &str, cursor_pos: usize) -> usize {
 // Get character count (not byte length)
 fn char_len(s: &str) -> usize {
     s.chars().count()
+}
+
+/// Narrowest body worth echoing on the request line. Below this the body is
+/// dropped entirely rather than rendered as a stub like `{…`.
+const MIN_INLINE_BODY_CHARS: usize = 8;
+
+/// Squash a request body onto a single line for logging: JSON is re-serialized
+/// compact, anything else has its whitespace runs (newlines included) collapsed
+/// to single spaces. A pasted 40-line JSON object becomes one short line.
+fn compact_body_for_display(body: &str) -> String {
+    let trimmed = body.trim_start();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        if let Some(compact) = serde_json::from_str::<Value>(body)
+            .ok()
+            .and_then(|v| serde_json::to_string(&v).ok())
+        {
+            return compact;
+        }
+    }
+    body.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Collapse only the whitespace runs that contain a newline, each to a single
+/// space. Everything else is left byte-for-byte, so a body typed on one line is
+/// echoed exactly as sent — this is the minimum reshaping needed to keep a
+/// multi-line body on the request line.
+fn collapse_newlines_for_log(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut run = String::new();
+    for c in body.chars() {
+        if c.is_whitespace() {
+            run.push(c);
+        } else {
+            if !run.is_empty() {
+                if run.contains('\n') || run.contains('\r') {
+                    out.push(' ');
+                } else {
+                    out.push_str(&run);
+                }
+                run.clear();
+            }
+            out.push(c);
+        }
+    }
+    // Trailing whitespace run, if any.
+    if !run.is_empty() {
+        if run.contains('\n') || run.contains('\r') {
+            out.push(' ');
+        } else {
+            out.push_str(&run);
+        }
+    }
+    out
+}
+
+/// Fit a body onto the request line: collapsed to one line, then cut to `budget`
+/// visible columns with an ellipsis. The `…` is counted inside the budget, so the
+/// result never exceeds it and the line lands at the terminal edge rather than
+/// wrapping. Counts chars rather than bytes, so multibyte input (`Möör`) is
+/// neither over-counted nor split mid-codepoint.
+fn fit_body_to_width(body: &str, budget: usize) -> String {
+    let collapsed = collapse_newlines_for_log(body);
+    if char_len(&collapsed) <= budget {
+        return collapsed;
+    }
+    // Reserve one column for the ellipsis itself.
+    let head: String = collapsed.chars().take(budget.saturating_sub(1)).collect();
+    format!("{}…", head)
 }
 
 // Strip ANSI escape codes and return visible character count
@@ -3599,18 +3663,102 @@ fn split_bulk_requests(
 /// The body is compacted (JSON re-serialized without whitespace) when possible,
 /// matching the bulk-silent status-line format.
 fn format_request_preview(method: &str, uri: &str, body: &str) -> String {
-    let display_body = if body.trim_start().starts_with('{') || body.trim_start().starts_with('[') {
-        serde_json::from_str::<Value>(body)
-            .ok()
-            .and_then(|v| serde_json::to_string(&v).ok())
-            .unwrap_or_else(|| body.to_string())
-    } else {
-        body.to_string()
-    };
+    let display_body = compact_body_for_display(body);
     if display_body.is_empty() {
         format!("{} {}", method, uri)
     } else {
         format!("{} {} {}", method, uri, display_body)
+    }
+}
+
+/// Format the request line echoed above a response in the TUI log:
+/// `METHOD /uri [body] [> outfile]`, always exactly one terminal row.
+///
+/// Every part keeps the terminal's default foreground — nothing here is styled.
+/// `METHOD /uri` and the outfile are never cut: they identify the request, so
+/// the body (or `@file` reference) absorbs the whole shortfall, collapsed to one
+/// line and fitted to whatever columns are left. When too few remain to say
+/// anything useful the body is dropped rather than stubbed. `parse_input` strips
+/// ` > outfile` off the input before the URI is set, so it's re-appended here.
+fn format_request_log_line(
+    method: &str,
+    uri: &str,
+    body: &str,
+    display_outfile: &str,
+    width: usize,
+) -> String {
+    let mut line = format!("{} {}", method, uri);
+    let suffix = if display_outfile.is_empty() {
+        String::new()
+    } else {
+        format!(" > {}", display_outfile)
+    };
+
+    if !body.is_empty() {
+        // What's left of the row once the prefix, the outfile suffix, and the
+        // space separating the body are accounted for. Saturating throughout, so
+        // a URI already wider than the terminal just drops the body.
+        let budget = width
+            .saturating_sub(char_len(&line))
+            .saturating_sub(char_len(&suffix))
+            .saturating_sub(1);
+        if budget >= MIN_INLINE_BODY_CHARS {
+            line.push(' ');
+            line.push_str(&fit_body_to_width(body, budget));
+        }
+    }
+
+    line.push_str(&suffix);
+    line
+}
+
+/// How many request/response blocks are kept for redraw on resize.
+const OUTPUT_HISTORY_LIMIT: usize = 10;
+
+/// One logged request/response block, kept as parts rather than rendered text so
+/// a resize can re-fit the request line to the new terminal width.
+///
+/// Only the request line is width-dependent — `head` and `tail` are stored as
+/// printed and replayed verbatim, since the terminal wraps them itself.
+#[derive(Clone, Default)]
+struct OutputBlock {
+    method: String,
+    uri: String,
+    body: String,
+    display_outfile: String,
+    /// Status line plus any `> outfile` note — what ctrl+j keeps.
+    head: String,
+    /// The response body block, or empty — what ctrl+j erases.
+    tail: String,
+}
+
+impl OutputBlock {
+    /// The full block as printed: request line fitted to `width`, then the
+    /// stored head and tail. Always ends with the newline that closes the
+    /// request line, so blocks concatenate cleanly.
+    fn render(&self, width: usize) -> String {
+        format!(
+            "{}\n{}{}",
+            format_request_log_line(&self.method, &self.uri, &self.body, &self.display_outfile, width),
+            self.head,
+            self.tail,
+        )
+    }
+
+    fn has_body(&self) -> bool {
+        !self.tail.is_empty()
+    }
+
+    fn strip_body(&mut self) {
+        self.tail.clear();
+    }
+}
+
+/// Push a finished block, evicting the oldest past `OUTPUT_HISTORY_LIMIT`.
+fn push_output_block(state: &mut AppState, block: OutputBlock) {
+    state.output_history.push(block);
+    if state.output_history.len() > OUTPUT_HISTORY_LIMIT {
+        state.output_history.remove(0);
     }
 }
 
@@ -3749,14 +3897,8 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
                 if config.bulk_silent {
                     // Compact the body for display: parse as JSON and re-serialize without whitespace,
                     // falling back to the raw body if it's not JSON (e.g., @file references).
-                    let display_body = if body.trim_start().starts_with('{') || body.trim_start().starts_with('[') {
-                        serde_json::from_str::<Value>(&body)
-                            .ok()
-                            .and_then(|v| serde_json::to_string(&v).ok())
-                            .unwrap_or_else(|| body.clone())
-                    } else {
-                        body.clone()
-                    };
+                    // Unstyled, like the TUI log.
+                    let display_body = compact_body_for_display(&body);
                     if display_body.is_empty() {
                         println!("{} {}", method, uri);
                     } else {
@@ -4313,9 +4455,10 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
                     // Re-print splash with current terminal width
                     print_splash_with_width(&state.config, w);
 
-                    // Re-print previous output (last 5 requests)
-                    for output in &state.output_history {
-                        print!("{}", output);
+                    // Re-print previous output, re-fitting each request line to the
+                    // new width rather than replaying it at the old one.
+                    for block in &state.output_history {
+                        print!("{}", block.render(w as usize));
                     }
 
                     // Placeholder lines for input area (match actual input height)
@@ -4807,10 +4950,8 @@ fn handle_key_event(
 
         // Clear all output (ctrl+l)
         (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
-            if !state.output_line_counts.is_empty() {
+            if !state.output_history.is_empty() {
                 state.output_history.clear();
-                state.output_line_counts.clear();
-                state.output_header_line_counts.clear();
 
                 terminal::disable_raw_mode()?;
                 print!("\x1b[2J\x1b[3J\x1b[H");
@@ -4827,34 +4968,22 @@ fn handle_key_event(
 
         // Erase last response body only, keep request+status headers (ctrl+j) — full redraw
         (KeyModifiers::CONTROL, KeyCode::Char('j')) => {
-            if !state.output_line_counts.is_empty() {
-                let last_total = *state.output_line_counts.last().unwrap();
-                let last_header = *state.output_header_line_counts.last().unwrap();
+            if state.output_history.last().is_some_and(|b| b.has_body()) {
+                state.output_history.last_mut().unwrap().strip_body();
 
-                if last_total > last_header {
-                    // Strip body, keep headers
-                    let last_output = state.output_history.last().cloned().unwrap_or_default();
-                    let header_output: String = last_output.split('\n')
-                        .take(last_header as usize)
-                        .collect::<Vec<&str>>()
-                        .join("\n") + "\n";
-                    *state.output_history.last_mut().unwrap() = header_output;
-                    *state.output_line_counts.last_mut().unwrap() = last_header;
-
-                    terminal::disable_raw_mode()?;
-                    print!("\x1b[2J\x1b[3J\x1b[H");
-                    io::stdout().flush().ok();
-                    print_splash_with_width(&state.config, state.width);
-                    for output in &state.output_history {
-                        print!("{}", output);
-                    }
-                    let input_lines = state.input.split('\n').count() as u16;
-                    for _ in 0..(2 + input_lines) { println!(); }
-                    io::stdout().flush().ok();
-                    terminal::enable_raw_mode()?;
-                    state.prev_input_lines = input_lines;
-                    render(stdout, state)?;
+                terminal::disable_raw_mode()?;
+                print!("\x1b[2J\x1b[3J\x1b[H");
+                io::stdout().flush().ok();
+                print_splash_with_width(&state.config, state.width);
+                for block in &state.output_history {
+                    print!("{}", block.render(state.width as usize));
                 }
+                let input_lines = state.input.split('\n').count() as u16;
+                for _ in 0..(2 + input_lines) { println!(); }
+                io::stdout().flush().ok();
+                terminal::enable_raw_mode()?;
+                state.prev_input_lines = input_lines;
+                render(stdout, state)?;
             }
         }
 
@@ -5228,38 +5357,84 @@ fn handle_key_event(
 /// Cycling window for re-pasting the same JSON to advance through its identifiers.
 const PASTE_CYCLE_WINDOW: Duration = Duration::from_secs(10);
 
+/// `@`-prefixed keys are JSON-LD metadata (e.g. `@type`), never identifiers.
+fn is_identifier_key(k: &str) -> bool {
+    !k.starts_with('@')
+}
+
+/// Parse a pasted JSON fragment, tolerating the artifacts of lifting a slice out
+/// of a larger document:
+/// - a trailing comma left behind by copying one entry of an object/array
+/// - a leading `"identifiers":` property label, when the selection included the
+///   key the identifiers were nested under (`"identifiers": { … },`)
+///
+/// The strictest reading is tried first and only relaxed on failure, so valid
+/// JSON is never reinterpreted.
+fn parse_pasted_json_fragment(s: &str) -> Option<Value> {
+    let trimmed = s.trim();
+    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+        return Some(v);
+    }
+
+    // Drop trailing commas (and the whitespace around them) left by the copy.
+    let no_comma = trimmed.trim_end_matches(|c: char| c == ',' || c.is_whitespace());
+    if no_comma.is_empty() {
+        return None;
+    }
+    if no_comma != trimmed {
+        if let Ok(v) = serde_json::from_str::<Value>(no_comma) {
+            return Some(v);
+        }
+    }
+
+    // A fragment labelled with the `identifiers` key is a bare property — brace
+    // it back into an object: `"identifiers": { … }` → `{"identifiers": { … }}`.
+    // Only that one key is repaired; any other bare property stays unparsed and
+    // is pasted verbatim.
+    if no_comma.starts_with("\"identifiers\"") {
+        if let Ok(v) = serde_json::from_str::<Value>(&format!("{{{}}}", no_comma)) {
+            return Some(v);
+        }
+    }
+
+    None
+}
+
+/// Every string-valued, non-metadata entry of `obj`, in insertion order.
+fn string_pairs(obj: &Map<String, Value>) -> Vec<(String, String)> {
+    obj.iter()
+        .filter(|(k, _)| is_identifier_key(k))
+        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+        .collect()
+}
+
 /// Pull `(key, value)` pairs out of pasted JSON, in insertion order.
 ///
 /// Recognizes two shapes:
 /// 1. An object with an `"identifiers"` field that is itself an object — uses
 ///    every string-valued key inside it (no dot requirement, because the user
-///    has explicitly nested them under `identifiers`).
-/// 2. A flat object where every value is a string — uses every key.
+///    has explicitly nested them under `identifiers`). Since
+///    `parse_pasted_json_fragment` braces a bare property back into an object,
+///    this also covers a paste of just `"identifiers": { … },`. Only that one
+///    key unwraps — an object nested under any other name is not searched.
+/// 2. A flat object where every (non-metadata) value is a string — uses every key.
 ///
 /// Returns an empty vec when the paste isn't JSON, isn't an object, or doesn't
 /// match either shape. Order follows the source JSON because `serde_json` is
 /// built with the `preserve_order` feature.
 fn extract_identifier_pairs(s: &str) -> Vec<(String, String)> {
-    let trimmed = s.trim();
-    let v: Value = match serde_json::from_str(trimmed) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
+    let value = match parse_pasted_json_fragment(s) {
+        Some(v) => v,
+        None => return Vec::new(),
     };
-    let obj = match v.as_object() {
+    let obj = match value.as_object() {
         Some(o) => o,
         None => return Vec::new(),
     };
 
-    // `@`-prefixed keys are JSON-LD metadata (e.g. `@type`), never identifiers.
-    let is_identifier_key = |k: &str| !k.starts_with('@');
-
-    // Case 1: object has an "identifiers" child object — use its string-valued keys.
+    // Case 1: explicit "identifiers" child object.
     if let Some(idents) = obj.get("identifiers").and_then(|v| v.as_object()) {
-        let pairs: Vec<(String, String)> = idents
-            .iter()
-            .filter(|(k, _)| is_identifier_key(k))
-            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-            .collect();
+        let pairs = string_pairs(idents);
         if !pairs.is_empty() {
             return pairs;
         }
@@ -5268,10 +5443,7 @@ fn extract_identifier_pairs(s: &str) -> Vec<(String, String)> {
     // Case 2: flat object, every (non-metadata) value is a string.
     let non_meta: Vec<(&String, &Value)> = obj.iter().filter(|(k, _)| is_identifier_key(k)).collect();
     if !non_meta.is_empty() && non_meta.iter().all(|(_, v)| v.is_string()) {
-        return non_meta
-            .iter()
-            .filter_map(|(k, v)| v.as_str().map(|s| ((*k).clone(), s.to_string())))
-            .collect();
+        return string_pairs(obj);
     }
 
     Vec::new()
@@ -5549,17 +5721,15 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     // Flash rulers on send
     flash_rulers(stdout, state, "\x1b[38;5;242m", 120)?;
 
-    // Build output string to store for resize redraw
-    let mut output_lines = String::new();
-
-    // Prepare request line — include @file/glob body in the log
-    let request_line = if state.body.starts_with('@') {
-        format!("{} {} {}", state.method, state.uri, state.body)
-    } else {
-        format!("{} {}", state.method, state.uri)
+    // The block accumulates what's printed below the request line, so history and
+    // screen can't drift apart; the request line itself is re-fitted per width.
+    let mut block = OutputBlock {
+        method: state.method.clone(),
+        uri: state.uri.clone(),
+        body: state.body.clone(),
+        display_outfile: state.display_outfile.clone(),
+        ..Default::default()
     };
-    output_lines.push_str(&request_line);
-    output_lines.push('\n');
 
     // Build request
     let client = build_request_client(state.config.timeout_secs);
@@ -5650,20 +5820,11 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
 
     let start = Instant::now();
 
-    // Buffer for display output (will print all at once)
-    let mut display_output = request_line.clone();
-    display_output.push('\n');
-    let mut header_lines: u16 = 1; // At minimum, the request line
-
     // If file error, show it and return
     if let Some(err) = file_error {
-        display_output.push_str(&format!("\n{}\n\n", err));
-        output_lines.push_str(&format!("\n{}\n\n", err));
-        let line_count = visual_line_count(&display_output, state.width as usize).saturating_sub(1);
-        state.output_history.push(display_output.clone());
-        state.output_line_counts.push(line_count);
-        state.output_header_line_counts.push(header_lines);
-        if state.output_history.len() > 5 { state.output_history.remove(0); state.output_line_counts.remove(0); state.output_header_line_counts.remove(0); }
+        block.head = format!("\n{}\n\n", err);
+        let display_output = block.render(state.width as usize);
+        push_output_block(state, block);
 
         // Update input with last command
         state.input = format!("{} {}", state.method, state.uri);
@@ -5846,34 +6007,34 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
                 match cli_clipboard::set_contents(clipboard_text) {
                     Ok(()) => {
                         if !state.config.silent {
-                            display_output.push_str(&format!(
+                            block.head = format!(
                                 "HTTP/1.1 {} {}\n{}\n\n",
                                 status_str,
                                 format!("{:.2}s", elapsed.as_secs_f64()).dimmed(),
                                 "> clipboard".dimmed()
-                            ));
+                            );
                         }
                         state.status_msg = "copied to clipboard".to_string();
                         state.status_msg_at = Some(Instant::now());
                     }
                     Err(e) => {
-                        display_output.push_str(&format!("clipboard unavailable: {}\n", e));
+                        block.head = format!("clipboard unavailable: {}\n", e);
                     }
                 }
             } else if !state.config.outfile.is_empty() {
                 if let Err(e) = fs::write(&state.config.outfile, &body_text) {
-                    display_output.push_str(&format!("Error writing to {}: {}\n", state.config.outfile, e));
+                    block.head = format!("Error writing to {}: {}\n", state.config.outfile, e);
                 } else {
                     state.last_outfile = state.config.outfile.clone();
                     state.last_display_outfile = state.display_outfile.clone();
 
                     if !state.config.silent {
-                        display_output.push_str(&format!(
+                        block.head = format!(
                             "HTTP/1.1 {} {}\n{}\n\n",
                             status_str,
                             format!("{:.2}s", elapsed.as_secs_f64()).dimmed(),
                             format!("> {}", state.display_outfile).dimmed()
-                        ));
+                        );
                     }
                     state.status_msg = "ctrl+o to open file".to_string();
                     state.status_msg_at = Some(Instant::now());
@@ -5881,21 +6042,16 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
             } else {
                 // Build status line
                 if !state.config.silent {
-                    let status_line = format!(
-                        "HTTP/1.1 {} {}",
+                    block.head = format!(
+                        "HTTP/1.1 {} {}\n",
                         status_str,
                         format!("{:.2}s", elapsed.as_secs_f64()).dimmed()
                     );
-                    display_output.push_str(&status_line);
-                    display_output.push('\n');
-                    output_lines.push_str(&status_line);
-                    output_lines.push('\n');
                 }
 
-                // Capture header line count (request line + status line) before body
-                header_lines = visual_line_count(&display_output, state.width as usize);
-
-                // Build body
+                // Build body. The trailing blank line belongs to the head when
+                // there's no body, so `has_body()` stays false and ctrl+j
+                // correctly finds nothing to erase.
                 if !body_text.is_empty() {
                     let output = if state.config.raw || state.config.ndjson {
                         body_text
@@ -5904,28 +6060,19 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
                     } else {
                         body_text
                     };
-                    display_output.push_str(&format!("\n{}\n\n", output));
-                    output_lines.push('\n');
-                    output_lines.push_str(&output);
-                    output_lines.push_str("\n\n");
+                    block.tail = format!("\n{}\n\n", output);
                 } else {
-                    // Add blank line after status when no body
-                    display_output.push('\n');
-                    output_lines.push('\n');
+                    block.head.push('\n');
                 }
             }
         }
         Some(Err(_)) => {
             let host = state.config.base_uri.trim_start_matches("https://").trim_start_matches("http://");
-            let err_msg = format!("\nIs COS running on {}? 🤔\n\n", host);
-            display_output.push_str(&err_msg);
-            output_lines.push_str(&err_msg);
+            block.head = format!("\nIs COS running on {}? 🤔\n\n", host);
         }
         None => {
             // Request was aborted or something went wrong
-            let err_msg = "\nRequest failed\n";
-            display_output.push_str(err_msg);
-            output_lines.push_str(err_msg);
+            block.head = "\nRequest failed\n".to_string();
         }
     }
 
@@ -5938,16 +6085,9 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
         state.mapped_types = names;
     }
 
-    // Store output for resize redraw (keep last 5)
-    let output_rendered_lines = visual_line_count(&display_output, state.width as usize).saturating_sub(1);
-    state.output_history.push(output_lines);
-    state.output_line_counts.push(output_rendered_lines);
-    state.output_header_line_counts.push(header_lines);
-    if state.output_history.len() > 5 {
-        state.output_history.remove(0);
-        state.output_line_counts.remove(0);
-        state.output_header_line_counts.remove(0);
-    }
+    // Render once, then store the parts so a resize can re-fit the request line.
+    let display_output = block.render(state.width as usize);
+    push_output_block(state, block);
 
     // Update input with last command
     state.input = format!("{} {}", state.method, state.uri);
@@ -6464,8 +6604,6 @@ fn handle_switch_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io
 
             // Full screen clear and fresh start for new connection
             state.output_history.clear();
-            state.output_line_counts.clear();
-            state.output_header_line_counts.clear();
             terminal::disable_raw_mode()?;
             print!("\x1b[2J\x1b[3J\x1b[H");
             io::stdout().flush().ok();
@@ -10986,6 +11124,301 @@ mod tests {
         // .DS_Store is handled by the leading-dot glob rule, not this filter —
         // but if a glob ever did surface it, this filter wouldn't claim it.
         assert!(!is_os_junk(Path::new(".DS_Store")));
+    }
+
+    #[test]
+    fn collapse_newlines_for_log_only_touches_newline_runs() {
+        // A body typed on one line is echoed byte-for-byte — odd spacing included.
+        let single = "{ \"a\":  1,\t\"b\": 2 }";
+        assert_eq!(collapse_newlines_for_log(single), single);
+
+        // Each newline-containing run becomes exactly one space, however long.
+        assert_eq!(
+            collapse_newlines_for_log("{\n  \"a\": 1,\n  \"b\": 2\n}"),
+            "{ \"a\": 1, \"b\": 2 }",
+        );
+        assert_eq!(
+            collapse_newlines_for_log("line one\n\n  line two"),
+            "line one line two",
+        );
+        // Trailing and leading newline runs collapse too, not dropped.
+        assert_eq!(collapse_newlines_for_log("\n{}\n"), " {} ");
+        assert_eq!(collapse_newlines_for_log("a\r\nb"), "a b");
+        assert_eq!(collapse_newlines_for_log(""), "");
+    }
+
+    #[test]
+    fn fit_body_to_width_fits_within_budget() {
+        // Under budget — returned as-is.
+        assert_eq!(fit_body_to_width("\"A new name\"", 40), "\"A new name\"");
+        // Exactly at budget — still untouched, no ellipsis.
+        let exact = "z".repeat(20);
+        assert_eq!(fit_body_to_width(&exact, 20), exact);
+
+        // One past budget — cut, and the result is never wider than the budget.
+        let over = "z".repeat(21);
+        let out = fit_body_to_width(&over, 20);
+        assert_eq!(char_len(&out), 20, "got: {out}");
+        assert_eq!(out, format!("{}…", "z".repeat(19)));
+
+        // The ellipsis counts inside the budget at every size.
+        for budget in MIN_INLINE_BODY_CHARS..40 {
+            let out = fit_body_to_width(&"x".repeat(200), budget);
+            assert!(char_len(&out) <= budget, "budget {budget} overflowed: {out}");
+        }
+
+        // Multibyte input is counted and cut by chars, never mid-codepoint.
+        let out = fit_body_to_width(&"ö".repeat(50), 10);
+        assert_eq!(out, format!("{}…", "ö".repeat(9)));
+
+        // A multi-line body is collapsed before it's measured.
+        let out = fit_body_to_width("{\n  \"a\": 1\n}", 40);
+        assert_eq!(out, "{ \"a\": 1 }");
+    }
+
+    /// Composition and styling of the echoed request line.
+    ///
+    /// Kept as one test on purpose: forcing color on flips a global in `colored`,
+    /// so a second test toggling it would race this one under the parallel test
+    /// runner. No other test asserts on color, so owning the global here is safe.
+    #[test]
+    fn format_request_log_line_composition_and_styling() {
+        // Under `cargo test` stdout isn't a tty, so `colored` emits no escapes by
+        // default — forcing the override on is what makes "no styling" provable.
+        colored::control::set_override(true);
+
+        // Bare request — no body, no outfile.
+        assert_eq!(format_request_log_line("GET", "/people", "", "", 80), "GET /people");
+
+        // Body follows the URI, unstyled and unreformatted.
+        assert_eq!(
+            format_request_log_line("PUT", "/people/*givenName", "\"A new name\"", "", 80),
+            "PUT /people/*givenName \"A new name\"",
+        );
+
+        // Outfile is appended last, after the body.
+        assert_eq!(
+            format_request_log_line("GET", "/people", "", "out.json", 80),
+            "GET /people > out.json",
+        );
+        assert_eq!(
+            format_request_log_line("PUT", "/people", "@data.json", "~/out.json", 80),
+            "PUT /people @data.json > ~/out.json",
+        );
+
+        // Nothing on the line is styled, so the renderer's `visible_len` sizing
+        // sees exactly the characters printed.
+        let line = format_request_log_line("PUT", "/people", "{ \"a\": 1 }", "out.json", 80);
+        assert!(!line.contains('\x1b'), "expected no escapes, got: {line:?}");
+        assert_eq!(visible_len(&line), char_len(&line));
+
+        colored::control::unset_override();
+    }
+
+    #[test]
+    fn format_request_log_line_fits_one_row_at_any_width() {
+        let long_body = format!("{{ \"name\": \"{}\" }}", "x".repeat(200));
+        let long_glob = format!("@/very/long/path/{}/*.json", "segment".repeat(10));
+        let multiline = "{\n  \"givenName\": \"Möör\",\n  \"familyName\": \"Test\"\n}";
+
+        for width in [20usize, 40, 60, 80, 120, 200] {
+            for body in [long_body.as_str(), long_glob.as_str(), multiline] {
+                for outfile in ["", "out.json", "~/some/longer/path/output.json"] {
+                    let line = format_request_log_line("PUT", "/people", body, outfile, width);
+                    // Never wraps...
+                    assert!(
+                        char_len(&line) <= width.max(char_len("PUT /people") + char_len(outfile) + 3),
+                        "width {width} overflowed with outfile {outfile:?}: {line:?}",
+                    );
+                    // ...and never spans rows.
+                    assert!(!line.contains('\n'), "line broke at width {width}: {line:?}");
+                    // The request identity always survives, body or not.
+                    assert!(line.starts_with("PUT /people"), "got: {line:?}");
+                    if !outfile.is_empty() {
+                        assert!(line.ends_with(outfile), "outfile lost at width {width}: {line:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn format_request_log_line_body_absorbs_the_shortfall() {
+        // Wide terminal: a long body is cut to the columns left over, exactly
+        // filling the row rather than wrapping.
+        let long = "x".repeat(500);
+        let line = format_request_log_line("PUT", "/people", &long, "", 80);
+        assert_eq!(char_len(&line), 80, "got: {line:?}");
+        assert!(line.ends_with('…'), "got: {line:?}");
+
+        // The outfile is reserved first, so it always survives intact.
+        let line = format_request_log_line("PUT", "/people", &long, "out.json", 80);
+        assert_eq!(char_len(&line), 80, "got: {line:?}");
+        assert!(line.ends_with(" > out.json"), "got: {line:?}");
+
+        // Exactly `MIN_INLINE_BODY_CHARS` left is still shown, filling the row.
+        // ("PUT /people" is 11 columns, plus the separating space.)
+        let at_min = 11 + 1 + MIN_INLINE_BODY_CHARS;
+        let line = format_request_log_line("PUT", "/people", &long, "", at_min);
+        assert_eq!(char_len(&line), at_min, "got: {line:?}");
+        assert!(line.ends_with('…'), "got: {line:?}");
+
+        // One column narrower and the body is dropped, not stubbed.
+        let line = format_request_log_line("PUT", "/people", &long, "", at_min - 1);
+        assert_eq!(line, "PUT /people");
+
+        // A URI wider than the terminal keeps the URI and drops the body; the
+        // saturating arithmetic must not panic here.
+        let long_uri = format!("/{}", "segment/".repeat(30));
+        let line = format_request_log_line("GET", &long_uri, &long, "", 40);
+        assert_eq!(line, format!("GET {}", long_uri));
+    }
+
+    fn sample_block() -> OutputBlock {
+        OutputBlock {
+            method: "PUT".to_string(),
+            uri: "/people".to_string(),
+            body: format!("{{ \"name\": \"{}\" }}", "x".repeat(200)),
+            display_outfile: String::new(),
+            head: "HTTP/1.1 200 OK 0.08s\n".to_string(),
+            tail: "\n{\n  \"ok\": true\n}\n\n".to_string(),
+        }
+    }
+
+    #[test]
+    fn output_block_refits_request_line_per_width() {
+        let block = sample_block();
+        let narrow = block.render(60);
+        let wide = block.render(200);
+
+        // The request line is fitted to each width...
+        let narrow_req = narrow.lines().next().unwrap();
+        let wide_req = wide.lines().next().unwrap();
+        assert_eq!(char_len(narrow_req), 60, "got: {narrow_req:?}");
+        assert_eq!(char_len(wide_req), 200, "got: {wide_req:?}");
+        assert!(narrow_req.ends_with('…') && wide_req.ends_with('…'));
+
+        // ...and the wide rendering recovers body text the narrow one cut.
+        assert!(char_len(wide_req) > char_len(narrow_req));
+        assert!(wide_req.starts_with(narrow_req.trim_end_matches('…')));
+
+        // Everything below the request line is replayed verbatim at any width.
+        let below = |s: &str| s.split_once('\n').unwrap().1.to_string();
+        assert_eq!(below(&narrow), below(&wide));
+        assert_eq!(below(&narrow), format!("{}{}", block.head, block.tail));
+    }
+
+    #[test]
+    fn output_block_strip_body_keeps_the_status_line() {
+        let mut block = sample_block();
+        assert!(block.has_body());
+
+        block.strip_body();
+        assert!(!block.has_body());
+        // The status line survives; only the response body is gone.
+        assert!(block.render(200).ends_with("HTTP/1.1 200 OK 0.08s\n"));
+        // Stripping twice is a no-op, so a repeated ctrl+j can't corrupt the block.
+        block.strip_body();
+        assert!(!block.has_body());
+    }
+
+    #[test]
+    fn output_block_outfile_response_keeps_its_status_line() {
+        // Regression: the outfile and clipboard branches used to write only to the
+        // printed buffer, never to the stored one, so a resize redraw dropped the
+        // status line and left a bare request line behind.
+        let block = OutputBlock {
+            method: "PUT".to_string(),
+            uri: "/people".to_string(),
+            body: "@data.json".to_string(),
+            display_outfile: "out.json".to_string(),
+            head: "HTTP/1.1 200 OK 0.08s\n> out.json\n\n".to_string(),
+            tail: String::new(),
+        };
+
+        let rendered = block.render(80);
+        assert!(rendered.starts_with("PUT /people @data.json > out.json\n"), "got: {rendered:?}");
+        assert!(rendered.contains("HTTP/1.1 200 OK"), "status line lost: {rendered:?}");
+        assert!(rendered.contains("> out.json"), "outfile note lost: {rendered:?}");
+        // No response body was printed, so ctrl+j has nothing to erase.
+        assert!(!block.has_body());
+    }
+
+    #[test]
+    fn push_output_block_evicts_oldest_past_the_limit() {
+        let mut state = AppState::new(Config::default());
+        for i in 0..(OUTPUT_HISTORY_LIMIT + 5) {
+            let mut block = sample_block();
+            block.uri = format!("/people/{i}");
+            push_output_block(&mut state, block);
+        }
+
+        assert_eq!(state.output_history.len(), OUTPUT_HISTORY_LIMIT);
+        // The survivors are the most recent ones, oldest-first.
+        assert_eq!(state.output_history.first().unwrap().uri, "/people/5");
+        assert_eq!(
+            state.output_history.last().unwrap().uri,
+            format!("/people/{}", OUTPUT_HISTORY_LIMIT + 4),
+        );
+    }
+
+    #[test]
+    fn extract_identifier_pairs_tolerates_trailing_comma() {
+        // Copying one entry out of a larger array/object leaves a trailing comma.
+        let s = "{\n  \"@type\": \"common identifiers\",\n  \"key\": \"97454f6f\",\n  \"com.heads.id\": \"omnium-out\"\n},\n";
+        let pairs = extract_identifier_pairs(s);
+        assert_eq!(pairs.len(), 2, "got: {pairs:?}");
+        assert_eq!(pairs[0], ("key".to_string(), "97454f6f".to_string()));
+        assert_eq!(pairs[1], ("com.heads.id".to_string(), "omnium-out".to_string()));
+    }
+
+    #[test]
+    fn extract_identifier_pairs_accepts_bare_property_wrapper() {
+        // The selection included the property label the identifiers sit under.
+        let s = "\"identifiers\": {\n  \"@type\": \"common identifiers\",\n  \"key\": \"97454f6f\",\n  \"com.heads.id\": \"omnium-out\"\n},";
+        let pairs = extract_identifier_pairs(s);
+        assert_eq!(pairs.len(), 2, "got: {pairs:?}");
+        assert_eq!(pairs[0], ("key".to_string(), "97454f6f".to_string()));
+        assert_eq!(pairs[1], ("com.heads.id".to_string(), "omnium-out".to_string()));
+
+        // Without the trailing comma too.
+        let no_comma = r#""identifiers": { "com.heads.id": "x" }"#;
+        assert_eq!(
+            extract_identifier_pairs(no_comma),
+            vec![("com.heads.id".to_string(), "x".to_string())]
+        );
+    }
+
+    #[test]
+    fn extract_identifier_pairs_only_unwraps_the_identifiers_key() {
+        // `identifiers` is the only bare property repaired into an object — a
+        // fragment labelled with any other key stays unparsed, even when its
+        // contents look exactly like identifiers.
+        let named = r#""whateverTheyCallIt": { "com.heads.id": "x" }"#;
+        assert_eq!(extract_identifier_pairs(named), Vec::<(String, String)>::new());
+
+        // Including a bare string-valued property (would otherwise be case 2).
+        let bare_string = r#""com.heads.id": "x""#;
+        assert_eq!(extract_identifier_pairs(bare_string), Vec::<(String, String)>::new());
+
+        // Braced-but-nested objects aren't searched either: no unwrapping of a
+        // lone object-valued property...
+        let wrapped = r#"{ "address": { "street": "Main" } }"#;
+        assert_eq!(extract_identifier_pairs(wrapped), Vec::<(String, String)>::new());
+
+        // ...and only a direct `identifiers` child counts, not a deeper one.
+        let nested = r#"{ "outer": { "identifiers": { "com.heads.id": "x" } } }"#;
+        assert_eq!(extract_identifier_pairs(nested), Vec::<(String, String)>::new());
+    }
+
+    #[test]
+    fn extract_identifier_pairs_rejects_unrecoverable_fragments() {
+        // A stray comma doesn't make broken JSON parse.
+        assert_eq!(extract_identifier_pairs("not json,"), Vec::<(String, String)>::new());
+        assert_eq!(extract_identifier_pairs(","), Vec::<(String, String)>::new());
+        assert_eq!(extract_identifier_pairs("\"unterminated: {"), Vec::<(String, String)>::new());
+        // A bare string is valid JSON but not an object.
+        assert_eq!(extract_identifier_pairs("\"just a string\""), Vec::<(String, String)>::new());
     }
 
     #[test]
