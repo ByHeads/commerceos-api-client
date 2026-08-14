@@ -1,5 +1,15 @@
 # Changelog
 
+## 3.0.5
+
+- **Request bodies stay on the request line in the log**: a sent request now echoes its body after the method and URI (`PUT /people/*givenName "A new name"`), instead of dropping everything but `@file` references. The body is shown as typed — no reformatting — and fitted to the terminal width, so the line always occupies exactly one row: the method, URI, and `> outfile` are never cut, and the body absorbs the shortfall, truncated with `…` at the right edge. A multi-line body has its line breaks collapsed to single spaces (the minimum needed to keep it on one row); everything else, including odd spacing and invalid JSON, is echoed verbatim. When too few columns remain to say anything useful the body is dropped rather than stubbed. Truncation is display-only: the request itself and the recalled input line still carry the full body.
+- **`> outfile` appears on the request line**, in addition to the existing confirmation line under the status.
+- **Resize re-renders the log**: widening or narrowing the terminal now re-fits every request line in scrollback to the new width, revealing more of a body or re-truncating it, instead of replaying lines rendered at the old width. Retained blocks went from 5 to 10.
+- **Identifier paste tolerates trailing commas**: copying one entry out of a larger JSON document leaves a `},` behind; that trailing comma no longer prevents identifier expansion.
+- **Identifier paste accepts a bare `"identifiers":` property**: a selection that includes the property label the identifiers sit under (`"identifiers": { … },`) now expands too. Only that one key is repaired — an object nested under any other name is pasted verbatim, so `"address": { "street": "Main" }` is left alone.
+- Fixed responses written to an outfile or the clipboard losing their status line on a resize redraw: those branches wrote only to the printed output and never to the stored history, leaving a bare request line behind. Printed and stored output are now the same text and can no longer drift apart.
+- Fixed ctrl+j (erase last response body) slicing the stored block by a wrap-aware line count against logical lines, which disagreed whenever the request line wrapped. It now tracks the body directly, and a repeated press is a no-op instead of redrawing.
+
 ## 3.0.4
 
 - **Pasted bodies are array-wrapped on array endpoints**: pasting a complete JSON body at the body position of a PUT/PATCH to an array endpoint wraps it in `[` … `]` (both brackets — unlike typing, a pasted body isn't still being composed): `GET /people ` + paste `{ "name": "Joe" }` → `PUT /people [{ "name": "Joe" }]` (the GET → PUT promotion from 3.0.3 applies first). Already-array pastes, partial JSON, and `@file` references are never wrapped.
