@@ -27,6 +27,78 @@ use serde_json::{Map, Value};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// How long a footer status message stays up before clearing.
+const STATUS_MSG_TTL: Duration = Duration::from_secs(3);
+
+/// Why a streamed 200 can still be a failure: the status line is sent before the
+/// body is generated, so errors arrive inside the stream. It only has to be
+/// noticed, not read — the explanation it points at lives in the ctrl+h panel,
+/// see `STREAMING_HELP_PROSE`.
+const STREAMING_INFO_MSG: &str = "streamed bodies may encode errors, ctrl+h for more info";
+
+/// The persistent footer marker shown while streaming is active.
+const STREAMING_INDICATOR: &str = "streaming";
+
+/// Prose of the long-form streaming caveat, shown in the ctrl+h panel while
+/// streaming is active — the footer notice only has room to point here. The
+/// link to the full documentation is appended by `streaming_help_lines`.
+///
+/// Kept under `STREAMING_HELP_MAX_COLS` a line: the help block is drawn at a
+/// fixed height, so a line that wraps would desync the count from the rows
+/// actually printed.
+const STREAMING_HELP_PROSE: &[&str] = &[
+    "  Response streaming is on, which means a 200 response can still",
+    "  carry an error inside the body — the status line is sent before",
+    "  the body is generated, so failures may show up mid-payload. Check",
+    "  the content, not just the status.",
+];
+
+/// Width the help section is written to. Lines are printed as-is, so anything
+/// longer would wrap and break the fixed-height block.
+const STREAMING_HELP_MAX_COLS: usize = 68;
+
+/// Where the API docs live for a connection — `ctrl+b` opens this, and the
+/// streaming help section deep-links into it. Falls back to the public host
+/// before a connection is established.
+fn api_docs_url(base_uri: &str) -> String {
+    if base_uri.is_empty() {
+        "https://dev.heads.com/api-docs".to_string()
+    } else {
+        format!("{}/api-docs", base_uri)
+    }
+}
+
+/// The streaming help section, with the docs link resolved against the current
+/// connection. The link is a line of its own so it stays copy-pasteable.
+fn streaming_help_lines(base_uri: &str) -> Vec<String> {
+    let mut lines: Vec<String> = STREAMING_HELP_PROSE.iter().map(|l| l.to_string()).collect();
+    lines.push(String::new());
+    lines.push(format!(
+        "  {}#description/streaming",
+        api_docs_url(base_uri)
+    ));
+    lines
+}
+
+/// Rows the ctrl+h panel occupies: the ruler, its 25 fixed lines, and the
+/// streaming section (a blank separator plus its text) when streaming is on.
+/// Derived rather than hardcoded so the clear span always matches what's drawn.
+///
+/// The streaming lines are measured against the terminal width rather than
+/// counted: the docs link carries the connection's host, and a long one would
+/// wrap into rows the clear span didn't know about.
+fn help_line_count(state: &AppState) -> u16 {
+    let base = 26;
+    if !state.config.streaming {
+        return base;
+    }
+    let rows: u16 = streaming_help_lines(&state.config.base_uri)
+        .iter()
+        .map(|line| visual_line_count(line, state.width as usize))
+        .sum();
+    base + 1 + rows
+}
+
 // Braille spinner frames (consistent everywhere)
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -115,7 +187,11 @@ struct Args {
     #[arg(short = 'p', long = "preview")]
     preview: bool,
 
-    /// Disable streaming even when the server supports it
+    /// Stream the response body instead of buffering it (also: API_STREAMING=1)
+    #[arg(long = "stream")]
+    stream: bool,
+
+    /// Disable streaming even when --stream or API_STREAMING asked for it
     #[arg(long = "no-streaming")]
     no_streaming: bool,
 
@@ -139,8 +215,16 @@ struct Config {
     /// `>> file` instead of `> file`: append to the target, merging arrays and
     /// format-aware for `.ndjson`/`.csv`, rather than overwriting.
     outfile_append: bool,
+    /// Streaming is active for this request: the user asked for it and (in the
+    /// TUI, where we know) the server advertises `response:streaming`.
     streaming: bool,
-    no_streaming: bool,
+    /// The user asked for streaming via `--stream` or `API_STREAMING`. Kept
+    /// separate from `streaming` so the TUI can re-derive the effective value
+    /// when the server flag arrives, and so ctrl+t has something to toggle.
+    stream_requested: bool,
+    /// Server advertises `response:streaming`. Only known in the TUI, which
+    /// reads it from /about at startup; assumed true elsewhere.
+    server_streaming: bool,
     experimental: bool,
     /// In silent bulk mode: print status line (with `|-` prefix) but suppress body output
     bulk_silent: bool,
@@ -166,7 +250,8 @@ impl Default for Config {
             outfile: String::new(),
             outfile_append: false,
             streaming: false,
-            no_streaming: false,
+            stream_requested: false,
+            server_streaming: true,
             experimental: false,
             bulk_silent: false,
             timeout_secs: DEFAULT_TIMEOUT_SECS,
@@ -515,6 +600,8 @@ struct AppState {
     loading_connection_name: Option<String>,  // Connection name for "Connecting to X..." spinner
     status_msg: String,
     status_msg_at: Option<std::time::Instant>,
+    /// Set when streaming turns on, to pulse the footer indicator white.
+    streaming_flash_at: Option<std::time::Instant>,
     ctrl_c_pending: bool,
     ctrl_c_at: Option<std::time::Instant>,
     width: u16,
@@ -595,6 +682,7 @@ impl AppState {
             loading_connection_name: None,
             status_msg: String::new(),
             status_msg_at: None,
+            streaming_flash_at: None,
             ctrl_c_pending: false,
             ctrl_c_at: None,
             width: 80,
@@ -2615,7 +2703,8 @@ fn main() {
     config.raw = args.raw;
     config.include_nulls = args.include_nulls;
     config.ndjson = args.ndjson;
-    config.no_streaming = args.no_streaming;
+    // Streaming is opt-in: --no-streaming beats --stream beats API_STREAMING.
+    config.stream_requested = !args.no_streaming && (args.stream || env_streaming_requested());
     config.experimental = args.experimental;
     if let Some(secs) = args.timeout {
         config.timeout_secs = secs;
@@ -3296,35 +3385,6 @@ fn check_connection(config: &Config) -> Result<(bool, bool, bool), u16> {
     }
 }
 
-fn fetch_feature_flags(config: &Config) -> bool {
-    let client = Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap_or_else(|_| Client::new());
-
-    let url = format!("{}/api/v1/about/feature-flags", config.base_uri);
-
-    let mut request = client.get(&url);
-
-    if !config.token.is_empty() {
-        request = request.header("Authorization", format!("Bearer {}", config.token));
-    } else if !config.api_key.is_empty() {
-        let encoded = BASE64.encode(format!(":{}", config.api_key));
-        request = request.header("Authorization", format!("Basic {}", encoded));
-    }
-
-    match request.send() {
-        Ok(resp) => {
-            if let Ok(flags) = resp.json::<Vec<String>>() {
-                flags.contains(&"response:streaming".to_string())
-            } else {
-                false
-            }
-        }
-        Err(_) => false,
-    }
-}
-
 /// Parse a single request line — same semantics as the interactive client's `parse_input`.
 /// Returns (method, uri_with_outfile_suffix, body) where the URI includes ` > outfile`
 /// if present, so run_non_interactive parses it the same way.
@@ -3533,6 +3593,77 @@ fn is_clipboard_target(s: &str) -> bool {
 /// Append `new_content` to the file at `path` for the `>>` redirect, merging by
 /// content rather than blindly concatenating:
 ///
+/// What became of a TUI response body. `Streamed` means it already went to the
+/// outfile and the accompanying string is only the retained prefix, so nothing
+/// downstream should try to write it again.
+enum BodyDelivery {
+    Buffered,
+    Streamed {
+        overflowed: bool,
+        error: Option<String>,
+    },
+}
+
+/// How much of a streamed body is retained for `classify_response`. Every falsy
+/// payload (`false`, `null`, `0`, `""`) is a handful of bytes, so a body that
+/// overflows this can only be truthy — the prefix decides chains exactly as a
+/// fully buffered read would.
+const CLASSIFY_PREFIX_BYTES: usize = 4096;
+
+/// What a streamed copy left behind, since the body itself was never held.
+struct StreamedBody {
+    /// The leading `CLASSIFY_PREFIX_BYTES` of the body.
+    prefix: String,
+    /// The body was longer than the prefix.
+    overflowed: bool,
+    /// Last byte written, so stdout can match the buffered path's trailing
+    /// newline. `None` for an empty body.
+    last_byte: Option<u8>,
+}
+
+/// Copy a streaming response into `sink` without holding the whole body, keeping
+/// the leading `CLASSIFY_PREFIX_BYTES` so `&&`/`||` chains still see a payload
+/// to judge.
+fn stream_to_sink(mut resp: impl IoRead, sink: &mut dyn Write) -> io::Result<StreamedBody> {
+    let mut prefix: Vec<u8> = Vec::new();
+    let mut overflowed = false;
+    let mut last_byte = None;
+    let mut buf = [0u8; 32 * 1024];
+
+    loop {
+        let n = resp.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        if prefix.len() < CLASSIFY_PREFIX_BYTES {
+            let take = (CLASSIFY_PREFIX_BYTES - prefix.len()).min(n);
+            prefix.extend_from_slice(&buf[..take]);
+            overflowed |= take < n;
+        } else {
+            overflowed = true;
+        }
+        last_byte = Some(buf[n - 1]);
+        sink.write_all(&buf[..n])?;
+    }
+    sink.flush()?;
+
+    Ok(StreamedBody {
+        prefix: String::from_utf8_lossy(&prefix).into_owned(),
+        overflowed,
+        last_byte,
+    })
+}
+
+/// Chain verdict for a streamed body, from the retained prefix. An overflowing
+/// body is truthy by construction — see `CLASSIFY_PREFIX_BYTES`.
+fn classify_streamed(status: u16, prefix: &str, overflowed: bool) -> RequestOutcome {
+    if overflowed && (200..300).contains(&status) {
+        RequestOutcome::Truthy
+    } else {
+        classify_response(status, prefix)
+    }
+}
+
 /// - target missing or empty → plain write, identical to `>`
 /// - `.ndjson`/`.njson` target → a JSON-array payload is exploded to one compact
 ///   object per line, a single JSON value becomes one compact line, and
@@ -3707,6 +3838,15 @@ fn status_is_error(status: u16) -> bool {
 /// Status is checked first — only a 2xx can be truthy. A 404 (and other non-auth
 /// 4xx) is a definite "no" that merely stops the chain, while auth failures, 5xx,
 /// and timeouts are errors.
+/// `API_STREAMING` asks for streaming globally, the way `--stream` does per-run.
+/// Anything other than the listed truthy words is off, so a stray value never
+/// silently changes how responses are written.
+fn env_streaming_requested() -> bool {
+    std::env::var("API_STREAMING")
+        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
 fn classify_response(status: u16, body: &str) -> RequestOutcome {
     if !(200..300).contains(&status) {
         return if status_is_error(status) {
@@ -4181,6 +4321,17 @@ impl OutputBlock {
     }
 }
 
+/// The response body as an `OutputBlock` tail: a blank line above, one below.
+///
+/// The payload's own trailing newline is dropped so this spacing is the only
+/// thing that decides it. Whether a body carries one varies by content type,
+/// status, and streaming — pretty-printing drops it, `-r` and NDJSON keep it,
+/// streamed JSON and error bodies arrive without one — and that difference
+/// otherwise surfaced as an extra blank line under the response.
+fn format_body_block(output: &str) -> String {
+    format!("\n{}\n\n", output.trim_end_matches('\n'))
+}
+
 /// Push a finished block, evicting the oldest past `OUTPUT_HISTORY_LIMIT`.
 fn push_output_block(state: &mut AppState, block: OutputBlock) {
     state.output_history.push(block);
@@ -4485,12 +4636,10 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
         (uri, None, None, false)
     };
 
-    // Fetch feature flags (unless explicitly disabled)
-    config.streaming = if config.no_streaming {
-        false
-    } else {
-        fetch_feature_flags(config)
-    };
+    // Streaming is opt-in and already resolved from --stream/API_STREAMING, so
+    // there is no per-request feature-flag round trip here. A server that
+    // doesn't stream ignores the unknown `;stream=true` media-type parameter.
+    config.streaming = config.stream_requested;
 
     let client = build_request_client(config.timeout_secs);
 
@@ -4584,10 +4733,26 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
         Ok(resp) => {
             let status = resp.status();
             let elapsed = start.elapsed();
-            // Read once, up front: the outcome depends on the body, and the
-            // branches below each need it (or would drain it anyway).
-            let body_text = resp.text().unwrap_or_default();
-            let outcome = classify_response(status.as_u16(), &body_text);
+
+            // `> clipboard` is a special outfile target — route to system clipboard.
+            let is_clipboard = display_outfile
+                .as_deref()
+                .map(is_clipboard_target)
+                .unwrap_or(false);
+
+            // Streaming needs a sink that accepts bytes as they arrive, which
+            // rules out everything that must see the whole body first: pretty
+            // printing, `>>` merging, and the clipboard. Non-2xx buffers too, so
+            // an error payload never streams into an outfile.
+            let stream_body = config.streaming
+                && status.is_success()
+                && !is_clipboard
+                && !outfile_append
+                && (outfile.is_some()
+                    || config.bulk_silent
+                    || config.raw
+                    || config.ndjson
+                    || !is_tty);
 
             // Print status
             if !config.silent {
@@ -4622,11 +4787,60 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                 }
             }
 
-            // `> clipboard` is a special outfile target — route to system clipboard.
-            let is_clipboard = display_outfile
-                .as_deref()
-                .map(is_clipboard_target)
-                .unwrap_or(false);
+            if stream_body {
+                let streamed = if let Some(ref file_path) = outfile {
+                    match fs::File::create(file_path) {
+                        Ok(file) => {
+                            let mut writer = io::BufWriter::new(file);
+                            let res = stream_to_sink(resp, &mut writer);
+                            if res.is_ok() && !config.silent && !config.bulk_silent {
+                                // Match the buffered path: status line, then `> outfile`.
+                                let display = display_outfile.as_deref().unwrap_or(file_path);
+                                eprintln!("{}", format!("> {}", display).dimmed());
+                            }
+                            res
+                        }
+                        Err(e) => Err(e),
+                    }
+                } else if config.bulk_silent {
+                    // Bodies are suppressed here, but the response still has to be
+                    // drained before the next request reuses the connection.
+                    stream_to_sink(resp, &mut io::sink())
+                } else {
+                    let stdout = io::stdout();
+                    let mut lock = stdout.lock();
+                    let res = stream_to_sink(resp, &mut lock);
+                    // Match the buffered path's trailing newline (and the blank
+                    // separator line on a TTY) so piping gives identical bytes.
+                    if let Ok(ref body) = res {
+                        if !matches!(body.last_byte, Some(b'\n') | None) {
+                            let _ = writeln!(lock);
+                        }
+                        let _ = lock.flush();
+                        if is_tty {
+                            eprintln!();
+                        }
+                    }
+                    res
+                };
+
+                return match streamed {
+                    Ok(body) => {
+                        classify_streamed(status.as_u16(), &body.prefix, body.overflowed)
+                    }
+                    Err(e) => {
+                        // A half-written outfile is worse than a loud failure —
+                        // the caller decides whether this ends a bulk run.
+                        eprintln!("Error streaming response: {}", e);
+                        RequestOutcome::Errored
+                    }
+                };
+            }
+
+            // Read once, up front: the outcome depends on the body, and the
+            // branches below each need it (or would drain it anyway).
+            let body_text = resp.text().unwrap_or_default();
+            let outcome = classify_response(status.as_u16(), &body_text);
 
             // Get response body — in bulk_silent mode, only write to outfile (no stdout)
             if config.bulk_silent {
@@ -5128,9 +5342,9 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
             state.loading_frame += 1;
             render(&mut stdout, &mut state)?;
         }
-        // Auto-clear status message after 3 seconds, animate spinner while active
+        // Auto-clear status message after its 3 seconds, animate spinner while active
         if let Some(at) = state.status_msg_at {
-            if at.elapsed() >= Duration::from_secs(3) {
+            if at.elapsed() >= STATUS_MSG_TTL {
                 state.status_msg.clear();
                 state.status_msg_at = None;
                 state.ctrl_c_pending = false;
@@ -5138,10 +5352,17 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
             }
             render(&mut stdout, &mut state)?;
         }
+        // Repaint while the indicator pulses, then let it settle to dimmed.
+        if let Some(at) = state.streaming_flash_at {
+            if at.elapsed() >= Duration::from_millis(400) {
+                state.streaming_flash_at = None;
+            }
+            render(&mut stdout, &mut state)?;
+        }
     }
 
     // Clear input area before exiting (move up and clear to end)
-    let help_lines: u16 = 25;
+    let help_lines: u16 = help_line_count(&state);
     let lines_to_clear: u16 = if state.show_help { help_lines } else { 2 + state.prev_input_lines };
     execute!(
         stdout,
@@ -5463,12 +5684,7 @@ fn handle_key_event(
 
         // Open docs
         (KeyModifiers::CONTROL, KeyCode::Char('b')) => {
-            // Use current base_uri, fallback to dev.heads.com only if no base_uri
-            let url = if state.config.base_uri.is_empty() {
-                "https://dev.heads.com/api-docs".to_string()
-            } else {
-                format!("{}/api-docs", state.config.base_uri)
-            };
+            let url = api_docs_url(&state.config.base_uri);
             let _ = Command::new("open").arg(&url).spawn();
         }
 
@@ -5490,6 +5706,25 @@ fn handle_key_event(
                     std::thread::sleep(Duration::from_secs(3));
                 });
             }
+        }
+
+        // Toggle response streaming (ctrl+t)
+        (KeyModifiers::CONTROL, KeyCode::Char('t')) => {
+            if state.config.streaming {
+                state.config.streaming = false;
+                state.config.stream_requested = false;
+                state.streaming_flash_at = None;
+                clear_streaming_info(state);
+            } else if state.config.server_streaming {
+                state.config.streaming = true;
+                state.config.stream_requested = true;
+                state.streaming_flash_at = Some(Instant::now());
+                show_streaming_info(state);
+            } else {
+                state.status_msg = "streaming not available on this server".to_string();
+                state.status_msg_at = Some(Instant::now());
+            }
+            render(stdout, state)?;
         }
 
         // Save connection (ctrl+s)
@@ -6444,16 +6679,57 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
         return Ok(RequestOutcome::Errored);
     }
 
+    // With no outfile the renderer owns the screen, so there's nothing to stream
+    // into and the body stays buffered. `>>` and clipboard both need the whole
+    // body, and a non-2xx buffers so an error payload never lands in the file.
+    let stream_outfile: Option<String> = if state.config.streaming
+        && !state.config.outfile.is_empty()
+        && !state.config.outfile_append
+        && !is_clipboard_target(&state.display_outfile)
+    {
+        Some(state.config.outfile.clone())
+    } else {
+        None
+    };
+
     // Run HTTP request + body read in a thread so we can handle spinner and ctrl+c
     // Both send() and text() can block — send() waits for headers, text() reads the full body
-    let response_result: Arc<std::sync::Mutex<Option<Result<(reqwest::StatusCode, String), reqwest::Error>>>> =
+    let response_result: Arc<std::sync::Mutex<Option<Result<(reqwest::StatusCode, String, BodyDelivery), reqwest::Error>>>> =
         Arc::new(std::sync::Mutex::new(None));
     let response_result_clone = Arc::clone(&response_result);
     let request_handle = thread::spawn(move || {
         let result = request.send().and_then(|resp| {
             let status = resp.status();
+            if let Some(path) = stream_outfile {
+                if status.is_success() {
+                    // Stream straight to the file. An io failure here is
+                    // reported through BodyDelivery — it isn't a request error.
+                    let streamed = fs::File::create(&path).and_then(|file| {
+                        let mut writer = io::BufWriter::new(file);
+                        stream_to_sink(resp, &mut writer)
+                    });
+                    return Ok(match streamed {
+                        Ok(body) => (
+                            status,
+                            body.prefix,
+                            BodyDelivery::Streamed {
+                                overflowed: body.overflowed,
+                                error: None,
+                            },
+                        ),
+                        Err(e) => (
+                            status,
+                            String::new(),
+                            BodyDelivery::Streamed {
+                                overflowed: false,
+                                error: Some(e.to_string()),
+                            },
+                        ),
+                    });
+                }
+            }
             let body = resp.text()?;
-            Ok((status, body))
+            Ok((status, body, BodyDelivery::Buffered))
         });
         *response_result_clone.lock().unwrap() = Some(result);
     });
@@ -6534,7 +6810,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     let mut response_opt = response_result.lock().unwrap().take();
 
     // Handle OAuth2 token refresh on 401
-    if let Some(Ok((status, _))) = &response_opt {
+    if let Some(Ok((status, _, _))) = &response_opt {
         if status.as_u16() == 401 && !state.oauth2_client_id.is_empty() && !state.oauth2_client_secret.is_empty() {
             // Attempt token refresh
             if let Ok((new_token, _)) = oauth2_token_exchange(&state.config.base_uri, &state.oauth2_client_id, &state.oauth2_client_secret) {
@@ -6566,7 +6842,9 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
                 if let Ok(resp) = retry_request.send() {
                     let retry_status = resp.status();
                     if let Ok(retry_body) = resp.text() {
-                        response_opt = Some(Ok((retry_status, retry_body)));
+                        // The retry buffers regardless — it is a short,
+                        // plain-header request sent after the token refresh.
+                        response_opt = Some(Ok((retry_status, retry_body, BodyDelivery::Buffered)));
                     }
                 }
             }
@@ -6577,12 +6855,20 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     // What this request means for a `&&` chain. Captured before the body is
     // consumed by the outfile/clipboard branches below.
     let outcome = match &response_opt {
-        Some(Ok((status, body_text))) => classify_response(status.as_u16(), body_text),
+        // A streamed body only left its prefix behind, and a write that failed
+        // partway is an error however truthy the bytes looked.
+        Some(Ok((_, _, BodyDelivery::Streamed { error: Some(_), .. }))) => RequestOutcome::Errored,
+        Some(Ok((status, prefix, BodyDelivery::Streamed { overflowed, .. }))) => {
+            classify_streamed(status.as_u16(), prefix, *overflowed)
+        }
+        Some(Ok((status, body_text, BodyDelivery::Buffered))) => {
+            classify_response(status.as_u16(), body_text)
+        }
         Some(Err(_)) | None => RequestOutcome::Errored,
     };
 
     match response_opt {
-        Some(Ok((status, body_text))) => {
+        Some(Ok((status, body_text, delivery))) => {
             let elapsed = start.elapsed();
 
             let status_str = if status.is_success() {
@@ -6626,10 +6912,20 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
                     }
                 }
             } else if !state.config.outfile.is_empty() {
-                let write_result = if state.config.outfile_append {
-                    append_to_outfile(&state.config.outfile, &body_text)
-                } else {
-                    fs::write(&state.config.outfile, &body_text)
+                // A streamed body is already on disk — only its io error, if
+                // any, is still to be reported.
+                let write_result = match delivery {
+                    BodyDelivery::Streamed { error: Some(ref e), .. } => {
+                        Err(io::Error::new(io::ErrorKind::Other, e.clone()))
+                    }
+                    BodyDelivery::Streamed { .. } => Ok(()),
+                    BodyDelivery::Buffered => {
+                        if state.config.outfile_append {
+                            append_to_outfile(&state.config.outfile, &body_text)
+                        } else {
+                            fs::write(&state.config.outfile, &body_text)
+                        }
+                    }
                 };
                 if let Err(e) = write_result {
                     block.head = format!("Error writing to {}: {}\n", state.config.outfile, e);
@@ -6670,7 +6966,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
                     } else {
                         body_text
                     };
-                    block.tail = format!("\n{}\n\n", output);
+                    block.tail = format_body_block(&output);
                 } else {
                     block.head.push('\n');
                 }
@@ -7713,6 +8009,77 @@ fn render_input_content(state: &mut AppState, width: usize) -> (String, u16, Str
     (output, input_line_count, ghost)
 }
 
+/// Right margin kept clear to the marker's right, mirroring the 2-space indent
+/// the hint line carries on the left.
+const STREAMING_INDICATOR_MARGIN: usize = 2;
+
+/// The right-aligned `streaming` marker for the hint line, sitting
+/// `STREAMING_INDICATOR_MARGIN` columns in from the right edge. `left_width` is
+/// the visible width already used by the hint or status message (excluding its
+/// 2-space indent). Returns an empty string when streaming is off or the line is
+/// too narrow to hold both.
+///
+/// Auto-wrap is disabled around this block, so even writing to the final column
+/// is safe — no phantom line appears.
+fn streaming_indicator(state: &AppState, left_width: usize) -> String {
+    if !state.config.streaming {
+        return String::new();
+    }
+    let width = state.width as usize;
+    let used = 2 + left_width + STREAMING_INDICATOR.len() + STREAMING_INDICATOR_MARGIN;
+    if width < used + 1 {
+        // Not enough room — the left-hand text is the more useful of the two.
+        return String::new();
+    }
+    let pad = width - used;
+
+    // Pulse white on activation, using the same two-beat envelope as status
+    // messages but reaching full white so it reads as a state change.
+    let styled = match state.streaming_flash_at {
+        Some(at) => {
+            let ms = at.elapsed().as_millis() as u16;
+            let base: u16 = 240;
+            let peak: u16 = 255;
+            let range = peak - base;
+            let shade = if ms < 150 {
+                let t = ms as f32 / 150.0;
+                Some(base + ((t * std::f32::consts::PI).sin() * range as f32) as u16)
+            } else if (200..350).contains(&ms) {
+                let t = (ms - 200) as f32 / 150.0;
+                Some(base + ((t * std::f32::consts::PI).sin() * range as f32) as u16)
+            } else {
+                None
+            };
+            match shade {
+                Some(s) => format!("\x1b[38;5;{}m{}\x1b[0m", s, STREAMING_INDICATOR),
+                None => STREAMING_INDICATOR.dimmed().to_string(),
+            }
+        }
+        None => STREAMING_INDICATOR.dimmed().to_string(),
+    };
+
+    // No trailing spaces needed — render clears the area first, so the margin is
+    // simply columns we decline to write into.
+    format!("{}{}", " ".repeat(pad), styled)
+}
+
+/// Put the streaming caveat on the footer. Shown on every activation, not once
+/// a session: at three seconds it reads as confirmation of the state change
+/// standing beside it, and the lasting reminder is the `streaming` marker.
+fn show_streaming_info(state: &mut AppState) {
+    state.status_msg = STREAMING_INFO_MSG.to_string();
+    state.status_msg_at = Some(Instant::now());
+}
+
+/// Drop the streaming caveat if it's the message currently up — used when
+/// streaming is switched off before the notice has finished.
+fn clear_streaming_info(state: &mut AppState) {
+    if state.status_msg == STREAMING_INFO_MSG {
+        state.status_msg.clear();
+        state.status_msg_at = None;
+    }
+}
+
 fn flash_rulers(stdout: &mut io::Stdout, state: &mut AppState, color: &str, ms: u64) -> io::Result<()> {
     let w = state.width as usize;
     let up = 2 + state.prev_input_lines;
@@ -7798,8 +8165,8 @@ fn render<W: Write>(stdout: &mut W, state: &mut AppState) -> io::Result<()> {
 
     // Determine how many lines to clear:
     // - Normal input area: 2 + input_lines (ruler + input line(s) + hint)
-    // - Help menu: 14 lines (15 with tab completion)
-    let help_lines: u16 = 25;
+    // - Help menu: its fixed rows, plus the streaming section when it applies
+    let help_lines: u16 = help_line_count(state);
     let normal_lines: u16 = 2 + state.prev_input_lines; // ruler + input line(s) + hint
     let lines_to_clear: u16 = if state.prev_show_help && !state.show_help {
         help_lines  // Closing help - clear all help lines
@@ -7902,10 +8269,18 @@ fn render<W: Write>(stdout: &mut W, state: &mut AppState) -> io::Result<()> {
             Print(format!("{}\r\n", "  ctrl+q     Switch connection".dimmed())),
             Print(format!("{}\r\n", "  ctrl+b     Open API docs in browser".dimmed())),
             Print(format!("{}\r\n", "  ctrl+o     Open last saved file".dimmed())),
+            Print(format!("{}\r\n", "  ctrl+t     Toggle response streaming".dimmed())),
             Print(format!("{}\r\n", "  ctrl+c     Quit".dimmed())),
             Print("\r\n"),
             Print(format!("{}\r\n", "  ctrl+h or esc to close".dimmed()))
         )?;
+        // Only worth the rows when it applies — see `help_line_count`.
+        if state.config.streaming {
+            queue!(stdout, Print("\r\n"))?;
+            for line in streaming_help_lines(&state.config.base_uri) {
+                queue!(stdout, Print(format!("{}\r\n", line.dimmed())))?;
+            }
+        }
     } else if state.body_input_mode {
         // Show method + URI on first line, prompt on second, buffer with cursor below
         let header = format!("{} {}", state.body_input_method, state.body_input_uri);
@@ -7983,8 +8358,11 @@ fn render<W: Write>(stdout: &mut W, state: &mut AppState) -> io::Result<()> {
                     state.status_msg.dimmed().to_string()
                 };
                 queue!(stdout, Print(format!("  {}", msg_style)))?;
+                queue!(stdout, Print(streaming_indicator(state, visible_len(&state.status_msg))))?;
             } else {
-                queue!(stdout, Print(format!("  {}", "ctrl+h for shortcuts".dimmed())))?;
+                let hint = "ctrl+h for shortcuts";
+                queue!(stdout, Print(format!("  {}", hint.dimmed())))?;
+                queue!(stdout, Print(streaming_indicator(state, hint.len())))?;
             }
         }
     }
@@ -8259,7 +8637,14 @@ fn apply_background_result(state: &mut AppState, result: BackgroundLoadResult) {
     if let Some(key) = result.api_key {
         state.config.api_key = key;
     }
-    state.config.streaming = result.streaming && !state.config.no_streaming;
+    // The TUI learns the server's capability from /about, so it can AND it with
+    // the user's opt-in rather than sending a header an old server can't parse.
+    state.config.server_streaming = result.streaming;
+    state.config.streaming = result.streaming && state.config.stream_requested;
+    if state.config.streaming {
+        state.streaming_flash_at = Some(Instant::now());
+        show_streaming_info(state);
+    }
     state.config.complete = result.complete;
     state.endpoints = result.endpoints;
     state.schema_props = result.schema_props;
@@ -12656,6 +13041,34 @@ mod tests {
     }
 
     #[test]
+    fn body_block_spacing_ignores_the_payloads_trailing_newline() {
+        // Same body, with and without the newline the server may or may not
+        // send: both must render identically. `-r` used to show an extra blank
+        // line because the raw payload kept a newline pretty-printing dropped.
+        let with = format_body_block("{\"a\":1}\n");
+        let without = format_body_block("{\"a\":1}");
+        assert_eq!(with, without);
+        assert_eq!(without, "\n{\"a\":1}\n\n");
+
+        // Streamed JSON and error bodies arrive with no trailing newline;
+        // NDJSON always has one. All land on the same spacing.
+        assert_eq!(format_body_block("{\"error\":\"nope\"}"), "\n{\"error\":\"nope\"}\n\n");
+
+        // A multi-line body keeps its internal breaks — only the final run goes.
+        assert_eq!(
+            format_body_block("{\"a\":1}\n{\"b\":2}\n"),
+            "\n{\"a\":1}\n{\"b\":2}\n\n"
+        );
+
+        // A blank line the server actually sent inside the payload is still
+        // trailing whitespace here; collapsing it keeps the block height fixed.
+        assert_eq!(format_body_block("x\n\n\n"), "\nx\n\n");
+
+        // Non-empty is what makes has_body() true, so ctrl+j still finds it.
+        assert!(!format_body_block("{}").is_empty());
+    }
+
+    #[test]
     fn output_block_strip_body_keeps_the_status_line() {
         let mut block = sample_block();
         assert!(block.has_body());
@@ -13204,6 +13617,257 @@ mod tests {
         // No body to test — the 2xx is the answer (204 from a DELETE).
         assert_eq!(classify_response(204, ""), Truthy);
         assert_eq!(classify_response(200, "   "), Truthy);
+    }
+
+    #[test]
+    fn streaming_indicator_is_right_aligned_and_drops_when_cramped() {
+        let hint = "ctrl+h for shortcuts";
+        let mut state = AppState::new(Config::default());
+
+        // Off by default — nothing is added to the hint line.
+        state.width = 80;
+        assert_eq!(streaming_indicator(&state, hint.len()), "");
+
+        // On: the label stops `STREAMING_INDICATOR_MARGIN` columns short of the
+        // edge. Overshooting would wrap and break the fixed-height input block.
+        state.config.streaming = true;
+        let indicator = streaming_indicator(&state, hint.len());
+        let rendered = format!("  {}{}", hint, indicator);
+        assert_eq!(visible_len(&rendered), 80 - STREAMING_INDICATOR_MARGIN);
+        // Padding first, label last — the label ends at the margin.
+        assert!(indicator.starts_with(' '));
+        assert!(indicator.contains(STREAMING_INDICATOR));
+
+        // Exactly enough room for indent + hint + a space + label + margin.
+        state.width =
+            (2 + hint.len() + 1 + STREAMING_INDICATOR.len() + STREAMING_INDICATOR_MARGIN) as u16;
+        let rendered = format!("  {}{}", hint, streaming_indicator(&state, hint.len()));
+        assert_eq!(
+            visible_len(&rendered),
+            state.width as usize - STREAMING_INDICATOR_MARGIN
+        );
+
+        // One column short: the hint is the more useful of the two, so the
+        // indicator gives way rather than wrapping.
+        state.width -= 1;
+        assert_eq!(streaming_indicator(&state, hint.len()), "");
+    }
+
+    #[test]
+    fn help_block_height_tracks_the_streaming_section() {
+        // The help panel is cleared by a line count, so a mismatch between what
+        // is drawn and what is counted corrupts the screen on close.
+        let mut state = AppState::new(Config::default());
+        state.width = 80;
+        let plain = help_line_count(&state);
+
+        state.config.base_uri = "http://localhost:5000".to_string();
+        state.config.streaming = true;
+        let lines = streaming_help_lines(&state.config.base_uri);
+        assert_eq!(
+            help_line_count(&state),
+            plain + 1 + lines.len() as u16,
+            "at 80 columns nothing wraps, so it's one row per line"
+        );
+
+        // The link carries the connection's host. A host long enough to wrap it
+        // must be counted as the rows it actually occupies, or closing help
+        // leaves the tail of the link on screen.
+        state.config.base_uri = format!("https://{}.example.com", "x".repeat(60));
+        let wrapped = streaming_help_lines(&state.config.base_uri);
+        let link_rows = visual_line_count(wrapped.last().unwrap(), 80);
+        assert!(link_rows > 1, "test needs a base URI long enough to wrap");
+        assert_eq!(
+            help_line_count(&state),
+            plain + 1 + (wrapped.len() as u16 - 1) + link_rows
+        );
+    }
+
+    #[test]
+    fn streaming_help_links_to_the_connections_own_docs() {
+        // Deep-links into the same docs ctrl+b opens, not a fixed host.
+        let lines = streaming_help_lines("http://localhost:5000");
+        let link = lines.last().expect("link line");
+        assert_eq!(
+            link.trim(),
+            "http://localhost:5000/api-docs#description/streaming"
+        );
+
+        // Before a connection exists, fall back to the public docs.
+        let lines = streaming_help_lines("");
+        assert_eq!(
+            lines.last().unwrap().trim(),
+            "https://dev.heads.com/api-docs#description/streaming"
+        );
+
+        // A blank line separates the prose from the link.
+        assert_eq!(lines[lines.len() - 2], "");
+    }
+
+    #[test]
+    fn streaming_help_lines_fit_without_wrapping() {
+        // A wrapped line would print more rows than `help_line_count` claims.
+        for line in STREAMING_HELP_PROSE {
+            assert!(
+                line.chars().count() <= STREAMING_HELP_MAX_COLS,
+                "help line too long ({}): {line}",
+                line.chars().count()
+            );
+        }
+        // The footer notice has to fit beside the indicator at 80 columns.
+        assert!(
+            2 + STREAMING_INFO_MSG.chars().count()
+                + 1
+                + STREAMING_INDICATOR.len()
+                + STREAMING_INDICATOR_MARGIN
+                <= 80,
+            "notice + indicator must fit on one 80-column line"
+        );
+    }
+
+    #[test]
+    fn streaming_indicator_pulses_bright_then_settles() {
+        let hint = "ctrl+h for shortcuts";
+        let mut state = AppState::new(Config::default());
+        state.width = 80;
+        state.config.streaming = true;
+
+        let shade_at = |state: &mut AppState, ms: u64| -> Option<u16> {
+            state.streaming_flash_at = Instant::now().checked_sub(Duration::from_millis(ms));
+            let s = streaming_indicator(state, hint.len());
+            // Pull the 256-colour index back out of the escape sequence.
+            s.split("38;5;")
+                .nth(1)
+                .and_then(|rest| rest.split('m').next())
+                .and_then(|n| n.parse::<u16>().ok())
+        };
+
+        // Peaks of the two peaks, and the trough between them.
+        assert_eq!(shade_at(&mut state, 75), Some(255), "first pulse should peak white");
+        assert_eq!(shade_at(&mut state, 275), Some(255), "second pulse should peak white");
+        let trough = shade_at(&mut state, 175);
+        assert!(
+            trough.is_none() || trough == Some(240),
+            "between pulses the indicator sits dim, got {trough:?}"
+        );
+
+        // Past the envelope it settles and the flash is cleared by the loop.
+        let settled = shade_at(&mut state, 500);
+        assert!(
+            settled.is_none() || settled == Some(240),
+            "after the flash it should be dimmed, got {settled:?}"
+        );
+    }
+
+    #[test]
+    fn streaming_info_shows_on_every_activation() {
+        let mut state = AppState::new(Config::default());
+
+        // Every activation puts the caveat up — it confirms the state change,
+        // so it must not fall silent after the first one.
+        for _ in 0..3 {
+            show_streaming_info(&mut state);
+            assert_eq!(state.status_msg, STREAMING_INFO_MSG);
+
+            // Switching off takes it down with the state it describes.
+            clear_streaming_info(&mut state);
+            assert!(state.status_msg.is_empty());
+            assert!(state.status_msg_at.is_none());
+        }
+    }
+
+    #[test]
+    fn clearing_streaming_info_leaves_other_messages_alone() {
+        // Toggling streaming off must not wipe an unrelated notice that
+        // happens to be up at the time.
+        let mut state = AppState::new(Config::default());
+        state.status_msg = "curl command copied to clipboard".to_string();
+        state.status_msg_at = Some(Instant::now());
+
+        clear_streaming_info(&mut state);
+        assert_eq!(state.status_msg, "curl command copied to clipboard");
+        assert!(state.status_msg_at.is_some());
+    }
+
+
+    #[test]
+    fn classify_streamed_matches_buffered_within_the_prefix() {
+        use RequestOutcome::*;
+        // A body that fit in the retained prefix decides exactly as a buffered
+        // read would — streaming must not change chain semantics.
+        for body in ["false", "null", "0", "\"\"", "[]", "{}", "true", "[{\"id\":1}]"] {
+            assert_eq!(
+                classify_streamed(200, body, false),
+                classify_response(200, body),
+                "streamed verdict diverged for {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_streamed_treats_overflow_as_truthy() {
+        use RequestOutcome::*;
+        // Past the prefix the payload can only be a big collection, and no falsy
+        // JSON literal is that long — so the truncated prefix must not be judged
+        // on its own (`[{"id":1},...` is not parseable JSON).
+        assert_eq!(classify_streamed(200, r#"[{"id":1},{"i"#, true), Truthy);
+        // Overflow doesn't rescue a non-2xx: those still fall to the status.
+        assert_eq!(classify_streamed(404, "a long error page", true), Falsy);
+        assert_eq!(classify_streamed(500, "a long error page", true), Errored);
+    }
+
+    #[test]
+    fn stream_to_sink_reports_overflow_only_past_the_prefix() {
+        // Exactly at the boundary is not an overflow — the whole body is still
+        // available for classification.
+        let body = vec![b'x'; CLASSIFY_PREFIX_BYTES];
+        let mut out = Vec::new();
+        let got = stream_to_sink(&body[..], &mut out).unwrap();
+        assert_eq!(out.len(), CLASSIFY_PREFIX_BYTES);
+        assert_eq!(got.prefix.len(), CLASSIFY_PREFIX_BYTES);
+        assert!(!got.overflowed);
+
+        // One byte more, and the prefix caps while the sink still gets it all.
+        let body = vec![b'x'; CLASSIFY_PREFIX_BYTES + 1];
+        let mut out = Vec::new();
+        let got = stream_to_sink(&body[..], &mut out).unwrap();
+        assert_eq!(out.len(), CLASSIFY_PREFIX_BYTES + 1);
+        assert_eq!(got.prefix.len(), CLASSIFY_PREFIX_BYTES);
+        assert!(got.overflowed);
+    }
+
+    #[test]
+    fn stream_to_sink_reports_the_last_byte_for_newline_matching() {
+        // Drives whether the stdout path adds the trailing newline that the
+        // buffered path always appends.
+        let got = stream_to_sink(&b"[1,2]"[..], &mut Vec::new()).unwrap();
+        assert_eq!(got.last_byte, Some(b']'));
+
+        let got = stream_to_sink(&b"[1,2]\n"[..], &mut Vec::new()).unwrap();
+        assert_eq!(got.last_byte, Some(b'\n'));
+
+        // An empty body must not gain a newline out of nowhere.
+        let got = stream_to_sink(&b""[..], &mut Vec::new()).unwrap();
+        assert_eq!(got.last_byte, None);
+        assert!(!got.overflowed);
+        assert!(got.prefix.is_empty());
+    }
+
+    #[test]
+    fn env_streaming_accepts_only_truthy_words() {
+        // Guard the parsing rule itself; the env var is read in one place.
+        for v in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(
+                matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+                "{v} should enable streaming"
+            );
+        }
+        for v in ["0", "false", "off", "no", "", "maybe"] {
+            assert!(
+                !matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+                "{v} should not enable streaming"
+            );
+        }
     }
 
     #[test]

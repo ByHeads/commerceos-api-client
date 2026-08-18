@@ -109,6 +109,45 @@ api GET /products~map(com.heads.sql-product) > products.sql
 The output extension also drives the `Accept` header (`.csv` → `text/csv`,
 `.ndjson` → `application/x-ndjson`, `.sql` → `application/sql`).
 
+### Streaming
+
+Streaming is **opt-in**. Without it the whole response is read into memory and
+pretty-printed; with it the body is written out as it arrives, which is what you
+want for large exports and `~map(...)` transformations.
+
+```sh
+api --stream GET "/products > products.ndjson"   # per-run
+export API_STREAMING=1                            # globally
+```
+
+`API_STREAMING` counts as on for `1`, `true`, `yes`, or `on` (any case).
+`--no-streaming` overrides both, so you can turn it off for a single run without
+unsetting the variable.
+
+Where the bytes go when streaming is on:
+
+| Destination | Behaviour |
+|---|---|
+| `> file` | streamed straight to the file |
+| stdout, piped (`api ... \| cat`) | streamed raw |
+| stdout with `-r` | streamed raw |
+| stdout, terminal, no `-r` | buffered and pretty-printed |
+| `>> file`, `> clipboard` | buffered — both need the whole body |
+| any non-2xx response | buffered, so an error page never streams into a file |
+
+Two consequences worth knowing:
+
+- A streamed `> file.json` is **not** pretty-printed — the file gets the
+  server's bytes verbatim. Drop `--stream` if you want it formatted.
+- A streaming response commits to its status code before the body is generated,
+  so **a `200` can still carry an error inside the stream**. Check the payload,
+  not just the status.
+
+In interactive mode, `ctrl+t` toggles streaming and a `streaming` marker appears
+at the bottom right while it's on. While streaming is active, `ctrl+h` adds a
+section spelling out these caveats, with a link to
+`<base-uri>/api-docs#description/streaming` for the full documentation.
+
 ### Bulk mode
 
 Run a sequence of requests from a text file with `-a`:
@@ -192,6 +231,7 @@ Press `ctrl+h` for the full list of key bindings:
 | `ctrl+q` | Switch connection |
 | `ctrl+b` | Open API docs in browser |
 | `ctrl+o` | Open last saved file |
+| `ctrl+t` | Toggle response streaming |
 | `ctrl+h` | Toggle help |
 | `ctrl+c` | Quit (double-press) |
 
@@ -229,9 +269,20 @@ Options:
   -x, --experimental              Enable experimental body completion / syntax highlighting
       --me                        Use /api/me/v1 instead of /api/v1
       --ndjson                    Use NDJSON for request and response
+      --stream                    Stream the response body (also: API_STREAMING=1)
+      --no-streaming              Force streaming off, overriding --stream/API_STREAMING
+      --timeout <SECONDS>         Request timeout; 0 disables it (default: 600)
+  -p, --preview                   Preview the request(s) and confirm before sending
   -v, --version                   Print version
   -h, --help                      Print help
 ```
+
+### Environment variables
+
+| Variable | Effect |
+|---|---|
+| `API_STREAMING` | `1`/`true`/`yes`/`on` turns on response streaming globally |
+| `API_CREDENTIALS_FILE` | Path to the plaintext credentials file used with `--no-keychain` |
 
 ## Tests
 

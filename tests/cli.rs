@@ -381,16 +381,156 @@ fn raw_disables_pretty_printing() {
     );
 }
 
+/// Send one request to a throwaway local server and return the raw request
+/// headers it received. The real COS doesn't reflect headers back, so this is
+/// the only way to assert on what was actually sent.
+fn captured_request_headers(args: &[&str], env: &[(&str, &str)]) -> String {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap_or(0);
+        let _ = stream.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n[]",
+        );
+        let _ = stream.flush();
+        String::from_utf8_lossy(&buf[..n]).to_string()
+    });
+
+    // Built directly rather than via api(): that helper may pass `-b` from the
+    // environment, which would collide with the dummy server here.
+    let mut cmd = Command::cargo_bin("api").expect("api binary built");
+    cmd.arg("--no-keychain");
+    cmd.env("API_CREDENTIALS_FILE", credentials_file());
+    cmd.args(["-b", &format!("http://127.0.0.1:{port}"), "-k", "dummy-key"]);
+    cmd.args(["GET", "/echo-all"]).args(args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.assert().success();
+
+    handle.join().expect("server thread")
+}
+
 #[test]
-fn no_streaming_flag_disables_streaming() {
+fn streaming_is_off_unless_asked_for() {
+    // The server advertising response:streaming is no longer enough — the
+    // client must be told to use it.
+    let headers = captured_request_headers(&[], &[]);
+    assert!(
+        !headers.contains("stream=true"),
+        "default run should not request streaming: {headers}"
+    );
+}
+
+#[test]
+fn stream_flag_enables_streaming() {
+    let headers = captured_request_headers(&["--stream"], &[]);
+    assert!(
+        headers.contains("stream=true"),
+        "--stream should request streaming: {headers}"
+    );
+}
+
+#[test]
+fn api_streaming_env_var_enables_streaming() {
+    let headers = captured_request_headers(&[], &[("API_STREAMING", "1")]);
+    assert!(
+        headers.contains("stream=true"),
+        "API_STREAMING=1 should request streaming: {headers}"
+    );
+    // A non-truthy value leaves it off rather than enabling on mere presence.
+    let headers = captured_request_headers(&[], &[("API_STREAMING", "0")]);
+    assert!(
+        !headers.contains("stream=true"),
+        "API_STREAMING=0 should not request streaming: {headers}"
+    );
+}
+
+#[test]
+fn no_streaming_beats_stream_and_env_var() {
+    let headers =
+        captured_request_headers(&["--stream", "--no-streaming"], &[("API_STREAMING", "1")]);
+    assert!(
+        !headers.contains("stream=true"),
+        "--no-streaming should win over both: {headers}"
+    );
+}
+
+#[test]
+fn streamed_outfile_matches_buffered_outfile() {
     require_local_cos();
-    // With --no-streaming, the request should succeed without ;stream=true
-    // (server still responds; the flag just changes the Accept/Content-Type headers).
+    let dir = tempdir().unwrap();
+    let streamed = dir.path().join("streamed.ndjson");
+    let buffered = dir.path().join("buffered.ndjson");
+
+    // NDJSON so neither path pretty-prints — the bytes are directly comparable.
     api()
-        .args(["GET", "/echo-all", "--no-streaming"])
+        .args([
+            "PUT",
+            &format!("/echo-all > {}", streamed.display()),
+            r#"{"id":1}"#,
+            "--ndjson",
+            "--stream",
+        ])
         .assert()
-        .success()
-        .stderr(predicate::str::contains("HTTP/1.1 200 OK"));
+        .success();
+    api()
+        .args([
+            "PUT",
+            &format!("/echo-all > {}", buffered.display()),
+            r#"{"id":1}"#,
+            "--ndjson",
+        ])
+        .assert()
+        .success();
+
+    let a = std::fs::read(&streamed).expect("streamed outfile written");
+    let b = std::fs::read(&buffered).expect("buffered outfile written");
+    assert!(!a.is_empty(), "streamed outfile should not be empty");
+    assert_eq!(a, b, "streaming must not change the bytes written");
+}
+
+#[test]
+fn streamed_stdout_matches_buffered_stdout() {
+    require_local_cos();
+    // Piped stdout streams rather than buffering, so the two paths must still
+    // emit identical bytes — including the trailing newline.
+    let streamed = api()
+        .args(["PUT", "/echo-all", r#"{"id":1}"#, "-r", "--stream"])
+        .output()
+        .expect("spawn api");
+    let buffered = api()
+        .args(["PUT", "/echo-all", r#"{"id":1}"#, "-r"])
+        .output()
+        .expect("spawn api");
+    assert!(!streamed.stdout.is_empty(), "streamed stdout should not be empty");
+    assert_eq!(
+        String::from_utf8_lossy(&streamed.stdout),
+        String::from_utf8_lossy(&buffered.stdout),
+        "streaming must not change what reaches stdout"
+    );
+}
+
+#[test]
+fn streaming_still_writes_an_outfile_for_a_chain() {
+    require_local_cos();
+    // The chain's truthiness comes from the retained prefix, so a streamed
+    // first segment must still let the second one run.
+    let dir = tempdir().unwrap();
+    let out = dir.path().join("chained.json");
+    api()
+        .args([
+            "--stream",
+            "GET",
+            &format!("/echo-all && GET /echo-all > {}", out.display()),
+        ])
+        .assert()
+        .success();
+    assert!(out.exists(), "second segment should have run");
 }
 
 #[test]

@@ -164,6 +164,29 @@ Recommended conventions for agents:
 - Match the file extension to the desired format (`.csv` for CSV exports, `.sql` for SQL, `.ndjson` for streams)
 - Re-running the batch overwrites the files, so they're always fresh
 
+### Streaming large exports (`--stream`)
+
+Streaming is off unless asked for, via `--stream` or `API_STREAMING=1`
+(`--no-streaming` overrides both). It matters for agents mainly on big exports:
+with `--stream`, a response bound for `> file` is written as it arrives instead
+of being held in memory first.
+
+```sh
+api --stream -sa export.api
+```
+
+Two caveats when reading the results back:
+
+- A streamed `> file.json` is **not** pretty-printed — it holds the server's
+  bytes verbatim. Parse it rather than eyeballing it, or drop `--stream`.
+- A streaming response sends its status line before the body exists, so **a
+  `200` can still carry an error inside the payload**. Check the content, not
+  just the status line.
+
+`>> file` appends and `> clipboard` both need the whole body, so they buffer
+even with `--stream`; so does any non-2xx response, which keeps error pages out
+of outfiles.
+
 ## 5. Includes
 
 A line that isn't a comment, isn't blank, and doesn't start with a method or `/`
