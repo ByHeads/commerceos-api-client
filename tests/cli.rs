@@ -433,6 +433,165 @@ fn outfile_writes_response_to_file() {
 }
 
 #[test]
+fn append_outfile_merges_arrays_across_bulk_runs() {
+    require_local_cos();
+    let dir = tempdir().unwrap();
+    let outfile = dir.path().join("collected.json");
+    let req_file = dir.path().join("append.api");
+    // Two `>>` writes to the same target: array payloads must merge into one
+    // array rather than the second overwriting the first.
+    let content = format!(
+        "PUT /echo-all [{{\"id\":1}}] >> {out}\nPUT /echo-all [{{\"id\":2}}] >> {out}\n",
+        out = outfile.display()
+    );
+    std::fs::write(&req_file, content).unwrap();
+
+    api().args(["-sa"]).arg(&req_file).assert().success();
+
+    let written = std::fs::read_to_string(&outfile).expect("outfile written");
+    let v: serde_json::Value = serde_json::from_str(&written).expect("merged file is valid JSON");
+    let arr = v.as_array().expect("merged file is one array");
+    assert_eq!(arr.len(), 2, "expected both payloads in one array, got: {written}");
+
+    // A plain `>` to the same target still overwrites.
+    let req2 = dir.path().join("overwrite.api");
+    std::fs::write(
+        &req2,
+        format!("PUT /echo-all [{{\"id\":9}}] > {}\n", outfile.display()),
+    )
+    .unwrap();
+    api().args(["-sa"]).arg(&req2).assert().success();
+    let written = std::fs::read_to_string(&outfile).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&written).unwrap();
+    assert_eq!(v.as_array().map(|a| a.len()), Some(1), "`>` must overwrite: {written}");
+}
+
+#[test]
+fn append_outfile_wraps_repeated_object_responses_into_an_array() {
+    require_local_cos();
+    let dir = tempdir().unwrap();
+    let outfile = dir.path().join("foo.json");
+    // The reported scenario: /about returns a single object; two `>>` runs must
+    // leave one two-element array, not two newline-separated objects.
+    let req_file = dir.path().join("about.api");
+    std::fs::write(
+        &req_file,
+        format!("GET /about >> {out}\nGET /about >> {out}\n", out = outfile.display()),
+    )
+    .unwrap();
+
+    api().args(["-sa"]).arg(&req_file).assert().success();
+
+    let written = std::fs::read_to_string(&outfile).expect("outfile written");
+    let v: serde_json::Value = serde_json::from_str(&written)
+        .expect("file must be valid JSON after repeated appends");
+    let arr = v.as_array().expect("repeated object responses should merge into an array");
+    assert_eq!(arr.len(), 2, "expected both responses in one array, got: {written}");
+    assert!(
+        arr.iter().all(|e| e.get("@type").is_some()),
+        "elements should be the /about objects: {written}"
+    );
+}
+
+#[test]
+fn or_chain_runs_fallback_on_falsy_and_skips_on_truthy() {
+    require_local_cos();
+    let dir = tempdir().unwrap();
+
+    // Falsy condition (404) → the || fallback runs.
+    let req = dir.path().join("or-falsy.api");
+    std::fs::write(&req, "GET /no-such-endpoint || PUT /echo-all [{\"fallback\":1}]\n").unwrap();
+    let assert = api().args(["-sa"]).arg(&req).assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    assert_eq!(
+        stdout.matches("└─HTTP/1.1").count(),
+        2,
+        "fallback should have run after the 404: {stdout}"
+    );
+    assert!(!stdout.contains("skipped"), "nothing should be skipped: {stdout}");
+
+    // Truthy condition → the || fallback is skipped.
+    let req = dir.path().join("or-truthy.api");
+    std::fs::write(&req, "GET /about || PUT /echo-all [{\"fallback\":1}]\n").unwrap();
+    let assert = api().args(["-sa"]).arg(&req).assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    assert_eq!(stdout.matches("└─HTTP/1.1").count(), 1, "fallback should be skipped: {stdout}");
+    assert!(stdout.contains("skipped 1 request"), "expected the skip note: {stdout}");
+}
+
+#[test]
+fn mixed_chain_behaves_as_if_then_else() {
+    require_local_cos();
+    let dir = tempdir().unwrap();
+
+    // Truthy condition: && branch runs, || branch skipped → 2 requests sent.
+    let req = dir.path().join("ite-truthy.api");
+    std::fs::write(
+        &req,
+        "GET /about && PUT /echo-all [{\"then\":1}] || PUT /echo-all [{\"else\":1}]\n",
+    )
+    .unwrap();
+    let assert = api().args(["-sa"]).arg(&req).assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    assert_eq!(stdout.matches("└─HTTP/1.1").count(), 2, "then-branch only: {stdout}");
+    assert!(stdout.contains("skipped 1 request"), "else-branch skipped: {stdout}");
+
+    // Falsy condition: && branch skipped, || branch runs → 2 requests sent,
+    // and the else body is the one that went out.
+    let req = dir.path().join("ite-falsy.api");
+    std::fs::write(
+        &req,
+        "GET /no-such-endpoint && PUT /echo-all [{\"then\":1}] || PUT /echo-all [{\"else\":1}]\n",
+    )
+    .unwrap();
+    let assert = api().args(["-sa"]).arg(&req).assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    assert_eq!(stdout.matches("└─HTTP/1.1").count(), 2, "else-branch ran: {stdout}");
+    assert!(stdout.contains("\"else\":1"), "the else body should have been sent: {stdout}");
+    assert!(!stdout.contains("\"then\":1") || stdout.matches("PUT /echo-all").count() == 2,
+        "then-branch must not run: {stdout}");
+    assert!(stdout.contains("skipped 1 request"), "then-branch skipped: {stdout}");
+}
+
+#[test]
+fn or_chain_does_not_catch_errors() {
+    require_local_cos();
+    let dir = tempdir().unwrap();
+    // A 401 is Errored, not Falsy — the || fallback must NOT run, and the run
+    // aborts with exit 1.
+    let req = dir.path().join("or-err.api");
+    std::fs::write(&req, "GET /about || PUT /echo-all [{\"fallback\":1}]\n").unwrap();
+    let mut cmd = Command::cargo_bin("api").expect("api binary built");
+    cmd.arg("--no-keychain");
+    cmd.env("API_CREDENTIALS_FILE", credentials_file());
+    let assert = cmd
+        .args(["-b", "http://localhost:5000", "-k", "badkey", "-sa"])
+        .arg(&req)
+        .assert()
+        .failure();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    assert_eq!(
+        stdout.matches("└─HTTP/1.1").count(),
+        1,
+        "the fallback must not run on a 401: {stdout}"
+    );
+}
+
+#[test]
+fn append_to_clipboard_is_rejected() {
+    require_local_cos();
+    let assert = api()
+        .args(["GET", "/echo-all >> clipboard"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("cannot append to clipboard"),
+        "expected append-to-clipboard rejection, got: {stderr}"
+    );
+}
+
+#[test]
 fn outfile_csv_extension_sets_csv_accept() {
     require_local_cos();
     let dir = tempdir().unwrap();
@@ -934,4 +1093,68 @@ fn timeout_flag_accepts_seconds_value() {
         .args(["GET", "/echo-all", "--timeout", "30", "--silent"])
         .assert()
         .success();
+}
+
+#[test]
+fn timeout_help_states_the_default_and_the_disable_value() {
+    // The help text used to claim "no timeout", which was never true — reqwest's
+    // blocking client applied a hidden 30s default.
+    Command::cargo_bin("api")
+        .expect("api binary built")
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("600"))
+        .stdout(predicate::str::contains("10 minutes"));
+}
+
+#[test]
+fn timeout_zero_disables_the_timeout() {
+    require_local_cos();
+    api()
+        .args(["GET", "/echo-all", "--timeout", "0", "--silent"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn timeout_expiry_reports_the_timeout_not_a_dead_server() {
+    // A 1s timeout against a host that accepts the connection but never answers.
+    // The old code discarded the error and always blamed the server.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    // Accept connections but never respond, so the client waits for headers.
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept() {
+            held.push(stream);
+        }
+    });
+
+    // Built directly rather than via api(): that helper may already pass `-b`
+    // from the environment, which would collide with the dummy server here.
+    let mut cmd = Command::cargo_bin("api").expect("api binary built");
+    cmd.arg("--no-keychain");
+    cmd.env("API_CREDENTIALS_FILE", credentials_file());
+    let assert = cmd
+        .args([
+            "-b",
+            &format!("http://127.0.0.1:{port}"),
+            "-k",
+            "dummy-key",
+            "--timeout",
+            "1",
+            "GET",
+            "/echo-all",
+        ])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+
+    assert!(stderr.contains("Timed out after 1s"), "expected timeout message, got: {stderr}");
+    assert!(stderr.contains("--timeout"), "expected the remedy, got: {stderr}");
+    assert!(
+        !stderr.contains("Is COS running"),
+        "a timeout must not be reported as a dead server: {stderr}"
+    );
 }

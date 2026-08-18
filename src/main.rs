@@ -119,7 +119,7 @@ struct Args {
     #[arg(long = "no-streaming")]
     no_streaming: bool,
 
-    /// Request timeout in seconds (default: no timeout)
+    /// Request timeout in seconds; 0 disables it (default: 600 = 10 minutes)
     #[arg(long = "timeout", value_name = "SECONDS")]
     timeout: Option<u64>,
 }
@@ -136,13 +136,17 @@ struct Config {
     ndjson: bool,
     complete: bool,
     outfile: String,
+    /// `>> file` instead of `> file`: append to the target, merging arrays and
+    /// format-aware for `.ndjson`/`.csv`, rather than overwriting.
+    outfile_append: bool,
     streaming: bool,
     no_streaming: bool,
     experimental: bool,
     /// In silent bulk mode: print status line (with `|-` prefix) but suppress body output
     bulk_silent: bool,
-    /// Request timeout in seconds. None = no timeout (indefinite).
-    timeout_secs: Option<u64>,
+    /// Request timeout in seconds. Always set — see `DEFAULT_TIMEOUT_SECS`.
+    /// `0` means no timeout (indefinite), via `--timeout 0`.
+    timeout_secs: u64,
     /// Preview request(s) and confirm before sending
     preview: bool,
 }
@@ -160,22 +164,42 @@ impl Default for Config {
             ndjson: false,
             complete: false,
             outfile: String::new(),
+            outfile_append: false,
             streaming: false,
             no_streaming: false,
             experimental: false,
             bulk_silent: false,
-            timeout_secs: None,
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
             preview: false,
         }
     }
 }
 
-fn build_request_client(timeout_secs: Option<u64>) -> Client {
-    let mut builder = Client::builder();
-    if let Some(secs) = timeout_secs {
-        builder = builder.timeout(Duration::from_secs(secs));
+/// Default request timeout. Set explicitly because reqwest's *blocking* client
+/// otherwise applies its own 30s default — far too short for large exports.
+const DEFAULT_TIMEOUT_SECS: u64 = 600; // 10 minutes
+
+/// Build the HTTP client. The timeout is always passed explicitly, so reqwest's
+/// hidden default can never apply; `0` disables it (`--timeout 0`).
+fn build_request_client(timeout_secs: u64) -> Client {
+    let timeout = if timeout_secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(timeout_secs))
+    };
+    Client::builder()
+        .timeout(timeout)
+        .build()
+        .unwrap_or_else(|_| Client::new())
+}
+
+/// How a request timeout should be described in errors and help text.
+fn describe_timeout(timeout_secs: u64) -> String {
+    if timeout_secs == 0 {
+        "no timeout".to_string()
+    } else {
+        format!("{}s", timeout_secs)
     }
-    builder.build().unwrap_or_else(|_| Client::new())
 }
 
 // Saved connection for keychain credential storage
@@ -523,7 +547,12 @@ struct AppState {
     last_was_splash: bool,  // True if last output was a splash (for consecutive env switches)
     last_method_cycle: Option<std::time::Instant>,  // For ctrl+space reset-to-GET-after-5s logic
     stashed_body: String,  // Body hidden when switching to GET, restored when switching back
+    // Full chain text while a `&&` chain is executing — the per-request input
+    // restore shows this instead of the just-sent segment, so the input area
+    // holds the whole chain from Enter to finish. None outside chains.
+    chain_input: Option<String>,
     method_auto_promoted: bool,  // True while the current PUT came from body auto-promotion (reverts to GET if the body is cleared)
+    method_auto_promoted_uri: String,  // URI whose method was auto-promoted — revert only fires while the last segment still targets it
     // Body input mode (for POST/PUT/PATCH without body)
     body_input_mode: bool,
     body_input_buffer: String,
@@ -597,7 +626,9 @@ impl AppState {
             last_was_splash: false,
             last_method_cycle: None,
             stashed_body: String::new(),
+            chain_input: None,
             method_auto_promoted: false,
+            method_auto_promoted_uri: String::new(),
             body_input_mode: false,
             body_input_buffer: String::new(),
             body_input_method: String::new(),
@@ -2586,7 +2617,9 @@ fn main() {
     config.ndjson = args.ndjson;
     config.no_streaming = args.no_streaming;
     config.experimental = args.experimental;
-    config.timeout_secs = args.timeout;
+    if let Some(secs) = args.timeout {
+        config.timeout_secs = secs;
+    }
     config.preview = args.preview;
 
     if args.me {
@@ -2999,9 +3032,121 @@ fn parse_positional_args(
     (result_method, result_uri, result_body)
 }
 
+/// Coarse progress of `background_load`, published so the spinner can say which
+/// step is actually running. A global rather than a threaded-through parameter
+/// because only one background load is ever in flight, and it would otherwise
+/// have to reach all eight call sites.
+mod load_phase {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    /// Waiting on the 1Password CLI.
+    pub const RESOLVING_1P: u8 = 0;
+    /// Waiting on the server's `/about`.
+    pub const CONNECTING: u8 = 1;
+    /// Waiting on the OpenAPI spec and mapped types.
+    pub const LOADING_SPEC: u8 = 2;
+
+    static PHASE: AtomicU8 = AtomicU8::new(RESOLVING_1P);
+
+    pub fn set(phase: u8) {
+        PHASE.store(phase, Ordering::Relaxed);
+    }
+
+    pub fn get() -> u8 {
+        PHASE.load(Ordering::Relaxed)
+    }
+}
+
+/// How long to wait for an `op` invocation before giving up. The 1Password CLI
+/// can block indefinitely on an unsurfaced biometric prompt or a stale session,
+/// which otherwise hangs the whole client with no way to tell what it's waiting for.
+const OP_TIMEOUT_SECS: u64 = 30;
+
+/// Run a command with a deadline, killing it if it overruns.
+///
+/// `Command::output()` waits forever; this doesn't. The pipes are drained on
+/// their own threads so a child writing more than the pipe buffer can't deadlock
+/// against our wait. Returns `Ok(None)` when the deadline passed.
+fn output_with_timeout(cmd: &mut Command, timeout: Duration) -> io::Result<Option<std::process::Output>> {
+    use std::process::Stdio;
+
+    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let mut child_stdout = child.stdout.take();
+    let mut child_stderr = child.stderr.take();
+    let stdout_handle = thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = child_stdout.as_mut() {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let stderr_handle = thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = child_stderr.as_mut() {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait()? {
+            Some(status) => {
+                return Ok(Some(std::process::Output {
+                    status,
+                    stdout: stdout_handle.join().unwrap_or_default(),
+                    stderr: stderr_handle.join().unwrap_or_default(),
+                }));
+            }
+            None => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Ok(None);
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+/// Run an `op` command, mapping both failure modes to a message the user can act
+/// on. `context` names what was being read, e.g. "the environment list".
+fn op_read(args: &[&str], context: &str) -> Result<std::process::Output, String> {
+    let mut cmd = Command::new("op");
+    cmd.args(args);
+    match output_with_timeout(&mut cmd, Duration::from_secs(OP_TIMEOUT_SECS)) {
+        Ok(Some(output)) => Ok(output),
+        Ok(None) => Err(format!(
+            "1Password did not respond within {}s while reading {}.\n\
+             Is `op` signed in? Try: op signin",
+            OP_TIMEOUT_SECS, context
+        )),
+        Err(e) => Err(format!("could not run 1Password CLI: {}", e)),
+    }
+}
+
+/// The trimmed stderr of a failed `op` call, for appending to an error message.
+/// Empty when `op` said nothing useful, so callers can keep their own wording.
+fn op_stderr_detail(output: &std::process::Output) -> String {
+    let msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if msg.is_empty() {
+        String::new()
+    } else {
+        format!("\n{}", msg)
+    }
+}
+
 fn get_1password_credentials(selector: &str) -> Result<(String, String), String> {
-    // Check if op command exists
-    if Command::new("which").arg("op").output().is_err() {
+    // Check if op command exists. `which` exits non-zero when it isn't found, so
+    // the exit status is what matters — `output()` itself only fails if `which`
+    // is missing, which would let a missing `op` through.
+    let has_op = Command::new("which")
+        .arg("op")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !has_op {
         return Err("1Password CLI is required for this option (try: brew install 1password-cli)".to_string());
     }
 
@@ -3014,13 +3159,13 @@ fn get_1password_credentials(selector: &str) -> Result<(String, String), String>
     }
 
     // Read environments.json from 1Password
-    let output = Command::new("op")
-        .args(["read", "op://Shared/COS environments/environments.json"])
-        .output()
-        .map_err(|e| format!("could not read from 1Password: {}", e))?;
+    let output = op_read(
+        &["read", "op://Shared/COS environments/environments.json"],
+        "the environment list",
+    )?;
 
     if !output.status.success() {
-        return Err("could not read from 1Password".to_string());
+        return Err(format!("could not read from 1Password.{}", op_stderr_detail(&output)));
     }
 
     let env_data: Value = serde_json::from_slice(&output.stdout)
@@ -3046,10 +3191,7 @@ fn get_1password_credentials(selector: &str) -> Result<(String, String), String>
                 .ok_or_else(|| format!("could not find an environment by '{}'. Check `COS environments` in 1P for available environments.", selector))?;
 
             // Read the actual key from the reference
-            let key_output = Command::new("op")
-                .args(["read", key_ref])
-                .output()
-                .map_err(|e| format!("could not read API key from 1Password: {}", e))?;
+            let key_output = op_read(&["read", key_ref], "the API key")?;
 
             if !key_output.status.success() {
                 let stderr_msg = String::from_utf8_lossy(&key_output.stderr).trim().to_string();
@@ -3064,8 +3206,9 @@ fn get_1password_credentials(selector: &str) -> Result<(String, String), String>
                     )
                 } else {
                     format!(
-                        "could not read API key for '{}' from 1Password.",
-                        selector
+                        "could not read API key for '{}' from 1Password.{}",
+                        selector,
+                        op_stderr_detail(&key_output)
                     )
                 };
                 return Err(hint);
@@ -3191,11 +3334,17 @@ fn parse_request_line(line: &str) -> Option<(String, String, String)> {
         return None;
     }
 
-    // Strip ` > outfile` from the end (matches parse_input)
+    // Strip ` > outfile` / ` >> outfile` from the end (matches parse_input),
+    // preserving which marker it was so append survives the round-trip.
     let outfile_suffix: String = if let Some(idx) = working.rfind(" >") {
-        let after_gt = working[idx + 2..].trim().to_string();
-        if !after_gt.is_empty() {
-            let suffix = format!(" > {}", after_gt);
+        let mut rest = &working[idx + 2..];
+        let append = rest.starts_with('>');
+        if append {
+            rest = &rest[1..];
+        }
+        let path = rest.trim().to_string();
+        if !path.is_empty() {
+            let suffix = format!(" {} {}", if append { ">>" } else { ">" }, path);
             working = working[..idx].trim().to_string();
             suffix
         } else {
@@ -3381,6 +3530,116 @@ fn is_clipboard_target(s: &str) -> bool {
     s.trim().eq_ignore_ascii_case("clipboard")
 }
 
+/// Append `new_content` to the file at `path` for the `>>` redirect, merging by
+/// content rather than blindly concatenating:
+///
+/// - target missing or empty → plain write, identical to `>`
+/// - `.ndjson`/`.njson` target → a JSON-array payload is exploded to one compact
+///   object per line, a single JSON value becomes one compact line, and
+///   anything else (already-NDJSON) is text-appended
+/// - `.csv` target → the payload's first line (its header row) is dropped,
+///   since the target already carries one
+/// - both sides parse as JSON → one array, merged as a textual splice: arrays
+///   concatenate, single values are wrapped/pushed, so `"a"` then `"b"` yields
+///   `["a","b"]`. Only array punctuation is added — neither side is
+///   re-serialized, so existing bytes keep their exact formatting
+/// - anything else → text append, with a separating newline when the target
+///   doesn't end in one
+///
+/// No path ever rewrites existing content bytes. An unparseable target is
+/// always text-appended — appending must never destroy what's already there.
+fn append_to_outfile(path: &str, new_content: &str) -> io::Result<()> {
+    let existing = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    if existing.trim().is_empty() {
+        return fs::write(path, new_content);
+    }
+
+    // Text append: keep existing bytes untouched, separate with one newline.
+    let text_append = |existing: &str, addition: &str| -> String {
+        let mut out = String::with_capacity(existing.len() + addition.len() + 1);
+        out.push_str(existing);
+        if !existing.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(addition);
+        out
+    };
+
+    let path_lower = path.to_lowercase();
+    let merged = if path_lower.ends_with(".ndjson") || path_lower.ends_with(".njson") {
+        // NDJSON: keep the one-value-per-line shape whatever shape the payload
+        // arrived in.
+        match serde_json::from_str::<Value>(new_content.trim()) {
+            Ok(Value::Array(items)) => {
+                let lines: Vec<String> = items
+                    .iter()
+                    .filter_map(|v| serde_json::to_string(v).ok())
+                    .collect();
+                text_append(&existing, &format!("{}\n", lines.join("\n")))
+            }
+            Ok(single) => {
+                let line = serde_json::to_string(&single).unwrap_or_else(|_| new_content.trim().to_string());
+                text_append(&existing, &format!("{}\n", line))
+            }
+            Err(_) => text_append(&existing, new_content),
+        }
+    } else if path_lower.ends_with(".csv") {
+        // CSV: the target already has a header row — drop the payload's.
+        let body = match new_content.split_once('\n') {
+            Some((_header, rest)) => rest,
+            // Header-only payload (empty result set): nothing to add.
+            None => return Ok(()),
+        };
+        if body.trim().is_empty() {
+            return Ok(());
+        }
+        text_append(&existing, body)
+    } else {
+        match (
+            serde_json::from_str::<Value>(existing.trim()),
+            serde_json::from_str::<Value>(new_content.trim()),
+        ) {
+            // Both sides JSON → the file becomes/stays one array: array+array
+            // concatenates, array+value pushes, value+value wraps both, and
+            // value+array wraps the existing value then appends the rest. The
+            // second append to a `>>` target is what turns a bare first
+            // response into an array.
+            //
+            // Merged as a TEXTUAL SPLICE: the parsed values only classify the
+            // shapes; the file is assembled from the original bytes with array
+            // punctuation added. Nothing is re-serialized, so existing content
+            // keeps its exact formatting (`1e2` stays `1e2`, not `100.0`).
+            (Ok(existing_v), Ok(new_v)) => {
+                let strip_brackets = |s: &str, is_array: bool| -> String {
+                    if is_array {
+                        s.trim()[1..s.trim().len() - 1].trim().to_string()
+                    } else {
+                        s.trim().to_string()
+                    }
+                };
+                let e_interior = strip_brackets(&existing, existing_v.is_array());
+                let n_interior = strip_brackets(new_content, new_v.is_array());
+                // Appending an empty array adds nothing — leave the file alone.
+                if n_interior.is_empty() {
+                    return Ok(());
+                }
+                if e_interior.is_empty() {
+                    format!("[{}]", n_interior)
+                } else {
+                    format!("[{},{}]", e_interior, n_interior)
+                }
+            }
+            _ => text_append(&existing, new_content),
+        }
+    };
+
+    fs::write(path, merged)
+}
+
 /// `MatchOptions` for glob expansion: behave like a shell — `*` does NOT match
 /// path segments beginning with `.`, so `mapped-types/*` skips `.DS_Store` etc.
 fn glob_match_options() -> glob::MatchOptions {
@@ -3412,7 +3671,156 @@ fn is_os_junk(path: &std::path::Path) -> bool {
 #[derive(Debug, Clone, PartialEq)]
 enum BulkStep {
     Request(String),
+    /// Two or more requests joined by `&&` / `||`; whether each runs depends on
+    /// its operator and the previous executed segment's outcome (see
+    /// `chain_segment_should_run`). Split at parse time so `-p` preview and the
+    /// URL gate see every segment.
+    Chain(Vec<(ChainOp, String)>),
     Sleep(Duration),
+}
+
+/// Outcome of a single request, deciding whether a `&&` chain continues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestOutcome {
+    /// 2xx with a truthy body — a following `&&` segment runs.
+    Truthy,
+    /// A definite negative answer: falsy body, or a "not there" status. The chain
+    /// stops, but nothing went wrong.
+    Falsy,
+    /// The request couldn't answer at all — auth, server fault, timeout, transport.
+    Errored,
+    /// ctrl+c / esc while the request was in flight.
+    Aborted,
+}
+
+/// Statuses that mean the question wasn't answered, rather than answered "no".
+/// These must not read as a quiet falsy, or a chain would silently skip its write
+/// when the real problem is expired credentials or a broken server.
+fn status_is_error(status: u16) -> bool {
+    matches!(status, 401 | 403 | 408 | 429) || status >= 500
+}
+
+/// Classify a completed response the way JavaScript coerces a value, so
+/// `~count` chains read naturally: `false`, `0`, `""`, and `null` are falsy;
+/// `[]`, `{}`, and everything else are truthy.
+///
+/// Status is checked first — only a 2xx can be truthy. A 404 (and other non-auth
+/// 4xx) is a definite "no" that merely stops the chain, while auth failures, 5xx,
+/// and timeouts are errors.
+fn classify_response(status: u16, body: &str) -> RequestOutcome {
+    if !(200..300).contains(&status) {
+        return if status_is_error(status) {
+            RequestOutcome::Errored
+        } else {
+            RequestOutcome::Falsy
+        };
+    }
+
+    // An empty body carries no value to test, so the 2xx status is the answer —
+    // e.g. a 204 from a successful DELETE continues the chain.
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return RequestOutcome::Truthy;
+    }
+
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(Value::Bool(false)) | Ok(Value::Null) => RequestOutcome::Falsy,
+        Ok(Value::Number(n)) if n.as_f64() == Some(0.0) => RequestOutcome::Falsy,
+        Ok(Value::String(s)) if s.is_empty() => RequestOutcome::Falsy,
+        // Arrays and objects are truthy in JS however empty they are, as is any
+        // non-JSON payload (CSV, NDJSON) that reached a 2xx.
+        _ => RequestOutcome::Truthy,
+    }
+}
+
+/// The separator that introduced a chain segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainOp {
+    /// `&&` — run when the previous executed segment was truthy. Also the
+    /// (never consulted) op of a chain's first segment.
+    And,
+    /// `||` — run when the previous executed segment was falsy.
+    Or,
+}
+
+impl ChainOp {
+    fn as_str(self) -> &'static str {
+        match self {
+            ChainOp::And => "&&",
+            ChainOp::Or => "||",
+        }
+    }
+}
+
+/// Whether a chain segment runs, given the outcome of the last EXECUTED segment
+/// (`None` until one has run — the first segment always runs). Skipped segments
+/// don't update that outcome, which is what makes shell-style if-then-else work:
+/// in `a && b || c`, a falsy `a` skips `b` and `a`'s own falsiness then runs `c`.
+/// Errored and Aborted stop the whole chain before this is ever consulted —
+/// everything that throws in `&&` throws in `||` too.
+fn chain_segment_should_run(prev: Option<RequestOutcome>, op: ChainOp) -> bool {
+    match prev {
+        None => true,
+        Some(RequestOutcome::Truthy) => op == ChainOp::And,
+        Some(RequestOutcome::Falsy) => op == ChainOp::Or,
+        Some(RequestOutcome::Errored) | Some(RequestOutcome::Aborted) => false,
+    }
+}
+
+/// Split a request line on top-level `&&` / `||`, ignoring separators inside
+/// JSON strings or brackets so a body like `{"expr": "a && b"}` stays a single
+/// request. Each segment carries the operator that introduced it (the first
+/// segment's op is `And`, but it's never consulted).
+///
+/// Always returns at least one segment for non-blank input, so callers can treat
+/// every line as a chain. Empty segments (from a stray or trailing separator)
+/// are dropped; the following segment keeps its own operator.
+fn split_request_chain(input: &str) -> Vec<(ChainOp, String)> {
+    let mut segments: Vec<(ChainOp, String)> = Vec::new();
+    let mut current = String::new();
+    // Operator that introduced the segment being accumulated.
+    let mut op = ChainOp::And;
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if escape {
+            escape = false;
+            current.push(ch);
+            continue;
+        }
+        if ch == '\\' && in_string {
+            escape = true;
+            current.push(ch);
+            continue;
+        }
+        if ch == '"' {
+            in_string = !in_string;
+            current.push(ch);
+            continue;
+        }
+        if !in_string {
+            match ch {
+                '{' | '[' => depth += 1,
+                '}' | ']' => depth -= 1,
+                // Only a top-level doubled `&&` / `||` separates requests.
+                c @ ('&' | '|') if depth <= 0 && chars.peek() == Some(&c) => {
+                    chars.next();
+                    segments.push((op, current.trim().to_string()));
+                    current.clear();
+                    op = if c == '&' { ChainOp::And } else { ChainOp::Or };
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        current.push(ch);
+    }
+    segments.push((op, current.trim().to_string()));
+    segments.retain(|(_, s)| !s.is_empty());
+    segments
 }
 
 /// A URL gate condition collected from `url has` / `url is` lines anywhere in the
@@ -3628,7 +4036,16 @@ fn split_bulk_requests_inner(
         // Strip JSONC comments inside bodies and check bracket balance
         let (cleaned, depth) = strip_body_comments_and_count(&current);
         if depth <= 0 {
-            program.steps.push(BulkStep::Request(escape_newlines_in_strings(&cleaned)));
+            // Split on `&&` here, once the whole request (multi-line bodies
+            // included) has been assembled, so a chained segment can carry a
+            // multi-line body of its own.
+            let assembled = escape_newlines_in_strings(&cleaned);
+            let segments = split_request_chain(&assembled);
+            program.steps.push(if segments.len() > 1 {
+                BulkStep::Chain(segments)
+            } else {
+                BulkStep::Request(assembled)
+            });
             current.clear();
         }
     }
@@ -3685,13 +4102,14 @@ fn format_request_log_line(
     uri: &str,
     body: &str,
     display_outfile: &str,
+    outfile_append: bool,
     width: usize,
 ) -> String {
     let mut line = format!("{} {}", method, uri);
     let suffix = if display_outfile.is_empty() {
         String::new()
     } else {
-        format!(" > {}", display_outfile)
+        format!(" {} {}", if outfile_append { ">>" } else { ">" }, display_outfile)
     };
 
     if !body.is_empty() {
@@ -3726,6 +4144,8 @@ struct OutputBlock {
     uri: String,
     body: String,
     display_outfile: String,
+    /// The outfile was `>>` (append) rather than `>` — affects only display.
+    outfile_append: bool,
     /// Status line plus any `> outfile` note — what ctrl+j keeps.
     head: String,
     /// The response body block, or empty — what ctrl+j erases.
@@ -3739,7 +4159,14 @@ impl OutputBlock {
     fn render(&self, width: usize) -> String {
         format!(
             "{}\n{}{}",
-            format_request_log_line(&self.method, &self.uri, &self.body, &self.display_outfile, width),
+            format_request_log_line(
+                &self.method,
+                &self.uri,
+                &self.body,
+                &self.display_outfile,
+                self.outfile_append,
+                width,
+            ),
             self.head,
             self.tail,
         )
@@ -3778,6 +4205,13 @@ fn confirm_preview(lines: &[String], base_uri: &str) -> bool {
     let mut methods: Vec<String> = Vec::new();
     let mut request_count = 0usize;
     for line in lines {
+        // Chained segments are shown as `&& METHOD /uri`; drop the marker so they
+        // count and contribute their method like any other request.
+        let trimmed_line = line.trim_start();
+        let line = trimmed_line
+            .strip_prefix("&&")
+            .or_else(|| trimmed_line.strip_prefix("||"))
+            .unwrap_or(line);
         if let Some(m) = line.split_whitespace().next() {
             if http_methods.contains(&m.to_uppercase().as_str()) {
                 request_count += 1;
@@ -3861,10 +4295,24 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
         let preview_lines: Vec<String> = program
             .steps
             .iter()
-            .filter_map(|step| match step {
+            .flat_map(|step| match step {
                 BulkStep::Request(r) => parse_request_line(r)
-                    .map(|(method, uri, body)| format_request_preview(&method, &uri, &body)),
-                BulkStep::Sleep(d) => Some(format!("sleep {}", format_duration(*d))),
+                    .map(|(method, uri, body)| format_request_preview(&method, &uri, &body))
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                // Show every segment, marked with its operator so it's clear the
+                // later ones are conditional on the earlier ones.
+                BulkStep::Chain(segments) => segments
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, (op, r))| {
+                        parse_request_line(r).map(|(method, uri, body)| {
+                            let line = format_request_preview(&method, &uri, &body);
+                            if i == 0 { line } else { format!("{} {}", op.as_str(), line) }
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+                BulkStep::Sleep(d) => vec![format!("sleep {}", format_duration(*d))],
             })
             .collect();
         if !confirm_preview(&preview_lines, &config.base_uri) {
@@ -3891,23 +4339,71 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
                 thread::sleep(*d);
             }
             BulkStep::Request(request) => {
-                let Some((method, uri, body)) = parse_request_line(request) else {
-                    continue;
-                };
-                if config.bulk_silent {
-                    // Compact the body for display: parse as JSON and re-serialize without whitespace,
-                    // falling back to the raw body if it's not JSON (e.g., @file references).
-                    // Unstyled, like the TUI log.
-                    let display_body = compact_body_for_display(&body);
-                    if display_body.is_empty() {
-                        println!("{} {}", method, uri);
-                    } else {
-                        println!("{} {} {}", method, uri, display_body);
+                run_bulk_request(config, request);
+            }
+            BulkStep::Chain(segments) => {
+                // Outcome of the last EXECUTED segment; skipped segments leave
+                // it alone (that's what makes `a && b || c` an if-then-else).
+                let mut prev: Option<RequestOutcome> = None;
+                let mut skipped = 0usize;
+                for (op, segment) in segments.iter() {
+                    if !chain_segment_should_run(prev, *op) {
+                        skipped += 1;
+                        continue;
+                    }
+                    match run_bulk_request(config, segment) {
+                        // Unparseable segment (comment-like or malformed): skipped,
+                        // matching how a standalone bad line is tolerated. Doesn't
+                        // count as executed, so it doesn't update the outcome.
+                        None => {}
+                        Some(o @ (RequestOutcome::Truthy | RequestOutcome::Falsy)) => {
+                            prev = Some(o);
+                        }
+                        // 401/403/5xx/timeouts mean the condition was never
+                        // answered — abort the run rather than quietly skipping
+                        // the write, which is what a false would have done. A
+                        // following `||` does NOT catch this.
+                        Some(RequestOutcome::Errored) => std::process::exit(1),
+                        // Preview declined — the user said no, so it isn't a failure.
+                        Some(RequestOutcome::Aborted) => break,
                     }
                 }
-                run_non_interactive(config, &method, &uri, &body);
+                note_skipped_chain(config, skipped);
             }
         }
+    }
+}
+
+/// Run one bulk request line, echoing it first in `-a` mode. `None` when the
+/// line isn't a request at all.
+fn run_bulk_request(config: &mut Config, request: &str) -> Option<RequestOutcome> {
+    let (method, uri, body) = parse_request_line(request)?;
+    if config.bulk_silent {
+        // Compact the body for display: parse as JSON and re-serialize without whitespace,
+        // falling back to the raw body if it's not JSON (e.g., @file references).
+        // Unstyled, like the TUI log.
+        let display_body = compact_body_for_display(&body);
+        if display_body.is_empty() {
+            println!("{} {}", method, uri);
+        } else {
+            println!("{} {} {}", method, uri, display_body);
+        }
+    }
+    Some(run_non_interactive(config, &method, &uri, &body))
+}
+
+/// Report that a falsy condition cut a chain short, so a skipped write is never
+/// silent. Goes to whichever stream carries that run's log.
+fn note_skipped_chain(config: &Config, skipped: usize) {
+    if skipped == 0 {
+        return;
+    }
+    let plural = if skipped == 1 { "request" } else { "requests" };
+    let note = format!("↳ skipped {} {}", skipped, plural).dimmed().to_string();
+    if config.bulk_silent {
+        println!("{}", note);
+    } else {
+        eprintln!("{}", note);
     }
 }
 
@@ -3944,7 +4440,10 @@ fn run_bulk(config: &mut Config, file_path: &str) {
     run_bulk_from_str(config, &contents, base_dir.as_deref());
 }
 
-fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str) {
+/// Send one request and report what it means for a `&&` chain. Errors are
+/// printed here; deciding whether they end the run is the caller's business
+/// (bulk exits 1, the TUI stops the chain and stays open).
+fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str) -> RequestOutcome {
     let is_tty = atty::is(Stream::Stdout);
 
     // Ensure colors work on stderr even when stdout is piped
@@ -3957,14 +4456,21 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
     if config.preview {
         let line = format_request_preview(method, uri, body);
         if !confirm_preview(&[line], &config.base_uri) {
-            return;
+            // Declined before sending — nothing ran, so a chain must not continue.
+            return RequestOutcome::Aborted;
         }
         config.preview = false;
     }
 
-    // Parse > outfile from URI (space required before >, optional after)
-    let (actual_uri, outfile, display_outfile) = if let Some(idx) = uri.find(" >") {
-        let display_path = uri[idx + 2..].trim().to_string();
+    // Parse > / >> outfile from URI (space required before >, optional after;
+    // `>>` appends instead of overwriting)
+    let (actual_uri, outfile, display_outfile, outfile_append) = if let Some(idx) = uri.find(" >") {
+        let mut rest = &uri[idx + 2..];
+        let append = rest.starts_with('>');
+        if append {
+            rest = &rest[1..];
+        }
+        let display_path = rest.trim().to_string();
         let outfile_path = if display_path.starts_with("~/") {
             if let Some(home) = dirs::home_dir() {
                 format!("{}{}", home.display(), &display_path[1..])
@@ -3974,9 +4480,9 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
         } else {
             display_path.clone()
         };
-        (uri[..idx].trim(), Some(outfile_path), Some(display_path))
+        (uri[..idx].trim(), Some(outfile_path), Some(display_path), append)
     } else {
-        (uri, None, None)
+        (uri, None, None, false)
     };
 
     // Fetch feature flags (unless explicitly disabled)
@@ -4078,6 +4584,10 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
         Ok(resp) => {
             let status = resp.status();
             let elapsed = start.elapsed();
+            // Read once, up front: the outcome depends on the body, and the
+            // branches below each need it (or would drain it anyway).
+            let body_text = resp.text().unwrap_or_default();
+            let outcome = classify_response(status.as_u16(), &body_text);
 
             // Print status
             if !config.silent {
@@ -4121,7 +4631,8 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
             // Get response body — in bulk_silent mode, only write to outfile (no stdout)
             if config.bulk_silent {
                 if let Some(ref file_path) = outfile {
-                    if let Ok(body_text) = resp.text() {
+                    {
+                        let body_text = body_text.clone();
                         let output = if config.raw || config.ndjson {
                             body_text
                         } else if let Ok(json) = serde_json::from_str::<Value>(&body_text) {
@@ -4130,17 +4641,27 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                             body_text
                         };
                         if is_clipboard {
+                            if outfile_append {
+                                eprintln!("error: cannot append to clipboard — use > clipboard");
+                                std::process::exit(1);
+                            }
                             if let Err(e) = cli_clipboard::set_contents(output) {
                                 eprintln!("Error copying to clipboard: {}", e);
                             }
-                        } else if let Err(e) = fs::write(file_path, &output) {
-                            eprintln!("Error writing to {}: {}", file_path, e);
+                        } else {
+                            let res = if outfile_append {
+                                append_to_outfile(file_path, &output)
+                            } else {
+                                fs::write(file_path, &output)
+                            };
+                            if let Err(e) = res {
+                                eprintln!("Error writing to {}: {}", file_path, e);
+                            }
                         }
                     }
-                } else {
-                    let _ = resp.text(); // drain body to free connection
                 }
-            } else if let Ok(body_text) = resp.text() {
+            } else {
+                let body_text = body_text.clone();
                 let output = if config.raw || config.ndjson {
                     body_text
                 } else if is_tty || outfile.is_some() {
@@ -4157,6 +4678,10 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
 
                 // Write to file, clipboard, or stdout
                 if is_clipboard {
+                    if outfile_append {
+                        eprintln!("error: cannot append to clipboard — use > clipboard");
+                        std::process::exit(1);
+                    }
                     match cli_clipboard::set_contents(output) {
                         Ok(()) => {
                             if !config.silent {
@@ -4169,13 +4694,19 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                         }
                     }
                 } else if let Some(ref file_path) = outfile {
-                    if let Err(e) = fs::write(file_path, &output) {
+                    let res = if outfile_append {
+                        append_to_outfile(file_path, &output)
+                    } else {
+                        fs::write(file_path, &output)
+                    };
+                    if let Err(e) = res {
                         eprintln!("Error writing to {}: {}", file_path, e);
                     } else if !config.silent {
                         // Match interactive output: status line already printed,
-                        // now print "> outfile" (dimmed) on the next line.
+                        // now print ">/>> outfile" (dimmed) on the next line.
                         let display = display_outfile.as_deref().unwrap_or(file_path);
-                        eprintln!("{}", format!("> {}", display).dimmed());
+                        let marker = if outfile_append { ">>" } else { ">" };
+                        eprintln!("{}", format!("{} {}", marker, display).dimmed());
                     }
                 } else {
                     print!("{}", output);
@@ -4187,11 +4718,20 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                     }
                 }
             }
+
+            outcome
         }
-        Err(_) => {
-            let host = config.base_uri.trim_start_matches("https://").trim_start_matches("http://");
+        Err(e) => {
             eprintln!();
-            eprintln!("Is COS running on {}? 🤔\n", host);
+            if e.is_timeout() {
+                eprintln!(
+                    "Timed out after {} — raise it with --timeout <seconds> (0 = no timeout)\n",
+                    describe_timeout(config.timeout_secs)
+                );
+            } else {
+                let host = config.base_uri.trim_start_matches("https://").trim_start_matches("http://");
+                eprintln!("Is COS running on {}? 🤔\n", host);
+            }
             std::process::exit(1);
         }
     }
@@ -4758,12 +5298,12 @@ fn handle_key_event(
         // Shift+Tab: reverse autocomplete
         (KeyModifiers::SHIFT, KeyCode::BackTab) | (_, KeyCode::BackTab) => {
             if !state.completions.is_empty() {
-                if extract_file_path_context(&state.input).is_some() {
+                if extract_file_path_context(&state.input, state.cursor_pos).is_some() {
                     handle_file_tab_completion_reverse(state);
                 } else if state.config.experimental && cursor_inside_brackets(&state.input, state.cursor_pos) {
-                    handle_json_tab_completion(state, true, true);
+                    with_chain_segment_view(state, |state| handle_json_tab_completion(state, true, true));
                 } else if state.config.complete {
-                    handle_tab_completion_reverse(state);
+                    with_chain_segment_view(state, handle_tab_completion_reverse);
                 }
                 render(stdout, state)?;
             }
@@ -4772,8 +5312,8 @@ fn handle_key_event(
         // Tab: autocomplete only
         (_, KeyCode::Tab) => {
             // Check if we're in file completion mode (after > or @) and cursor is in the file path region
-            if extract_file_path_context(&state.input).map_or(false, |(path_start, _)| {
-                let path_char_start = state.input[..path_start].chars().count();
+            if extract_file_path_context(&state.input, state.cursor_pos).is_some_and(|ctx| {
+                let path_char_start = state.input[..ctx.path_start].chars().count();
                 state.cursor_pos >= path_char_start
             }) {
                 handle_file_tab_completion(state);
@@ -4813,49 +5353,58 @@ fn handle_key_event(
                     state.completions.clear();
                     state.last_tab_input.clear();
                 } else {
-                    // JSON body tab completion
-                    handle_json_tab_completion(state, false, true);
+                    // JSON body tab completion — viewed per segment, so a chain's
+                    // second body completes against its own text, not segment 1's.
+                    with_chain_segment_view(state, |state| handle_json_tab_completion(state, false, true));
                 }
                 render(stdout, state)?;
             } else {
-                // If input already has body content (brackets), don't fall through to URI completion
-                let has_body_content = find_body_start(&state.input)
-                    .map_or(false, |bs| state.input[bs..].trim().starts_with(|c: char| c == '[' || c == '{'));
-                if has_body_content {
-                    // Tab at end of body — ignore
-                } else {
-                let had_completions = !state.completions.is_empty();
-                let parts: Vec<&str> = state.input.split_whitespace().collect();
-                let uri = if parts.len() >= 2 { parts[1] } else if parts.len() == 1 && parts[0].starts_with('/') { parts[0] } else { "" };
+                // URI/body-bracket completion, on the cursor's `&&` segment: every
+                // check below parses the input as a single request line, so hand it
+                // one segment. Renders happen after the view is restored.
+                let needs_render = with_chain_segment_view(state, |state| {
+                    // If input already has body content (brackets), don't fall through to URI completion
+                    let has_body_content = find_body_start(&state.input)
+                        .map_or(false, |bs| state.input[bs..].trim().starts_with(|c: char| c == '[' || c == '{'));
+                    if has_body_content {
+                        // Tab at end of body — ignore
+                        return false;
+                    }
+                    let had_completions = !state.completions.is_empty();
+                    let parts: Vec<&str> = state.input.split_whitespace().collect();
+                    let uri = if parts.len() >= 2 { parts[1] } else if parts.len() == 1 && parts[0].starts_with('/') { parts[0] } else { "" };
 
-                // Try body bracket completion first (e.g., Tab after "PUT /people ")
-                let bracket_ghost = if state.config.experimental { get_body_bracket_ghost(state, &parts, uri) } else { String::new() };
-                if !bracket_ghost.is_empty() {
-                    // Expand brackets to multiline block with matching closers on one line
-                    // e.g. "[{ " → "[{\n  \n}]"  or "{ " → "{\n  \n}"
-                    // Brackets on the same line count as one indent level
-                    let ins_byte = char_to_byte_idx(&state.input, state.cursor_pos);
-                    let trimmed = bracket_ghost.trim();
-                    let bracket_count = trimmed.len();
-                    // Build closers: reverse of openers on a single line (mirrors the openers)
-                    let closers: String = trimmed.chars().rev()
-                        .map(|ch| if ch == '[' { ']' } else { '}' })
-                        .collect();
-                    let expanded = format!("{}\n  \n{}", trimmed, closers);
-                    let cursor_offset = bracket_count + 1 + 2; // brackets + \n + 2-space indent
-                    state.input.insert_str(ins_byte, &expanded);
-                    state.cursor_pos += cursor_offset;
-                    render(stdout, state)?;
-                } else {
+                    // Try body bracket completion first (e.g., Tab after "PUT /people ")
+                    let bracket_ghost = if state.config.experimental { get_body_bracket_ghost(state, &parts, uri) } else { String::new() };
+                    if !bracket_ghost.is_empty() {
+                        // Expand brackets to multiline block with matching closers on one line
+                        // e.g. "[{ " → "[{\n  \n}]"  or "{ " → "{\n  \n}"
+                        // Brackets on the same line count as one indent level
+                        let ins_byte = char_to_byte_idx(&state.input, state.cursor_pos);
+                        let trimmed = bracket_ghost.trim();
+                        let bracket_count = trimmed.len();
+                        // Build closers: reverse of openers on a single line (mirrors the openers)
+                        let closers: String = trimmed.chars().rev()
+                            .map(|ch| if ch == '[' { ']' } else { '}' })
+                            .collect();
+                        let expanded = format!("{}\n  \n{}", trimmed, closers);
+                        let cursor_offset = bracket_count + 1 + 2; // brackets + \n + 2-space indent
+                        state.input.insert_str(ins_byte, &expanded);
+                        state.cursor_pos += cursor_offset;
+                        return true;
+                    }
                     // Complete if URI contains a delimiter (we're typing after /, (, or ~)
                     let has_delim = uri.rfind(|c| c == '/' || c == '(' || c == '~').is_some();
                     let should_complete = has_delim || had_completions;
 
                     if !state.endpoints.is_empty() && should_complete {
                         handle_tab_completion(state);
-                        render(stdout, state)?;
+                        return true;
                     }
-                }
+                    false
+                });
+                if needs_render {
+                    render(stdout, state)?;
                 }
             }
         }
@@ -5164,10 +5713,16 @@ fn handle_key_event(
                 let input = state.input.trim().to_string();
                 let input = if input.is_empty() { "GET /".to_string() } else { input };
 
-                parse_input(state, &input);
+                let segments = split_request_chain(&input);
+                let is_chain = segments.len() > 1;
 
-                // If method expects a body but none provided and no infile, enter body input mode
-                if state.body.is_empty()
+                parse_input(state, if is_chain { &segments[0].1 } else { &input });
+
+                // If method expects a body but none provided and no infile, enter body input mode.
+                // Never mid-chain: opening the multi-line editor between segments
+                // would strand the rest of the chain.
+                if !is_chain
+                    && state.body.is_empty()
                     && state.config.outfile.is_empty()
                     && ["POST", "PUT", "PATCH"].contains(&state.method.as_str())
                 {
@@ -5177,6 +5732,7 @@ fn handle_key_event(
                     state.body_input_uri = state.uri.clone();
                     render(stdout, state)?;
                 } else {
+                    // History keeps the whole chain, so up-arrow returns what was typed.
                     state.history.push(input.clone());
                     append_history(&input);
                     state.history_idx = -1;
@@ -5185,7 +5741,14 @@ fn handle_key_event(
                     state.prev_body = state.body.clone();
                     state.prev_outfile = state.config.outfile.clone();
 
-                    execute_request(state, stdout)?;
+                    if is_chain {
+                        // The per-segment restore keeps the full chain on the
+                        // input line throughout, so it can be re-sent or edited
+                        // without retyping — no post-hoc restore needed.
+                        execute_request_chain(state, stdout, &segments, &input)?;
+                    } else {
+                        execute_request(state, stdout)?;
+                    }
                 }
             }
         }
@@ -5622,14 +6185,15 @@ fn handle_paste<W: Write>(
     state.cursor_pos += char_len(&insert_text);
 
     // Pasting a body at the first-body position promotes GET → PUT, matching the
-    // typing behavior (`>` redirects excluded). The paste's own leading whitespace
-    // can serve as the URI/body separator. On an array endpoint, a complete pasted
-    // JSON body is then wrapped in `[` … `]` (both brackets — unlike typing, a
-    // pasted body isn't still being composed).
+    // typing behavior (`>` redirects and `&` chain separators excluded — pasting
+    // `&& GET /b` after a GET must not turn that GET into a PUT). The paste's own
+    // leading whitespace can serve as the URI/body separator. On an array
+    // endpoint, a complete pasted JSON body is then wrapped in `[` … `]` (both
+    // brackets — unlike typing, a pasted body isn't still being composed).
     if !inside_body {
         let lead_ws = insert_text.len() - insert_text.trim_start().len();
         if let Some(first) = insert_text.trim_start().chars().next() {
-            if first != '>' {
+            if first != '>' && first != '&' && first != '|' {
                 let delta = promote_method_prefix(state, byte_idx + lead_ws);
                 state.cursor_pos = (state.cursor_pos as i64 + delta).max(0) as usize;
                 // Method tokens are ASCII, so the char delta equals the byte
@@ -5653,15 +6217,22 @@ fn handle_paste<W: Write>(
 fn parse_input(state: &mut AppState, input: &str) {
     let mut input = input.to_string();
 
-    // Parse > outfile from the end (space required before >, optional after)
+    // Parse > / >> outfile from the end (space required before >, optional after;
+    // `>>` appends instead of overwriting)
     state.config.outfile.clear();
+    state.config.outfile_append = false;
     state.display_outfile.clear();
     if let Some(idx) = input.rfind(" >") {
-        let after_gt = &input[idx + 2..];
+        let mut after_gt = &input[idx + 2..];
+        let append = after_gt.starts_with('>');
+        if append {
+            after_gt = &after_gt[1..];
+        }
         let outfile_raw = after_gt.trim_start().trim_end().to_string();
         if !outfile_raw.is_empty() {
             state.display_outfile = outfile_raw.clone();
             state.config.outfile = outfile_raw;
+            state.config.outfile_append = append;
             if state.config.outfile.starts_with("~/") {
                 if let Some(home) = dirs::home_dir() {
                     state.config.outfile = format!("{}{}", home.display(), &state.config.outfile[1..]);
@@ -5710,7 +6281,35 @@ fn parse_input(state: &mut AppState, input: &str) {
     }
 }
 
-fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<()> {
+/// Restore the input line after a request has been sent: normally the request
+/// that just ran (method, URI, body, and the `>`/`>>` outfile as typed); inside
+/// a `&&` chain, the FULL chain — otherwise the input area would show segment 1
+/// alone while segment 2 runs, then snap to the chain at the end. Also clears
+/// completion state so no stale ghost flashes.
+fn restore_input_after_send(state: &mut AppState) {
+    if let Some(chain) = state.chain_input.clone() {
+        state.input = chain;
+    } else {
+        state.input = format!("{} {}", state.method, state.uri);
+        if !state.body.is_empty() {
+            state.input.push_str(&format!(" {}", state.body));
+        }
+        if !state.display_outfile.is_empty() {
+            // Keep the marker the user typed — restoring `>>` as `>` would
+            // silently turn an append into an overwrite on re-send.
+            let marker = if state.config.outfile_append { ">>" } else { ">" };
+            state.input.push_str(&format!(" {} {}", marker, state.display_outfile));
+        }
+    }
+    state.cursor_pos = char_len(&state.input);
+    // Clear stale completion state to prevent ghost text flash
+    state.completions.clear();
+    state.last_tab_input.clear();
+}
+
+/// Send the request currently in `state` and report what it means for a `&&`
+/// chain. See `classify_response`.
+fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<RequestOutcome> {
     // Clear stashed body since a request was sent
     state.stashed_body.clear();
     // A sent request finalizes the method choice — no auto-revert afterwards.
@@ -5728,6 +6327,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
         uri: state.uri.clone(),
         body: state.body.clone(),
         display_outfile: state.display_outfile.clone(),
+        outfile_append: state.config.outfile_append,
         ..Default::default()
     };
 
@@ -5826,15 +6426,8 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
         let display_output = block.render(state.width as usize);
         push_output_block(state, block);
 
-        // Update input with last command
-        state.input = format!("{} {}", state.method, state.uri);
-        if !state.body.is_empty() {
-            state.input.push_str(&format!(" {}", state.body));
-        }
-        state.cursor_pos = char_len(&state.input);
-        // Clear stale completion state to prevent ghost text flash
-        state.completions.clear();
-        state.last_tab_input.clear();
+        // Update input with last command (chain-aware, outfile marker included)
+        restore_input_after_send(state);
 
         // Clear input area, print output, render new input (stay in raw mode)
         let clear_lines = 2 + state.prev_input_lines;
@@ -5847,7 +6440,8 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
         state.prev_input_lines = input_lines;
         // No flush here — render() will flush everything atomically
         render(stdout, state)?;
-        return Ok(());
+        // The @file couldn't be read, so nothing was sent.
+        return Ok(RequestOutcome::Errored);
     }
 
     // Run HTTP request + body read in a thread so we can handle spinner and ctrl+c
@@ -5921,7 +6515,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
             Print(format!("  {}", state.status_msg.dimmed()))
         )?;
         stdout.flush()?;
-        return Ok(());
+        return Ok(RequestOutcome::Aborted);
     }
 
     // Clear spinner from hint line
@@ -5980,6 +6574,13 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     }
 
 
+    // What this request means for a `&&` chain. Captured before the body is
+    // consumed by the outfile/clipboard branches below.
+    let outcome = match &response_opt {
+        Some(Ok((status, body_text))) => classify_response(status.as_u16(), body_text),
+        Some(Err(_)) | None => RequestOutcome::Errored,
+    };
+
     match response_opt {
         Some(Ok((status, body_text))) => {
             let elapsed = start.elapsed();
@@ -5995,7 +6596,10 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
             };
 
             // Handle outfile — including the `> clipboard` special target.
-            if is_clipboard_target(&state.display_outfile) {
+            if is_clipboard_target(&state.display_outfile) && state.config.outfile_append {
+                // `>> clipboard` is meaningless — there's nothing to append to.
+                block.head = "cannot append to clipboard — use > clipboard\n".to_string();
+            } else if is_clipboard_target(&state.display_outfile) {
                 // Pretty-print JSON for clipboard so it's pasteable as-is.
                 let clipboard_text = if state.config.raw || state.config.ndjson {
                     body_text.clone()
@@ -6022,18 +6626,24 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
                     }
                 }
             } else if !state.config.outfile.is_empty() {
-                if let Err(e) = fs::write(&state.config.outfile, &body_text) {
+                let write_result = if state.config.outfile_append {
+                    append_to_outfile(&state.config.outfile, &body_text)
+                } else {
+                    fs::write(&state.config.outfile, &body_text)
+                };
+                if let Err(e) = write_result {
                     block.head = format!("Error writing to {}: {}\n", state.config.outfile, e);
                 } else {
                     state.last_outfile = state.config.outfile.clone();
                     state.last_display_outfile = state.display_outfile.clone();
 
                     if !state.config.silent {
+                        let marker = if state.config.outfile_append { ">>" } else { ">" };
                         block.head = format!(
                             "HTTP/1.1 {} {}\n{}\n\n",
                             status_str,
                             format!("{:.2}s", elapsed.as_secs_f64()).dimmed(),
-                            format!("> {}", state.display_outfile).dimmed()
+                            format!("{} {}", marker, state.display_outfile).dimmed()
                         );
                     }
                     state.status_msg = "ctrl+o to open file".to_string();
@@ -6066,9 +6676,16 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
                 }
             }
         }
-        Some(Err(_)) => {
-            let host = state.config.base_uri.trim_start_matches("https://").trim_start_matches("http://");
-            block.head = format!("\nIs COS running on {}? 🤔\n\n", host);
+        Some(Err(e)) => {
+            block.head = if e.is_timeout() {
+                format!(
+                    "\nTimed out after {} — raise it with --timeout <seconds> (0 = no timeout)\n\n",
+                    describe_timeout(state.config.timeout_secs)
+                )
+            } else {
+                let host = state.config.base_uri.trim_start_matches("https://").trim_start_matches("http://");
+                format!("\nIs COS running on {}? 🤔\n\n", host)
+            };
         }
         None => {
             // Request was aborted or something went wrong
@@ -6089,18 +6706,9 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     let display_output = block.render(state.width as usize);
     push_output_block(state, block);
 
-    // Update input with last command
-    state.input = format!("{} {}", state.method, state.uri);
-    if !state.body.is_empty() {
-        state.input.push_str(&format!(" {}", state.body));
-    }
-    if !state.display_outfile.is_empty() {
-        state.input.push_str(&format!(" > {}", state.display_outfile));
-    }
-    state.cursor_pos = char_len(&state.input);
-    // Clear stale completion state to prevent ghost text flash
-    state.completions.clear();
-    state.last_tab_input.clear();
+    // Update input with last command — or, mid-chain, keep the full chain on
+    // the line so it doesn't flash the just-sent segment between requests.
+    restore_input_after_send(state);
 
     // Now clear input area, print output, and render new input - all at once
     let clear_lines = 2 + state.prev_input_lines;
@@ -6123,42 +6731,221 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     // No flush here — render() will flush everything atomically
     render(stdout, state)?;
 
+    Ok(outcome)
+}
+
+/// Run a `&&` chain in the TUI: each segment sends only if the previous was
+/// truthy. Returns once the chain finishes or is cut short.
+///
+/// Each segment prints its own block, so the log reads the same as if the
+/// requests had been sent one at a time.
+fn execute_request_chain(
+    state: &mut AppState,
+    stdout: &mut io::Stdout,
+    segments: &[(ChainOp, String)],
+    full_chain: &str,
+) -> io::Result<()> {
+    // Published so every per-segment input restore shows the whole chain.
+    state.chain_input = Some(full_chain.to_string());
+    let result: io::Result<usize> = (|| {
+        // Outcome of the last EXECUTED segment; skipped segments leave it
+        // alone (that's what makes `a && b || c` an if-then-else).
+        let mut prev: Option<RequestOutcome> = None;
+        let mut skipped = 0usize;
+        for (i, (op, segment)) in segments.iter().enumerate() {
+            if !chain_segment_should_run(prev, *op) {
+                skipped += 1;
+                continue;
+            }
+            parse_input(state, segment);
+            let outcome = execute_request(state, stdout)?;
+            match outcome {
+                RequestOutcome::Truthy | RequestOutcome::Falsy => prev = Some(outcome),
+                // Errored or aborted ends the chain — a following `||` does
+                // NOT catch it. The reason is already on screen.
+                RequestOutcome::Errored | RequestOutcome::Aborted => {
+                    skipped += segments.len() - i - 1;
+                    break;
+                }
+            }
+        }
+        Ok(skipped)
+    })();
+    // Cleared on every exit, including an Err from execute_request — a stale
+    // Some() would make the NEXT single request restore the old chain.
+    state.chain_input = None;
+    let skipped = result?;
+    if skipped > 0 {
+        let plural = if skipped == 1 { "request" } else { "requests" };
+        state.status_msg = format!("↳ skipped {} {}", skipped, plural);
+        state.status_msg_at = Some(Instant::now());
+        render(stdout, state)?;
+    }
     Ok(())
 }
 
-/// Core of body auto-promotion. If the text before byte offset `body_start` is
-/// exactly `GET <uri> ` (method + URI + separating whitespace) or `<uri> `
-/// (URI-only line, implicit GET), rewrite the method to PUT — replacing the GET
-/// token or prepending `PUT ` — since a body implies a write. Also arms the
-/// ctrl+space cycle window (so an immediate cycle goes PUT → PATCH instead of
-/// resetting to GET) and marks the promotion as automatic (so clearing the body
-/// reverts to GET). Returns the change in the input's char length (0 = no
-/// promotion).
+/// Byte range `[start, end)` of the `&&` chain segment containing `byte_pos` —
+/// the whole input when the line isn't chained. Separator bytes belong to
+/// neither segment. Same scan semantics as `split_request_chain`: separators
+/// inside JSON strings or brackets don't count. A `byte_pos` on a segment's end
+/// boundary (just before ` &&`) belongs to that segment.
+fn chain_segment_bounds_at(input: &str, byte_pos: usize) -> (usize, usize) {
+    let mut seg_start = 0usize;
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    let mut iter = input.char_indices().peekable();
+
+    while let Some((i, ch)) = iter.next() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if ch == '\\' && in_string {
+            escape = true;
+            continue;
+        }
+        if ch == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if !in_string {
+            match ch {
+                '{' | '[' => depth += 1,
+                '}' | ']' => depth -= 1,
+                c @ ('&' | '|') if depth <= 0 && iter.peek().map(|&(_, n)| n) == Some(c) => {
+                    // The segment ending here contains byte_pos — done.
+                    if byte_pos <= i {
+                        return (seg_start, i);
+                    }
+                    iter.next();
+                    seg_start = i + 2;
+                }
+                _ => {}
+            }
+        }
+    }
+    (seg_start, input.len())
+}
+
+/// Byte offset just past the final top-level `&&` of `input` — the start of the
+/// chain's last segment (0 when the line isn't chained).
+fn last_chain_segment_start(input: &str) -> usize {
+    chain_segment_bounds_at(input, input.len()).0
+}
+
+/// Run `f` with the cursor's `&&` segment presented as if it were the whole
+/// input line, then splice whatever `f` did to it back into the full line.
+///
+/// The URI completion and ghost machinery all parse `state.input` as a single
+/// `METHOD /uri …` line; inside a chain that made them operate on segment 1's
+/// URI wherever the cursor was. Rather than teach each of them about chains,
+/// this hands them one segment — cursor made segment-relative on the way in,
+/// text and cursor restored to absolute on the way out. Unchained lines call
+/// `f` directly, so single-request behavior is bit-for-bit unchanged.
+///
+/// Completion-cycling state (`last_tab_input`, `completions`) naturally stores
+/// segment-relative text while chained, which stays consistent because every
+/// completion path runs under the same view.
+fn with_chain_segment_view<R>(state: &mut AppState, f: impl FnOnce(&mut AppState) -> R) -> R {
+    let cursor_byte = char_to_byte_idx(&state.input, state.cursor_pos.min(char_len(&state.input)));
+    let (seg_start, seg_end) = chain_segment_bounds_at(&state.input, cursor_byte);
+    if seg_start == 0 && seg_end == state.input.len() {
+        return f(state);
+    }
+
+    // Trim the segment's leading whitespace (the space after `&&`), and — for a
+    // segment followed by a separator — its trailing whitespace (the space
+    // before ` &&`), so the view looks exactly like a normal input line and a
+    // cursor at the segment's text end reads as "at end". The last segment
+    // keeps trailing spaces: `PUT /b ` at line end is meaningful (body ghosts).
+    let segment = &state.input[seg_start..seg_end];
+    let lead_ws = segment.len() - segment.trim_start().len();
+    let view_start = seg_start + lead_ws;
+    let view_end = if seg_end < state.input.len() {
+        view_start + segment.trim().len()
+    } else {
+        seg_end
+    };
+
+    let original_cursor = state.cursor_pos;
+    let full = std::mem::take(&mut state.input);
+    let prefix_chars = char_len(&full[..view_start]);
+    state.input = full[view_start..view_end].to_string();
+    let entry_view_cursor = original_cursor.saturating_sub(prefix_chars).min(char_len(&state.input));
+    state.cursor_pos = entry_view_cursor;
+
+    let result = f(state);
+
+    // Splice the (possibly edited) segment back between the untouched prefix
+    // and tail. If the closure left the cursor where it entered (read-only use,
+    // e.g. ghost computation), restore the ORIGINAL cursor exactly — the entry
+    // clamp must never move the user's cursor as a side effect of a render.
+    let view_cursor = state.cursor_pos.min(char_len(&state.input));
+    let mut restored = String::with_capacity(view_start + state.input.len() + (full.len() - view_end));
+    restored.push_str(&full[..view_start]);
+    restored.push_str(&state.input);
+    restored.push_str(&full[view_end..]);
+    state.input = restored;
+    state.cursor_pos = if view_cursor == entry_view_cursor {
+        original_cursor
+    } else {
+        prefix_chars + view_cursor
+    };
+
+    result
+}
+
+/// Core of body auto-promotion. If the text between the start of the line's LAST
+/// `&&` segment and byte offset `body_start` is exactly `GET <uri> ` (method +
+/// URI + separating whitespace) or `<uri> ` (URI-only, implicit GET), rewrite
+/// that segment's method to PUT — replacing the GET token or prepending `PUT ` —
+/// since a body implies a write. Promotion never touches earlier segments: only
+/// the last method of a `&&` sequence is ever promoted, and editing an earlier
+/// segment's body position does nothing.
+///
+/// Records the promoted URI so the revert can refuse to fire once the last
+/// segment targets something else (see `auto_revert_method_on_body_clear`).
+/// `state.method` and the ctrl+space cycle window are only updated when the
+/// promoted segment is the first — both refer to the line's leading method
+/// token, and arming the cycle for a later segment would let ctrl+space rewrite
+/// segment 1. Returns the change in the input's char length (0 = no promotion).
 fn promote_method_prefix(state: &mut AppState, body_start: usize) -> i64 {
-    let before = &state.input[..body_start];
-    // There must be separating whitespace between the URI and the body.
-    if !before.ends_with(char::is_whitespace) {
+    if body_start > state.input.len() {
         return 0;
     }
-    let tokens: Vec<&str> = before.split_whitespace().collect();
-    let trimmed_start = state.input.len() - state.input.trim_start().len();
-    let delta: i64 = match tokens.len() {
-        2 if tokens[0].to_uppercase() == "GET" => {
-            // Replace the leading method token (preserving its position) with PUT.
-            let method_len = tokens[0].len();
-            state.input.replace_range(trimmed_start..trimmed_start + method_len, "PUT");
-            3 - method_len as i64
+    let seg_start = last_chain_segment_start(&state.input);
+    // Editing an earlier segment's body position never promotes.
+    if body_start < seg_start {
+        return 0;
+    }
+    let segment = &state.input[seg_start..body_start];
+    // There must be separating whitespace between the URI and the body.
+    if !segment.ends_with(char::is_whitespace) {
+        return 0;
+    }
+    let tokens: Vec<String> = segment.split_whitespace().map(str::to_string).collect();
+    // Where the segment's first token begins, in absolute bytes.
+    let token_start = seg_start + (segment.len() - segment.trim_start().len());
+    let (delta, promoted_uri): (i64, String) = match tokens.as_slice() {
+        [method, uri] if method.to_uppercase() == "GET" => {
+            // Replace the segment's method token (preserving its position) with PUT.
+            state.input.replace_range(token_start..token_start + method.len(), "PUT");
+            (3 - method.len() as i64, uri.clone())
         }
-        1 if tokens[0].starts_with('/') => {
-            // URI-only line (implicit GET): prepend an explicit PUT.
-            state.input.insert_str(trimmed_start, "PUT ");
-            4
+        [uri] if uri.starts_with('/') => {
+            // URI-only segment (implicit GET): prepend an explicit PUT.
+            state.input.insert_str(token_start, "PUT ");
+            (4, uri.clone())
         }
         _ => return 0,
     };
-    state.method = "PUT".to_string();
     state.method_auto_promoted = true;
-    state.last_method_cycle = Some(std::time::Instant::now());
+    state.method_auto_promoted_uri = promoted_uri;
+    if seg_start == 0 {
+        state.method = "PUT".to_string();
+        state.last_method_cycle = Some(std::time::Instant::now());
+    }
     delta
 }
 
@@ -6167,11 +6954,13 @@ fn promote_method_prefix(state: &mut AppState, body_start: usize) -> i64 {
 /// non-whitespace character of the body section — i.e. the text before it is
 /// exactly `GET <uri> ` (or `<uri> ` for a URI-only line). The `>` outfile
 /// redirect operator is excluded, as it begins an output redirect, not a body.
+/// `&` and `|` are excluded too: they begin `&&`/`||` chain separators, not a body — promoting
+/// there would silently turn the GET the user just chained after into a PUT.
 /// The `@` infile prefix DOES promote: at the body position it always denotes a
 /// file-reference request body (`PUT /people @data.json`), which implies a write
 /// just like a literal JSON body.
 fn auto_promote_method_on_body_start(state: &mut AppState, typed: char) {
-    if typed.is_whitespace() || typed == '>' {
+    if typed.is_whitespace() || typed == '>' || typed == '&' || typed == '|' {
         return;
     }
     if state.cursor_pos == 0 {
@@ -6183,15 +6972,24 @@ fn auto_promote_method_on_body_start(state: &mut AppState, typed: char) {
 }
 
 /// Revert an automatic GET→PUT promotion once the body is gone again: if the
-/// current PUT came from auto-promotion and nothing follows the URI anymore,
-/// rewrite the method back to GET. Called after deletion/clear operations. A
-/// manual method change (ctrl+space, ctrl+g, paste-replace, …) clears the flag,
-/// so explicitly chosen methods are never reverted.
+/// last `&&` segment's PUT came from auto-promotion and nothing follows its URI
+/// anymore, rewrite that method back to GET. Called after deletion/clear
+/// operations. A manual method change (ctrl+space, ctrl+g, paste-replace, …)
+/// clears the flag, so explicitly chosen methods are never reverted.
+///
+/// Guarded by the recorded promoted URI: the revert fires only while the last
+/// segment still targets the URI that was promoted. Without this, deleting a
+/// promoted trailing segment could leave an EXPLICITLY typed `PUT /a` as the
+/// last segment with the flag still set — and a further deletion would rewrite
+/// a method the user chose by hand. On any mismatch the flag is cleared and
+/// nothing is touched.
 fn auto_revert_method_on_body_clear(state: &mut AppState) {
     if !state.method_auto_promoted {
         return;
     }
-    let tokens: Vec<&str> = state.input.split_whitespace().collect();
+    let seg_start = last_chain_segment_start(&state.input);
+    let segment = &state.input[seg_start..];
+    let tokens: Vec<String> = segment.split_whitespace().map(str::to_string).collect();
     if tokens.is_empty() {
         state.method_auto_promoted = false;
         return;
@@ -6201,14 +6999,22 @@ fn auto_revert_method_on_body_clear(state: &mut AppState) {
         state.method_auto_promoted = false;
         return;
     }
+    // The last segment no longer targets what was promoted — this PUT is not
+    // the one the promotion created. Never touch it.
+    if tokens.len() < 2 || tokens[1] != state.method_auto_promoted_uri {
+        state.method_auto_promoted = false;
+        return;
+    }
     if tokens.len() > 2 {
         return; // body still present
     }
-    // Replace the leading PUT with GET (same length — cursor stays aligned).
-    let trimmed_start = state.input.len() - state.input.trim_start().len();
+    // Replace the segment's PUT with GET (same length — cursor stays aligned).
+    let token_start = seg_start + (segment.len() - segment.trim_start().len());
     let put_len = tokens[0].len();
-    state.input.replace_range(trimmed_start..trimmed_start + put_len, "GET");
-    state.method = "GET".to_string();
+    state.input.replace_range(token_start..token_start + put_len, "GET");
+    if seg_start == 0 {
+        state.method = "GET".to_string();
+    }
     state.method_auto_promoted = false;
 }
 
@@ -6222,16 +7028,24 @@ fn auto_revert_method_on_body_clear(state: &mut AppState) {
 /// just promoted to `PUT` is handled in the same keystroke. The `@` infile prefix
 /// is excluded, as a file reference already provides the full body shape.
 fn auto_wrap_array_body(state: &mut AppState, typed: char) {
-    if typed.is_whitespace() || typed == '[' || typed == '@' {
+    // `&` starts a `&&` chain separator, not a body — wrapping would corrupt the
+    // line to `PUT /x [&`.
+    if typed.is_whitespace() || typed == '[' || typed == '@' || typed == '&' || typed == '|' {
         return;
     }
     if state.cursor_pos == 0 {
         return;
     }
-    // The just-typed character must be the first non-whitespace char of the body:
-    // exactly METHOD + URI before it, with a separating space.
+    // The just-typed character must be the first non-whitespace char of the LAST
+    // `&&` segment's body: exactly METHOD + URI before it (within that segment),
+    // with a separating space. Like promotion, never fires in earlier segments.
+    // Runs after promotion, so a segment promoted this keystroke wraps too.
     let typed_byte = char_to_byte_idx(&state.input, state.cursor_pos - 1);
-    let before = &state.input[..typed_byte];
+    let seg_start = last_chain_segment_start(&state.input);
+    if typed_byte < seg_start {
+        return;
+    }
+    let before = &state.input[seg_start..typed_byte];
     if !before.ends_with(char::is_whitespace) {
         return;
     }
@@ -6269,7 +7083,13 @@ fn wrap_pasted_array_body(state: &mut AppState, body_start: usize, body_end: usi
     if body_start >= body_end || body_end > state.input.len() {
         return;
     }
-    let before = &state.input[..body_start];
+    // Segment-aware like the typing variant: the span must be the whole body of
+    // the LAST `&&` segment; a paste into an earlier segment is never wrapped.
+    let seg_start = last_chain_segment_start(&state.input);
+    if body_start < seg_start {
+        return;
+    }
+    let before = &state.input[seg_start..body_start];
     if !before.ends_with(char::is_whitespace) {
         return;
     }
@@ -6734,6 +7554,25 @@ fn copy_curl(state: &AppState) -> bool {
 }
 
 fn render_input_content(state: &mut AppState, width: usize) -> (String, u16, String) {
+    // Ghost text is computed per `&&` segment, FIRST — the view mutates
+    // `state.input` in place, so it must run before any slices are taken.
+    // Inside the view, "cursor at end" means at the end of the cursor's SEGMENT
+    // (e.g. just before ` && …`), so editing an earlier segment gets the same
+    // ghosts as a standalone line.
+    let ghost = with_chain_segment_view(state, |state| {
+        let in_file_mode = extract_file_path_context(&state.input, state.cursor_pos).is_some();
+        let at_segment_end = state.cursor_pos == char_len(&state.input);
+        if at_segment_end
+            && (in_file_mode || (state.config.complete && !state.endpoints.is_empty()))
+        {
+            get_completion_ghost(state)
+        } else if !at_segment_end && state.config.complete && !state.endpoints.is_empty() {
+            get_completion_ghost_at_cursor(state)
+        } else {
+            String::new()
+        }
+    });
+
     // Build the rendered input string with cursor and ghost text
     let cursor_byte = char_to_byte_idx(&state.input, state.cursor_pos);
     let input_char_len = char_len(&state.input);
@@ -6746,17 +7585,9 @@ fn render_input_content(state: &mut AppState, width: usize) -> (String, u16, Str
         ""
     };
 
-    let in_file_mode = extract_file_path_context(&state.input).is_some();
+    // Whether the cursor sits at the end of the WHOLE line — decides how the
+    // ghost is drawn below (appended vs. inserted before the rest of the line).
     let cursor_at_end = state.cursor_pos == input_char_len;
-    let ghost = if cursor_at_end
-        && (in_file_mode || (state.config.complete && !state.endpoints.is_empty()))
-    {
-        get_completion_ghost(state)
-    } else if !cursor_at_end && state.config.complete && !state.endpoints.is_empty() {
-        get_completion_ghost_at_cursor(state)
-    } else {
-        String::new()
-    };
 
     // Apply JSON syntax highlighting to the full body as one unit, then split at cursor
     let body_start = find_body_start(&state.input);
@@ -7027,14 +7858,20 @@ fn render<W: Write>(stdout: &mut W, state: &mut AppState) -> io::Result<()> {
     // Input line or help
     if state.loading {
         let frame = SPINNER_FRAMES[state.loading_frame % SPINNER_FRAMES.len()];
-        let msg = if let Some(ref env_name) = state.loading_connection_name {
-            if state.config.base_uri.is_empty() {
+        // Which step is running is reported by the background thread — the main
+        // thread's `config.base_uri` isn't set until the whole load finishes, so
+        // it can't distinguish a 1P wait from a slow server.
+        let msg = match (&state.loading_connection_name, load_phase::get()) {
+            (Some(env_name), load_phase::RESOLVING_1P) => {
                 format!(" {} Loading connection {} from 1P...", frame, env_name)
-            } else {
-                format!(" {} Connecting to {}...", frame, env_name)
             }
-        } else {
-            format!(" {} Loading environment from 1P...", frame)
+            (Some(env_name), load_phase::LOADING_SPEC) => {
+                format!(" {} Loading API spec from {}...", frame, env_name)
+            }
+            (Some(env_name), _) => format!(" {} Connecting to {}...", frame, env_name),
+            (None, load_phase::RESOLVING_1P) => format!(" {} Loading environment from 1P...", frame),
+            (None, load_phase::LOADING_SPEC) => format!(" {} Loading API spec...", frame),
+            (None, _) => format!(" {} Connecting...", frame),
         };
         queue!(stdout, Print(format!("{}\r\n", msg.dimmed())))?;
         state.prev_input_lines = 1; // single spinner line — keep the span exact
@@ -7251,6 +8088,14 @@ fn background_load(config: &Config, op_selector: Option<String>) -> BackgroundLo
     let mut base_uri: Option<String> = None;
     let mut api_key: Option<String> = None;
 
+    // Publish the starting phase so the spinner doesn't report a 1P wait that
+    // isn't happening (or keep reporting one that's already finished).
+    load_phase::set(if op_selector.is_some() {
+        load_phase::RESOLVING_1P
+    } else {
+        load_phase::CONNECTING
+    });
+
     if let Some(selector) = op_selector {
         match get_1password_credentials(&selector) {
             Ok((uri, key)) => {
@@ -7258,6 +8103,7 @@ fn background_load(config: &Config, op_selector: Option<String>) -> BackgroundLo
                 config.api_key = key.clone();
                 base_uri = Some(uri);
                 api_key = Some(key);
+                load_phase::set(load_phase::CONNECTING);
             }
             Err(e) => {
                 return BackgroundLoadResult {
@@ -7350,6 +8196,8 @@ fn background_load(config: &Config, op_selector: Option<String>) -> BackgroundLo
     };
 
     if complete {
+        load_phase::set(load_phase::LOADING_SPEC);
+
         // Parallelize OpenAPI spec and mapped types fetches
         let config_clone = config.clone();
         let mapped_types_handle = std::thread::spawn(move || {
@@ -8305,18 +9153,28 @@ fn handle_tab_completion_reverse(state: &mut AppState) {
     state.cursor_pos = char_len(&new_base);
 }
 
+/// Replace the file-path span `[path_start, path_end)` with `new_path`, keeping
+/// everything after it (` && …` chain tail) intact, and leave the cursor at the
+/// end of the replacement — mid-line when a tail follows, end-of-line otherwise.
+fn replace_file_path_span(state: &mut AppState, path_start: usize, path_end: usize, new_path: &str) {
+    let prefix = &state.input[..path_start];
+    let tail = &state.input[path_end..];
+    let cursor = char_len(prefix) + char_len(new_path);
+    state.input = format!("{}{}{}", prefix, new_path, tail);
+    state.cursor_pos = cursor;
+}
+
 fn handle_file_tab_completion(state: &mut AppState) {
-    let (path_start, partial) = match extract_file_path_context(&state.input) {
+    let ctx = match extract_file_path_context(&state.input, state.cursor_pos) {
         Some(ctx) => ctx,
         None => return,
     };
-
-    let prefix = &state.input[..path_start];
+    let FilePathContext { path_start, path_end, partial, is_outfile, is_append } = ctx;
 
     // Check for ~ operator on body file argument
     if let Some(tilde_idx) = partial.rfind('~') {
-        let file_part = &partial[..tilde_idx];
-        let after_tilde = &partial[tilde_idx + 1..];
+        let file_part = partial[..tilde_idx].to_string();
+        let after_tilde = partial[tilde_idx + 1..].to_string();
         if after_tilde.starts_with("map(") {
             let inside_raw = &after_tilde[4..];
             // Strip trailing ) so cycling works after a completed type name
@@ -8342,25 +9200,26 @@ fn handle_file_tab_completion(state: &mut AppState) {
                 state.completion_idx = 0;
             }
             if !state.completions.is_empty() {
-                let completion = &state.completions[state.completion_idx];
-                state.input = format!("{}{}~map({}", prefix, file_part, completion);
-                state.cursor_pos = char_len(&state.input);
+                let completion = state.completions[state.completion_idx].clone();
+                let new_path = format!("{}~map({}", file_part, completion);
+                replace_file_path_span(state, path_start, path_end, &new_path);
             }
             return;
         }
         // Only complete map( on body file args
-        if !after_tilde.contains('(') && "map(".starts_with(after_tilde) && *after_tilde != *"map(" {
-            state.input = format!("{}{}~map(", prefix, file_part);
-            state.cursor_pos = char_len(&state.input);
+        if !after_tilde.contains('(') && "map(".starts_with(after_tilde.as_str()) && after_tilde != "map(" {
+            let new_path = format!("{}~map(", file_part);
+            replace_file_path_span(state, path_start, path_end, &new_path);
             return;
         }
     }
 
-    // Check if cycling through completions
+    // Check if cycling through completions: the current path span matching one
+    // of the completions means the last Tab produced it — advance to the next.
+    let current_span = state.input[path_start..path_end].to_string();
     let is_cycling = if !state.completions.is_empty() && !state.last_tab_input.is_empty() {
         state.completions.iter().enumerate().any(|(i, comp)| {
-            let expected = format!("{}{}", prefix, comp);
-            if state.input == expected {
+            if current_span == *comp {
                 state.completion_idx = (i + 1) % state.completions.len();
                 true
             } else {
@@ -8372,7 +9231,9 @@ fn handle_file_tab_completion(state: &mut AppState) {
     };
 
     if !is_cycling {
-        state.completions = if is_outfile_context(&state.input) {
+        // Append targets get plain file completions — the virtual `clipboard`
+        // entry only makes sense for `>`, where it can be overwritten.
+        state.completions = if is_outfile && !is_append {
             get_outfile_completions(&partial)
         } else {
             get_file_completions(&partial)
@@ -8382,9 +9243,8 @@ fn handle_file_tab_completion(state: &mut AppState) {
     }
 
     if !state.completions.is_empty() {
-        let completion = &state.completions[state.completion_idx];
-        state.input = format!("{}{}", prefix, completion);
-        state.cursor_pos = char_len(&state.input);
+        let completion = state.completions[state.completion_idx].clone();
+        replace_file_path_span(state, path_start, path_end, &completion);
     }
 }
 
@@ -8393,12 +9253,11 @@ fn handle_file_tab_completion_reverse(state: &mut AppState) {
         return;
     }
 
-    let (path_start, partial) = match extract_file_path_context(&state.input) {
+    let ctx = match extract_file_path_context(&state.input, state.cursor_pos) {
         Some(ctx) => ctx,
         None => return,
     };
-
-    let prefix = &state.input[..path_start].to_string();
+    let FilePathContext { path_start, path_end, partial, .. } = ctx;
 
     if state.completion_idx == 0 {
         state.completion_idx = state.completions.len() - 1;
@@ -8406,21 +9265,20 @@ fn handle_file_tab_completion_reverse(state: &mut AppState) {
         state.completion_idx -= 1;
     }
 
-    let completion = &state.completions[state.completion_idx];
+    let completion = state.completions[state.completion_idx].clone();
 
     // Handle ~map() completions: reconstruct with file path prefix
     if let Some(tilde_idx) = partial.rfind('~') {
-        let file_part = &partial[..tilde_idx];
+        let file_part = partial[..tilde_idx].to_string();
         let after_tilde = &partial[tilde_idx + 1..];
         if after_tilde.starts_with("map(") {
-            state.input = format!("{}{}~map({}", prefix, file_part, completion);
-            state.cursor_pos = char_len(&state.input);
+            let new_path = format!("{}~map({}", file_part, completion);
+            replace_file_path_span(state, path_start, path_end, &new_path);
             return;
         }
     }
 
-    state.input = format!("{}{}", prefix, completion);
-    state.cursor_pos = char_len(&state.input);
+    replace_file_path_span(state, path_start, path_end, &completion);
 }
 
 fn get_json_completion_ghost(state: &AppState) -> Option<String> {
@@ -8601,7 +9459,8 @@ fn get_completion_ghost(state: &AppState) -> String {
     }
 
     // File completion ghost text (works even without API completion)
-    if let Some((_, partial)) = extract_file_path_context(&state.input) {
+    if let Some(ctx) = extract_file_path_context(&state.input, state.cursor_pos) {
+        let partial = ctx.partial;
         // Check for ~ operator on body file argument
         if let Some(tilde_idx) = partial.rfind('~') {
             let after_tilde = &partial[tilde_idx + 1..];
@@ -8630,7 +9489,7 @@ fn get_completion_ghost(state: &AppState) -> String {
         let completions = if !state.completions.is_empty() && state.last_tab_input == state.input {
             &state.completions
         } else {
-            fresh = if is_outfile_context(&state.input) {
+            fresh = if ctx.is_outfile && !ctx.is_append {
                 get_outfile_completions(&partial)
             } else {
                 get_file_completions(&partial)
@@ -8818,25 +9677,50 @@ fn get_completion_ghost_at_cursor(state: &AppState) -> String {
 /// True when the active file-path context is the `>` outfile redirect (as opposed
 /// to a `@` body-file). Mirrors `extract_file_path_context`, which checks `" >"`
 /// first and uses it whenever present.
-fn is_outfile_context(input: &str) -> bool {
-    input.rfind(" >").is_some()
+/// A file-path region (outfile `> path` or body `@path`) in the `&&` segment
+/// the cursor is in. Byte offsets are absolute; the partial excludes trailing
+/// whitespace, so `path_end` marks exactly where a completion's replacement
+/// stops — everything from there on (` && …`) is a tail to preserve.
+struct FilePathContext {
+    path_start: usize,
+    path_end: usize,
+    partial: String,
+    /// `> outfile` (true) vs `@file` body (false) — decides the completion set.
+    is_outfile: bool,
+    /// `>> outfile` — append mode; `clipboard` is not a valid target there.
+    is_append: bool,
 }
 
-fn extract_file_path_context(input: &str) -> Option<(usize, String)> {
-    // Check for " >" (outfile) - must have space before > but not necessarily after
-    if let Some(idx) = input.rfind(" >") {
-        let after_gt = idx + 2;
-        // Skip optional space after >
-        let path_start = if input[after_gt..].starts_with(' ') { after_gt + 1 } else { after_gt };
-        let after = &input[path_start..];
-        return Some((path_start, after.to_string()));
-    }
-    // Check for " @" (file body input) - must have space before @ but not necessarily after
-    if let Some(idx) = input.rfind(" @") {
-        let after_at = idx + 2;
-        let path_start = if input[after_at..].starts_with(' ') { after_at + 1 } else { after_at };
-        let after = &input[path_start..];
-        return Some((path_start, after.to_string()));
+/// Find the file-path region at the cursor, scoped to the cursor's `&&`
+/// segment: a ` >` or ` @` in some OTHER segment never produces a context here,
+/// and the partial never runs past the segment into the rest of the chain.
+/// `cursor_pos` is in chars, like `state.cursor_pos`.
+fn extract_file_path_context(input: &str, cursor_pos: usize) -> Option<FilePathContext> {
+    let cursor_byte = char_to_byte_idx(input, cursor_pos.min(char_len(input)));
+    let (seg_start, seg_end) = chain_segment_bounds_at(input, cursor_byte);
+    let segment = &input[seg_start..seg_end];
+
+    // ` >` (outfile, including ` >>` append) takes precedence over ` @`, as
+    // before. Space before the marker required, optional space after.
+    for (marker, is_outfile) in [(" >", true), (" @", false)] {
+        if let Some(idx) = segment.rfind(marker) {
+            let mut after = idx + 2;
+            // ` >>` — the second `>` is part of the marker, not the path.
+            let is_append = is_outfile && segment[after..].starts_with('>');
+            if is_append {
+                after += 1;
+            }
+            let path_rel = if segment[after..].starts_with(' ') { after + 1 } else { after };
+            let partial = segment[path_rel..].trim_end();
+            let path_start = seg_start + path_rel;
+            return Some(FilePathContext {
+                path_start,
+                path_end: path_start + partial.len(),
+                partial: partial.to_string(),
+                is_outfile,
+                is_append,
+            });
+        }
     }
     None
 }
@@ -10812,11 +11696,473 @@ mod tests {
     }
 
     #[test]
+    fn with_chain_segment_view_presents_one_segment_and_splices_back() {
+        // Identity on an unchained line: the closure sees the input untouched.
+        let mut state = test_state();
+        state.input = "GET /people".to_string();
+        state.cursor_pos = 5;
+        with_chain_segment_view(&mut state, |s| {
+            assert_eq!(s.input, "GET /people");
+            assert_eq!(s.cursor_pos, 5);
+        });
+        assert_eq!(state.input, "GET /people");
+        assert_eq!(state.cursor_pos, 5);
+
+        // Cursor in the LAST segment: the view is that segment, cursor relative.
+        let mut state = test_state();
+        state.input = "GET /a && GET /pro".to_string();
+        state.cursor_pos = char_len(&state.input);
+        with_chain_segment_view(&mut state, |s| {
+            assert_eq!(s.input, "GET /pro");
+            assert_eq!(s.cursor_pos, char_len("GET /pro"));
+            // Edit as a completion would: replace the URI.
+            s.input = "GET /products".to_string();
+            s.cursor_pos = char_len(&s.input);
+        });
+        assert_eq!(state.input, "GET /a && GET /products");
+        assert_eq!(state.cursor_pos, char_len(&state.input));
+
+        // Cursor in the FIRST segment: edits there leave the tail alone.
+        let mut state = test_state();
+        state.input = "GET /peo && GET /b".to_string();
+        state.cursor_pos = char_len("GET /peo");
+        with_chain_segment_view(&mut state, |s| {
+            assert_eq!(s.input, "GET /peo");
+            s.input = "GET /people".to_string();
+            s.cursor_pos = char_len(&s.input);
+        });
+        assert_eq!(state.input, "GET /people && GET /b");
+        assert_eq!(state.cursor_pos, char_len("GET /people"));
+
+        // A `&&` inside a JSON string doesn't split the view.
+        let mut state = test_state();
+        state.input = r#"PUT /r {"e": "a && b"}"#.to_string();
+        state.cursor_pos = char_len(&state.input);
+        with_chain_segment_view(&mut state, |s| {
+            assert_eq!(s.input, r#"PUT /r {"e": "a && b"}"#);
+        });
+    }
+
+    #[test]
+    fn uri_tab_completion_targets_the_cursor_segment() {
+        // The reported bug: Tab in the LAST segment completed against segment 1's
+        // URI. Through the view, handle_tab_completion sees only its segment.
+        let mut state = test_state();
+        state.config.complete = true;
+        state.endpoints = vec!["/people".to_string(), "/products".to_string()];
+        state.input = "GET /people~take(1) && GET /pro".to_string();
+        state.cursor_pos = char_len(&state.input);
+        with_chain_segment_view(&mut state, handle_tab_completion);
+        assert_eq!(state.input, "GET /people~take(1) && GET /products");
+        assert_eq!(state.cursor_pos, char_len(&state.input));
+
+        // First segment: completing its URI must preserve the tail.
+        let mut state = test_state();
+        state.config.complete = true;
+        state.endpoints = vec!["/people".to_string(), "/products".to_string()];
+        state.input = "GET /peo && GET /b".to_string();
+        state.cursor_pos = char_len("GET /peo");
+        with_chain_segment_view(&mut state, handle_tab_completion);
+        assert_eq!(state.input, "GET /people && GET /b");
+        assert_eq!(state.cursor_pos, char_len("GET /people"));
+    }
+
+    #[test]
+    fn ghost_text_is_computed_per_segment() {
+        // URI ghost in the LAST segment (cursor at line end) — previously empty
+        // because the ghost parsed segment 1's URI.
+        let mut state = test_state();
+        state.config.complete = true;
+        state.endpoints = vec!["/people".to_string(), "/products".to_string()];
+        state.input = "GET /people~take(1) && GET /pro".to_string();
+        state.cursor_pos = char_len(&state.input);
+        let ghost = with_chain_segment_view(&mut state, |s| get_completion_ghost(s));
+        assert_eq!(ghost, "ducts");
+        // The view must leave the line and cursor untouched.
+        assert_eq!(state.input, "GET /people~take(1) && GET /pro");
+        assert_eq!(state.cursor_pos, char_len(&state.input));
+
+        // File ghost in the FIRST segment with the cursor at the segment's end
+        // (mid-line absolutely) — previously the mid-line branch had no file
+        // mode at all, so editing the first segment's outfile showed nothing.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("report.json"), "{}").unwrap();
+        let base = dir.path().display().to_string();
+        let mut state = test_state();
+        state.input = format!("GET /a > {}/rep && GET /b > keep.json", base);
+        state.cursor_pos = char_len(&format!("GET /a > {}/rep", base));
+        let ghost = with_chain_segment_view(&mut state, |s| {
+            let in_file_mode = extract_file_path_context(&s.input, s.cursor_pos).is_some();
+            assert!(in_file_mode, "view must expose the first segment's outfile");
+            assert_eq!(s.cursor_pos, char_len(&s.input), "cursor is at the SEGMENT's end");
+            get_completion_ghost(s)
+        });
+        assert_eq!(ghost, "ort.json");
+    }
+
+    #[test]
+    fn append_to_outfile_merges_json_arrays() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.json");
+        let p = path.to_str().unwrap();
+
+        // Missing target → identical to `>`.
+        append_to_outfile(p, r#"[{"id":1}]"#).unwrap();
+        assert_eq!(fs::read_to_string(p).unwrap(), r#"[{"id":1}]"#);
+
+        // Array + array → one concatenated array, pretty-printed.
+        append_to_outfile(p, r#"[{"id":2}]"#).unwrap();
+        let v: Value = serde_json::from_str(&fs::read_to_string(p).unwrap()).unwrap();
+        assert_eq!(v, serde_json::json!([{"id":1},{"id":2}]));
+
+        // Array + single value → pushed.
+        append_to_outfile(p, r#"{"id":3}"#).unwrap();
+        let v: Value = serde_json::from_str(&fs::read_to_string(p).unwrap()).unwrap();
+        assert_eq!(v, serde_json::json!([{"id":1},{"id":2},{"id":3}]));
+
+        // Empty (whitespace-only) target → plain write.
+        let path2 = dir.path().join("empty.json");
+        fs::write(&path2, "  \n").unwrap();
+        append_to_outfile(path2.to_str().unwrap(), "[1]").unwrap();
+        assert_eq!(fs::read_to_string(&path2).unwrap(), "[1]");
+    }
+
+    #[test]
+    fn append_to_outfile_text_appends_without_touching_existing_bytes() {
+        // Text append applies only when at least one side is NOT JSON — two JSON
+        // values merge into an array instead (see the wrap test below).
+        let dir = tempfile::tempdir().unwrap();
+
+        // Unparseable existing + JSON payload → text append, never an error.
+        let path = dir.path().join("notjson.txt");
+        let p = path.to_str().unwrap();
+        fs::write(p, "hello\n").unwrap();
+        append_to_outfile(p, r#"[1,2]"#).unwrap();
+        assert_eq!(fs::read_to_string(p).unwrap(), "hello\n[1,2]");
+
+        // JSON existing + non-JSON payload → text append, existing bytes untouched.
+        let path = dir.path().join("obj.json");
+        let p = path.to_str().unwrap();
+        fs::write(p, r#"{"a":1}"#).unwrap();
+        append_to_outfile(p, "not json at all").unwrap();
+        assert_eq!(fs::read_to_string(p).unwrap(), "{\"a\":1}\nnot json at all");
+    }
+
+    #[test]
+    fn append_to_outfile_wraps_two_json_values_into_an_array() {
+        // The reported bug: GET /about >> f twice left two newline-separated
+        // objects — an invalid JSON file. The second append must produce an array.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("foo.json");
+        let p = path.to_str().unwrap();
+
+        let about = r#"{"@type":"api version info","schema-version":"1.1"}"#;
+        append_to_outfile(p, about).unwrap();
+        // First write: bare object, verbatim.
+        assert_eq!(fs::read_to_string(p).unwrap(), about);
+
+        append_to_outfile(p, about).unwrap();
+        let v: Value = serde_json::from_str(&fs::read_to_string(p).unwrap())
+            .expect("file must be valid JSON after the second append");
+        assert_eq!(
+            v,
+            serde_json::json!([
+                {"@type":"api version info","schema-version":"1.1"},
+                {"@type":"api version info","schema-version":"1.1"},
+            ]),
+        );
+
+        // Third append flows through the array+push path: one three-element array.
+        append_to_outfile(p, r#"{"id":3}"#).unwrap();
+        let v: Value = serde_json::from_str(&fs::read_to_string(p).unwrap()).unwrap();
+        assert_eq!(v.as_array().map(|a| a.len()), Some(3), "got: {v}");
+
+        // value + array → the existing value is wrapped, then the rest appended.
+        let path = dir.path().join("scalar.json");
+        let p = path.to_str().unwrap();
+        append_to_outfile(p, "5").unwrap();
+        append_to_outfile(p, "[6, 7]").unwrap();
+        let v: Value = serde_json::from_str(&fs::read_to_string(p).unwrap()).unwrap();
+        assert_eq!(v, serde_json::json!([5, 6, 7]));
+    }
+
+    #[test]
+    fn append_to_outfile_splices_without_reserializing() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // The user's example, byte-for-byte: no pretty-printing, no reflow.
+        let path = dir.path().join("ex.json");
+        let p = path.to_str().unwrap();
+        append_to_outfile(p, "\"example1\"").unwrap();
+        assert_eq!(fs::read_to_string(p).unwrap(), "\"example1\"");
+        append_to_outfile(p, "\"example2\"").unwrap();
+        assert_eq!(fs::read_to_string(p).unwrap(), "[\"example1\",\"example2\"]");
+        append_to_outfile(p, "\"example3\"").unwrap();
+        assert_eq!(fs::read_to_string(p).unwrap(), "[\"example1\",\"example2\",\"example3\"]");
+
+        // The property that distinguishes a splice from compact re-serialization:
+        // existing bytes are NEVER normalized. Serde would turn `1e2` into `100.0`.
+        let path = dir.path().join("sci.json");
+        let p = path.to_str().unwrap();
+        fs::write(p, "[1e2]").unwrap();
+        append_to_outfile(p, "3").unwrap();
+        assert_eq!(fs::read_to_string(p).unwrap(), "[1e2,3]");
+
+        // Array + array splices interiors.
+        let path = dir.path().join("arr.json");
+        let p = path.to_str().unwrap();
+        fs::write(p, r#"[{"id":1}]"#).unwrap();
+        append_to_outfile(p, r#"[{"id":2},{"id":3}]"#).unwrap();
+        assert_eq!(fs::read_to_string(p).unwrap(), r#"[{"id":1},{"id":2},{"id":3}]"#);
+
+        // Appending an empty array is a no-op — the file is left byte-identical.
+        append_to_outfile(p, "[]").unwrap();
+        assert_eq!(fs::read_to_string(p).unwrap(), r#"[{"id":1},{"id":2},{"id":3}]"#);
+
+        // Appending ONTO an empty array wraps just the payload.
+        let path = dir.path().join("onto-empty.json");
+        let p = path.to_str().unwrap();
+        fs::write(p, "[]").unwrap();
+        append_to_outfile(p, r#"{"id":9}"#).unwrap();
+        assert_eq!(fs::read_to_string(p).unwrap(), r#"[{"id":9}]"#);
+
+        // A legacy pretty-printed file (from the previous merge style) splices
+        // into a still-valid array, existing formatting preserved inside.
+        let path = dir.path().join("legacy.json");
+        let p = path.to_str().unwrap();
+        fs::write(p, "[\n  {\n    \"id\": 1\n  }\n]").unwrap();
+        append_to_outfile(p, r#"{"id":2}"#).unwrap();
+        let merged = fs::read_to_string(p).unwrap();
+        assert_eq!(merged, "[{\n    \"id\": 1\n  },{\"id\":2}]");
+        let v: Value = serde_json::from_str(&merged).expect("mixed-format file stays valid JSON");
+        assert_eq!(v.as_array().map(|a| a.len()), Some(2));
+    }
+
+    #[test]
+    fn append_to_outfile_is_format_aware_for_ndjson_and_csv() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // NDJSON: a JSON-array payload explodes to one compact object per line.
+        let path = dir.path().join("out.ndjson");
+        let p = path.to_str().unwrap();
+        fs::write(p, "{\"id\":1}\n").unwrap();
+        append_to_outfile(p, r#"[{"id":2}, {"id":3}]"#).unwrap();
+        assert_eq!(fs::read_to_string(p).unwrap(), "{\"id\":1}\n{\"id\":2}\n{\"id\":3}\n");
+
+        // A single (even pretty-printed) JSON value becomes one compact line.
+        append_to_outfile(p, "{\n  \"id\": 4\n}").unwrap();
+        assert_eq!(
+            fs::read_to_string(p).unwrap(),
+            "{\"id\":1}\n{\"id\":2}\n{\"id\":3}\n{\"id\":4}\n",
+        );
+
+        // Already-NDJSON payload → plain text append.
+        append_to_outfile(p, "{\"id\":5}\n{\"id\":6}\n").unwrap();
+        assert!(fs::read_to_string(p).unwrap().ends_with("{\"id\":5}\n{\"id\":6}\n"));
+
+        // CSV: the payload's header row is dropped when the target has content.
+        let path = dir.path().join("out.csv");
+        let p = path.to_str().unwrap();
+        fs::write(p, "id,name\n1,Alice\n").unwrap();
+        append_to_outfile(p, "id,name\n2,Bob\n").unwrap();
+        assert_eq!(fs::read_to_string(p).unwrap(), "id,name\n1,Alice\n2,Bob\n");
+
+        // Header-only payload (empty result set) → nothing added.
+        append_to_outfile(p, "id,name\n").unwrap();
+        assert_eq!(fs::read_to_string(p).unwrap(), "id,name\n1,Alice\n2,Bob\n");
+
+        // First write to a missing CSV keeps its header.
+        let fresh = dir.path().join("fresh.csv");
+        append_to_outfile(fresh.to_str().unwrap(), "id,name\n9,Zoe\n").unwrap();
+        assert_eq!(fs::read_to_string(&fresh).unwrap(), "id,name\n9,Zoe\n");
+    }
+
+    #[test]
+    fn parse_input_detects_append_redirect() {
+        // `>>` sets the append flag; the path parses identically to `>`.
+        let mut state = test_state();
+        parse_input(&mut state, "GET /people >> out.json");
+        assert_eq!(state.config.outfile, "out.json");
+        assert_eq!(state.display_outfile, "out.json");
+        assert!(state.config.outfile_append);
+        assert_eq!(state.method, "GET");
+        assert_eq!(state.uri, "/people");
+
+        // Plain `>` leaves it unset.
+        let mut state = test_state();
+        parse_input(&mut state, "GET /people > out.json");
+        assert_eq!(state.config.outfile, "out.json");
+        assert!(!state.config.outfile_append);
+
+        // The flag resets between parses — a previous `>>` must not leak into
+        // a later request without one (chains re-parse per segment).
+        parse_input(&mut state, "GET /people >> a.json");
+        assert!(state.config.outfile_append);
+        parse_input(&mut state, "GET /people > b.json");
+        assert!(!state.config.outfile_append);
+        parse_input(&mut state, "GET /people");
+        assert!(!state.config.outfile_append);
+
+        // No space after `>>` works, matching `>`.
+        let mut state = test_state();
+        parse_input(&mut state, "GET /people >>out.json");
+        assert_eq!(state.config.outfile, "out.json");
+        assert!(state.config.outfile_append);
+    }
+
+    #[test]
+    fn parse_request_line_preserves_the_append_marker() {
+        // Bulk lines carry the outfile in the URI suffix; `>>` must survive the
+        // round-trip so run_non_interactive sees it.
+        let (method, uri, body) = parse_request_line("GET /people >> out.json").unwrap();
+        assert_eq!(method, "GET");
+        assert_eq!(uri, "/people >> out.json");
+        assert_eq!(body, "");
+
+        let (_, uri, _) = parse_request_line("GET /people > out.json").unwrap();
+        assert_eq!(uri, "/people > out.json");
+    }
+
+    #[test]
+    fn file_context_and_log_line_understand_append() {
+        // Completion context: the second `>` is part of the marker, not the path.
+        let input = "GET /people >> ou";
+        let ctx = extract_file_path_context(input, char_len(input)).expect("context");
+        assert_eq!(ctx.partial, "ou");
+        assert!(ctx.is_outfile);
+        assert!(ctx.is_append);
+
+        // `>` alone is not append.
+        let input = "GET /people > ou";
+        let ctx = extract_file_path_context(input, char_len(input)).expect("context");
+        assert!(!ctx.is_append);
+
+        // The request log line shows the marker the user typed.
+        assert_eq!(
+            format_request_log_line("GET", "/people", "", "out.json", true, 80),
+            "GET /people >> out.json",
+        );
+    }
+
+    #[test]
+    fn restore_input_after_send_is_chain_aware() {
+        // Single request: rebuilt from method/URI/body plus the outfile marker
+        // as typed — `>>` must survive (restoring it as `>` would turn an
+        // append into an overwrite on re-send). This also covers the @file-error
+        // path, which used to drop the outfile entirely.
+        let mut state = test_state();
+        state.method = "PUT".to_string();
+        state.uri = "/people".to_string();
+        state.body = "@missing.json".to_string();
+        state.display_outfile = "out.json".to_string();
+        state.config.outfile_append = true;
+        restore_input_after_send(&mut state);
+        assert_eq!(state.input, "PUT /people @missing.json >> out.json");
+        assert_eq!(state.cursor_pos, char_len(&state.input));
+
+        // Plain `>` restores as `>`.
+        state.config.outfile_append = false;
+        restore_input_after_send(&mut state);
+        assert_eq!(state.input, "PUT /people @missing.json > out.json");
+
+        // Mid-chain: the full chain wins over the just-sent segment, and stale
+        // completion state is cleared.
+        let mut state = test_state();
+        state.method = "GET".to_string();
+        state.uri = "/about".to_string();
+        state.chain_input = Some("GET /about && GET /about/api-versions".to_string());
+        state.completions = vec!["stale".to_string()];
+        state.last_tab_input = "stale".to_string();
+        restore_input_after_send(&mut state);
+        assert_eq!(state.input, "GET /about && GET /about/api-versions");
+        assert_eq!(state.cursor_pos, char_len(&state.input));
+        assert!(state.completions.is_empty());
+        assert!(state.last_tab_input.is_empty());
+    }
+
+    #[test]
+    fn file_path_context_is_scoped_to_the_cursor_segment() {
+        // Cursor in the FIRST segment's outfile: the context is that segment's,
+        // not the rightmost `>` on the line — the reported bug.
+        let input = "GET /people~take(1) > ~/Do && GET /products~take(1) > ~/Downloads/1.json";
+        let cursor = char_len("GET /people~take(1) > ~/Do"); // right after "Do"
+        let ctx = extract_file_path_context(input, cursor).expect("context in segment 1");
+        assert_eq!(ctx.partial, "~/Do");
+        assert!(ctx.is_outfile);
+        assert_eq!(&input[ctx.path_start..ctx.path_end], "~/Do");
+        // The partial must never run past the segment into the chain tail.
+        assert!(!ctx.partial.contains("&&"));
+
+        // Cursor at end of line: the LAST segment's outfile, as before.
+        let ctx = extract_file_path_context(input, char_len(input)).expect("context in segment 2");
+        assert_eq!(ctx.partial, "~/Downloads/1.json");
+
+        // Cursor in a segment with no `>`/`@` of its own: no file context, even
+        // though other segments have one — URI completion applies there instead.
+        let input = "GET /people && GET /products > out.json";
+        let cursor = char_len("GET /peop");
+        assert!(extract_file_path_context(input, cursor).is_none());
+
+        // `@` body in the first segment, cursor inside it.
+        let input = "PUT /people @da && GET /check > out.json";
+        let cursor = char_len("PUT /people @da");
+        let ctx = extract_file_path_context(input, cursor).expect("body-file context");
+        assert_eq!(ctx.partial, "da");
+        assert!(!ctx.is_outfile);
+
+        // A `&&` inside a JSON string doesn't split the segment.
+        let input = r#"PUT /r {"e": "a && b"} > out"#;
+        let ctx = extract_file_path_context(input, char_len(input)).expect("single segment");
+        assert_eq!(ctx.partial, "out");
+
+        // Single request behaves exactly as before, wherever the cursor is.
+        let input = "GET /people > ~/Do";
+        for cursor in [0, 4, char_len(input)] {
+            let ctx = extract_file_path_context(input, cursor).expect("context");
+            assert_eq!(ctx.partial, "~/Do");
+        }
+    }
+
+    #[test]
+    fn file_completion_in_first_segment_preserves_the_chain_tail() {
+        // End-to-end against a real directory: completing the FIRST segment's
+        // outfile must replace only that path — wiping the ` && …` tail was the
+        // second half of the reported bug.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("report.json"), "{}").unwrap();
+        let base = dir.path().display().to_string();
+
+        let mut state = test_state();
+        state.input = format!("GET /a~take(1) > {}/rep && GET /b > keep.json", base);
+        state.cursor_pos = char_len(&format!("GET /a~take(1) > {}/rep", base));
+        handle_file_tab_completion(&mut state);
+
+        assert_eq!(
+            state.input,
+            format!("GET /a~take(1) > {}/report.json && GET /b > keep.json", base),
+            "tail must survive completion",
+        );
+        // Cursor sits at the end of the completed path, mid-line.
+        assert_eq!(state.cursor_pos, char_len(&format!("GET /a~take(1) > {}/report.json", base)));
+
+        // A second Tab cycles (single match → same value), still preserving the tail.
+        handle_file_tab_completion(&mut state);
+        assert!(state.input.ends_with(" && GET /b > keep.json"), "got: {}", state.input);
+
+        // Reverse cycling preserves the tail too.
+        handle_file_tab_completion_reverse(&mut state);
+        assert!(state.input.ends_with(" && GET /b > keep.json"), "got: {}", state.input);
+    }
+
+    #[test]
     fn is_outfile_context_distinguishes_redirect_from_body() {
-        assert!(is_outfile_context("GET /foo > cl"));
-        assert!(is_outfile_context("GET /foo >"));
-        assert!(!is_outfile_context("PUT /foo @cl"));
-        assert!(!is_outfile_context("GET /foo"));
+        let is_outfile = |s: &str| {
+            extract_file_path_context(s, char_len(s)).map(|c| c.is_outfile)
+        };
+        assert_eq!(is_outfile("GET /foo > cl"), Some(true));
+        assert_eq!(is_outfile("GET /foo >"), Some(true));
+        assert_eq!(is_outfile("PUT /foo @cl"), Some(false));
+        assert_eq!(is_outfile("GET /foo"), None);
     }
 
     #[test]
@@ -11188,27 +12534,27 @@ mod tests {
         colored::control::set_override(true);
 
         // Bare request — no body, no outfile.
-        assert_eq!(format_request_log_line("GET", "/people", "", "", 80), "GET /people");
+        assert_eq!(format_request_log_line("GET", "/people", "", "", false, 80), "GET /people");
 
         // Body follows the URI, unstyled and unreformatted.
         assert_eq!(
-            format_request_log_line("PUT", "/people/*givenName", "\"A new name\"", "", 80),
+            format_request_log_line("PUT", "/people/*givenName", "\"A new name\"", "", false, 80),
             "PUT /people/*givenName \"A new name\"",
         );
 
         // Outfile is appended last, after the body.
         assert_eq!(
-            format_request_log_line("GET", "/people", "", "out.json", 80),
+            format_request_log_line("GET", "/people", "", "out.json", false, 80),
             "GET /people > out.json",
         );
         assert_eq!(
-            format_request_log_line("PUT", "/people", "@data.json", "~/out.json", 80),
+            format_request_log_line("PUT", "/people", "@data.json", "~/out.json", false, 80),
             "PUT /people @data.json > ~/out.json",
         );
 
         // Nothing on the line is styled, so the renderer's `visible_len` sizing
         // sees exactly the characters printed.
-        let line = format_request_log_line("PUT", "/people", "{ \"a\": 1 }", "out.json", 80);
+        let line = format_request_log_line("PUT", "/people", "{ \"a\": 1 }", "out.json", false, 80);
         assert!(!line.contains('\x1b'), "expected no escapes, got: {line:?}");
         assert_eq!(visible_len(&line), char_len(&line));
 
@@ -11224,7 +12570,7 @@ mod tests {
         for width in [20usize, 40, 60, 80, 120, 200] {
             for body in [long_body.as_str(), long_glob.as_str(), multiline] {
                 for outfile in ["", "out.json", "~/some/longer/path/output.json"] {
-                    let line = format_request_log_line("PUT", "/people", body, outfile, width);
+                    let line = format_request_log_line("PUT", "/people", body, outfile, false, width);
                     // Never wraps...
                     assert!(
                         char_len(&line) <= width.max(char_len("PUT /people") + char_len(outfile) + 3),
@@ -11247,30 +12593,30 @@ mod tests {
         // Wide terminal: a long body is cut to the columns left over, exactly
         // filling the row rather than wrapping.
         let long = "x".repeat(500);
-        let line = format_request_log_line("PUT", "/people", &long, "", 80);
+        let line = format_request_log_line("PUT", "/people", &long, "", false, 80);
         assert_eq!(char_len(&line), 80, "got: {line:?}");
         assert!(line.ends_with('…'), "got: {line:?}");
 
         // The outfile is reserved first, so it always survives intact.
-        let line = format_request_log_line("PUT", "/people", &long, "out.json", 80);
+        let line = format_request_log_line("PUT", "/people", &long, "out.json", false, 80);
         assert_eq!(char_len(&line), 80, "got: {line:?}");
         assert!(line.ends_with(" > out.json"), "got: {line:?}");
 
         // Exactly `MIN_INLINE_BODY_CHARS` left is still shown, filling the row.
         // ("PUT /people" is 11 columns, plus the separating space.)
         let at_min = 11 + 1 + MIN_INLINE_BODY_CHARS;
-        let line = format_request_log_line("PUT", "/people", &long, "", at_min);
+        let line = format_request_log_line("PUT", "/people", &long, "", false, at_min);
         assert_eq!(char_len(&line), at_min, "got: {line:?}");
         assert!(line.ends_with('…'), "got: {line:?}");
 
         // One column narrower and the body is dropped, not stubbed.
-        let line = format_request_log_line("PUT", "/people", &long, "", at_min - 1);
+        let line = format_request_log_line("PUT", "/people", &long, "", false, at_min - 1);
         assert_eq!(line, "PUT /people");
 
         // A URI wider than the terminal keeps the URI and drops the body; the
         // saturating arithmetic must not panic here.
         let long_uri = format!("/{}", "segment/".repeat(30));
-        let line = format_request_log_line("GET", &long_uri, &long, "", 40);
+        let line = format_request_log_line("GET", &long_uri, &long, "", false, 40);
         assert_eq!(line, format!("GET {}", long_uri));
     }
 
@@ -11280,6 +12626,7 @@ mod tests {
             uri: "/people".to_string(),
             body: format!("{{ \"name\": \"{}\" }}", "x".repeat(200)),
             display_outfile: String::new(),
+            outfile_append: false,
             head: "HTTP/1.1 200 OK 0.08s\n".to_string(),
             tail: "\n{\n  \"ok\": true\n}\n\n".to_string(),
         }
@@ -11332,6 +12679,7 @@ mod tests {
             uri: "/people".to_string(),
             body: "@data.json".to_string(),
             display_outfile: "out.json".to_string(),
+            outfile_append: false,
             head: "HTTP/1.1 200 OK 0.08s\n> out.json\n\n".to_string(),
             tail: String::new(),
         };
@@ -11360,6 +12708,541 @@ mod tests {
             state.output_history.last().unwrap().uri,
             format!("/people/{}", OUTPUT_HISTORY_LIMIT + 4),
         );
+    }
+
+    #[test]
+    fn output_with_timeout_returns_fast_command_output() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf hello; printf oops >&2"]);
+        let out = output_with_timeout(&mut cmd, Duration::from_secs(10))
+            .expect("spawn")
+            .expect("should finish well inside the deadline");
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "hello");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "oops");
+    }
+
+    #[test]
+    fn output_with_timeout_kills_an_overrunning_command() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 30"]);
+        let start = Instant::now();
+        let out = output_with_timeout(&mut cmd, Duration::from_millis(300)).expect("spawn");
+        assert!(out.is_none(), "expected the deadline to be reported");
+        // Returns promptly rather than waiting out the child — this is the hang
+        // the 1Password calls used to be able to produce.
+        assert!(start.elapsed() < Duration::from_secs(5), "took {:?}", start.elapsed());
+    }
+
+    #[test]
+    fn output_with_timeout_survives_output_larger_than_the_pipe_buffer() {
+        // A child writing more than the pipe buffer blocks until it's drained. If
+        // the wait didn't drain concurrently, this would deadlock until the
+        // deadline instead of returning the full output.
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "yes abcdefghijklmnopqrstuvwxyz | head -c 400000"]);
+        let out = output_with_timeout(&mut cmd, Duration::from_secs(20))
+            .expect("spawn")
+            .expect("should finish, not deadlock against the pipe buffer");
+        assert!(out.status.success());
+        assert_eq!(out.stdout.len(), 400_000);
+    }
+
+    #[test]
+    fn output_with_timeout_reports_spawn_failure() {
+        let mut cmd = Command::new("definitely-not-a-real-binary-xyz");
+        assert!(output_with_timeout(&mut cmd, Duration::from_secs(1)).is_err());
+    }
+
+    #[test]
+    fn op_stderr_detail_appends_only_real_output() {
+        use std::os::unix::process::ExitStatusExt;
+        let mk = |stderr: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+        assert_eq!(op_stderr_detail(&mk("")), "");
+        assert_eq!(op_stderr_detail(&mk("   \n  ")), "");
+        assert_eq!(op_stderr_detail(&mk("not signed in")), "\nnot signed in");
+        // Trailing newlines from the CLI don't produce a blank line.
+        assert_eq!(op_stderr_detail(&mk("session expired\n")), "\nsession expired");
+    }
+
+    #[test]
+    fn last_chain_segment_start_finds_the_final_separator() {
+        // Returns the offset just past the final `&&` — the leading space (if
+        // any) belongs to the segment and is trimmed by the callers.
+        assert_eq!(last_chain_segment_start("GET /a"), 0);
+        assert_eq!(last_chain_segment_start("GET /a && GET /b"), 9);
+        assert_eq!(last_chain_segment_start("GET /a && GET /b && GET /c"), 19);
+        // Inside a string or body, `&&` doesn't start a segment.
+        assert_eq!(last_chain_segment_start(r#"PUT /r {"e": "a && b"}"#), 0);
+        assert_eq!(last_chain_segment_start(r#"PUT /r {"a": 1 && 2}"#), 0);
+        // After a body closes, it does.
+        let s = r#"PUT /a {"x":1} && GET /b"#;
+        assert_eq!(last_chain_segment_start(s), s.find(" GET").unwrap());
+        // `&&&`: the separator is the first two chars, the third starts the segment.
+        assert_eq!(last_chain_segment_start("GET /a &&& GET /b"), 9);
+        // Trailing separator — the (empty) last segment starts at the end.
+        assert_eq!(last_chain_segment_start("GET /a &&"), 9);
+    }
+
+    #[test]
+    fn promotion_fires_only_in_the_last_segment() {
+        // Typing `{` at the end of the last segment promotes THAT segment's GET.
+        let mut state = test_state();
+        state.input = "GET /a && GET /b {".to_string();
+        state.cursor_pos = char_len(&state.input);
+        state.method = "GET".to_string();
+        auto_promote_method_on_body_start(&mut state, '{');
+        assert_eq!(state.input, "GET /a && PUT /b {");
+        // The line's leading method is untouched, as is the TUI's method state.
+        assert_eq!(state.method, "GET");
+        assert!(state.method_auto_promoted);
+        assert_eq!(state.method_auto_promoted_uri, "/b");
+
+        // URI-only last segment gets an explicit PUT prepended.
+        let mut state = test_state();
+        state.input = "GET /a && /b {".to_string();
+        state.cursor_pos = char_len(&state.input);
+        state.method = "GET".to_string();
+        auto_promote_method_on_body_start(&mut state, '{');
+        assert_eq!(state.input, "GET /a && PUT /b {");
+        assert_eq!(state.method, "GET");
+
+        // Typing a body char in an EARLIER segment never promotes anything —
+        // the `&&` after the cursor stays top-level, so the edit is not in the
+        // last segment.
+        let mut state = test_state();
+        state.input = "GET /a x && GET /b".to_string();
+        // Cursor just after the `x` (char 8).
+        state.cursor_pos = 8;
+        state.method = "GET".to_string();
+        auto_promote_method_on_body_start(&mut state, 'x');
+        assert_eq!(state.input, "GET /a x && GET /b");
+        assert_eq!(state.method, "GET");
+        assert!(!state.method_auto_promoted);
+
+        // Typing `{` mid-line is different BY THE GRAMMAR: the unclosed bracket
+        // swallows the rest of the line into a body (the `&&` is no longer
+        // top-level), the line is one request again, and prefix-based promotion
+        // applies exactly as it did before chains existed.
+        let mut state = test_state();
+        state.input = "GET /a { && GET /b".to_string();
+        state.cursor_pos = 8; // just after the `{`
+        state.method = "GET".to_string();
+        auto_promote_method_on_body_start(&mut state, '{');
+        assert_eq!(state.input, "PUT /a { && GET /b");
+        assert_eq!(state.method, "PUT");
+
+        // A `&&` inside a JSON string is body text — the whole line is one
+        // segment, and its promotion works as for any single request.
+        let mut state = test_state();
+        state.input = "GET /r {".to_string();
+        state.cursor_pos = char_len(&state.input);
+        state.method = "GET".to_string();
+        auto_promote_method_on_body_start(&mut state, '{');
+        assert_eq!(state.input, "PUT /r {");
+        assert_eq!(state.method, "PUT");
+    }
+
+    #[test]
+    fn revert_fires_only_on_the_promoted_segment_uri() {
+        // Promote in the last segment, clear its body → that segment reverts.
+        let mut state = test_state();
+        state.input = "GET /a && GET /b {".to_string();
+        state.cursor_pos = char_len(&state.input);
+        auto_promote_method_on_body_start(&mut state, '{');
+        assert_eq!(state.input, "GET /a && PUT /b {");
+        state.input = "GET /a && PUT /b ".to_string(); // body deleted
+        auto_revert_method_on_body_clear(&mut state);
+        assert_eq!(state.input, "GET /a && GET /b ");
+        assert!(!state.method_auto_promoted);
+
+        // THE protection case: segment-1 PUT was typed by hand; a promotion in
+        // segment 2 then a deletion of segment 2 must never revert segment 1.
+        let mut state = test_state();
+        state.input = "PUT /a && /b {".to_string();
+        state.cursor_pos = char_len(&state.input);
+        state.method = "PUT".to_string();
+        auto_promote_method_on_body_start(&mut state, '{');
+        assert_eq!(state.input, "PUT /a && PUT /b {");
+        // Segment 2 deleted wholesale (e.g. kill-to-end from before the `&&`).
+        state.input = "PUT /a ".to_string();
+        auto_revert_method_on_body_clear(&mut state);
+        assert_eq!(state.input, "PUT /a ", "an explicitly typed PUT must survive");
+        assert_eq!(state.method, "PUT");
+        // The stale promotion flag is cleared, so no later edit can revert either.
+        assert!(!state.method_auto_promoted);
+        auto_revert_method_on_body_clear(&mut state);
+        assert_eq!(state.input, "PUT /a ");
+
+        // Narrowing (pinned as intended): editing the promoted URI while the
+        // body exists, then clearing the body, no longer reverts — the URI on
+        // the line isn't the one that was promoted.
+        let mut state = test_state();
+        state.input = "GET /x {".to_string();
+        state.cursor_pos = char_len(&state.input);
+        state.method = "GET".to_string();
+        auto_promote_method_on_body_start(&mut state, '{');
+        assert_eq!(state.input, "PUT /x {");
+        state.input = "PUT /xy ".to_string(); // URI edited, body cleared
+        auto_revert_method_on_body_clear(&mut state);
+        assert_eq!(state.input, "PUT /xy ");
+        assert!(!state.method_auto_promoted);
+    }
+
+    #[test]
+    fn array_wrap_is_scoped_to_the_last_segment() {
+        // Wrap fires for the last segment of a chain on an array endpoint.
+        let mut state = test_state();
+        state.array_endpoints.insert("/people".to_string());
+        state.input = "GET /a && PUT /people {".to_string();
+        state.cursor_pos = char_len(&state.input);
+        auto_wrap_array_body(&mut state, '{');
+        assert_eq!(state.input, "GET /a && PUT /people [{");
+
+        // But never for an earlier segment: typing a body char inside segment 1
+        // while the `&&` stays top-level does not wrap.
+        let mut state = test_state();
+        state.array_endpoints.insert("/people".to_string());
+        state.input = "PUT /people x && GET /b".to_string();
+        state.cursor_pos = 13; // just after the `x`
+        auto_wrap_array_body(&mut state, 'x');
+        assert_eq!(state.input, "PUT /people x && GET /b");
+
+        // Promotion + wrap in one keystroke, chained: GET → PUT then `[`.
+        let mut state = test_state();
+        state.array_endpoints.insert("/people".to_string());
+        state.input = "GET /a && GET /people {".to_string();
+        state.cursor_pos = char_len(&state.input);
+        auto_promote_method_on_body_start(&mut state, '{');
+        auto_wrap_array_body(&mut state, '{');
+        assert_eq!(state.input, "GET /a && PUT /people [{");
+    }
+
+    #[test]
+    fn paste_promotion_is_scoped_to_the_last_segment() {
+        // Pasting a body at the end of a chain promotes the LAST segment only.
+        let mut state = test_state();
+        state.input = "GET /a && GET /b ".to_string();
+        state.cursor_pos = char_len(&state.input);
+        state.method = "GET".to_string();
+        let mut out = sink();
+        handle_paste(&mut state, "{\"x\":1}", &mut out).unwrap();
+        assert_eq!(state.input, "GET /a && PUT /b {\"x\":1}");
+        assert_eq!(state.method, "GET");
+
+        // Pasted array wrap in the last segment of a chain.
+        let mut state = test_state();
+        state.array_endpoints.insert("/people".to_string());
+        state.input = "GET /a && GET /people ".to_string();
+        state.cursor_pos = char_len(&state.input);
+        state.method = "GET".to_string();
+        let mut out = sink();
+        handle_paste(&mut state, "{\"n\":\"Joe\"}", &mut out).unwrap();
+        assert_eq!(state.input, "GET /a && PUT /people [{\"n\":\"Joe\"}]");
+    }
+
+    #[test]
+    fn typing_a_chain_separator_never_promotes_get() {
+        // Typing `&` after `GET /uri ` starts a `&&` chain, not a body — the GET
+        // must survive, or the chain the user is composing silently becomes a PUT.
+        let mut state = test_state();
+        state.input = "GET /people &".to_string();
+        state.cursor_pos = char_len(&state.input);
+        state.method = "GET".to_string();
+        auto_promote_method_on_body_start(&mut state, '&');
+        assert_eq!(state.input, "GET /people &");
+        assert_eq!(state.method, "GET");
+        assert!(!state.method_auto_promoted);
+
+        // Same for a URI-only line (implicit GET) — no `PUT ` prepended.
+        let mut state = test_state();
+        state.input = "/people &".to_string();
+        state.cursor_pos = char_len(&state.input);
+        state.method = "GET".to_string();
+        auto_promote_method_on_body_start(&mut state, '&');
+        assert_eq!(state.input, "/people &");
+        assert_eq!(state.method, "GET");
+
+        // And the array auto-wrap must not produce `PUT /people [&`.
+        let mut state = test_state();
+        state.array_endpoints.insert("/people".to_string());
+        state.input = "PUT /people &".to_string();
+        state.cursor_pos = char_len(&state.input);
+        auto_wrap_array_body(&mut state, '&');
+        assert_eq!(state.input, "PUT /people &");
+
+        // Sanity: a real body char right after still promotes as before.
+        let mut state = test_state();
+        state.input = "GET /people {".to_string();
+        state.cursor_pos = char_len(&state.input);
+        state.method = "GET".to_string();
+        auto_promote_method_on_body_start(&mut state, '{');
+        assert_eq!(state.input, "PUT /people {");
+        assert_eq!(state.method, "PUT");
+    }
+
+    #[test]
+    fn pasting_a_chain_tail_never_promotes_get() {
+        // Pasting `&& GET /b` at the body position of `GET /a ` extends the
+        // chain; it must not read as a body and promote.
+        let mut state = test_state();
+        state.input = "GET /a ".to_string();
+        state.cursor_pos = char_len(&state.input);
+        state.method = "GET".to_string();
+        let mut out = sink();
+        handle_paste(&mut state, "&& GET /b", &mut out).unwrap();
+        assert_eq!(state.input, "GET /a && GET /b");
+        assert_eq!(state.method, "GET");
+        assert!(!state.method_auto_promoted);
+
+        // Even with a body inside the pasted tail — the `&` prefix decides.
+        let mut state = test_state();
+        state.input = "GET /a ".to_string();
+        state.cursor_pos = char_len(&state.input);
+        state.method = "GET".to_string();
+        let mut out = sink();
+        handle_paste(&mut state, "&& PUT /b {\"x\":1}", &mut out).unwrap();
+        assert_eq!(state.input, "GET /a && PUT /b {\"x\":1}");
+        assert_eq!(state.method, "GET");
+    }
+
+    fn chain_texts(input: &str) -> Vec<String> {
+        split_request_chain(input).into_iter().map(|(_, s)| s).collect()
+    }
+
+    #[test]
+    fn split_request_chain_records_operators() {
+        assert_eq!(
+            split_request_chain("GET /a || GET /b && GET /c"),
+            vec![
+                (ChainOp::And, "GET /a".to_string()),
+                (ChainOp::Or, "GET /b".to_string()),
+                (ChainOp::And, "GET /c".to_string()),
+            ],
+        );
+        // `||` inside a JSON string or body is literal.
+        let in_string = r#"PUT /r { "expr": "a || b" }"#;
+        assert_eq!(chain_texts(in_string), vec![in_string.to_string()]);
+        // A single `|` is not a separator.
+        assert_eq!(chain_texts("GET /a|b"), vec!["GET /a|b".to_string()]);
+        // An empty middle segment is dropped; the follower keeps ITS operator.
+        assert_eq!(
+            split_request_chain("GET /a && || GET /b"),
+            vec![(ChainOp::And, "GET /a".to_string()), (ChainOp::Or, "GET /b".to_string())],
+        );
+    }
+
+    #[test]
+    fn chain_segment_should_run_implements_shell_rules() {
+        use ChainOp::*;
+        use RequestOutcome::*;
+        // First segment always runs.
+        assert!(chain_segment_should_run(None, And));
+        assert!(chain_segment_should_run(None, Or));
+        // Truthy: && runs, || skips.
+        assert!(chain_segment_should_run(Some(Truthy), And));
+        assert!(!chain_segment_should_run(Some(Truthy), Or));
+        // Falsy: && skips, || runs.
+        assert!(!chain_segment_should_run(Some(Falsy), And));
+        assert!(chain_segment_should_run(Some(Falsy), Or));
+
+        // If-then-else, simulated with the skipped-doesn't-update rule:
+        // a && b || c — truthy a runs b; b truthy skips c.
+        let mut prev = Some(Truthy);
+        assert!(chain_segment_should_run(prev, And)); // b runs
+        prev = Some(Truthy); // b's own outcome
+        assert!(!chain_segment_should_run(prev, Or)); // c skipped
+        // Falsy a skips b (prev unchanged), a's falsiness then runs c.
+        prev = Some(Falsy);
+        assert!(!chain_segment_should_run(prev, And)); // b skipped, prev stays
+        assert!(chain_segment_should_run(prev, Or)); // c runs
+    }
+
+    #[test]
+    fn or_separator_composes_with_segment_features() {
+        // Typing the first `|` of a separator never promotes or wraps — the
+        // same guard class as `&`.
+        let mut state = test_state();
+        state.input = "GET /people |".to_string();
+        state.cursor_pos = char_len(&state.input);
+        state.method = "GET".to_string();
+        auto_promote_method_on_body_start(&mut state, '|');
+        assert_eq!(state.input, "GET /people |");
+        assert_eq!(state.method, "GET");
+
+        let mut state = test_state();
+        state.array_endpoints.insert("/people".to_string());
+        state.input = "PUT /people |".to_string();
+        state.cursor_pos = char_len(&state.input);
+        auto_wrap_array_body(&mut state, '|');
+        assert_eq!(state.input, "PUT /people |");
+
+        // Pasting a `||` tail never promotes.
+        let mut state = test_state();
+        state.input = "GET /a ".to_string();
+        state.cursor_pos = char_len(&state.input);
+        state.method = "GET".to_string();
+        let mut out = sink();
+        handle_paste(&mut state, "|| PUT /a {\"x\":1}", &mut out).unwrap();
+        assert_eq!(state.input, "GET /a || PUT /a {\"x\":1}");
+        assert_eq!(state.method, "GET");
+
+        // `||` bounds the "last segment" for promotion, like `&&`.
+        let mut state = test_state();
+        state.input = "GET /a || GET /b {".to_string();
+        state.cursor_pos = char_len(&state.input);
+        state.method = "GET".to_string();
+        auto_promote_method_on_body_start(&mut state, '{');
+        assert_eq!(state.input, "GET /a || PUT /b {");
+        assert_eq!(state.method, "GET");
+
+        // The segment view splits on `||` too — completion in the last segment.
+        let mut state = test_state();
+        state.config.complete = true;
+        state.endpoints = vec!["/people".to_string(), "/products".to_string()];
+        state.input = "GET /people || GET /pro".to_string();
+        state.cursor_pos = char_len(&state.input);
+        with_chain_segment_view(&mut state, handle_tab_completion);
+        assert_eq!(state.input, "GET /people || GET /products");
+    }
+
+    #[test]
+    fn split_request_chain_splits_on_top_level_separators() {
+        assert_eq!(
+            chain_texts("GET /people/123 && PUT /people/123 { \"name\": \"Joe\" }"),
+            vec![
+                "GET /people/123".to_string(),
+                "PUT /people/123 { \"name\": \"Joe\" }".to_string(),
+            ],
+        );
+
+        // Three segments, and whitespace around separators is trimmed.
+        assert_eq!(
+            chain_texts("GET /a&&GET /b   &&   GET /c"),
+            vec!["GET /a".to_string(), "GET /b".to_string(), "GET /c".to_string()],
+        );
+
+        // An unchained line is a one-segment chain, so callers need no special case.
+        assert_eq!(chain_texts("GET /people"), vec!["GET /people".to_string()]);
+    }
+
+    #[test]
+    fn split_request_chain_ignores_separators_inside_bodies_and_strings() {
+        // Inside a JSON string — one request, not two.
+        let in_string = r#"PUT /rules { "expr": "a && b" }"#;
+        assert_eq!(chain_texts(in_string), vec![in_string.to_string()]);
+
+        // Inside brackets but outside a string — still one request.
+        let in_body = r#"PUT /rules { "a": 1 && 2 }"#;
+        assert_eq!(chain_texts(in_body), vec![in_body.to_string()]);
+
+        // An escaped quote must not end the string early and expose the `&&`.
+        let escaped = r#"PUT /x { "s": "he said \"hi\" && bye" }"#;
+        assert_eq!(chain_texts(escaped), vec![escaped.to_string()]);
+
+        // A separator after a body closes is a real split.
+        assert_eq!(
+            chain_texts(r#"PUT /a { "x": 1 } && GET /b"#),
+            vec![r#"PUT /a { "x": 1 }"#.to_string(), "GET /b".to_string()],
+        );
+    }
+
+    #[test]
+    fn split_request_chain_drops_empty_segments() {
+        // Trailing/leading/doubled separators leave nothing to run.
+        assert_eq!(chain_texts("GET /a &&"), vec!["GET /a".to_string()]);
+        assert_eq!(chain_texts("&& GET /a"), vec!["GET /a".to_string()]);
+        assert_eq!(
+            chain_texts("GET /a && && GET /b"),
+            vec!["GET /a".to_string(), "GET /b".to_string()],
+        );
+        assert!(chain_texts("   ").is_empty());
+        // A single `&` is not a separator.
+        assert_eq!(chain_texts("GET /a&b"), vec!["GET /a&b".to_string()]);
+    }
+
+    #[test]
+    fn split_request_chain_handles_multiline_bodies() {
+        let input = "GET /people/123 && PUT /people/123 {\n  \"name\": \"Joe\"\n}";
+        assert_eq!(
+            chain_texts(input),
+            vec![
+                "GET /people/123".to_string(),
+                "PUT /people/123 {\n  \"name\": \"Joe\"\n}".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn classify_response_follows_js_truthiness_on_2xx() {
+        use RequestOutcome::*;
+        // Falsy exactly where JavaScript is falsy.
+        assert_eq!(classify_response(200, "false"), Falsy);
+        assert_eq!(classify_response(200, "null"), Falsy);
+        assert_eq!(classify_response(200, "0"), Falsy);
+        assert_eq!(classify_response(200, "0.0"), Falsy);
+        assert_eq!(classify_response(200, "-0"), Falsy);
+        assert_eq!(classify_response(200, "\"\""), Falsy);
+        // Surrounding whitespace doesn't change the verdict.
+        assert_eq!(classify_response(200, "  0\n"), Falsy);
+
+        // Truthy everywhere else — including empty collections, which are
+        // truthy in JS.
+        assert_eq!(classify_response(200, "[]"), Truthy);
+        assert_eq!(classify_response(200, "{}"), Truthy);
+        assert_eq!(classify_response(200, "true"), Truthy);
+        assert_eq!(classify_response(200, "1"), Truthy);
+        assert_eq!(classify_response(200, "-1"), Truthy);
+        assert_eq!(classify_response(200, "\"Möör\""), Truthy);
+        assert_eq!(classify_response(200, r#"[{"id":1}]"#), Truthy);
+        // Non-JSON payloads (CSV, NDJSON) that reached a 2xx.
+        assert_eq!(classify_response(200, "id,name\n1,Joe"), Truthy);
+        // No body to test — the 2xx is the answer (204 from a DELETE).
+        assert_eq!(classify_response(204, ""), Truthy);
+        assert_eq!(classify_response(200, "   "), Truthy);
+    }
+
+    #[test]
+    fn classify_response_separates_no_from_could_not_answer() {
+        use RequestOutcome::*;
+        // A definite "no" — stops a chain, but nothing went wrong.
+        assert_eq!(classify_response(404, ""), Falsy);
+        assert_eq!(classify_response(400, "bad request"), Falsy);
+        assert_eq!(classify_response(409, ""), Falsy);
+        // Even a body that looks truthy can't rescue a non-2xx.
+        assert_eq!(classify_response(404, r#"{"error":"nope"}"#), Falsy);
+
+        // Credentials, server faults, and backpressure never read as "no" —
+        // treating these as falsy would silently skip a chained write.
+        assert_eq!(classify_response(401, ""), Errored);
+        assert_eq!(classify_response(403, ""), Errored);
+        assert_eq!(classify_response(408, ""), Errored);
+        assert_eq!(classify_response(429, ""), Errored);
+        assert_eq!(classify_response(500, ""), Errored);
+        assert_eq!(classify_response(503, ""), Errored);
+    }
+
+    #[test]
+    fn bulk_program_splits_chained_lines_into_chain_steps() {
+        let src = "GET /people/123 && PUT /people/123 {\n  \"name\": \"Joe\"\n}\nGET /plain\n";
+        let prog = split_bulk_requests(src, None).expect("parse");
+        assert_eq!(prog.steps.len(), 2, "got: {:?}", prog.steps);
+        match &prog.steps[0] {
+            BulkStep::Chain(segments) => {
+                assert_eq!(segments.len(), 2, "got: {segments:?}");
+                assert_eq!(segments[0], (ChainOp::And, "GET /people/123".to_string()));
+                assert_eq!(segments[1].0, ChainOp::And);
+                assert!(segments[1].1.starts_with("PUT /people/123 {"), "got: {}", segments[1].1);
+                assert!(segments[1].1.contains("Joe"));
+            }
+            other => panic!("expected a chain, got: {other:?}"),
+        }
+        // An unchained line stays a plain request.
+        assert!(matches!(&prog.steps[1], BulkStep::Request(r) if r.starts_with("GET /plain")));
     }
 
     #[test]
