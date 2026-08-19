@@ -138,8 +138,8 @@ struct Args {
     #[arg(short = 'k', long = "key")]
     key: Option<String>,
 
-    /// Bearer token for authentication
-    #[arg(short = 't', long = "token")]
+    /// Bearer token for authentication (long form only — `-t` is --stream)
+    #[arg(long = "token")]
     token: Option<String>,
 
     /// Use a saved connection (by alias or URL)
@@ -188,7 +188,7 @@ struct Args {
     preview: bool,
 
     /// Stream the response body instead of buffering it (also: API_STREAMING=1)
-    #[arg(long = "stream")]
+    #[arg(short = 't', long = "stream")]
     stream: bool,
 
     /// Disable streaming even when --stream or API_STREAMING asked for it
@@ -2615,16 +2615,33 @@ impl ConnectionFlow {
     }
 }
 
+/// Add a scheme to a bare base URI: http for localhost/127.0.0.1 or anything
+/// carrying an explicit port, https for everything else. Already-schemed URIs
+/// pass through untouched.
+fn normalize_base_uri(uri: &str) -> String {
+    if uri.starts_with("http://") || uri.starts_with("https://") {
+        return uri.to_string();
+    }
+    if uri.starts_with("localhost") || uri.starts_with("127.0.0.1") || uri.contains(':') {
+        format!("http://{}", uri)
+    } else {
+        format!("https://{}", uri)
+    }
+}
+
+/// Bail out when there's no host to send to. Without this the request goes to a
+/// bare path, reqwest fails, and the caller asks whether COS is running on the
+/// empty string.
+fn require_base_uri(config: &Config) {
+    if config.base_uri.is_empty() {
+        eprintln!("{}", "Error: no base URL specified. Use -b <url> or -c <connection>.".red());
+        std::process::exit(1);
+    }
+}
+
 // Apply a saved connection to a Config
 fn apply_connection_to_config(config: &mut Config, env: &SavedConnection) {
-    config.base_uri = env.url.clone();
-    if !config.base_uri.starts_with("http://") && !config.base_uri.starts_with("https://") {
-        if config.base_uri.starts_with("localhost") || config.base_uri.starts_with("127.0.0.1") || config.base_uri.contains(':') {
-            config.base_uri = format!("http://{}", config.base_uri);
-        } else {
-            config.base_uri = format!("https://{}", config.base_uri);
-        }
-    }
+    config.base_uri = normalize_base_uri(&env.url);
     match env.auth_type.as_str() {
         "token" => {
             config.token = env.credential.clone();
@@ -2689,15 +2706,7 @@ fn main() {
 
     // Apply CLI args to config
     if let Some(ref uri) = args.base_uri {
-        config.base_uri = uri.clone();
-        if !config.base_uri.starts_with("http://") && !config.base_uri.starts_with("https://") {
-            // Use http for localhost/127.0.0.1 or URLs with a port, https for everything else
-            if config.base_uri.starts_with("localhost") || config.base_uri.starts_with("127.0.0.1") || config.base_uri.contains(':') {
-                config.base_uri = format!("http://{}", config.base_uri);
-            } else {
-                config.base_uri = format!("https://{}", config.base_uri);
-            }
-        }
+        config.base_uri = normalize_base_uri(uri);
     }
     config.silent = args.silent;
     config.raw = args.raw;
@@ -2738,6 +2747,17 @@ fn main() {
 
     // Parse positional args like bash client
     let (method, uri, mut body) = parse_positional_args(args.method, args.uri, args.body);
+
+    // `-t` used to take a bearer token and now means --stream, so an old
+    // invocation leaves the token sitting in the method slot. Say so rather
+    // than letting it become a request to a nonsense method.
+    if args.stream && looks_like_bearer_token(&method) {
+        eprintln!(
+            "{}",
+            "error: -t is now --stream. Use --token <TOKEN> for a bearer token.".red()
+        );
+        std::process::exit(1);
+    }
 
     // Read from stdin if available and no body provided (and not bulk mode)
     if body.is_empty() && args.all.is_none() && !atty::is(Stream::Stdin) {
@@ -2874,8 +2894,10 @@ fn main() {
         }
     }
 
-    // If no explicit auth/uri args, check saved connections
-    if args.connection.is_none() && !has_explicit_auth && !has_explicit_uri && op_selector.is_none() {
+    // If no explicit uri arg, check saved connections. Passing --key/--token
+    // without -b still resolves the URL from the default connection — supplying
+    // credentials shouldn't discard the saved host — but keeps the CLI auth.
+    if args.connection.is_none() && !has_explicit_uri && op_selector.is_none() {
         let envs = list_connections();
         let default_connection = get_default_connection();
 
@@ -2883,10 +2905,17 @@ fn main() {
             // If there's a default connection, auto-load it
             if let Some(ref def) = default_connection {
                 if let Some(env) = load_connection(def) {
-                    loaded_connection_alias = env.name.clone();
-                    apply_connection_to_config(&mut config, &env);
+                    if has_explicit_auth {
+                        // URL only. Deliberately not apply_connection_to_config:
+                        // an oauth2 connection would exchange a token we'd throw
+                        // away, and the CLI credential must win.
+                        config.base_uri = normalize_base_uri(&env.url);
+                    } else {
+                        loaded_connection_alias = env.name.clone();
+                        apply_connection_to_config(&mut config, &env);
+                    }
                 }
-            } else if uri.is_empty() && atty::is(Stream::Stdout) {
+            } else if !has_explicit_auth && uri.is_empty() && atty::is(Stream::Stdout) {
                 // No default set + interactive: show unified connection flow
                 let (term_width, _) = terminal::size().unwrap_or((80, 24));
                 let mut flow = ConnectionFlow::for_startup(&envs, term_width, true);
@@ -2960,7 +2989,7 @@ fn main() {
                     }
                 }
             }
-        } else if uri.is_empty() && atty::is(Stream::Stdout) {
+        } else if !has_explicit_auth && uri.is_empty() && atty::is(Stream::Stdout) {
             // No saved connections + interactive: show unified connection flow (setup only)
             let (term_width, _) = terminal::size().unwrap_or((80, 24));
             let envs: Vec<String> = Vec::new();
@@ -3082,10 +3111,31 @@ fn main() {
     }
 
     // Interactive mode (1Password loads in background)
-    if let Err(e) = run_interactive(config, op_selector, from_setup, loaded_connection_alias, connecting_to, oauth2_creds, startup_preloaded, has_explicit_auth && has_explicit_uri) {
+    // "Auth came from the CLI and we have a host to use it against" — the URL
+    // may have come from the default connection rather than -b, and a 401 there
+    // is still the user's own credential failing, so report it instead of
+    // reopening the picker.
+    let from_cli_auth = has_explicit_auth && !config.base_uri.is_empty();
+    if let Err(e) = run_interactive(config, op_selector, from_setup, loaded_connection_alias, connecting_to, oauth2_creds, startup_preloaded, from_cli_auth) {
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
+}
+
+/// Whether a positional method slot is really a bearer token left over from the
+/// old `-t <TOKEN>` spelling. Deliberately narrow: a JWT-shaped string (three
+/// dot-separated segments, no slashes) that could never be an HTTP method.
+fn looks_like_bearer_token(method: &str) -> bool {
+    let methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+    if method.is_empty() || methods.contains(&method) || method.starts_with('/') {
+        return false;
+    }
+    method.len() > 40
+        && !method.contains('/')
+        && method.split('.').count() == 3
+        && method
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
 }
 
 fn parse_positional_args(
@@ -4418,6 +4468,8 @@ fn confirm_preview(lines: &[String], base_uri: &str) -> bool {
 }
 
 fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std::path::Path>) {
+    require_base_uri(config);
+
     // Silent + bulk: enable "silent bulk mode" — show request line + status, skip body.
     // We clear silent so status line still prints; bulk_silent suppresses body output.
     if config.silent {
@@ -4601,6 +4653,8 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
     if atty::is(Stream::Stderr) {
         colored::control::set_override(true);
     }
+
+    require_base_uri(config);
 
     // Preview: show the request and confirm before sending (and before any
     // network call such as the feature-flag fetch below).
@@ -4817,7 +4871,7 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                             let _ = writeln!(lock);
                         }
                         let _ = lock.flush();
-                        if is_tty {
+                        if is_tty && !config.silent {
                             eprintln!();
                         }
                     }
@@ -4927,7 +4981,7 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                     if !output.ends_with('\n') {
                         println!();
                     }
-                    if is_tty {
+                    if is_tty && !config.silent {
                         eprintln!();
                     }
                 }

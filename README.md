@@ -249,8 +249,10 @@ Credentials are stored securely in your OS keychain (macOS Keychain, Windows Cre
 ### Authentication
 
 - **API key**: `api -k YOUR_API_KEY` (sent as Basic auth)
-- **Bearer token**: `api -t YOUR_TOKEN`
+- **Bearer token**: `api --token YOUR_TOKEN` (long form only — `-t` is `--stream`)
 - **Interactive**: when no key or token is provided, you'll be prompted during connection setup
+
+When a key or token is given without `-b`, the base URL still comes from your default saved connection.
 
 ### Options
 
@@ -260,7 +262,7 @@ Usage: api [method] [uri [body]] [options]
 Options:
   -b, --base-uri <URI>            Base URI for the API
   -k, --key <KEY>                 API key (Basic auth)
-  -t, --token <TOKEN>             Bearer token
+      --token <TOKEN>             Bearer token
   -c, --connection <ALIAS_OR_URL> Use a saved connection
   -a, --all [FILE]                Bulk mode: run requests from FILE (or stdin if omitted/`-`)
   -s, --silent                    Do not print status info
@@ -269,7 +271,7 @@ Options:
   -x, --experimental              Enable experimental body completion / syntax highlighting
       --me                        Use /api/me/v1 instead of /api/v1
       --ndjson                    Use NDJSON for request and response
-      --stream                    Stream the response body (also: API_STREAMING=1)
+  -t, --stream                    Stream the response body (also: API_STREAMING=1)
       --no-streaming              Force streaming off, overriding --stream/API_STREAMING
       --timeout <SECONDS>         Request timeout; 0 disables it (default: 600)
   -p, --preview                   Preview the request(s) and confirm before sending
