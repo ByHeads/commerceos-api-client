@@ -4371,7 +4371,8 @@ impl OutputBlock {
     }
 }
 
-/// The response body as an `OutputBlock` tail: a blank line above, one below.
+/// The response body as an `OutputBlock` tail: straight under the status line,
+/// with one blank line below to separate it from the next block.
 ///
 /// The payload's own trailing newline is dropped so this spacing is the only
 /// thing that decides it. Whether a body carries one varies by content type,
@@ -4379,7 +4380,7 @@ impl OutputBlock {
 /// streamed JSON and error bodies arrive without one — and that difference
 /// otherwise surfaced as an extra blank line under the response.
 fn format_body_block(output: &str) -> String {
-    format!("\n{}\n\n", output.trim_end_matches('\n'))
+    format!("{}\n\n", output.trim_end_matches('\n'))
 }
 
 /// Push a finished block, evicting the oldest past `OUTPUT_HISTORY_LIMIT`.
@@ -4834,10 +4835,8 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                         status_str,
                         format!("{:.2}s", elapsed.as_secs_f64()).dimmed()
                     );
-                    // No blank line before "> outfile" — that line itself acts as the separator
-                    if outfile.is_none() {
-                        eprintln!();
-                    }
+                    // The body follows straight under the status line; the
+                    // "> outfile" line, when there is one, takes its place.
                 }
             }
 
@@ -7310,7 +7309,10 @@ fn promote_method_prefix(state: &mut AppState, body_start: usize) -> i64 {
 /// file-reference request body (`PUT /people @data.json`), which implies a write
 /// just like a literal JSON body.
 fn auto_promote_method_on_body_start(state: &mut AppState, typed: char) {
-    if typed.is_whitespace() || typed == '>' || typed == '&' || typed == '|' {
+    // A body implies a write, so only something that could start one promotes.
+    // `@` is a file reference, which is a body too; `>` (outfile), `&`/`|`
+    // (chain separators), and stray keystrokes are not.
+    if typed != '@' && !is_json_value_start(typed) {
         return;
     }
     if state.cursor_pos == 0 {
@@ -7368,6 +7370,70 @@ fn auto_revert_method_on_body_clear(state: &mut AppState) {
     state.method_auto_promoted = false;
 }
 
+/// What the loaded OpenAPI spec says a body to `uri` should look like.
+///
+/// `Unknown` covers both "the spec describes neither an array nor an object"
+/// and "no spec is loaded yet" — neither is grounds for reshaping what the user
+/// types, so both must behave the same.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BodyShape {
+    /// An array whose elements are objects: a body starts `[{`.
+    ArrayOfObjects,
+    /// An array of scalars: a body starts `[` plus a scalar.
+    ArrayOfScalars,
+    /// A single object: a body starts `{`.
+    Object,
+    Unknown,
+}
+
+impl BodyShape {
+    fn is_array(self) -> bool {
+        matches!(self, BodyShape::ArrayOfObjects | BodyShape::ArrayOfScalars)
+    }
+
+    fn is_object(self) -> bool {
+        matches!(self, BodyShape::ArrayOfObjects | BodyShape::Object)
+    }
+}
+
+/// Resolve `uri` against the spec: whether the endpoint carries an array, and
+/// whether the element type has properties (i.e. is an object). Shared by the
+/// body ghost and the `[` auto-wrap so the hint and the expansion can never
+/// disagree about the shape of the same endpoint.
+fn expected_body_shape(state: &AppState, uri: &str) -> BodyShape {
+    let is_array = state.array_endpoints.contains(uri);
+    let (schema, _, _) = resolve_type_at_path(state, &format!("{}/", uri.trim_end_matches('/')));
+    let is_object = schema
+        .as_ref()
+        .and_then(|s| {
+            if let Some(indexer) = state.indexer_info.get(s) {
+                indexer.return_type.as_ref().map(|rt| rt.trim_end_matches('?').to_string())
+            } else {
+                Some(s.clone())
+            }
+        })
+        .map_or(false, |s| state.schema_props.contains_key(&s));
+    match (is_array, is_object) {
+        (true, true) => BodyShape::ArrayOfObjects,
+        (true, false) => BodyShape::ArrayOfScalars,
+        (false, true) => BodyShape::Object,
+        (false, false) => BodyShape::Unknown,
+    }
+}
+
+/// Whether `c` could begin a JSON value, i.e. whether typing it at the body
+/// position plausibly starts a body at all. The RFC 8259 set: `{`, `[`, `"`,
+/// a number (`-` or a digit), and the literals `true`/`false`/`null`.
+///
+/// Both body auto-expansions gate on this so a stray keystroke at the body
+/// position is left alone. `<` — a mistyped `>` — is the motivating case: it
+/// used to expand to `PUT /x [<`, costing two backspaces to undo. Blocklisting
+/// the characters seen in practice (`>`, `&`, `|`, `@`, whitespace) could never
+/// cover this; an allowlist inverts the default so only a real body expands.
+fn is_json_value_start(c: char) -> bool {
+    matches!(c, '{' | '[' | '"' | '-') || c.is_ascii_digit() || matches!(c, 't' | 'f' | 'n')
+}
+
 /// When the user starts typing a body on a PUT/PATCH to an array endpoint, and
 /// the first body character isn't already `[`, prepend an opening `[` so the
 /// body matches the expected array shape (e.g. `PUT /people {` → `PUT /people [{`).
@@ -7378,9 +7444,8 @@ fn auto_revert_method_on_body_clear(state: &mut AppState) {
 /// just promoted to `PUT` is handled in the same keystroke. The `@` infile prefix
 /// is excluded, as a file reference already provides the full body shape.
 fn auto_wrap_array_body(state: &mut AppState, typed: char) {
-    // `&` starts a `&&` chain separator, not a body — wrapping would corrupt the
-    // line to `PUT /x [&`.
-    if typed.is_whitespace() || typed == '[' || typed == '@' || typed == '&' || typed == '|' {
+    // `[` is a body start but needs no wrapping — it's already an array.
+    if typed == '[' {
         return;
     }
     if state.cursor_pos == 0 {
@@ -7407,9 +7472,15 @@ fn auto_wrap_array_body(state: &mut AppState, typed: char) {
     if method != "PUT" && method != "PATCH" {
         return;
     }
-    // Only when the target endpoint returns an array (per the loaded OpenAPI spec).
-    if !state.array_endpoints.contains(tokens[1]) {
-        return;
+    // What the spec says the endpoint carries decides what may expand. Only an
+    // array wraps at all; an array of objects takes only `{`, so a stray `<` or
+    // a `"` that could never be a valid element is left exactly as typed. With
+    // no spec loaded the shape is `Unknown` and nothing expands, as before.
+    match expected_body_shape(state, tokens[1]) {
+        BodyShape::ArrayOfObjects if typed != '{' => return,
+        BodyShape::ArrayOfScalars if !is_json_value_start(typed) => return,
+        BodyShape::Object | BodyShape::Unknown => return,
+        _ => {}
     }
     // Prepend `[` immediately before the typed body character, keeping the cursor
     // just after what was typed.
@@ -7451,7 +7522,8 @@ fn wrap_pasted_array_body(state: &mut AppState, body_start: usize, body_end: usi
     if method != "PUT" && method != "PATCH" {
         return;
     }
-    if !state.array_endpoints.contains(tokens[1]) {
+    let shape = expected_body_shape(state, tokens[1]);
+    if !shape.is_array() {
         return;
     }
     let body_trimmed = state.input[body_start..body_end].trim_end();
@@ -7459,9 +7531,14 @@ fn wrap_pasted_array_body(state: &mut AppState, body_start: usize, body_end: usi
         return;
     }
     // Complete JSON only, and not already an array (covers `@file` too — it
-    // doesn't parse as JSON).
+    // doesn't parse as JSON). On an array of objects a pasted scalar is a
+    // mistake, and wrapping it would only cement it.
     match serde_json::from_str::<Value>(body_trimmed) {
-        Ok(v) if !v.is_array() => {}
+        Ok(v) if !v.is_array() => {
+            if shape == BodyShape::ArrayOfObjects && !v.is_object() {
+                return;
+            }
+        }
         _ => return,
     }
     let close_at = body_start + body_trimmed.len();
@@ -10011,17 +10088,8 @@ fn get_body_bracket_ghost(state: &AppState, parts: &[&str], uri: &str) -> String
         return String::new();
     }
 
-    let is_array = state.array_endpoints.contains(uri);
-    let (schema, _, _) = resolve_type_at_path(state, &format!("{}/", uri.trim_end_matches('/')));
-    let is_object = schema.as_ref()
-        .and_then(|s| {
-            if let Some(indexer) = state.indexer_info.get(s) {
-                indexer.return_type.as_ref().map(|rt| rt.trim_end_matches('?').to_string())
-            } else {
-                Some(s.clone())
-            }
-        })
-        .map_or(false, |s| state.schema_props.contains_key(&s));
+    let shape = expected_body_shape(state, uri);
+    let (is_array, is_object) = (shape.is_array(), shape.is_object());
 
     if is_put_patch && is_array && is_object {
         "[{ ".to_string()
@@ -11670,6 +11738,150 @@ mod tests {
     }
 
     #[test]
+    fn expected_body_shape_reads_the_spec() {
+        // Array endpoint whose element type has properties → array of objects.
+        let mut state = test_state();
+        state.array_endpoints.insert("/suppliers".to_string());
+        state.endpoint_types.insert("/suppliers".to_string(), "supplier".to_string());
+        state.schema_props.insert("supplier".to_string(), vec!["name".to_string()]);
+        assert_eq!(expected_body_shape(&state, "/suppliers"), BodyShape::ArrayOfObjects);
+
+        // Array endpoint with no object element type → array of scalars.
+        let mut state = test_state();
+        state.array_endpoints.insert("/tags".to_string());
+        assert_eq!(expected_body_shape(&state, "/tags"), BodyShape::ArrayOfScalars);
+
+        // Non-array endpoint with a known object schema → single object.
+        let mut state = test_state();
+        state.endpoint_types.insert("/settings".to_string(), "settings".to_string());
+        state.schema_props.insert("settings".to_string(), vec!["locale".to_string()]);
+        assert_eq!(expected_body_shape(&state, "/settings"), BodyShape::Object);
+
+        // No spec loaded at all → Unknown, so nothing may be reshaped.
+        let state = test_state();
+        assert_eq!(expected_body_shape(&state, "/suppliers"), BodyShape::Unknown);
+    }
+
+    #[test]
+    fn auto_wrap_array_body_follows_the_endpoint_shape() {
+        // An array OF OBJECTS takes only `{`. A `"` or a digit could never be a
+        // valid element, so neither expands any more — previously both did.
+        for c in ['"', '7', '-', 't', 'f', 'n', '<', '>', 'x'] {
+            let mut state = test_state();
+            state.array_endpoints.insert("/suppliers".to_string());
+            state.endpoint_types.insert("/suppliers".to_string(), "supplier".to_string());
+            state.schema_props.insert("supplier".to_string(), vec!["name".to_string()]);
+            state.input = format!("PUT /suppliers {c}");
+            state.cursor_pos = char_len(&state.input);
+            auto_wrap_array_body(&mut state, c);
+            assert_eq!(state.input, format!("PUT /suppliers {c}"), "should not wrap: {c:?}");
+        }
+
+        // `{` still wraps there, which is the whole point.
+        let mut state = test_state();
+        state.array_endpoints.insert("/suppliers".to_string());
+        state.endpoint_types.insert("/suppliers".to_string(), "supplier".to_string());
+        state.schema_props.insert("supplier".to_string(), vec!["name".to_string()]);
+        state.input = "PUT /suppliers {".to_string();
+        state.cursor_pos = char_len(&state.input);
+        auto_wrap_array_body(&mut state, '{');
+        assert_eq!(state.input, "PUT /suppliers [{");
+
+        // With no spec loaded nothing expands, however plausible the character.
+        let mut state = test_state();
+        state.input = "PUT /suppliers {".to_string();
+        state.cursor_pos = char_len(&state.input);
+        auto_wrap_array_body(&mut state, '{');
+        assert_eq!(state.input, "PUT /suppliers {");
+    }
+
+    #[test]
+    fn wrap_pasted_array_body_requires_an_object_on_an_object_array() {
+        // Pasting a scalar onto an array-of-objects endpoint is a mistake;
+        // wrapping it to `["x"]` would only cement it.
+        let mut state = test_state();
+        state.array_endpoints.insert("/suppliers".to_string());
+        state.endpoint_types.insert("/suppliers".to_string(), "supplier".to_string());
+        state.schema_props.insert("supplier".to_string(), vec!["name".to_string()]);
+        state.input = "PUT /suppliers \"x\"".to_string();
+        let body_start = "PUT /suppliers ".len();
+        let body_end = state.input.len();
+        wrap_pasted_array_body(&mut state, body_start, body_end);
+        assert_eq!(state.input, "PUT /suppliers \"x\"");
+
+        // An object still wraps.
+        let mut state = test_state();
+        state.array_endpoints.insert("/suppliers".to_string());
+        state.endpoint_types.insert("/suppliers".to_string(), "supplier".to_string());
+        state.schema_props.insert("supplier".to_string(), vec!["name".to_string()]);
+        state.input = "PUT /suppliers {\"name\":\"A\"}".to_string();
+        let body_start = "PUT /suppliers ".len();
+        let body_end = state.input.len();
+        wrap_pasted_array_body(&mut state, body_start, body_end);
+        assert_eq!(state.input, "PUT /suppliers [{\"name\":\"A\"}]");
+    }
+
+    #[test]
+    fn auto_wrap_array_body_only_expands_on_a_json_value_start() {
+        // The reported bug: `<` is a mistyped `>`, and wrapping it to `PUT
+        // /suppliers [<` cost two backspaces to undo.
+        let mut state = test_state();
+        state.array_endpoints.insert("/suppliers".to_string());
+        state.input = "PUT /suppliers <".to_string();
+        state.cursor_pos = char_len(&state.input);
+        auto_wrap_array_body(&mut state, '<');
+        assert_eq!(state.input, "PUT /suppliers <");
+        assert_eq!(state.cursor_pos, char_len("PUT /suppliers <"));
+
+        // `>` opens an outfile, not a body — it had the same defect.
+        let mut state = test_state();
+        state.array_endpoints.insert("/suppliers".to_string());
+        state.input = "PUT /suppliers >".to_string();
+        state.cursor_pos = char_len(&state.input);
+        auto_wrap_array_body(&mut state, '>');
+        assert_eq!(state.input, "PUT /suppliers >");
+
+        // Every JSON value start still expands, `[` excepted (already an array).
+        for c in ['{', '"', '-', '0', '7', 't', 'f', 'n'] {
+            let mut state = test_state();
+            state.array_endpoints.insert("/suppliers".to_string());
+            state.input = format!("PUT /suppliers {c}");
+            state.cursor_pos = char_len(&state.input);
+            auto_wrap_array_body(&mut state, c);
+            assert_eq!(state.input, format!("PUT /suppliers [{c}"), "should wrap: {c:?}");
+        }
+
+        // A letter that starts no JSON literal is a typo, not a body.
+        for c in ['x', 'q', '<', '>', '%', ')'] {
+            let mut state = test_state();
+            state.array_endpoints.insert("/suppliers".to_string());
+            state.input = format!("PUT /suppliers {c}");
+            state.cursor_pos = char_len(&state.input);
+            auto_wrap_array_body(&mut state, c);
+            assert_eq!(state.input, format!("PUT /suppliers {c}"), "should not wrap: {c:?}");
+        }
+    }
+
+    #[test]
+    fn auto_promote_only_fires_on_a_body_start() {
+        // Same defect on the promotion path: `/suppliers <` used to become
+        // `PUT /suppliers <`.
+        let mut state = test_state();
+        state.input = "/suppliers <".to_string();
+        state.cursor_pos = char_len(&state.input);
+        auto_promote_method_on_body_start(&mut state, '<');
+        assert_eq!(state.input, "/suppliers <");
+        assert!(!state.method_auto_promoted);
+
+        // `@` is a file reference — a body, so it still promotes.
+        let mut state = test_state();
+        state.input = "/suppliers @data.json".to_string();
+        state.cursor_pos = char_len("/suppliers @");
+        auto_promote_method_on_body_start(&mut state, '@');
+        assert_eq!(state.input, "PUT /suppliers @data.json");
+    }
+
+    #[test]
     fn auto_wrap_array_body_guards() {
         // Self-typed `[` → no extra bracket.
         let mut state = test_state();
@@ -13102,21 +13314,21 @@ mod tests {
         let with = format_body_block("{\"a\":1}\n");
         let without = format_body_block("{\"a\":1}");
         assert_eq!(with, without);
-        assert_eq!(without, "\n{\"a\":1}\n\n");
+        assert_eq!(without, "{\"a\":1}\n\n");
 
         // Streamed JSON and error bodies arrive with no trailing newline;
         // NDJSON always has one. All land on the same spacing.
-        assert_eq!(format_body_block("{\"error\":\"nope\"}"), "\n{\"error\":\"nope\"}\n\n");
+        assert_eq!(format_body_block("{\"error\":\"nope\"}"), "{\"error\":\"nope\"}\n\n");
 
         // A multi-line body keeps its internal breaks — only the final run goes.
         assert_eq!(
             format_body_block("{\"a\":1}\n{\"b\":2}\n"),
-            "\n{\"a\":1}\n{\"b\":2}\n\n"
+            "{\"a\":1}\n{\"b\":2}\n\n"
         );
 
         // A blank line the server actually sent inside the payload is still
         // trailing whitespace here; collapsing it keeps the block height fixed.
-        assert_eq!(format_body_block("x\n\n\n"), "\nx\n\n");
+        assert_eq!(format_body_block("x\n\n\n"), "x\n\n");
 
         // Non-empty is what makes has_body() true, so ctrl+j still finds it.
         assert!(!format_body_block("{}").is_empty());
