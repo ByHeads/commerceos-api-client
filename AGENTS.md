@@ -217,6 +217,94 @@ api -a -                              # explicit stdin
 api -sa parent.api                    # silent batch mode (see below)
 ```
 
+### Credentials from disk (`--no-keychain`)
+
+By default the client stores connections in the OS keychain, which needs an
+unlocked desktop session — no good for an agent, a container, or CI. Passing
+`--no-keychain` moves all credential I/O to a plaintext JSON file instead.
+
+```sh
+api --no-keychain -sa seed.api
+```
+
+The flag is what activates file mode. `API_CREDENTIALS_FILE` alone does
+nothing — without `--no-keychain` the client still reads the keychain and
+ignores the variable entirely.
+
+**Where the file lives**, in order:
+
+1. `API_CREDENTIALS_FILE`, if set — an absolute path is safest.
+2. Otherwise `./.api-credentials.json`, relative to the **current working
+   directory**. Running from a different directory silently finds no
+   credentials, so prefer the env var in scripts.
+
+**File format.** `default` names the connection used when no `-c` is given:
+
+```json
+{
+  "connections": [
+    {
+      "name": "local",
+      "url": "http://localhost:5000",
+      "auth_type": "key",
+      "credential": "<api key>",
+      "client_id": ""
+    }
+  ],
+  "default": "local"
+}
+```
+
+- `auth_type` is `"key"` (Basic), `"token"` (Bearer), or `"oauth2"`.
+- For `"oauth2"`, put the client secret in `credential` and the client ID in
+  `client_id`; the client exchanges them for a token at startup.
+- For `"key"` and `"token"`, leave `client_id` as `""`.
+- A `url` without a scheme gets one inferred: `http` for localhost, an IP, or
+  anything with an explicit port; `https` otherwise.
+
+**Using it.** With a `default` set, no connection flags are needed at all:
+
+```sh
+export API_CREDENTIALS_FILE=/run/secrets/api-credentials.json
+api --no-keychain -sa seed.api                 # uses the default connection
+api --no-keychain -c staging GET /people       # pick another by alias
+api --no-keychain -k "$API_KEY" GET /people    # URL from file, key from the CLI
+```
+
+A `-k`/`--token` on the command line overrides the stored credential but keeps
+the file's URL, so one file can serve several keys. `-b` overrides the URL.
+
+**No file at all** is also fine — pass both parts explicitly and nothing is read
+or written:
+
+```sh
+api --no-keychain -b https://cos.example.com -k "$API_KEY" -sa seed.api
+```
+
+**Failure mode to know.** A missing, unreadable, or malformed file is treated as
+*empty*, not as an error. There is no warning about the bad file; you get:
+
+```
+Error: no base URL specified. Use -b <url> or -c <connection>.
+```
+
+If you see that while expecting the file to work, check the path, the JSON
+syntax, and that `--no-keychain` was actually passed.
+
+**Security.** The file is plaintext and is created with your default umask
+(commonly world-readable `0644`) — the client does not restrict it. Keep real
+keys out of the repo:
+
+```sh
+chmod 600 "$API_CREDENTIALS_FILE"     # do this yourself
+echo '.api-credentials.json' >> .gitignore
+```
+
+Prefer a path outside the working tree (`/run/secrets/...`, `$XDG_RUNTIME_DIR`)
+for anything but a local dev key. Saving a connection with `ctrl+s` in
+interactive mode writes to this file too, so an interactive session can create
+it for later non-interactive runs.
+
 ### Silent batch mode (`-sa`)
 
 Prints the env URL once, then each request line followed by a compact
@@ -271,6 +359,7 @@ Run it: `api -sa workshop.api`.
 - **Unclosed brackets** → the whole run fails with `"unclosed body at end of bulk file"`. If a body looks wrong, check that `{}` and `[]` balance.
 - **Glob with no matches** → hard error. Check the directory and pattern.
 - **Include loops** → `a.api` including `b.api` which includes `a.api` is detected and refused.
+- **`API_CREDENTIALS_FILE` without `--no-keychain`** → the variable is ignored and the keychain is read instead. A bad path or malformed credentials file fails the same silent way: no warning, just `Error: no base URL specified`.
 
 ## 9. Tips for agents
 
@@ -280,3 +369,4 @@ Run it: `api -sa workshop.api`.
 - For repeated boilerplate, factor it into a `shared/` directory and use includes.
 - When generating files programmatically, prefer compact single-line JSON bodies — they're easier to grep and diff.
 - Use silent batch mode (`-sa`) when you want to verify that a long seeding script worked without drowning in response bodies.
+- Run with `--no-keychain` and an absolute `API_CREDENTIALS_FILE` so nothing depends on an unlocked keychain or on the working directory.
