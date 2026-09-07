@@ -208,10 +208,10 @@ PATCH /people/com.heads.foo=123 { "name": "after seeds" }
 - Glob includes work: `shared/*.api` includes all matching files in sorted order.
 - Recursive includes are supported. Loops are detected and reported as errors.
 
-## 6. Directives: `sleep`, `sleep while`, `url`
+## 6. Directives: `sleep`, `sleep while`, `assert`, `url`
 
-Besides requests and includes, a few control lines are recognised. None of them
-sends anything on its own except `sleep while`, whose polls are never printed.
+Besides requests and includes, a few control lines are recognised. `sleep while`
+and `assert` send a request whose answer is only judged, never printed as data.
 
 ### `sleep N`
 
@@ -247,6 +247,29 @@ GET /people~take(5) > /tmp/people.json
 - A 401/403, 5xx, 408/429, or timeout during a poll aborts the whole run with
   exit 1, exactly as in a chain. Retrying an unanswerable question forever would
   hide a broken token or server.
+
+### `assert [not] <request>`
+
+Run a request once and stop the batch unless the answer is truthy (`not`: unless
+it's falsy). Put it at the top as a pre-check that the environment holds what
+the batch depends on, or after a write to verify the result.
+
+```
+assert GET /companies/com.heads.seedID=ourcompany
+assert not GET /people~where(givenName=Test)~count
+
+PUT /people [ … ]
+```
+
+- Truthiness is the chain rule again, so `assert GET /companies/…` fails on a
+  404 and `assert not GET /…~count` fails once the count is non-zero.
+- The request follows the `sleep while` rules: one line, implied `GET` allowed,
+  no `&&`/`||`, no `> outfile`.
+- The status line is printed like any request's; the body never is, so an
+  assert can't pollute a batch's stdout.
+- Failure exits 1 before anything else runs, naming the reason — the status
+  (`assertion failed: assert GET /companies/x (404 Not Found)`) or the falsy
+  body (`(0)`, `(null)`). A 401/403, 5xx, or timeout also exits 1.
 
 ### `url has <text>` / `url is <url>`
 
@@ -411,6 +434,7 @@ Run it: `api -sa workshop.api`.
 - **Unclosed brackets** → the whole run fails with `"unclosed body at end of bulk file"`. If a body looks wrong, check that `{}` and `[]` balance.
 - **Glob with no matches** → hard error. Check the directory and pattern.
 - **Include loops** → `a.api` including `b.api` which includes `a.api` is detected and refused.
+- **`assert` on a list endpoint** → `[]` is truthy, so `assert GET /people~where(x)` passes even when nothing matches. Assert a `~count` or a single item by identifier instead.
 - **`sleep while` that never ends** → `[]` and `{}` are truthy, so `sleep while GET /people~where(x)` loops forever once the list is merely empty. Poll a `~count` (or a single scalar field) instead, so the answer can become `0`/`null`.
 - **`API_CREDENTIALS_FILE` without `--no-keychain`** → the variable is ignored and the keychain is read instead. A bad path or malformed credentials file fails the same silent way: no warning, just `Error: no base URL specified`.
 

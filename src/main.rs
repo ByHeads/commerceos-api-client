@@ -238,6 +238,13 @@ struct Config {
     /// `sleep while` polls, which only care about truthiness. Error statuses
     /// still print so an aborted poll says why.
     quiet: bool,
+    /// Print the status line as usual but never the body — the response is a
+    /// verdict, not data. Used by `assert`, whose payload must not leak into
+    /// whatever the batch is producing on stdout.
+    check_only: bool,
+    /// Status and body of the last response taken in `quiet`/`check_only`
+    /// mode, so the caller can say *why* a check failed.
+    last_response: Option<(u16, String)>,
 }
 
 impl Default for Config {
@@ -262,6 +269,8 @@ impl Default for Config {
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             preview: false,
             quiet: false,
+            check_only: false,
+            last_response: None,
         }
     }
 }
@@ -3872,6 +3881,9 @@ enum BulkStep {
         negate: bool,
         request: String,
     },
+    /// `assert [not] <request>` — run `request` once and abort the batch unless
+    /// its outcome is truthy (falsy, when `negate`). Same truthiness as chains.
+    Assert { negate: bool, request: String },
 }
 
 /// Outcome of a single request, deciding whether a `&&` chain continues.
@@ -4112,43 +4124,87 @@ fn parse_sleep_step(rest: &str) -> Result<BulkStep, String> {
         return Ok(BulkStep::Sleep(parse_sleep_directive(rest)?));
     };
 
+    let (negate, request) = parse_condition(
+        condition,
+        "sleep while",
+        "usage: `sleep [interval] while [not] <request>`",
+    )?;
+    Ok(BulkStep::SleepWhile { interval, negate, request })
+}
+
+/// Parse `assert [not] <request>`: run the request once and stop the batch
+/// unless it's truthy (falsy, with `not`). Shares its condition grammar with
+/// `sleep while`.
+fn parse_assert_step(rest: &str) -> Result<BulkStep, String> {
+    let (negate, request) =
+        parse_condition(rest, "assert", "usage: `assert [not] <request>`")?;
+    Ok(BulkStep::Assert { negate, request })
+}
+
+/// The `[not] <request>` tail shared by `sleep while` and `assert`. The request
+/// must be a single-line request (implied GET allowed, inline body allowed),
+/// not a `&&`/`||` chain and not writing to an outfile — its response is only
+/// ever judged, never shown. `what` names the directive in error messages.
+fn parse_condition(condition: &str, what: &str, usage: &str) -> Result<(bool, String), String> {
+    let condition = condition.trim();
     let (negate, request) = match condition.split_once(char::is_whitespace) {
         Some((w, tail)) if w.eq_ignore_ascii_case("not") => (true, tail.trim()),
         None if condition.eq_ignore_ascii_case("not") => (true, ""),
         _ => (false, condition),
     };
 
-    let usage = "usage: `sleep [interval] while [not] <request>`";
     if request.is_empty() {
-        return Err(format!("sleep while requires a request to poll — {}", usage));
+        return Err(format!("{} requires a request — {}", what, usage));
     }
     let (_, depth) = strip_body_comments_and_count(request);
     if depth != 0 {
-        return Err(format!(
-            "sleep while condition must fit on one line: `{}`",
-            request
-        ));
+        return Err(format!("{} condition must fit on one line: `{}`", what, request));
     }
     if split_request_chain(request).len() > 1 {
-        return Err(format!(
-            "sleep while condition can't be a `&&`/`||` chain: `{}`",
-            request
-        ));
+        return Err(format!("{} condition can't be a `&&`/`||` chain: `{}`", what, request));
     }
     let (_, uri, _) = parse_request_line(request)
-        .ok_or_else(|| format!("sleep while condition is not a request: `{}` — {}", request, usage))?;
+        .ok_or_else(|| format!("{} condition is not a request: `{}` — {}", what, request, usage))?;
     if uri.contains(" >") {
         return Err(format!(
-            "sleep while condition can't write to a file (its output is discarded): `{}`",
-            request
+            "{} condition can't write to a file (its output is discarded): `{}`",
+            what, request
         ));
     }
+    Ok((negate, request.to_string()))
+}
 
-    Ok(BulkStep::SleepWhile {
-        interval,
-        negate,
-        request: request.to_string(),
-    })
+/// The `assert not GET /x` line as shown in previews and the `-sa` log.
+fn format_assert(negate: bool, request: &str) -> String {
+    let shown = parse_request_line(request)
+        .map(|(m, u, b)| format_request_preview(&m, &u, &b))
+        .unwrap_or_else(|| request.to_string());
+    format!("assert {}{}", if negate { "not " } else { "" }, shown)
+}
+
+/// Why an assertion failed, for the error line: the status when it wasn't a
+/// 2xx (`404 Not Found`), otherwise the falsy body itself (`0`, `null`),
+/// compacted and cut short so a large payload can't flood the terminal.
+fn describe_check_response(status: u16, body: &str) -> String {
+    if !(200..300).contains(&status) {
+        let reason = reqwest::StatusCode::from_u16(status)
+            .ok()
+            .and_then(|c| c.canonical_reason())
+            .unwrap_or("");
+        return format!("{} {}", status, reason).trim().to_string();
+    }
+    let compact = compact_body_for_display(body);
+    let compact = compact.trim();
+    if compact.is_empty() {
+        return "empty response".to_string();
+    }
+    const MAX: usize = 80;
+    if compact.chars().count() > MAX {
+        let cut: String = compact.chars().take(MAX).collect();
+        format!("{}…", cut)
+    } else {
+        compact.to_string()
+    }
 }
 
 /// The `sleep 20s while not GET /x` line as shown in previews and the `-sa` log.
@@ -4292,6 +4348,12 @@ fn split_bulk_requests_inner(
                 if first_word.eq_ignore_ascii_case("sleep") {
                     let rest = trimmed["sleep".len()..].trim();
                     program.steps.push(parse_sleep_step(rest)?);
+                    continue;
+                }
+                // `assert [not] <request>` — pre-check directive.
+                if first_word.eq_ignore_ascii_case("assert") {
+                    let rest = trimmed["assert".len()..].trim();
+                    program.steps.push(parse_assert_step(rest)?);
                     continue;
                 }
                 // `url has`/`url is` — environment gate, collected globally.
@@ -4624,6 +4686,7 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
                 BulkStep::SleepWhile { interval, negate, request } => {
                     vec![format_sleep_while(*interval, *negate, request)]
                 }
+                BulkStep::Assert { negate, request } => vec![format_assert(*negate, request)],
             })
             .collect();
         if !confirm_preview(&preview_lines, &config.base_uri) {
@@ -4657,6 +4720,11 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
                     return;
                 }
             }
+            BulkStep::Assert { negate, request } => {
+                if !run_assert(config, *negate, request) {
+                    return;
+                }
+            }
             BulkStep::Chain(segments) => {
                 // Outcome of the last EXECUTED segment; skipped segments leave
                 // it alone (that's what makes `a && b || c` an if-then-else).
@@ -4687,6 +4755,47 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
                 note_skipped_chain(config, skipped);
             }
         }
+    }
+}
+
+/// Run an `assert [not] <request>` step. The request goes out like any other
+/// (echoed in `-sa`, status line printed) but its body is never shown — the
+/// answer is pass/fail. A failed assertion exits 1 with the reason (`404 Not
+/// Found`, or the falsy body such as `0`); an error status exits 1 through the
+/// usual path, since a pre-check that couldn't be answered mustn't let the
+/// batch proceed. Returns `false` only when the user aborted at the preview.
+fn run_assert(config: &mut Config, negate: bool, request: &str) -> bool {
+    // Validated at parse time; a None here would be a parser bug.
+    let Some((method, uri, body)) = parse_request_line(request) else {
+        eprintln!("error: {} is not a request", request);
+        std::process::exit(1);
+    };
+    let line = format_assert(negate, request);
+    if config.bulk_silent {
+        println!("{}", line);
+    }
+
+    config.check_only = true;
+    config.last_response = None;
+    let outcome = run_non_interactive(config, &method, &uri, &body);
+    config.check_only = false;
+    let response = config.last_response.take();
+
+    match outcome {
+        RequestOutcome::Truthy if !negate => true,
+        RequestOutcome::Falsy if negate => true,
+        RequestOutcome::Truthy | RequestOutcome::Falsy => {
+            let why = response
+                .map(|(status, body)| describe_check_response(status, &body))
+                .unwrap_or_default();
+            eprintln!("error: assertion failed: {} ({})", line, why);
+            std::process::exit(1);
+        }
+        RequestOutcome::Errored => {
+            eprintln!("error: {} — could not be evaluated, aborting", line);
+            std::process::exit(1);
+        }
+        RequestOutcome::Aborted => false,
     }
 }
 
@@ -4965,6 +5074,7 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
             let stream_body = config.streaming
                 && status.is_success()
                 && !config.quiet
+                && !config.check_only
                 && !is_clipboard
                 && !outfile_append
                 && (outfile.is_some()
@@ -5060,8 +5170,10 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
             let body_text = resp.text().unwrap_or_default();
             let outcome = classify_response(status.as_u16(), &body_text);
 
-            // A poll wants the verdict only; the body has been drained above.
-            if config.quiet {
+            // A poll or assert wants the verdict only; the body has been drained
+            // above. Keep it so the caller can explain a failed check.
+            if config.quiet || config.check_only {
+                config.last_response = Some((status.as_u16(), body_text));
                 return outcome;
             }
 
@@ -12521,14 +12633,64 @@ mod tests {
     #[test]
     fn parse_sleep_step_while_rejects_bad_conditions() {
         let err = |s: &str| parse_sleep_step(s).unwrap_err();
-        assert!(err("while").contains("requires a request"));
-        assert!(err("while not").contains("requires a request"));
+        assert!(err("while").contains("sleep while requires a request"));
+        assert!(err("while not").contains("sleep while requires a request"));
         assert!(err("abc while GET /x").contains("invalid sleep duration"));
         assert!(err("while GET /a && GET /b").contains("chain"));
         assert!(err("while GET /a || GET /b").contains("chain"));
         assert!(err("while GET /a > out.json").contains("write to a file"));
         assert!(err("while POST /a {\"open\": 1").contains("one line"));
         assert!(err("while nonsense").contains("not a request"));
+    }
+
+    #[test]
+    fn parse_assert_step_forms() {
+        let step = |negate, request: &str| BulkStep::Assert { negate, request: request.to_string() };
+        assert_eq!(
+            parse_assert_step("GET /companies/com.heads.seedID=ourcompany").unwrap(),
+            step(false, "GET /companies/com.heads.seedID=ourcompany")
+        );
+        assert_eq!(parse_assert_step("/companies/x").unwrap(), step(false, "/companies/x"));
+        assert_eq!(
+            parse_assert_step("not GET /people~where(givenName=Test)~count").unwrap(),
+            step(true, "GET /people~where(givenName=Test)~count")
+        );
+        assert_eq!(
+            parse_assert_step("  NOT   post /search {\"q\":1}").unwrap(),
+            step(true, "post /search {\"q\":1}")
+        );
+    }
+
+    #[test]
+    fn parse_assert_step_rejects_bad_conditions() {
+        let err = |s: &str| parse_assert_step(s).unwrap_err();
+        assert!(err("").contains("assert requires a request"));
+        assert!(err("not").contains("assert requires a request"));
+        assert!(err("GET /a && GET /b").contains("chain"));
+        assert!(err("GET /a > out.json").contains("write to a file"));
+        assert!(err("POST /a {\"open\": 1").contains("one line"));
+        assert!(err("nonsense").contains("not a request"));
+    }
+
+    #[test]
+    fn split_bulk_requests_recognises_assert() {
+        let src = "assert /companies/x\nGET /a\nASSERT not GET /b~count\n";
+        let prog = split_bulk_requests(src, None).unwrap();
+        assert_eq!(prog.steps.len(), 3);
+        assert_eq!(prog.steps[0], BulkStep::Assert { negate: false, request: "/companies/x".to_string() });
+        assert_eq!(prog.steps[2], BulkStep::Assert { negate: true, request: "GET /b~count".to_string() });
+    }
+
+    #[test]
+    fn format_assert_and_describe_check_response() {
+        assert_eq!(format_assert(true, "/companies/x"), "assert not GET /companies/x");
+        assert_eq!(describe_check_response(404, ""), "404 Not Found");
+        assert_eq!(describe_check_response(200, "0"), "0");
+        assert_eq!(describe_check_response(200, "{\n  \"a\": null\n}"), "{\"a\":null}");
+        assert_eq!(describe_check_response(200, "  "), "empty response");
+        let long = format!("\"{}\"", "x".repeat(200));
+        let shown = describe_check_response(200, &long);
+        assert!(shown.ends_with('…') && shown.chars().count() == 81, "{shown}");
     }
 
     #[test]

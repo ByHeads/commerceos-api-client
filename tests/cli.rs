@@ -811,6 +811,53 @@ fn sleep_while_is_silent_outside_silent_bulk_mode() {
 }
 
 #[test]
+fn assert_passes_and_continues_without_printing_the_body() {
+    require_local_cos();
+    let dir = tempdir().unwrap();
+    let req = dir.path().join("assert-ok.api");
+    std::fs::write(&req, "assert GET /about\nGET /about\n").unwrap();
+
+    // -sa: the assert line is echoed with a status, and the next request runs.
+    let assert = api().args(["-sa"]).arg(&req).assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    assert!(stdout.contains("assert GET /about"), "{stdout}");
+    assert_eq!(stdout.matches("└─HTTP/1.1").count(), 2, "{stdout}");
+
+    // -a: only the second request's body reaches stdout.
+    let assert = api().args(["-a"]).arg(&req).assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert_eq!(stdout.matches("@type").count(), 1, "assert body must not print: {stdout}");
+    assert_eq!(stderr.matches("HTTP/1.1 200").count(), 2, "both statuses shown: {stderr}");
+}
+
+#[test]
+fn assert_failure_stops_the_batch_with_a_reason() {
+    require_local_cos();
+    let dir = tempdir().unwrap();
+    let req = dir.path().join("assert-fail.api");
+    std::fs::write(&req, "assert GET /no-such-endpoint\nGET /about\n").unwrap();
+    let assert = api().args(["-sa"]).arg(&req).assert().failure();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(stderr.contains("assertion failed: assert GET /no-such-endpoint (404 Not Found)"), "{stderr}");
+    assert_eq!(stdout.matches("└─HTTP/1.1").count(), 1, "the next request must not run: {stdout}");
+}
+
+#[test]
+fn assert_not_inverts_and_reports_the_falsy_body() {
+    // `assert not` passes on a falsy answer and fails on a truthy one, quoting it.
+    let (port, server) = flipping_server(vec!["0", "213"]);
+    let dir = tempdir().unwrap();
+    let req = dir.path().join("assert-not.api");
+    std::fs::write(&req, "assert not /people~count\nassert /people~count\nassert not /people~count\n").unwrap();
+    let assert = api_against_port(port).args(["-sa"]).arg(&req).assert().failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(stderr.contains("assertion failed: assert not GET /people~count (213)"), "{stderr}");
+    assert_eq!(server.join().unwrap().len(), 3);
+}
+
+#[test]
 fn sleep_while_aborts_on_error_status() {
     require_local_cos();
     let dir = tempdir().unwrap();
