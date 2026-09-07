@@ -208,7 +208,59 @@ PATCH /people/com.heads.foo=123 { "name": "after seeds" }
 - Glob includes work: `shared/*.api` includes all matching files in sorted order.
 - Recursive includes are supported. Loops are detected and reported as errors.
 
-## 6. Running
+## 6. Directives: `sleep`, `sleep while`, `url`
+
+Besides requests and includes, a few control lines are recognised. None of them
+sends anything on its own except `sleep while`, whose polls are never printed.
+
+### `sleep N`
+
+Pause before the next step. `N` is seconds by default; `s`, `ms`, and fractions
+work (`sleep 2`, `sleep 500ms`, `sleep 1.5s`).
+
+### `sleep [N] while [not] <request>`
+
+Wait for something asynchronous on the server by polling a request every `N`
+seconds (default 5) until its answer flips, then carry on with the next line.
+The first check happens immediately.
+
+```
+POST /imports { "source": "erp" }
+
+# Wait until the import queue is empty…
+sleep 20 while GET /imports~where(state=running)~count
+
+# …or until the data has arrived.
+sleep while not GET /people~count
+
+GET /people~take(5) > /tmp/people.json
+```
+
+- `while X` loops **while X is truthy**; `while not X` loops **while X is falsy**.
+  Truthiness is the same as for `&&`/`||` chains: `false`, `null`, `0`, `""` and
+  non-2xx statuses like 404 are falsy; everything else on a 2xx is truthy.
+- The request is any single-line request (implied `GET` included, bodies allowed).
+  It can't be a `&&`/`||` chain and can't write to an outfile.
+- Polls print nothing. In `-sa` mode the loop logs one line when it starts and one
+  when it ends (`↳ waited 1m40s (5 checks)`), so a long pause is explained.
+- There is no maximum wait; ctrl+c stops the run.
+- A 401/403, 5xx, 408/429, or timeout during a poll aborts the whole run with
+  exit 1, exactly as in a chain. Retrying an unanswerable question forever would
+  hide a broken token or server.
+
+### `url has <text>` / `url is <url>`
+
+Environment gate. Before anything runs, the configured base URL must match at
+least one `url` line in the file (or its includes): `has` is a substring match,
+`is` is exact. No match aborts the whole batch, so test data can't be sent to
+the wrong environment. Multiple `url` lines form an allowlist.
+
+```
+url has localhost:5000
+url has test.app.heads.com
+```
+
+## 7. Running
 
 ```sh
 api -a parent.api                     # from a file
@@ -322,7 +374,7 @@ GET /people > out.json
 Use this when you only care that requests succeeded or want a tidy log of a
 seeding run.
 
-## 7. A complete example
+## 8. A complete example
 
 `workshop.api`:
 
@@ -352,16 +404,17 @@ GET /people~with(com.heads.*) > ~/workshop-snapshot.json
 
 Run it: `api -sa workshop.api`.
 
-## 8. Common pitfalls
+## 9. Common pitfalls
 
 - **Trailing comma in JSON** → server returns 500 with a parse error. JSON is strict; don't trail commas in objects/arrays.
 - **`>` inside a body** → the parser uses `rfind(" >")` from the end of the request, which can mis-detect outfile when bodies contain `>`. Avoid bare `>` in bodies, or escape it inside strings.
 - **Unclosed brackets** → the whole run fails with `"unclosed body at end of bulk file"`. If a body looks wrong, check that `{}` and `[]` balance.
 - **Glob with no matches** → hard error. Check the directory and pattern.
 - **Include loops** → `a.api` including `b.api` which includes `a.api` is detected and refused.
+- **`sleep while` that never ends** → `[]` and `{}` are truthy, so `sleep while GET /people~where(x)` loops forever once the list is merely empty. Poll a `~count` (or a single scalar field) instead, so the answer can become `0`/`null`.
 - **`API_CREDENTIALS_FILE` without `--no-keychain`** → the variable is ignored and the keychain is read instead. A bad path or malformed credentials file fails the same silent way: no warning, just `Error: no base URL specified`.
 
-## 9. Tips for agents
+## 10. Tips for agents
 
 - **Always pipe GET responses to a file** (`> /tmp/something.json`) when you need to read them back. In `-sa` mode, response bodies aren't printed at all; without `> file`, the data is gone.
 - Keep one logical operation per request line; let the bracket accumulator handle multi-line bodies.

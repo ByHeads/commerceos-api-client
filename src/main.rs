@@ -233,6 +233,11 @@ struct Config {
     timeout_secs: u64,
     /// Preview request(s) and confirm before sending
     preview: bool,
+    /// Send the request and classify the response, but print nothing for a
+    /// non-error status: no status line, no body, no outfile. Used by
+    /// `sleep while` polls, which only care about truthiness. Error statuses
+    /// still print so an aborted poll says why.
+    quiet: bool,
 }
 
 impl Default for Config {
@@ -256,6 +261,7 @@ impl Default for Config {
             bulk_silent: false,
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             preview: false,
+            quiet: false,
         }
     }
 }
@@ -3858,6 +3864,14 @@ enum BulkStep {
     /// URL gate see every segment.
     Chain(Vec<(ChainOp, String)>),
     Sleep(Duration),
+    /// `sleep [N] while [not] <request>` — poll `request` every `interval`
+    /// until its outcome is falsy (or truthy, when `negate`), then continue.
+    /// Truthiness is `classify_response`, the same rule `&&` chains use.
+    SleepWhile {
+        interval: Duration,
+        negate: bool,
+        request: String,
+    },
 }
 
 /// Outcome of a single request, deciding whether a `&&` chain continues.
@@ -4071,6 +4085,97 @@ fn parse_sleep_directive(rest: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs_f64(secs))
 }
 
+/// Poll interval when `sleep while` names none.
+const DEFAULT_SLEEP_WHILE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Parse what follows the `sleep` keyword into a step:
+///
+/// - `sleep N`                      → `BulkStep::Sleep`
+/// - `sleep [N] while <request>`     → poll while the response is truthy
+/// - `sleep [N] while not <request>` → poll while the response is falsy
+///
+/// `N` takes the same forms as plain `sleep` and defaults to 5s. The request is
+/// anything a bulk line accepts (implied GET included) but must fit on one line
+/// and can't be a `&&`/`||` chain or write to an outfile — a poll has no output.
+fn parse_sleep_step(rest: &str) -> Result<BulkStep, String> {
+    let rest = rest.trim();
+    let mut words = rest.split_whitespace();
+    let first = words.next().unwrap_or("");
+    let second = words.next().unwrap_or("");
+
+    let (interval, condition) = if first.eq_ignore_ascii_case("while") {
+        (DEFAULT_SLEEP_WHILE_INTERVAL, rest[first.len()..].trim())
+    } else if second.eq_ignore_ascii_case("while") {
+        let after_first = rest[first.len()..].trim_start();
+        (parse_sleep_directive(first)?, after_first[second.len()..].trim())
+    } else {
+        return Ok(BulkStep::Sleep(parse_sleep_directive(rest)?));
+    };
+
+    let (negate, request) = match condition.split_once(char::is_whitespace) {
+        Some((w, tail)) if w.eq_ignore_ascii_case("not") => (true, tail.trim()),
+        None if condition.eq_ignore_ascii_case("not") => (true, ""),
+        _ => (false, condition),
+    };
+
+    let usage = "usage: `sleep [interval] while [not] <request>`";
+    if request.is_empty() {
+        return Err(format!("sleep while requires a request to poll — {}", usage));
+    }
+    let (_, depth) = strip_body_comments_and_count(request);
+    if depth != 0 {
+        return Err(format!(
+            "sleep while condition must fit on one line: `{}`",
+            request
+        ));
+    }
+    if split_request_chain(request).len() > 1 {
+        return Err(format!(
+            "sleep while condition can't be a `&&`/`||` chain: `{}`",
+            request
+        ));
+    }
+    let (_, uri, _) = parse_request_line(request)
+        .ok_or_else(|| format!("sleep while condition is not a request: `{}` — {}", request, usage))?;
+    if uri.contains(" >") {
+        return Err(format!(
+            "sleep while condition can't write to a file (its output is discarded): `{}`",
+            request
+        ));
+    }
+
+    Ok(BulkStep::SleepWhile {
+        interval,
+        negate,
+        request: request.to_string(),
+    })
+}
+
+/// The `sleep 20s while not GET /x` line as shown in previews and the `-sa` log.
+fn format_sleep_while(interval: Duration, negate: bool, request: &str) -> String {
+    let shown = parse_request_line(request)
+        .map(|(m, u, b)| format_request_preview(&m, &u, &b))
+        .unwrap_or_else(|| request.to_string());
+    format!(
+        "sleep {} while {}{}",
+        format_duration(interval),
+        if negate { "not " } else { "" },
+        shown
+    )
+}
+
+/// Human-friendly elapsed time for the `sleep while` summary: `800ms`, `12s`, `1m40s`.
+fn format_elapsed(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs == 0 {
+        format!("{}ms", d.as_millis())
+    } else if secs < 60 {
+        format!("{}s", secs)
+    } else {
+        format!("{}m{}s", secs / 60, secs % 60)
+    }
+}
+
 /// If `line` (already trimmed, known not to be a request) is a `url has`/`url is`
 /// gate directive, parse it. Returns `Ok(Some(cond))` for a url directive,
 /// `Ok(None)` if it isn't one (so the caller falls through to include handling),
@@ -4186,8 +4291,7 @@ fn split_bulk_requests_inner(
                 // `sleep N` — timing directive.
                 if first_word.eq_ignore_ascii_case("sleep") {
                     let rest = trimmed["sleep".len()..].trim();
-                    let dur = parse_sleep_directive(rest)?;
-                    program.steps.push(BulkStep::Sleep(dur));
+                    program.steps.push(parse_sleep_step(rest)?);
                     continue;
                 }
                 // `url has`/`url is` — environment gate, collected globally.
@@ -4517,6 +4621,9 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
                     })
                     .collect::<Vec<_>>(),
                 BulkStep::Sleep(d) => vec![format!("sleep {}", format_duration(*d))],
+                BulkStep::SleepWhile { interval, negate, request } => {
+                    vec![format_sleep_while(*interval, *negate, request)]
+                }
             })
             .collect();
         if !confirm_preview(&preview_lines, &config.base_uri) {
@@ -4544,6 +4651,11 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
             }
             BulkStep::Request(request) => {
                 run_bulk_request(config, request);
+            }
+            BulkStep::SleepWhile { interval, negate, request } => {
+                if !run_sleep_while(config, *interval, *negate, request) {
+                    return;
+                }
             }
             BulkStep::Chain(segments) => {
                 // Outcome of the last EXECUTED segment; skipped segments leave
@@ -4576,6 +4688,57 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
             }
         }
     }
+}
+
+/// Poll `request` every `interval` until it stops being truthy (falsy, when
+/// `negate`). The first check is immediate. Polls print nothing themselves; in
+/// `-sa` mode the loop logs one line when it starts and one when it ends, so a
+/// long wait is explained and a stalled one is diagnosable. An error outcome
+/// (401/403/5xx/timeout) aborts the run like it would in a chain — retrying an
+/// unanswerable question forever is the worst thing a poll could do. Returns
+/// `false` only when the user aborted, so the caller stops the batch.
+fn run_sleep_while(config: &mut Config, interval: Duration, negate: bool, request: &str) -> bool {
+    let line = format_sleep_while(interval, negate, request);
+    if config.bulk_silent {
+        println!("{}", line.dimmed());
+    }
+    // Validated at parse time; a None here would be a parser bug.
+    let Some((method, uri, body)) = parse_request_line(request) else {
+        eprintln!("error: {} is not a request", request);
+        std::process::exit(1);
+    };
+
+    let start = Instant::now();
+    let mut checks = 0usize;
+    loop {
+        checks += 1;
+        config.quiet = true;
+        let outcome = run_non_interactive(config, &method, &uri, &body);
+        config.quiet = false;
+        match outcome {
+            RequestOutcome::Truthy if negate => break,
+            RequestOutcome::Falsy if !negate => break,
+            RequestOutcome::Truthy | RequestOutcome::Falsy => {}
+            RequestOutcome::Errored => {
+                eprintln!(
+                    "error: {} — condition could not be evaluated (check {}), aborting",
+                    line, checks
+                );
+                std::process::exit(1);
+            }
+            RequestOutcome::Aborted => return false,
+        }
+        thread::sleep(interval);
+    }
+
+    if config.bulk_silent {
+        let plural = if checks == 1 { "check" } else { "checks" };
+        println!(
+            "{}",
+            format!("↳ waited {} ({} {})", format_elapsed(start.elapsed()), checks, plural).dimmed()
+        );
+    }
+    true
 }
 
 /// Run one bulk request line, echoing it first in `-a` mode. `None` when the
@@ -4801,6 +4964,7 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
             // an error payload never streams into an outfile.
             let stream_body = config.streaming
                 && status.is_success()
+                && !config.quiet
                 && !is_clipboard
                 && !outfile_append
                 && (outfile.is_some()
@@ -4809,8 +4973,9 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                     || config.ndjson
                     || !is_tty);
 
-            // Print status
-            if !config.silent {
+            // Print status. A quiet poll only speaks up when the status is an
+            // error, so the abort that follows has a reason next to it.
+            if !config.silent && (!config.quiet || status_is_error(status.as_u16())) {
                 let status_str = if status.is_success() {
                     format!("{} {}", status.as_u16(), status.canonical_reason().unwrap_or(""))
                         .green()
@@ -4894,6 +5059,11 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
             // branches below each need it (or would drain it anyway).
             let body_text = resp.text().unwrap_or_default();
             let outcome = classify_response(status.as_u16(), &body_text);
+
+            // A poll wants the verdict only; the body has been drained above.
+            if config.quiet {
+                return outcome;
+            }
 
             // Get response body — in bulk_silent mode, only write to outfile (no stdout)
             if config.bulk_silent {
@@ -12301,6 +12471,90 @@ mod tests {
         assert!(parse_sleep_directive("").is_err());
         assert!(parse_sleep_directive("abc").is_err());
         assert!(parse_sleep_directive("-3").is_err());
+    }
+
+    #[test]
+    fn parse_sleep_step_plain_sleep_is_unchanged() {
+        assert_eq!(parse_sleep_step("5").unwrap(), BulkStep::Sleep(Duration::from_secs(5)));
+        assert_eq!(parse_sleep_step("500ms").unwrap(), BulkStep::Sleep(Duration::from_millis(500)));
+        assert!(parse_sleep_step("").is_err());
+        assert!(parse_sleep_step("abc").is_err());
+    }
+
+    #[test]
+    fn parse_sleep_step_while_forms() {
+        let step = |interval, negate, request: &str| BulkStep::SleepWhile {
+            interval,
+            negate,
+            request: request.to_string(),
+        };
+        let five = DEFAULT_SLEEP_WHILE_INTERVAL;
+        assert_eq!(
+            parse_sleep_step("while GET /people~count/==0").unwrap(),
+            step(five, false, "GET /people~count/==0")
+        );
+        assert_eq!(
+            parse_sleep_step("while not GET /people~count/==0").unwrap(),
+            step(five, true, "GET /people~count/==0")
+        );
+        assert_eq!(
+            parse_sleep_step("20 while GET /people~count/==0").unwrap(),
+            step(Duration::from_secs(20), false, "GET /people~count/==0")
+        );
+        assert_eq!(
+            parse_sleep_step("20 while not GET /people~count/==0").unwrap(),
+            step(Duration::from_secs(20), true, "GET /people~count/==0")
+        );
+        // Same interval grammar as plain sleep; keywords are case-insensitive;
+        // extra spaces don't matter; GET is implied by a leading slash.
+        assert_eq!(
+            parse_sleep_step("500ms   WHILE   NOT   /jobs/1/done").unwrap(),
+            step(Duration::from_millis(500), true, "/jobs/1/done")
+        );
+        // A body is fine when it fits on the line.
+        assert_eq!(
+            parse_sleep_step("while POST /search {\"q\":1}").unwrap(),
+            step(five, false, "POST /search {\"q\":1}")
+        );
+    }
+
+    #[test]
+    fn parse_sleep_step_while_rejects_bad_conditions() {
+        let err = |s: &str| parse_sleep_step(s).unwrap_err();
+        assert!(err("while").contains("requires a request"));
+        assert!(err("while not").contains("requires a request"));
+        assert!(err("abc while GET /x").contains("invalid sleep duration"));
+        assert!(err("while GET /a && GET /b").contains("chain"));
+        assert!(err("while GET /a || GET /b").contains("chain"));
+        assert!(err("while GET /a > out.json").contains("write to a file"));
+        assert!(err("while POST /a {\"open\": 1").contains("one line"));
+        assert!(err("while nonsense").contains("not a request"));
+    }
+
+    #[test]
+    fn split_bulk_requests_keeps_sleep_while_in_order() {
+        let src = "PUT /import {\"x\":1}\nsleep 2 while not GET /import~count\nGET /done\n";
+        let prog = split_bulk_requests(src, None).unwrap();
+        assert_eq!(prog.steps.len(), 3);
+        assert_eq!(
+            prog.steps[1],
+            BulkStep::SleepWhile {
+                interval: Duration::from_secs(2),
+                negate: true,
+                request: "GET /import~count".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn format_sleep_while_and_elapsed() {
+        assert_eq!(
+            format_sleep_while(Duration::from_secs(20), true, "/people~count/==0"),
+            "sleep 20s while not GET /people~count/==0"
+        );
+        assert_eq!(format_elapsed(Duration::from_millis(800)), "800ms");
+        assert_eq!(format_elapsed(Duration::from_millis(12_400)), "12s");
+        assert_eq!(format_elapsed(Duration::from_secs(100)), "1m40s");
     }
 
     #[test]

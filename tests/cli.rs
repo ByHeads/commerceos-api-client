@@ -693,6 +693,146 @@ fn mixed_chain_behaves_as_if_then_else() {
     assert!(stdout.contains("skipped 1 request"), "then-branch skipped: {stdout}");
 }
 
+/// A tiny HTTP server that answers each request with the next body from
+/// `bodies` (repeating the last one), and reports how many requests it saw and
+/// what it received. Lets a `sleep while` test drive a condition that flips.
+fn flipping_server(bodies: Vec<&'static str>) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(false).unwrap();
+    let handle = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        for i in 0.. {
+            // Stop once the client is done: give it a second to reconnect.
+            listener
+                .set_nonblocking(true)
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let accepted = loop {
+                match listener.accept() {
+                    Ok(pair) => break Some(pair),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() > deadline {
+                            break None;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("accept: {e}"),
+                }
+            };
+            let Some((mut stream, _)) = accepted else { break };
+            stream.set_nonblocking(false).unwrap();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            seen.push(String::from_utf8_lossy(&buf[..n]).to_string());
+            let body = bodies[i.min(bodies.len() - 1)];
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            );
+            let _ = stream.flush();
+        }
+        seen
+    });
+    (port, handle)
+}
+
+fn api_against_port(port: u16) -> Command {
+    let mut cmd = Command::cargo_bin("api").expect("api binary built");
+    cmd.arg("--no-keychain");
+    cmd.env("API_CREDENTIALS_FILE", credentials_file());
+    cmd.args(["-b", &format!("http://127.0.0.1:{port}"), "-k", "dummy-key"]);
+    cmd
+}
+
+#[test]
+fn sleep_while_polls_until_falsy_and_logs_once() {
+    // Count is 2, then 1, then 0 → three checks, two sleeps.
+    let (port, server) = flipping_server(vec!["2", "1", "0", "[]"]);
+    let dir = tempdir().unwrap();
+    let req = dir.path().join("poll.api");
+    std::fs::write(
+        &req,
+        "sleep 200ms while GET /people~count/==0\nGET /after\n",
+    )
+    .unwrap();
+
+    let started = std::time::Instant::now();
+    let assert = api_against_port(port).args(["-sa"]).arg(&req).assert().success();
+    let elapsed = started.elapsed();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+
+    let seen = server.join().expect("server thread");
+    let polls = seen.iter().filter(|r| r.contains("/people~count/==0")).count();
+    assert_eq!(polls, 3, "expected three polls, saw: {seen:?}");
+    assert!(seen.iter().any(|r| r.contains("GET /api/v1/after")), "the next step should run: {seen:?}");
+    assert!(elapsed >= std::time::Duration::from_millis(400), "two intervals should elapse: {elapsed:?}");
+
+    // One start line, one summary line, and no per-poll status lines: the only
+    // status line belongs to GET /after.
+    assert!(stdout.contains("sleep 200ms while GET /people~count/==0"), "{stdout}");
+    assert!(stdout.contains("waited ") && stdout.contains("(3 checks)"), "{stdout}");
+    assert_eq!(stdout.matches("└─HTTP/1.1").count(), 1, "polls must be silent: {stdout}");
+}
+
+#[test]
+fn sleep_while_not_polls_until_truthy() {
+    // 0, 0, then 5 → three checks.
+    let (port, server) = flipping_server(vec!["0", "0", "5"]);
+    let dir = tempdir().unwrap();
+    let req = dir.path().join("poll-not.api");
+    std::fs::write(&req, "sleep 100ms while not /people~count\n").unwrap();
+
+    let assert = api_against_port(port).args(["-sa"]).arg(&req).assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    let seen = server.join().expect("server thread");
+    assert_eq!(seen.len(), 3, "saw: {seen:?}");
+    assert!(stdout.contains("sleep 100ms while not GET /people~count"), "{stdout}");
+    assert!(stdout.contains("(3 checks)"), "{stdout}");
+}
+
+#[test]
+fn sleep_while_is_silent_outside_silent_bulk_mode() {
+    let (port, server) = flipping_server(vec!["1", "0"]);
+    let dir = tempdir().unwrap();
+    let req = dir.path().join("poll-quiet.api");
+    std::fs::write(&req, "sleep 50ms while GET /x\n").unwrap();
+
+    let assert = api_against_port(port).args(["-a"]).arg(&req).assert().success();
+    let out = assert.get_output();
+    assert!(out.stdout.is_empty(), "stdout: {}", String::from_utf8_lossy(&out.stdout));
+    assert!(out.stderr.is_empty(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(server.join().unwrap().len(), 2);
+}
+
+#[test]
+fn sleep_while_aborts_on_error_status() {
+    require_local_cos();
+    let dir = tempdir().unwrap();
+    // A bad key makes the poll a 401: Errored, not falsy — the run must stop
+    // with exit 1 and say why, rather than retry forever.
+    let req = dir.path().join("poll-err.api");
+    std::fs::write(&req, "sleep 100ms while GET /about\nGET /about\n").unwrap();
+    let mut cmd = Command::cargo_bin("api").expect("api binary built");
+    cmd.arg("--no-keychain");
+    cmd.env("API_CREDENTIALS_FILE", credentials_file());
+    let assert = cmd
+        .args(["-b", "http://localhost:5000", "-k", "badkey", "-sa"])
+        .arg(&req)
+        .assert()
+        .failure();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert_eq!(stdout.matches("└─HTTP/1.1").count(), 1, "the 401 should be shown once: {stdout}");
+    assert!(stderr.contains("could not be evaluated"), "{stderr}");
+    assert!(!stdout.contains("waited"), "must not report success: {stdout}");
+}
+
 #[test]
 fn or_chain_does_not_catch_errors() {
     require_local_cos();
