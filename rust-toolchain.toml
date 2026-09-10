@@ -1,0 +1,19 @@
+# Pins the exact compiler used for development, tests, and the cross-compiled
+# release binaries in dist/. Before this file existed, local builds resolved to
+# Homebrew's rust while dist/ was produced by rustup's older toolchain, so the
+# binaries we shipped were never built by the compiler we tested against.
+#
+# rustup reads this automatically and will install the toolchain and targets on
+# first use, so a fresh clone is self-provisioning. Requires that cargo/rustc
+# resolve to rustup's shims -- a separately installed `rust` (e.g. the Homebrew
+# formula) shadows those shims and silently ignores this file.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-unknown-linux-musl",
+    "x86_64-unknown-linux-musl",
+    "x86_64-pc-windows-gnu",
+]
