@@ -462,13 +462,20 @@ fn no_streaming_beats_stream_and_env_var() {
 
 #[test]
 fn streamed_outfile_matches_buffered_outfile() {
-    require_local_cos();
+    // Both runs hit a mock server that returns the same bytes whatever the
+    // request's media type, so any difference in the files is the client's
+    // doing — which is what this test is for. (Against real COS the two runs
+    // legitimately differ: it emits a trailing blank line for plain
+    // `application/x-ndjson` but not for `;stream=true`, and the client writes
+    // whatever it receives verbatim.)
+    const BODY: &str = "{\"id\":1}\n{\"id\":2}\n";
     let dir = tempdir().unwrap();
     let streamed = dir.path().join("streamed.ndjson");
     let buffered = dir.path().join("buffered.ndjson");
 
+    let (port, server) = flipping_server(vec![BODY, BODY]);
     // NDJSON so neither path pretty-prints — the bytes are directly comparable.
-    api()
+    api_against_port(port)
         .args([
             "PUT",
             &format!("/echo-all > {}", streamed.display()),
@@ -478,7 +485,7 @@ fn streamed_outfile_matches_buffered_outfile() {
         ])
         .assert()
         .success();
-    api()
+    api_against_port(port)
         .args([
             "PUT",
             &format!("/echo-all > {}", buffered.display()),
@@ -487,10 +494,17 @@ fn streamed_outfile_matches_buffered_outfile() {
         ])
         .assert()
         .success();
+    let seen = server.join().expect("server thread");
+    assert_eq!(seen.len(), 2, "both runs should have reached the server");
+    assert!(
+        seen[0].contains("application/x-ndjson;stream=true"),
+        "the first run should have asked to stream: {}",
+        seen[0]
+    );
 
     let a = std::fs::read(&streamed).expect("streamed outfile written");
     let b = std::fs::read(&buffered).expect("buffered outfile written");
-    assert!(!a.is_empty(), "streamed outfile should not be empty");
+    assert_eq!(a, BODY.as_bytes(), "streamed outfile should hold the server's bytes verbatim");
     assert_eq!(a, b, "streaming must not change the bytes written");
 }
 
@@ -808,6 +822,40 @@ fn sleep_while_is_silent_outside_silent_bulk_mode() {
     assert!(out.stdout.is_empty(), "stdout: {}", String::from_utf8_lossy(&out.stdout));
     assert!(out.stderr.is_empty(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(server.join().unwrap().len(), 2);
+}
+
+#[test]
+fn uri_without_leading_slash_does_not_duplicate_the_api_prefix() {
+    // A path copied out of a URL or a log: `api/v1/...` must go out as
+    // `/api/v1/...`, not `/api/v1api/v1/...`.
+    let captured = captured_request_headers(
+        &["--silent"],
+        &[],
+    );
+    assert!(captured.starts_with("GET /api/v1/echo-all "), "sanity: {captured}");
+
+    let (port, server) = flipping_server(vec!["[]"]);
+    api_against_port(port)
+        .args(["-s", "GET", "api/v1/stock-transfers/key=8298~map(no.omnium.outbound-stock-transfer)"])
+        .assert()
+        .success();
+    let seen = server.join().expect("server thread");
+    let line = seen.first().expect("one request").lines().next().unwrap_or("").to_string();
+    assert_eq!(
+        line,
+        "GET /api/v1/stock-transfers/key=8298~map(no.omnium.outbound-stock-transfer) HTTP/1.1",
+        "got: {line}"
+    );
+
+    // A bare resource name still gets the default prefix.
+    let (port, server) = flipping_server(vec!["[]"]);
+    api_against_port(port).args(["-s", "GET", "people"]).assert().success();
+    let seen = server.join().expect("server thread");
+    assert!(
+        seen[0].starts_with("GET /api/v1/people "),
+        "got: {}",
+        seen[0].lines().next().unwrap_or("")
+    );
 }
 
 #[test]

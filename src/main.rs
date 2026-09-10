@@ -3548,7 +3548,18 @@ fn escape_newlines_in_strings(s: &str) -> String {
 /// - `/api/...` or `/api` → used as-is
 /// - `/v<N>` or `/v<N>/...` → prepend `/api` (so it becomes `/api/v<N>/...`)
 /// - anything else → prepend `api_path` (typically `/api/v1`)
+///
+/// A missing leading slash is added first, so a path copied out of a URL or a
+/// log (`api/v1/people`, `people`) is the same request as `/api/v1/people` and
+/// `/people` — rather than being glued onto the prefix as `/api/v1api/v1/…`.
 fn resolve_request_path(api_path: &str, uri: &str) -> String {
+    let with_slash;
+    let uri = if uri.is_empty() || uri.starts_with('/') {
+        uri
+    } else {
+        with_slash = format!("/{}", uri);
+        &with_slash
+    };
     // Already absolute under /api
     if uri == "/api" || uri.starts_with("/api/") {
         return uri.to_string();
@@ -13384,6 +13395,26 @@ mod tests {
         assert_eq!(resolve_request_path("/api/v1", "/v/foo"), "/api/v1/v/foo");
         // /v2foo — digits not followed by /
         assert_eq!(resolve_request_path("/api/v1", "/v2foo"), "/api/v1/v2foo");
+    }
+
+    #[test]
+    fn resolve_request_path_without_leading_slash() {
+        // A path pasted from a URL or a log resolves like the slashed form —
+        // the `/api` prefix must not be duplicated.
+        assert_eq!(
+            resolve_request_path("/api/v1", "api/v1/stock-transfers/key=8298~map(no.omnium.x)"),
+            "/api/v1/stock-transfers/key=8298~map(no.omnium.x)"
+        );
+        assert_eq!(resolve_request_path("/api/v1", "api/v2/people"), "/api/v2/people");
+        assert_eq!(resolve_request_path("/api/v1", "api/me/v1/people"), "/api/me/v1/people");
+        assert_eq!(resolve_request_path("/api/v1", "api"), "/api");
+        // The version and default rules apply to bare paths too.
+        assert_eq!(resolve_request_path("/api/v1", "v2/people"), "/api/v2/people");
+        assert_eq!(resolve_request_path("/api/v1", "people"), "/api/v1/people");
+        assert_eq!(resolve_request_path("/api/me/v1", "people"), "/api/me/v1/people");
+        assert_eq!(resolve_request_path("/api/v1", "version/foo"), "/api/v1/version/foo");
+        // Empty stays empty-prefixed, exactly as before.
+        assert_eq!(resolve_request_path("/api/v1", ""), "/api/v1");
     }
 
     #[test]
