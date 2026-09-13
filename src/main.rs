@@ -6563,6 +6563,11 @@ fn string_pairs(obj: &Map<String, Value>) -> Vec<(String, String)> {
 ///    key unwraps — an object nested under any other name is not searched.
 /// 2. A flat object where every (non-metadata) value is a string — uses every key.
 ///
+/// A top-level array holding exactly one object is unwrapped first, so a
+/// list-endpoint body like `[{ "identifiers": { … } }]` addresses the same
+/// index slot as the bare object would. Arrays with zero, several, or
+/// non-object elements can't name a single index slot and are left alone.
+///
 /// Returns an empty vec when the paste isn't JSON, isn't an object, or doesn't
 /// match either shape. Order follows the source JSON because `serde_json` is
 /// built with the `preserve_order` feature.
@@ -6570,6 +6575,11 @@ fn extract_identifier_pairs(s: &str) -> Vec<(String, String)> {
     let value = match parse_pasted_json_fragment(s) {
         Some(v) => v,
         None => return Vec::new(),
+    };
+    let value = match value.as_array() {
+        Some(items) if items.len() == 1 => &items[0],
+        Some(_) => return Vec::new(),
+        None => &value,
     };
     let obj = match value.as_object() {
         Some(o) => o,
@@ -13486,11 +13496,60 @@ mod tests {
     }
 
     #[test]
-    fn extract_identifier_pairs_array_returns_empty() {
-        // Top-level array isn't identifier-shaped.
+    fn extract_identifier_pairs_unwraps_single_element_array() {
+        // A one-item list body (as pasted for a list endpoint) addresses the
+        // same index slot as the bare object would — flat shape …
         assert_eq!(
             extract_identifier_pairs(r#"[{"com.heads.id": "x"}]"#),
-            Vec::<(String, String)>::new()
+            vec![("com.heads.id".to_string(), "x".to_string())]
+        );
+        // … and the explicit `identifiers` child shape, keeping key order.
+        let json = r#"[{ "identifiers": { "com.heads.seedID": "martintörnwall", "com.heads.test2": "123"} }]"#;
+        assert_eq!(
+            extract_identifier_pairs(json),
+            vec![
+                ("com.heads.seedID".to_string(), "martintörnwall".to_string()),
+                ("com.heads.test2".to_string(), "123".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_identifier_pairs_rejects_other_arrays() {
+        let none = Vec::<(String, String)>::new();
+        // Several items can't name a single index slot.
+        assert_eq!(
+            extract_identifier_pairs(r#"[{"com.heads.id": "x"}, {"com.heads.id": "y"}]"#),
+            none
+        );
+        // Empty array and non-object element stay verbatim.
+        assert_eq!(extract_identifier_pairs("[]"), none);
+        assert_eq!(extract_identifier_pairs(r#"["com.heads.id=x"]"#), none);
+    }
+
+    #[test]
+    fn handle_paste_single_element_array_indexes_uri_and_keeps_body() {
+        // Cursor right after the URI, body already present after the cursor:
+        // pasting the body's one-item array inserts the identifier index and
+        // leaves the body untouched.
+        let body = r#"[{ "identifiers": { "com.heads.seedID": "martintörnwall", "com.heads.test2": "123"} }]"#;
+        let mut state = AppState::new(Config::default());
+        state.input = format!("PUT /people {}", body);
+        state.cursor_pos = char_len("PUT /people");
+        state.method = "PUT".to_string();
+        let mut sink: Vec<u8> = Vec::new();
+        handle_paste(&mut state, body, &mut sink).unwrap();
+        assert_eq!(
+            state.input,
+            format!("PUT /people/com.heads.seedID=martintörnwall {}", body)
+        );
+        assert_eq!(state.cursor_pos, char_len("PUT /people/com.heads.seedID=martintörnwall"));
+
+        // Re-pasting within the window cycles to the second identifier.
+        handle_paste(&mut state, body, &mut sink).unwrap();
+        assert_eq!(
+            state.input,
+            format!("PUT /people/com.heads.test2=123 {}", body)
         );
     }
 
