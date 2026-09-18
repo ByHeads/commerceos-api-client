@@ -142,6 +142,11 @@ GET /events > stream.ndjson              # Accept: application/x-ndjson
 
 Paths can use `~/` for the home directory.
 
+Under the status line the client prints the target and the size written, on
+stderr: `> people.json (47.1 KB)`, `> clipboard (1.2 KB)`. A `>>` append shows
+how much the file grew: `>> people.json (+1.2 KB)`. Units are 1024-based.
+`-s` suppresses the line.
+
 ### Why agents should always pipe GET responses to a file
 
 When an agent runs `api -sa` to execute a batch, response bodies are not echoed

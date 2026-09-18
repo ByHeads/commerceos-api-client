@@ -586,6 +586,64 @@ fn outfile_writes_response_to_file() {
     assert!(written.contains("saved"), "outfile content: {written}");
 }
 
+/// The `(size)` suffix of a `> target (…)` marker line on stderr.
+fn marker_size(stderr: &str, prefix: &str) -> String {
+    let line = stderr
+        .lines()
+        .find(|l| l.contains(prefix))
+        .unwrap_or_else(|| panic!("no `{prefix}` marker line in stderr={stderr}"));
+    let open = line.rfind('(').unwrap_or_else(|| panic!("no size on marker line: {line}"));
+    let close = line.rfind(')').unwrap_or_else(|| panic!("no size on marker line: {line}"));
+    line[open + 1..close].to_string()
+}
+
+#[test]
+fn outfile_marker_reports_bytes_written() {
+    require_local_cos();
+    let dir = tempdir().unwrap();
+    let outfile = dir.path().join("out.json");
+    let uri_with_outfile = format!("/echo-all > {}", outfile.display());
+
+    // Buffered and streamed writes both report the size of the file they left.
+    for extra in [&[][..], &["--stream"][..]] {
+        let assert = api()
+            .args(extra)
+            .args(["PUT", &uri_with_outfile, r#"{"saved":true}"#])
+            .assert()
+            .success();
+        let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+        let on_disk = std::fs::metadata(&outfile).expect("outfile written").len();
+        assert!(on_disk < 1024, "fixture assumed a sub-KB body, got {on_disk}");
+        assert_eq!(marker_size(&stderr, "> "), format!("{} B", on_disk), "args={extra:?}");
+    }
+
+    // `>>` reports the growth of the file, as a `+` delta.
+    let before = std::fs::metadata(&outfile).unwrap().len();
+    let uri_append = format!("/echo-all >> {}", outfile.display());
+    let assert = api()
+        .args(["PUT", &uri_append, r#"{"saved":true}"#])
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    let grown = std::fs::metadata(&outfile).unwrap().len() - before;
+    assert_eq!(marker_size(&stderr, ">> "), format!("+{} B", grown));
+}
+
+#[test]
+fn clipboard_marker_reports_bytes_copied() {
+    require_local_cos();
+    let assert = api()
+        .args(["GET", "/echo-all > clipboard"])
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    let size = marker_size(&stderr, "> clipboard");
+    assert!(
+        size.ends_with(" B") || size.ends_with(" KB"),
+        "expected a short size on the clipboard marker, got `{size}` in stderr={stderr}"
+    );
+}
+
 #[test]
 fn append_outfile_merges_arrays_across_bulk_runs() {
     require_local_cos();

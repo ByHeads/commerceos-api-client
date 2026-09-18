@@ -3677,6 +3677,8 @@ enum BodyDelivery {
     Streamed {
         overflowed: bool,
         error: Option<String>,
+        /// Bytes written to the outfile.
+        bytes: u64,
     },
 }
 
@@ -3685,6 +3687,48 @@ enum BodyDelivery {
 /// overflows this can only be truthy — the prefix decides chains exactly as a
 /// fully buffered read would.
 const CLASSIFY_PREFIX_BYTES: usize = 4096;
+
+/// Short human-readable size for the `> outfile` marker line: `512 B`,
+/// `47.1 KB`, `128 MB`. Units are 1024-based; one decimal below 100, none above.
+fn format_byte_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["KB", "MB", "GB", "TB", "PB"];
+    if bytes < 1024 {
+        return format!("{} B", bytes);
+    }
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    // Rounding can carry a value up to the next unit (1023.97 KB → "1024 KB").
+    if value >= 999.5 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if value < 99.95 {
+        format!("{:.1} {}", value, UNITS[unit])
+    } else {
+        format!("{:.0} {}", value, UNITS[unit])
+    }
+}
+
+/// The `> outfile (47.1 KB)` line shown under the status line after a redirect.
+/// `bytes` is what this request wrote; an append shows it as a `+` delta.
+fn outfile_marker(target: &str, bytes: u64, append: bool) -> String {
+    if append {
+        format!(">> {} (+{})", target, format_byte_size(bytes))
+    } else {
+        format!("> {} ({})", target, format_byte_size(bytes))
+    }
+}
+
+/// Size of `path` on disk, 0 when it doesn't exist yet. Sampled either side of
+/// a `>>` append, because merging can splice brackets or drop a CSV header —
+/// the growth of the file is the only honest count of what was added.
+fn file_len(path: &str) -> u64 {
+    fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
 
 /// What a streamed copy left behind, since the body itself was never held.
 struct StreamedBody {
@@ -3695,6 +3739,8 @@ struct StreamedBody {
     /// Last byte written, so stdout can match the buffered path's trailing
     /// newline. `None` for an empty body.
     last_byte: Option<u8>,
+    /// Total bytes written to the sink.
+    bytes: u64,
 }
 
 /// Copy a streaming response into `sink` without holding the whole body, keeping
@@ -3704,6 +3750,7 @@ fn stream_to_sink(mut resp: impl IoRead, sink: &mut dyn Write) -> io::Result<Str
     let mut prefix: Vec<u8> = Vec::new();
     let mut overflowed = false;
     let mut last_byte = None;
+    let mut bytes: u64 = 0;
     let mut buf = [0u8; 32 * 1024];
 
     loop {
@@ -3719,6 +3766,7 @@ fn stream_to_sink(mut resp: impl IoRead, sink: &mut dyn Write) -> io::Result<Str
             overflowed = true;
         }
         last_byte = Some(buf[n - 1]);
+        bytes += n as u64;
         sink.write_all(&buf[..n])?;
     }
     sink.flush()?;
@@ -3727,6 +3775,7 @@ fn stream_to_sink(mut resp: impl IoRead, sink: &mut dyn Write) -> io::Result<Str
         prefix: String::from_utf8_lossy(&prefix).into_owned(),
         overflowed,
         last_byte,
+        bytes,
     })
 }
 
@@ -5132,10 +5181,10 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                         Ok(file) => {
                             let mut writer = io::BufWriter::new(file);
                             let res = stream_to_sink(resp, &mut writer);
-                            if res.is_ok() && !config.silent && !config.bulk_silent {
+                            if let (Ok(body), false, false) = (&res, config.silent, config.bulk_silent) {
                                 // Match the buffered path: status line, then `> outfile`.
                                 let display = display_outfile.as_deref().unwrap_or(file_path);
-                                eprintln!("{}", format!("> {}", display).dimmed());
+                                eprintln!("{}", outfile_marker(display, body.bytes, false).dimmed());
                             }
                             res
                         }
@@ -5242,10 +5291,11 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                         eprintln!("error: cannot append to clipboard — use > clipboard");
                         std::process::exit(1);
                     }
+                    let copied = output.len() as u64;
                     match cli_clipboard::set_contents(output) {
                         Ok(()) => {
                             if !config.silent {
-                                eprintln!("{}", "> clipboard".dimmed());
+                                eprintln!("{}", outfile_marker("clipboard", copied, false).dimmed());
                             }
                         }
                         Err(e) => {
@@ -5254,6 +5304,7 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                         }
                     }
                 } else if let Some(ref file_path) = outfile {
+                    let before = if outfile_append { file_len(file_path) } else { 0 };
                     let res = if outfile_append {
                         append_to_outfile(file_path, &output)
                     } else {
@@ -5263,10 +5314,14 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                         eprintln!("Error writing to {}: {}", file_path, e);
                     } else if !config.silent {
                         // Match interactive output: status line already printed,
-                        // now print ">/>> outfile" (dimmed) on the next line.
+                        // now print ">/>> outfile (size)" (dimmed) on the next line.
                         let display = display_outfile.as_deref().unwrap_or(file_path);
-                        let marker = if outfile_append { ">>" } else { ">" };
-                        eprintln!("{}", format!("{} {}", marker, display).dimmed());
+                        let written = if outfile_append {
+                            file_len(file_path).saturating_sub(before)
+                        } else {
+                            output.len() as u64
+                        };
+                        eprintln!("{}", outfile_marker(display, written, outfile_append).dimmed());
                     }
                 } else {
                     print!("{}", output);
@@ -7071,6 +7126,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
                             BodyDelivery::Streamed {
                                 overflowed: body.overflowed,
                                 error: None,
+                                bytes: body.bytes,
                             },
                         ),
                         Err(e) => (
@@ -7079,6 +7135,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
                             BodyDelivery::Streamed {
                                 overflowed: false,
                                 error: Some(e.to_string()),
+                                bytes: 0,
                             },
                         ),
                     });
@@ -7250,6 +7307,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
                 } else {
                     body_text.clone()
                 };
+                let copied = clipboard_text.len() as u64;
                 match cli_clipboard::set_contents(clipboard_text) {
                     Ok(()) => {
                         if !state.config.silent {
@@ -7257,7 +7315,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
                                 "HTTP/1.1 {} {}\n{}\n\n",
                                 status_str,
                                 format!("{:.2}s", elapsed.as_secs_f64()).dimmed(),
-                                "> clipboard".dimmed()
+                                outfile_marker("clipboard", copied, false).dimmed()
                             );
                         }
                         state.status_msg = "copied to clipboard".to_string();
@@ -7270,32 +7328,36 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
             } else if !state.config.outfile.is_empty() {
                 // A streamed body is already on disk — only its io error, if
                 // any, is still to be reported.
-                let write_result = match delivery {
+                // Each arm yields the bytes this request put in the file.
+                let write_result: io::Result<u64> = match delivery {
                     BodyDelivery::Streamed { error: Some(ref e), .. } => {
                         Err(io::Error::new(io::ErrorKind::Other, e.clone()))
                     }
-                    BodyDelivery::Streamed { .. } => Ok(()),
+                    BodyDelivery::Streamed { bytes, .. } => Ok(bytes),
                     BodyDelivery::Buffered => {
                         if state.config.outfile_append {
+                            let before = file_len(&state.config.outfile);
                             append_to_outfile(&state.config.outfile, &body_text)
+                                .map(|()| file_len(&state.config.outfile).saturating_sub(before))
                         } else {
                             fs::write(&state.config.outfile, &body_text)
+                                .map(|()| body_text.len() as u64)
                         }
                     }
                 };
-                if let Err(e) = write_result {
+                if let Err(ref e) = write_result {
                     block.head = format!("Error writing to {}: {}\n", state.config.outfile, e);
                 } else {
+                    let written = write_result.unwrap_or(0);
                     state.last_outfile = state.config.outfile.clone();
                     state.last_display_outfile = state.display_outfile.clone();
 
                     if !state.config.silent {
-                        let marker = if state.config.outfile_append { ">>" } else { ">" };
                         block.head = format!(
                             "HTTP/1.1 {} {}\n{}\n\n",
                             status_str,
                             format!("{:.2}s", elapsed.as_secs_f64()).dimmed(),
-                            format!("{} {}", marker, state.display_outfile).dimmed()
+                            outfile_marker(&state.display_outfile, written, state.config.outfile_append).dimmed()
                         );
                     }
                     state.status_msg = "ctrl+o to open file".to_string();
@@ -13515,6 +13577,49 @@ mod tests {
     }
 
     #[test]
+    fn format_byte_size_picks_short_units() {
+        assert_eq!(format_byte_size(0), "0 B");
+        assert_eq!(format_byte_size(1), "1 B");
+        assert_eq!(format_byte_size(1023), "1023 B");
+        assert_eq!(format_byte_size(1024), "1.0 KB");
+        assert_eq!(format_byte_size(1204), "1.2 KB");
+        assert_eq!(format_byte_size(48_213), "47.1 KB");
+        // One decimal below 100, none from 100 up.
+        assert_eq!(format_byte_size(150 * 1024), "150 KB");
+        assert_eq!(format_byte_size(5 * 1024 * 1024 + 512 * 1024), "5.5 MB");
+        assert_eq!(format_byte_size(3 * 1024 * 1024 * 1024), "3.0 GB");
+        // A value that would round to "1024 KB" carries into the next unit.
+        assert_eq!(format_byte_size(1024 * 1024 - 1), "1.0 MB");
+    }
+
+    #[test]
+    fn outfile_marker_shows_size_and_append_delta() {
+        assert_eq!(outfile_marker("out.json", 48_213, false), "> out.json (47.1 KB)");
+        assert_eq!(outfile_marker("clipboard", 300, false), "> clipboard (300 B)");
+        assert_eq!(outfile_marker("out.json", 1204, true), ">> out.json (+1.2 KB)");
+    }
+
+    #[test]
+    fn stream_to_sink_counts_every_byte_past_the_prefix() {
+        let body = vec![b'x'; CLASSIFY_PREFIX_BYTES * 3 + 7];
+        let got = stream_to_sink(&body[..], &mut Vec::new()).unwrap();
+        assert_eq!(got.bytes, body.len() as u64);
+        assert_eq!(stream_to_sink(&b""[..], &mut Vec::new()).unwrap().bytes, 0);
+    }
+
+    #[test]
+    fn file_len_is_zero_for_a_missing_file() {
+        let dir = std::env::temp_dir().join(format!("api-file-len-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f.txt");
+        let path = path.to_str().unwrap();
+        assert_eq!(file_len(path), 0);
+        std::fs::write(path, b"12345").unwrap();
+        assert_eq!(file_len(path), 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn extract_identifier_pairs_rejects_other_arrays() {
         let none = Vec::<(String, String)>::new();
         // Several items can't name a single index slot.
@@ -14598,6 +14703,7 @@ mod tests {
         assert_eq!(out.len(), CLASSIFY_PREFIX_BYTES);
         assert_eq!(got.prefix.len(), CLASSIFY_PREFIX_BYTES);
         assert!(!got.overflowed);
+        assert_eq!(got.bytes, CLASSIFY_PREFIX_BYTES as u64);
 
         // One byte more, and the prefix caps while the sink still gets it all.
         let body = vec![b'x'; CLASSIFY_PREFIX_BYTES + 1];
