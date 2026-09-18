@@ -9,7 +9,7 @@ https://github.com/ByHeads/commerceos-api-reference
 
 ## Install
 
-Every CommerceOS instance serves an install script; `dev.heads.com` works for everyone:
+Every CommerceOS instance serves an install script that works for mac or linux.
 
 ```sh
 curl -fsSL https://my-tenant.app.heads.com/api-client-install.sh | bash
