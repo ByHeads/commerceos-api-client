@@ -1,6 +1,6 @@
 # Changelog
 
-## 3.1.5
+## 3.1.6
 
 - **The `> outfile` marker shows how much was written**: the dimmed line under the status now reads `> people.json (47.1 KB)` or `> clipboard (1.2 KB)`, so a suspiciously small export is visible at a glance without opening the file. A `>>` append reports the growth of the file as a delta, `>> people.json (+1.2 KB)`, because merging can splice brackets or drop a CSV header, and the delta is the honest number. Streamed writes are counted as they go. Units are 1024-based; `-s` suppresses the line as before.
 - **URIs work with or without the leading slash**: `GET api/v1/people`, `GET v1/people`, and `GET people` are the same request as `GET /people`, so a path copied out of a browser URL or a log is usable as-is instead of being glued onto the prefix as `/api/v1api/v1/…`. In a `.api` file this needs an explicit method — a bare slashless line is read as an include path and fails with `could not read include`. Documented in `AGENTS.md`.
