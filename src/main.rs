@@ -60,6 +60,21 @@ const STREAMING_HELP_MAX_COLS: usize = 68;
 /// Where the API docs live for a connection — `ctrl+b` opens this, and the
 /// streaming help section deep-links into it. Falls back to the public host
 /// before a connection is established.
+/// Open a file or URL with the system handler, swallowing its stdio so
+/// Launch Services errors never leak into the raw-mode terminal.
+/// Returns false when the handler could not be run or reported failure.
+fn open_external(target: &str) -> bool {
+    use std::process::Stdio;
+    Command::new("open")
+        .arg(target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|st| st.success())
+        .unwrap_or(false)
+}
+
 fn api_docs_url(base_uri: &str) -> String {
     if base_uri.is_empty() {
         "https://dev.heads.com/api-docs".to_string()
@@ -2266,7 +2281,7 @@ impl ConnectionFlow {
 
         // Ctrl+B opens docs
         if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('b') {
-            let _ = Command::new("open").arg("https://dev.heads.com/api-docs").spawn();
+            let _ = open_external("https://dev.heads.com/api-docs");
             return Ok(None);
         }
 
@@ -6086,13 +6101,19 @@ fn handle_key_event(
         // Open docs
         (KeyModifiers::CONTROL, KeyCode::Char('b')) => {
             let url = api_docs_url(&state.config.base_uri);
-            let _ = Command::new("open").arg(&url).spawn();
+            let _ = open_external(&url);
         }
 
         // Open last file
         (KeyModifiers::CONTROL, KeyCode::Char('o')) => {
-            if !state.last_outfile.is_empty() {
-                let _ = Command::new("open").arg(&state.last_outfile).spawn();
+            if !state.last_outfile.is_empty() && !open_external(&state.last_outfile) {
+                let name = std::path::Path::new(&state.last_outfile)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| state.last_outfile.clone());
+                state.status_msg = format!("could not open {}", name);
+                state.status_msg_at = Some(Instant::now());
+                render(stdout, state)?;
             }
         }
 
