@@ -1,28 +1,23 @@
 # CommerceOS API Client
 
-An interactive command-line client for the CommerceOS API built on Rust. Supports interactive REPL mode with tab completion, one-shot commands for scripting, batch request files, saved connections with OS keychain integration, and cross-platform binaries for macOS, Linux, and Windows.
+`api` is a command-line client for the CommerceOS API, written in Rust. It has an
+interactive mode with tab completion, a one-shot mode for scripting, `.api` batch
+files, saved connections in the OS keychain, and binaries for macOS, Linux, and Windows.
 
-You can find more information about the CommerceOS API in the global API documentation:
-
-https://dev.heads.com/api-docs
-
-or in the companion reference repo:
-
+API documentation: https://dev.heads.com/api-docs — companion reference repo:
 https://github.com/ByHeads/commerceos-api-reference
 
-## Quick-install
+## Install
 
-You can install the latest version of the API client using the `api-client-install.sh` bundled with each instance of COS. Use `dev.heads.com` for global access.
+Every CommerceOS instance serves an install script; `dev.heads.com` works for everyone:
 
-```
+```sh
 curl -fsSL https://my-tenant.app.heads.com/api-client-install.sh | bash
 # or
 curl -fsSL https://dev.heads.com/api-client-install.sh | bash
 ```
 
-## Install
-
-Download the binary for your platform from the [latest release](https://github.com/byheads/commerceos-api-client/releases/latest):
+Or download a binary from the [latest release](https://github.com/byheads/commerceos-api-client/releases/latest):
 
 | Platform | Binary |
 |---|---|
@@ -32,282 +27,250 @@ Download the binary for your platform from the [latest release](https://github.c
 | Linux (ARM64) | `api-linux-arm64` |
 | Windows (x86_64) | `api-windows-x86_64.exe` |
 
-On macOS and Linux, make it executable and move it to your PATH:
-
 ```sh
 chmod +x api-macos-arm64
 sudo mv api-macos-arm64 /usr/local/bin/api
 ```
 
-On Windows, rename `api-windows-x86_64.exe` to `api.exe` and add its location to your PATH.
+On Windows, rename the file to `api.exe` and put it on your PATH.
 
-### Build from source
+To build from source you need the [Rust toolchain](https://rustup.rs/); `cargo build --release` produces `target/release/api`.
 
-Requires the [Rust toolchain](https://rustup.rs/).
+## Quick start
 
 ```sh
-cargo build --release
-# Binary at: target/release/api
+api -b https://your-instance.example.com -k YOUR_API_KEY   # interactive, explicit credentials
+api                                                        # interactive, saved connection
+api GET /people                                            # one-shot
 ```
 
-## Usage
+## One-shot requests
 
-### Quick start
-
-```sh
-# Start interactive mode, connecting to a CommerceOS instance
-api -b https://your-instance.example.com -k YOUR_API_KEY
-
-# Or just start interactively and set up a connection
-api
+```
+api [METHOD] URI [BODY] [options]
 ```
 
-### One-shot commands
-
 ```sh
-api GET /users -b https://your-instance.example.com -k YOUR_API_KEY
+api /people                                   # GET is the default
+api GET /people~take(5)
+api PUT /people/123 '{"name":"Updated"}'
 api POST /people '[{"name":"Jane"}]'
-api /users                    # GET is the default method
-api PUT /people/123 '{"name":"Updated"}'
+api PUT /people/123 @body.json                # body from a file
+echo '{"name":"X"}' | api PUT /people/123     # body from stdin
+api PATCH /people/123                         # terminal stdin: prompts for the body, ctrl+d to send
 ```
 
-### Body input
+The URI may omit its leading slash and the `/api/v1` prefix, so a path copied from a browser or a log works as-is.
 
-A request body can be supplied four ways:
+### Bodies
 
-```sh
-# Inline argument
-api PUT /people/123 '{"name":"Updated"}'
-
-# From a file (the `@` prefix)
-api PUT /people/123 @body.json
-
-# From stdin (when the body argument is omitted)
-echo '{"name":"Updated"}' | api PUT /people/123
-
-# Interactive prompt (terminal-attached stdin, no inline body)
-api PATCH /people/123          # prompts: "Reading body from stdin (ctrl+d to finish):"
-```
-
-The `@file` form auto-detects content type from the extension (`.csv`, `.ndjson`).
-Append `~map(typeName)` to a file body to send the type name as an `X-Request-Map`
-header (used for streamed transformations):
+- `@file` reads the body from a file. Content type follows the extension (`.json`, `.csv`, `.ndjson`).
+- `@dir/*.json` combines matching files into one JSON array; `@dir/*.ndjson` concatenates them.
+- `@file~map(typeName)` sends the type as an `X-Request-Map` header for streamed transformations:
 
 ```sh
 api PUT /sync-webhooks @data.csv~map(com.heads.csv-product)
 ```
 
-### Output to file
+### Output to file or clipboard
 
-Append `> path` to write the response body to a file:
+The client parses `> path` off the end of the request line itself. In a shell that means
+the redirect must be **inside the quoted URI argument**, otherwise the shell takes it:
 
 ```sh
-api GET /products > products.json
-api GET /products~map(com.heads.sql-product) > products.sql
+api GET "/products > products.json"        # handled by api: Accept header, size marker, ~/ expansion
+api GET /products > products.json          # handled by the shell: plain stdout capture, no Accept override
 ```
 
-The output extension also drives the `Accept` header (`.csv` → `text/csv`,
-`.ndjson` → `application/x-ndjson`, `.sql` → `application/sql`).
+| Target | Effect |
+|---|---|
+| `> file` | write the body to `file` (`~/` is expanded) |
+| `>> file` | append: JSON merges into one array, NDJSON gets one object per line, CSV drops the duplicate header, other text appends |
+| `> clipboard` | copy the body to the system clipboard (case-insensitive) |
+
+The extension of the target sets the `Accept` header: `.csv` → `text/csv`,
+`.ndjson` → `application/x-ndjson`, `.sql` → `application/sql`, anything else JSON.
+So `GET "/products~map(com.heads.sql-product) > products.sql"` asks for SQL.
+
+After the status line the client prints the target and the size written, e.g.
+`> products.json (47.1 KB)` or `>> products.json (+1.2 KB)`.
+
+### Chaining
+
+In interactive mode and in batch files, `&&` runs the next request only if the previous one
+was truthy and `||` only if it was falsy. Truthy means a 2xx whose body is not `false`,
+`null`, `0`, or `""`. A 404 is falsy; 401/403, 5xx, and timeouts abort the whole line.
+Chains evaluate left to right like a shell, and separators inside JSON are ignored.
+
+```
+GET /people/123 || PUT /people/123 { "name": "Joe" }                       # create if missing
+GET /people~where(givenName=X)~count && DELETE /people~where(givenName=X)  # delete only if any
+```
+
+One-shot arguments are not chained; pipe the line into `api -a` instead.
 
 ### Streaming
 
-Streaming is **opt-in**. Without it the whole response is read into memory and
-pretty-printed; with it the body is written out as it arrives, which is what you
-want for large exports and `~map(...)` transformations.
+Off by default. With `--stream` (or `API_STREAMING=1`; `--no-streaming` overrides both)
+the body is written as it arrives, which is what large exports and `~map(...)` want.
 
-```sh
-api --stream GET "/products > products.ndjson"   # per-run
-export API_STREAMING=1                            # globally
-```
-
-`API_STREAMING` counts as on for `1`, `true`, `yes`, or `on` (any case).
-`--no-streaming` overrides both, so you can turn it off for a single run without
-unsetting the variable.
-
-Where the bytes go when streaming is on:
-
-| Destination | Behaviour |
+| Destination | Streamed? |
 |---|---|
-| `> file` | streamed straight to the file |
-| stdout, piped (`api ... \| cat`) | streamed raw |
-| stdout with `-r` | streamed raw |
-| stdout, terminal, no `-r` | buffered and pretty-printed |
-| `>> file`, `> clipboard` | buffered — both need the whole body |
-| any non-2xx response | buffered, so an error page never streams into a file |
+| `> file`, piped stdout, stdout with `-r` | yes |
+| terminal stdout without `-r` | no, buffered and pretty-printed |
+| `>> file`, `> clipboard`, any non-2xx | no, both need the whole body |
 
-Two consequences worth knowing:
+A streamed `> file.json` holds the server's bytes verbatim, not pretty-printed. A streaming
+response commits to its status before the body exists, so a `200` can still carry an error in
+the payload.
 
-- A streamed `> file.json` is **not** pretty-printed — the file gets the
-  server's bytes verbatim. Drop `--stream` if you want it formatted.
-- A streaming response commits to its status code before the body is generated,
-  so **a `200` can still carry an error inside the stream**. Check the payload,
-  not just the status.
+## Batch files
 
-In interactive mode, `ctrl+t` toggles streaming and a `streaming` marker appears
-at the bottom right while it's on. While streaming is active, `ctrl+h` adds a
-section spelling out these caveats, with a link to
-`<base-uri>/api-docs#description/streaming` for the full documentation.
-
-### Bulk mode
-
-Run a sequence of requests from a text file with `-a`:
+`api -a file.api` runs the requests in a file top to bottom; `-a -` or a pipe reads stdin.
+`-s` makes it a compact log of one status line per request; `-p` previews the requests and
+asks before sending.
 
 ```sh
-api -a requests.txt
-cat requests.txt | api -a       # stdin
-api -a -                        # explicit stdin
-```
-
-Each non-empty line is a full request, parsed exactly like interactive input.
-Lines starting with `#` are comments; blank lines are skipped.
-
-```
-# requests.txt
-GET /people
-PUT /people/com.heads.seedID=joe {"name":"Joe"} > ~/Downloads/joe.json
-PATCH /sync-webhooks @webhooks/foo.json
-```
-
-### Silent bulk mode
-
-Combine `-s` with `-a` for compact progress-style output: each request line is
-echoed, followed by an indented status line. Response bodies are suppressed.
-
-```sh
-api -sa requests.txt
+api -sa seed.api
+api -spa seed.api        # preview first
 ```
 
 ```
-PUT /people [{"name": "Joe"}]
-└─HTTP/1.1 200 OK 0.08s
-GET /people
-└─HTTP/1.1 200 OK 0.07s
+# seed.api
+url has localhost:5000                        # refuse to run against anything else
+assert GET /companies/com.heads.seedID=ours   # stop unless this exists
+
+PUT /people/com.heads.seedID=joe { "name": "Joe" }
+PUT /people [
+  { "identifiers": { "com.heads.seedID": "ann" }, "name": "Ann" }
+]
+PUT /people @people/*.json
+
+POST /imports { "source": "erp" }
+sleep 20 while GET /imports~where(state=running)~count
+
+shared/*.api                                  # include other files
+GET /people~take(5) > /tmp/people.json
 ```
 
-Useful for running large batches where you only care about status codes.
+| Line | Meaning |
+|---|---|
+| `METHOD URI [BODY] [> file]` | a request; multi-line bodies continue until brackets balance |
+| `# …` | comment; `//`, `#`, and `/* */` also work inside JSON bodies |
+| `path/to/file.api` | include, relative to the including file; globs allowed |
+| `sleep N` | pause (`2`, `500ms`, `1.5s`) |
+| `sleep [N] while [not] <request>` | poll every N seconds (default 5) until the answer flips |
+| `assert [not] <request>` | exit 1 unless the answer is truthy (falsy with `not`) |
+| `url has <text>` / `url is <url>` | allowlist of base URLs; no match aborts before anything runs |
 
-### Interactive mode
+`AGENTS.md` is the full reference for the file format.
 
-Start `api` without a URI to enter interactive mode. The prompt accepts input in the format:
+## Interactive mode
 
+Start `api` without a URI. The prompt takes the same `METHOD URI [BODY] [> file]` line as
+one-shot mode, with tab completion for endpoints, operators, properties, and file paths.
+
+- **Typing a body promotes GET to PUT**; on an array endpoint the opening `[` is added for you.
+- **`ctrl+space` cycles** PUT → PATCH → POST → GET. Switching to GET stashes the body; switching back restores it.
+- **Enter on a body method without a body** opens a multi-line editor: `ctrl+d` sends, `esc` cancels.
+
+### Copy and paste identifiers
+
+Paste JSON onto the URI and the client turns it into an index segment. Any of these shapes work:
+
+```json
+{ "identifiers": { "com.heads.seedID": "joe", "com.erp.id": "42" }, "name": "Joe" }
+"identifiers": { "com.heads.seedID": "joe" },
+{ "com.heads.seedID": "joe" }
+[{ "identifiers": { "com.heads.seedID": "joe" } }]
 ```
-METHOD URI [BODY] [> OUTFILE]
-```
 
-Examples at the prompt:
+Pasting the first one onto `GET /people` gives `GET /people/com.heads.seedID=joe`. Paste it
+again within 10 seconds to cycle to `com.erp.id=42`. An existing `key=value` segment is
+replaced, so repeated pastes never pile up. Trailing commas from a copied fragment are fine,
+and `@type`/`@id` are never used as identifiers.
 
-```
-GET /users
-POST /people [{"name":"Jane"}]
-GET /orders > orders.json
-PATCH /people/123 {"name":"Updated"}
-```
+Pasting a whole request line (`GET /people/...`) replaces the input. Pasting a JSON body after
+the URI inserts it verbatim and promotes the method. `ctrl+y` copies the last request as a
+`curl` command.
 
-For `PATCH`, `POST`, and `PUT` without a body, pressing `enter` opens an inline
-body editor: type the body (multiline supported), `ctrl+d` to send, `esc` to
-cancel.
-
-Switching to GET via `ctrl+space` hides the current body from the input and
-stashes it. Switching back to a body method restores it. Sending a request
-clears the stash.
-
-Press `ctrl+h` for the full list of key bindings:
+### Key bindings (`ctrl+h`)
 
 | Key | Action |
 |---|---|
-| `enter` | Send request |
-| `opt+enter` | New line (multiline body) \[or `ctrl+n`\] |
-| `tab` | Auto-complete endpoints, operators, properties |
-| `up` / `down` | Browse request history |
-| `ctrl+space` | Cycle method (GET → PUT → PATCH → POST). Resets to GET if >5s since last cycle. |
-| `ctrl+g` | Quick GET on current URI |
-| `ctrl+x` | Clear body (keep method and URI) |
-| `ctrl+f` | Clear all (reset to `GET /`) |
-| `ctrl+y` | Copy last request as curl command |
-| `ctrl+w` | Erase last request+response from output |
-| `ctrl+j` | Erase last response body (keep request+status headers) |
-| `ctrl+l` | Erase all output back to splash |
-| `ctrl+s` | Save the current connection |
+| `enter` | Send |
+| `opt+enter` / `ctrl+n` | New line in body |
+| `tab` | Complete |
+| `up` / `down` | History |
+| `ctrl+space` | Cycle method; resets to GET if the last cycle was over 5s ago |
+| `ctrl+g` | GET the current URI |
+| `ctrl+x` | Clear body |
+| `ctrl+f` | Reset to `GET /` |
+| `ctrl+u` | Clear the input line |
+| `ctrl+k` | Kill to end of line |
+| `ctrl+a` / `ctrl+e` | Start / end of line |
+| `alt+←` / `alt+→` | Move by word (also `ctrl+←/→`, `alt+b/f`) |
+| `alt+backspace` / `ctrl+w` | Delete word backward |
+| `alt+d` | Delete word forward |
+| `ctrl+y` | Copy last request as curl |
+| `ctrl+j` | Erase last response body |
+| `ctrl+l` | Clear output |
+| `ctrl+o` | Open the last saved file |
+| `ctrl+b` | Open API docs in the browser |
+| `ctrl+t` | Toggle streaming |
+| `ctrl+s` | Save connection |
 | `ctrl+q` | Switch connection |
-| `ctrl+b` | Open API docs in browser |
-| `ctrl+o` | Open last saved file |
-| `ctrl+t` | Toggle response streaming |
-| `ctrl+h` | Toggle help |
-| `ctrl+c` | Quit (double-press) |
+| `ctrl+c` | Quit (press twice) |
 
-### Saved connections
+## Connections and authentication
 
-Save a connection with `ctrl+s` during interactive mode. Switch between saved connections with `ctrl+q`, or use the `-c` flag:
+- `-b URL -k KEY` sends the key as Basic auth. `--token TOKEN` sends a Bearer token (long form only; `-t` is `--stream`).
+- With neither, the client prompts for credentials; `ctrl+s` saves the connection, `ctrl+q` switches.
+- `-c alias` (or `-c url`) picks a saved connection: `api -c staging GET /people`.
+- A key or token without `-b` uses the default saved connection's URL.
+- Credentials live in the OS keychain. `--no-keychain` uses a plaintext JSON file instead
+  (`API_CREDENTIALS_FILE`, else `./.api-credentials.json`), for CI and agents. See `AGENTS.md`.
 
-```sh
-api -c my-connection
-api -c my-connection GET /users
-```
-
-Credentials are stored securely in your OS keychain (macOS Keychain, Windows Credential Manager, or Linux file-based keyring).
-
-### Authentication
-
-- **API key**: `api -k YOUR_API_KEY` (sent as Basic auth)
-- **Bearer token**: `api --token YOUR_TOKEN` (long form only — `-t` is `--stream`)
-- **Interactive**: when no key or token is provided, you'll be prompted during connection setup
-
-When a key or token is given without `-b`, the base URL still comes from your default saved connection.
-
-### Options
+## Options
 
 ```
-Usage: api [method] [uri [body]] [options]
+Usage: api [OPTIONS] [METHOD] [URI] [BODY]
 
-Options:
-  -b, --base-uri <URI>            Base URI for the API
+  -b, --base-uri <URI>            Base URI
   -k, --key <KEY>                 API key (Basic auth)
       --token <TOKEN>             Bearer token
-  -c, --connection <ALIAS_OR_URL> Use a saved connection
-  -a, --all [FILE]                Bulk mode: run requests from FILE (or stdin if omitted/`-`)
-  -s, --silent                    Do not print status info
-  -r, --raw                       Output raw JSON (no pretty printing)
-  -i, --include-nulls             Include null values in response
-  -x, --experimental              Enable experimental body completion / syntax highlighting
+  -c, --connection <ALIAS|URL>    Use a saved connection
+      --no-keychain               Read/write connections from a plaintext JSON file
       --me                        Use /api/me/v1 instead of /api/v1
-      --ndjson                    Use NDJSON for request and response
-  -t, --stream                    Stream the response body (also: API_STREAMING=1)
-      --no-streaming              Force streaming off, overriding --stream/API_STREAMING
-      --timeout <SECONDS>         Request timeout; 0 disables it (default: 600)
-  -p, --preview                   Preview the request(s) and confirm before sending
-  -v, --version                   Print version
-  -h, --help                      Print help
+  -a, --all [FILE]                Run requests from FILE (stdin if omitted or `-`)
+  -s, --silent                    No status output; with -a, one status line per request
+  -p, --preview                   Show the request(s) and confirm before sending
+  -r, --raw                       No pretty-printing
+  -i, --include-nulls             Include null values in the response
+      --ndjson                    NDJSON request and response
+  -t, --stream                    Stream the response body
+      --no-streaming              Force streaming off
+      --timeout <SECONDS>         Request timeout, 0 disables (default 600)
+  -x, --experimental              Experimental body completion and highlighting
+  -v, --version
+  -h, --help
 ```
-
-### Environment variables
 
 | Variable | Effect |
 |---|---|
-| `API_STREAMING` | `1`/`true`/`yes`/`on` turns on response streaming globally |
-| `API_CREDENTIALS_FILE` | Path to the plaintext credentials file used with `--no-keychain` |
+| `API_STREAMING` | `1`/`true`/`yes`/`on` turns streaming on |
+| `API_CREDENTIALS_FILE` | Credentials file path, used with `--no-keychain` |
 
 ## Tests
 
-Integration tests in `tests/cli.rs` exercise the binary against a running local
-CommerceOS instance via the `/echo-all` endpoint (which round-trips request
-bodies, so nothing is persisted).
-
 ```sh
-cargo test --test cli
+cargo test --bin api                                     # unit tests
+API_TEST_BASE_URI=http://localhost:5000 API_TEST_KEY=… cargo test --test cli   # end-to-end, needs a local COS
 ```
 
-By default the tests use the saved default connection, which means every test
-invocation prompts for keychain access. To skip the keychain entirely, pass
-credentials via environment variables:
-
-```sh
-API_TEST_BASE_URI=http://localhost:5000 API_TEST_KEY=your-local-key cargo test --test cli
-```
-
-When both env vars are set, the test harness adds `-b` and `-k` flags to every
-`api` invocation so no keychain lookup happens.
+The end-to-end tests go through `/echo-all`, so nothing is persisted. Without the two
+variables they use the default saved connection and prompt for keychain access.
 
 ## License
 
 [MIT](LICENSE)
-

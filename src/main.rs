@@ -8770,7 +8770,7 @@ fn render<W: Write>(stdout: &mut W, state: &mut AppState) -> io::Result<()> {
         queue!(stdout, Print(format!("{}\r\n", "  tab        Complete URI (endpoints, operators, properties)".dimmed())))?;
         queue!(
             stdout,
-            Print(format!("{}\r\n", "  ctrl+space Cycle method: GET → POST → PATCH → PUT".dimmed())),
+            Print(format!("{}\r\n", "  ctrl+space Cycle method: GET → PUT → PATCH → POST".dimmed())),
             Print(format!("{}\r\n", "  ctrl+g     Quick GET current URI".dimmed())),
             Print(format!("{}\r\n", "  ctrl+x     Clear body (keep method and URI)".dimmed())),
             Print(format!("{}\r\n", "  ctrl+f     Clear all (reset to GET /)".dimmed())),

@@ -12,8 +12,9 @@ METHOD URI [BODY] [> OUTFILE]
 
 - `METHOD` is one of `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS`.
 - If the first token starts with `/`, `GET` is implied — `/people` is the same as `GET /people`.
-- `URI` may be written **with or without its leading slash**, and with or without the `/api/v1` prefix — `GET api/v1/people`, `GET /api/v1/people`, `GET v1/people`, and `GET /people` all request the same thing. That makes a path copied out of a browser URL or a log usable as-is. In a `.api` file this needs an explicit method, because a bare line that doesn't start with `/` is an [include](#5-includes).
+- `URI` may be written **with or without its leading slash**, and with or without the `/api/v1` prefix — `GET api/v1/people`, `GET /api/v1/people`, `GET v1/people`, and `GET /people` all request the same thing. That makes a path copied out of a browser URL or a log usable as-is. In a `.api` file this needs an explicit method, because a bare line that doesn't start with `/` is an [include](#6-includes).
 - `BODY` and `OUTFILE` are optional. If both are present, `BODY` comes first; the `> path` suffix is parsed off the end.
+- A line may hold several requests joined by `&&` / `||`, see [chaining](#5-chaining).
 
 ```
 # Smallest possible file
@@ -125,75 +126,88 @@ PUT /events @events/*.ndjson
 PUT /sync-webhooks @data.csv~map(com.heads.csv-product)
 ```
 
-Globs are processed in **sorted order**. Empty match sets and invalid JSON are
-hard errors (the run exits non-zero).
+Globs are processed in **sorted order** and skip OS junk (`.DS_Store`,
+`Thumbs.db`, `desktop.ini`, `._*`). `.njson` counts as NDJSON too. Empty match
+sets and invalid JSON are hard errors (the run exits non-zero).
 
 ## 4. Output to file (`> path`)
 
-Append `> outfile` to write the response body to a file. The output file's
-extension drives the `Accept` header:
+Append `> outfile` to write the response body to a file instead of stdout. The
+client parses the redirect itself; no shell is involved in a `.api` file.
 
 ```
 GET /people > people.json                # Accept: application/json
 GET /events~map(com.heads.csv) > out.csv # Accept: text/csv
 GET /events~map(com.heads.sql) > out.sql # Accept: application/sql
 GET /events > stream.ndjson              # Accept: application/x-ndjson
+GET /people >> people.json               # append (see below)
+GET /people > clipboard                  # system clipboard, case-insensitive
 ```
 
-Paths can use `~/` for the home directory.
+- The extension drives the `Accept` header as above; anything else asks for JSON.
+- `~/` expands to the home directory.
+- `>> file` appends by content: JSON is spliced into one array, `.ndjson`/`.njson`
+  targets get one compact object per line, `.csv` appends drop the duplicate
+  header row, anything else is text-appended. `>> clipboard` is rejected.
+- Under the status line the client prints the target and the size written, on
+  stderr: `> people.json (47.1 KB)`, `>> people.json (+1.2 KB)`. `-s` suppresses it.
 
-Under the status line the client prints the target and the size written, on
-stderr: `> people.json (47.1 KB)`, `> clipboard (1.2 KB)`. A `>>` append shows
-how much the file grew: `>> people.json (+1.2 KB)`. Units are 1024-based.
-`-s` suppresses the line.
+### Always pipe GET responses to a file
 
-### Why agents should always pipe GET responses to a file
-
-When an agent runs `api -sa` to execute a batch, response bodies are not echoed
-back — only the status line is shown. To inspect the data returned by a `GET`,
-the agent must persist it. The standard pattern:
+In `-sa` mode response bodies are not printed at all, and in `-a` mode stdout is
+pretty-printed and colored; neither is meant to be parsed. To read data back,
+write it to a file and read the file:
 
 ```
-# In the .api file:
 GET /people~where(active=true)~with(com.heads.*) > /tmp/active-people.json
 ```
 
-Then read `/tmp/active-people.json` afterward. This works the same way for `-a`
-non-silent mode too — even though stdout shows the body, capturing it to a
-file is more reliable than parsing terminal output (ANSI codes, pretty-printing,
-truncation in pipes).
-
-Recommended conventions for agents:
-
-- Use `/tmp/` for ephemeral inspection files (e.g. `/tmp/api-{step}.json`)
-- Use distinct filenames per step so a multi-step batch leaves a readable audit trail
-- Match the file extension to the desired format (`.csv` for CSV exports, `.sql` for SQL, `.ndjson` for streams)
-- Re-running the batch overwrites the files, so they're always fresh
+Use `/tmp/` with a distinct name per step so a batch leaves an audit trail, and
+match the extension to the format you want (`.csv`, `.sql`, `.ndjson`).
+Re-running the batch overwrites the files.
 
 ### Streaming large exports (`--stream`)
 
-Streaming is off unless asked for, via `--stream` or `API_STREAMING=1`
-(`--no-streaming` overrides both). It matters for agents mainly on big exports:
-with `--stream`, a response bound for `> file` is written as it arrives instead
-of being held in memory first.
+Off unless asked for, via `--stream` or `API_STREAMING=1` (`--no-streaming`
+overrides both). With it, a response bound for `> file` is written as it
+arrives instead of being held in memory first:
 
 ```sh
 api --stream -sa export.api
 ```
 
-Two caveats when reading the results back:
+- A streamed `> file.json` holds the server's bytes verbatim, not pretty-printed.
+  Parse it rather than eyeballing it, or drop `--stream`.
+- A streaming response sends its status line before the body exists, so a `200`
+  can still carry an error inside the payload. Check the content.
+- `>> file`, `> clipboard`, and any non-2xx response buffer even with `--stream`.
 
-- A streamed `> file.json` is **not** pretty-printed — it holds the server's
-  bytes verbatim. Parse it rather than eyeballing it, or drop `--stream`.
-- A streaming response sends its status line before the body exists, so **a
-  `200` can still carry an error inside the payload**. Check the content, not
-  just the status line.
+## 5. Chaining
 
-`>> file` appends and `> clipboard` both need the whole body, so they buffer
-even with `--stream`; so does any non-2xx response, which keeps error pages out
-of outfiles.
+`GET /a && PUT /b {…}` runs the PUT only if the GET was truthy; `||` runs the
+next request only if the previous was falsy. Mixed chains evaluate left to right
+like a shell, so `GET /x && PUT /x {…} || POST /x {…}` is if-then-else.
 
-## 5. Includes
+```
+# Create only if missing
+GET /people/com.mi6.id=007 || PUT /people/com.mi6.id=007 { "name": "James Bond" }
+
+# Delete only if there is something to delete
+GET /people~where(givenName=Test)~count && DELETE /people~where(givenName=Test)
+```
+
+- Truthy: a 2xx whose body is not `false`, `null`, `0`, or `""`. `[]` and `{}`
+  are truthy, so condition on a `~count` or a single item, never on a list.
+- Falsy: those bodies, or a plain non-2xx such as 404. The rest of the chain is
+  skipped quietly and noted as `↳ skipped 1 request`.
+- Error: 401/403, 5xx, 408/429, or a timeout aborts the whole batch with exit 1.
+  `||` never catches an error.
+- `&&`/`||` inside a JSON string or body are not separators. Multi-line bodies
+  work in any segment, and a `> outfile` belongs to the segment it follows.
+
+The same truthiness rule drives `sleep while` and `assert` below.
+
+## 6. Includes
 
 A line that isn't a comment, isn't blank, and doesn't start with a method or `/`
 is treated as an **include**: the named file is loaded and its requests are
@@ -214,7 +228,7 @@ PATCH /people/com.heads.foo=123 { "name": "after seeds" }
 - Glob includes work: `shared/*.api` includes all matching files in sorted order.
 - Recursive includes are supported. Loops are detected and reported as errors.
 
-## 6. Directives: `sleep`, `sleep while`, `assert`, `url`
+## 7. Directives: `sleep`, `sleep while`, `assert`, `url`
 
 Besides requests and includes, a few control lines are recognised. `sleep while`
 and `assert` send a request whose answer is only judged, never printed as data.
@@ -289,13 +303,14 @@ url has localhost:5000
 url has test.app.heads.com
 ```
 
-## 7. Running
+## 8. Running
 
 ```sh
 api -a parent.api                     # from a file
 cat parent.api | api -a               # from stdin (the dash is implicit)
 api -a -                              # explicit stdin
 api -sa parent.api                    # silent batch mode (see below)
+api -spa parent.api                   # preview the requests, confirm before sending
 ```
 
 ### Credentials from disk (`--no-keychain`)
@@ -403,7 +418,7 @@ GET /people > out.json
 Use this when you only care that requests succeeded or want a tidy log of a
 seeding run.
 
-## 8. A complete example
+## 9. A complete example
 
 `workshop.api`:
 
@@ -433,7 +448,7 @@ GET /people~with(com.heads.*) > ~/workshop-snapshot.json
 
 Run it: `api -sa workshop.api`.
 
-## 9. Common pitfalls
+## 10. Common pitfalls
 
 - **Trailing comma in JSON** → server returns 500 with a parse error. JSON is strict; don't trail commas in objects/arrays.
 - **`>` inside a body** → the parser uses `rfind(" >")` from the end of the request, which can mis-detect outfile when bodies contain `>`. Avoid bare `>` in bodies, or escape it inside strings.
@@ -445,9 +460,9 @@ Run it: `api -sa workshop.api`.
 - **`sleep while` that never ends** → `[]` and `{}` are truthy, so `sleep while GET /people~where(x)` loops forever once the list is merely empty. Poll a `~count` (or a single scalar field) instead, so the answer can become `0`/`null`.
 - **`API_CREDENTIALS_FILE` without `--no-keychain`** → the variable is ignored and the keychain is read instead. A bad path or malformed credentials file fails the same silent way: no warning, just `Error: no base URL specified`.
 
-## 10. Tips for agents
+## 11. Tips for agents
 
-- **Always pipe GET responses to a file** (`> /tmp/something.json`) when you need to read them back. In `-sa` mode, response bodies aren't printed at all; without `> file`, the data is gone.
+- Write anything you need to read back to a file (`> /tmp/step.json`); see §4.
 - Keep one logical operation per request line; let the bracket accumulator handle multi-line bodies.
 - Use `@file`/`@glob` for large bodies instead of inlining huge JSON blobs.
 - For repeated boilerplate, factor it into a `shared/` directory and use includes.
