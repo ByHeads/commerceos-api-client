@@ -3959,6 +3959,10 @@ enum BulkStep {
     /// `assert [not] <request>` — run `request` once and abort the batch unless
     /// its outcome is truthy (falsy, when `negate`). Same truthiness as chains.
     Assert { negate: bool, request: String },
+    /// `confirm [message]` — pause and ask the user for confirmation before
+    /// continuing. If a message is provided, it's used as the prompt; otherwise
+    /// the default "Continue?" is used.
+    Confirm(Option<String>),
 }
 
 /// Outcome of a single request, deciding whether a `&&` chain continues.
@@ -4216,6 +4220,19 @@ fn parse_assert_step(rest: &str) -> Result<BulkStep, String> {
     Ok(BulkStep::Assert { negate, request })
 }
 
+/// Parse `confirm [message]`: ask the user for confirmation before continuing.
+/// If a message is provided, it's used as the prompt (with a `? [Y/n]` suffix if
+/// it doesn't already end with `?`); otherwise the default "Continue?" is used.
+fn parse_confirm_step(rest: &str) -> Result<BulkStep, String> {
+    let msg = rest.trim();
+    let message = if msg.is_empty() {
+        None
+    } else {
+        Some(msg.to_string())
+    };
+    Ok(BulkStep::Confirm(message))
+}
+
 /// The `[not] <request>` tail shared by `sleep while` and `assert`. The request
 /// must be a single-line request (implied GET allowed, inline body allowed),
 /// not a `&&`/`||` chain and not writing to an outfile — its response is only
@@ -4293,6 +4310,14 @@ fn format_sleep_while(interval: Duration, negate: bool, request: &str) -> String
         if negate { "not " } else { "" },
         shown
     )
+}
+
+/// The `confirm [message]` line as shown in previews and the `-sa` log.
+fn format_confirm(message: &Option<String>) -> String {
+    match message {
+        Some(msg) => format!("confirm {}", msg),
+        None => "confirm".to_string(),
+    }
 }
 
 /// Human-friendly elapsed time for the `sleep while` summary: `800ms`, `12s`, `1m40s`.
@@ -4429,6 +4454,12 @@ fn split_bulk_requests_inner(
                 if first_word.eq_ignore_ascii_case("assert") {
                     let rest = trimmed["assert".len()..].trim();
                     program.steps.push(parse_assert_step(rest)?);
+                    continue;
+                }
+                // `confirm [message]` — ask for user confirmation.
+                if first_word.eq_ignore_ascii_case("confirm") {
+                    let rest = trimmed["confirm".len()..].trim();
+                    program.steps.push(parse_confirm_step(rest)?);
                     continue;
                 }
                 // `url has`/`url is` — environment gate, collected globally.
@@ -4632,6 +4663,37 @@ fn push_output_block(state: &mut AppState, block: OutputBlock) {
     }
 }
 
+/// Ask the user a yes/no question and return true if they confirm (Y/yes/empty).
+/// Prompt is printed to stderr; answer read from /dev/tty (falling back to stdin)
+/// so it works when stdin is piped. On error (can't read), prints an abort message
+/// and returns false.
+fn ask_yes_no(prompt: &str) -> bool {
+    eprint!("{} ", prompt.bold());
+    let _ = io::stderr().flush();
+
+    // Read a single line of input, preferring /dev/tty so a piped stdin
+    // (e.g. `-a -`) does not consume the request data as the answer.
+    let mut answer = String::new();
+    let read_ok = match fs::File::open("/dev/tty") {
+        Ok(tty) => {
+            let mut reader = io::BufReader::new(tty);
+            reader.read_line(&mut answer).is_ok()
+        }
+        Err(_) => io::stdin().read_line(&mut answer).is_ok(),
+    };
+    if !read_ok {
+        // No way to ask — treat as decline to be safe.
+        eprintln!("aborted (could not read confirmation)");
+        return false;
+    }
+    let a = answer.trim().to_lowercase();
+    let proceed = a.is_empty() || a == "y" || a == "yes";
+    if !proceed {
+        eprintln!("aborted");
+    }
+    proceed
+}
+
 /// Show a preview of the request line(s) and ask the user to confirm before
 /// sending. Output and prompt go to stderr so piped stdout stays clean. Reads
 /// the answer from /dev/tty (falling back to stdin) so it works even when stdin
@@ -4683,30 +4745,7 @@ fn confirm_preview(lines: &[String], base_uri: &str) -> bool {
     for line in lines {
         eprintln!("  {}", line);
     }
-    eprint!("{} ", "Run? [Y/n]".bold());
-    let _ = io::stderr().flush();
-
-    // Read a single line of input, preferring /dev/tty so a piped stdin
-    // (e.g. `-a -`) does not consume the request data as the answer.
-    let mut answer = String::new();
-    let read_ok = match fs::File::open("/dev/tty") {
-        Ok(tty) => {
-            let mut reader = io::BufReader::new(tty);
-            reader.read_line(&mut answer).is_ok()
-        }
-        Err(_) => io::stdin().read_line(&mut answer).is_ok(),
-    };
-    if !read_ok {
-        // No way to ask — treat as decline to be safe.
-        eprintln!("aborted (could not read confirmation)");
-        return false;
-    }
-    let a = answer.trim().to_lowercase();
-    let proceed = a.is_empty() || a == "y" || a == "yes";
-    if !proceed {
-        eprintln!("aborted");
-    }
-    proceed
+    ask_yes_no("Run? [Y/n]")
 }
 
 fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std::path::Path>) {
@@ -4762,6 +4801,7 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
                     vec![format_sleep_while(*interval, *negate, request)]
                 }
                 BulkStep::Assert { negate, request } => vec![format_assert(*negate, request)],
+                BulkStep::Confirm(message) => vec![format_confirm(message)],
             })
             .collect();
         if !confirm_preview(&preview_lines, &config.base_uri) {
@@ -4797,6 +4837,11 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
             }
             BulkStep::Assert { negate, request } => {
                 if !run_assert(config, *negate, request) {
+                    return;
+                }
+            }
+            BulkStep::Confirm(message) => {
+                if !run_confirm(config, message) {
                     return;
                 }
             }
@@ -4872,6 +4917,29 @@ fn run_assert(config: &mut Config, negate: bool, request: &str) -> bool {
         }
         RequestOutcome::Aborted => false,
     }
+}
+
+/// Execute a `confirm [message]` step. Displays the confirm line in `-sa` mode
+/// and asks the user for confirmation. Returns true if they confirm (Y/yes/empty),
+/// false (exit 0 with `aborted` message) if they decline. On error (can't read),
+/// also returns false after printing an abort message.
+fn run_confirm(config: &Config, message: &Option<String>) -> bool {
+    let line = format_confirm(message);
+    if config.bulk_silent {
+        println!("{}", line);
+    }
+    let prompt = match message {
+        Some(msg) => {
+            // Add ? [Y/n] suffix if message doesn't already end with ?
+            if msg.ends_with('?') {
+                format!("{} [Y/n]", msg)
+            } else {
+                format!("{}? [Y/n]", msg)
+            }
+        }
+        None => "Continue? [Y/n]".to_string(),
+    };
+    ask_yes_no(&prompt)
 }
 
 /// Poll `request` every `interval` until it stops being truthy (falsy, when
@@ -12795,6 +12863,44 @@ mod tests {
         let long = format!("\"{}\"", "x".repeat(200));
         let shown = describe_check_response(200, &long);
         assert!(shown.ends_with('…') && shown.chars().count() == 81, "{shown}");
+    }
+
+    #[test]
+    fn parse_confirm_step_forms() {
+        // Empty message uses default.
+        assert_eq!(parse_confirm_step("").unwrap(), BulkStep::Confirm(None));
+        // Custom message is preserved.
+        assert_eq!(
+            parse_confirm_step("Move on to the next step").unwrap(),
+            BulkStep::Confirm(Some("Move on to the next step".to_string()))
+        );
+        // Extra whitespace is trimmed.
+        assert_eq!(
+            parse_confirm_step("  Ready?  ").unwrap(),
+            BulkStep::Confirm(Some("Ready?".to_string()))
+        );
+    }
+
+    #[test]
+    fn format_confirm_lines() {
+        assert_eq!(format_confirm(&None), "confirm");
+        assert_eq!(
+            format_confirm(&Some("Ready?".to_string())),
+            "confirm Ready?"
+        );
+        assert_eq!(
+            format_confirm(&Some("Move forward".to_string())),
+            "confirm Move forward"
+        );
+    }
+
+    #[test]
+    fn split_bulk_requests_recognises_confirm() {
+        let src = "confirm\nGET /a\nconfirm Ready?\n";
+        let prog = split_bulk_requests(src, None).unwrap();
+        assert_eq!(prog.steps.len(), 3);
+        assert_eq!(prog.steps[0], BulkStep::Confirm(None));
+        assert_eq!(prog.steps[2], BulkStep::Confirm(Some("Ready?".to_string())));
     }
 
     #[test]

@@ -161,6 +161,7 @@ GET /people~take(5) > /tmp/people.json
 | `sleep N` | pause (`2`, `500ms`, `1.5s`) |
 | `sleep [N] while [not] <request>` | poll every N seconds (default 5) until the answer flips |
 | `assert [not] <request>` | exit 1 unless the answer is truthy (falsy with `not`) |
+| `confirm [message]` | pause and ask for confirmation before continuing |
 | `url has <text>` / `url is <url>` | allowlist of base URLs; no match aborts before anything runs |
 
 `AGENTS.md` is the full reference for the file format.

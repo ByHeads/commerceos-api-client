@@ -228,10 +228,11 @@ PATCH /people/com.heads.foo=123 { "name": "after seeds" }
 - Glob includes work: `shared/*.api` includes all matching files in sorted order.
 - Recursive includes are supported. Loops are detected and reported as errors.
 
-## 7. Directives: `sleep`, `sleep while`, `assert`, `url`
+## 7. Directives: `sleep`, `sleep while`, `assert`, `confirm`, `url`
 
 Besides requests and includes, a few control lines are recognised. `sleep while`
 and `assert` send a request whose answer is only judged, never printed as data.
+`confirm` pauses and asks for user confirmation before continuing.
 
 ### `sleep N`
 
@@ -290,6 +291,27 @@ PUT /people [ … ]
 - Failure exits 1 before anything else runs, naming the reason — the status
   (`assertion failed: assert GET /companies/x (404 Not Found)`) or the falsy
   body (`(0)`, `(null)`). A 401/403, 5xx, or timeout also exits 1.
+
+### `confirm [message]`
+
+Pause and ask for user confirmation before continuing. Useful for manual approval
+gates in longer batch runs. If a message is provided, it becomes the prompt; if
+not, the default is "Continue?". The prompt defaults to `? [Y/n]` unless the
+message already ends with `?`.
+
+```
+PUT /release { "version": "1.0.0" }
+
+confirm Ready to deploy to production?
+
+POST /deploy { "go": true }
+```
+
+- Enter, `y`, or `yes` continues; anything else prints `aborted` and stops the
+  batch with exit 0 (the user declined, so it's not a failure).
+- In `-sa` mode the confirm line is echoed, then the prompt appears on stderr.
+- If no terminal is available and stdin can't be read, the batch aborts with
+  `aborted (could not read confirmation)` and exit 0, matching declined previews.
 
 ### `url has <text>` / `url is <url>`
 
