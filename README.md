@@ -174,6 +174,11 @@ one-shot mode, with tab completion for endpoints, operators, properties, and fil
 - **Typing a body promotes GET to PUT**; on an array endpoint the opening `[` is added for you.
 - **`ctrl+space` cycles** PUT → PATCH → POST → GET. Switching to GET stashes the body; switching back restores it.
 - **Enter on a body method without a body** opens a multi-line editor: `ctrl+d` sends, `esc` cancels.
+- **Batch-file syntax works at the prompt too.** A line that isn't a request is read as `.api`
+  syntax: `confirm Ready?` asks in the hint line, `sleep 5 while not /imports~count` polls,
+  `assert /companies/x` checks, and `seed.api` runs the file, includes and all. `esc` stops a
+  wait; a failed assert or a declined confirm stops the rest of the line. A mistyped request
+  says `not a request or .api file` instead of re-sending the last one.
 
 ### Copy and paste identifiers
 

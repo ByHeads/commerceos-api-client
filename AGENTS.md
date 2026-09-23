@@ -313,6 +313,17 @@ POST /deploy { "go": true }
 - If no terminal is available and stdin can't be read, the batch aborts with
   `aborted (could not read confirmation)` and exit 0, matching declined previews.
 
+### Directives at the interactive prompt
+
+Every line in this section, and an include, can also be typed at the interactive
+prompt. A line whose first word is neither a method nor a `/path` is parsed as
+`.api` syntax and run in the session: `confirm` asks in the hint line (`y`/enter
+or `n`/esc), `sleep` and `sleep while` show a spinner and stop on esc, `assert`
+logs the request and status but not the body, `url` checks the current
+connection, and `seed.api` runs the file with each request logged as if typed.
+A stopped program (failed assert, declined confirm, errored request, esc) leaves
+the session open. A mistyped request reports `not a request or .api file`.
+
 ### `url has <text>` / `url is <url>`
 
 Environment gate. Before anything runs, the configured base URL must match at

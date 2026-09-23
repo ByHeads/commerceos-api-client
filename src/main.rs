@@ -4612,16 +4612,29 @@ struct OutputBlock {
     head: String,
     /// The response body block, or empty — what ctrl+j erases.
     tail: String,
+    /// A directive log line (`sleep 2s`, `confirm Ready? y`) printed verbatim
+    /// in place of the request line. Not width-dependent.
+    raw_line: Option<String>,
 }
 
 impl OutputBlock {
+    /// A block for a directive line typed at the prompt: the line itself, then
+    /// one blank line so it doesn't run into the next block.
+    fn directive(line: String) -> Self {
+        OutputBlock {
+            raw_line: Some(line),
+            head: "\n".to_string(),
+            ..Default::default()
+        }
+    }
+
     /// The full block as printed: request line fitted to `width`, then the
     /// stored head and tail. Always ends with the newline that closes the
     /// request line, so blocks concatenate cleanly.
     fn render(&self, width: usize) -> String {
-        format!(
-            "{}\n{}{}",
-            format_request_log_line(
+        let line = match &self.raw_line {
+            Some(raw) => raw.clone(),
+            None => format_request_log_line(
                 &self.method,
                 &self.uri,
                 &self.body,
@@ -4629,9 +4642,8 @@ impl OutputBlock {
                 self.outfile_append,
                 width,
             ),
-            self.head,
-            self.tail,
-        )
+        };
+        format!("{}\n{}{}", line, self.head, self.tail)
     }
 
     fn has_body(&self) -> bool {
@@ -4661,6 +4673,43 @@ fn push_output_block(state: &mut AppState, block: OutputBlock) {
     if state.output_history.len() > OUTPUT_HISTORY_LIMIT {
         state.output_history.remove(0);
     }
+}
+
+/// Print an already-rendered block above the input area and redraw the area
+/// below it, all in raw mode so nothing flashes: clear the input block, print
+/// the output, lay down placeholder rows, then `render` the input block.
+fn print_output_and_rerender(
+    state: &mut AppState,
+    stdout: &mut io::Stdout,
+    display_output: &str,
+) -> io::Result<()> {
+    let clear_lines = 2 + state.prev_input_lines;
+    queue!(
+        stdout,
+        cursor::Hide,
+        cursor::MoveUp(clear_lines.min(state.height.saturating_sub(1))),
+        cursor::MoveToColumn(0),
+        Clear(ClearType::FromCursorDown)
+    )?;
+    // Raw mode needs \r\n line endings.
+    let raw_output = display_output.replace('\n', "\r\n");
+    queue!(stdout, Print(&raw_output))?;
+    let input_lines = visual_line_count(&state.input, state.width as usize);
+    for _ in 0..(2 + input_lines) {
+        queue!(stdout, Print("\r\n"))?;
+    }
+    state.prev_input_lines = input_lines;
+    // No flush here — render() flushes everything atomically.
+    render(stdout, state)
+}
+
+/// Log a directive line (`sleep 2s`, `confirm Ready? y`) to the output area,
+/// kept in history so a resize replays it.
+fn log_directive_line(state: &mut AppState, stdout: &mut io::Stdout, line: String) -> io::Result<()> {
+    let block = OutputBlock::directive(line);
+    let display_output = block.render(state.width as usize);
+    push_output_block(state, block);
+    print_output_and_rerender(state, stdout, &display_output)
 }
 
 /// Ask the user a yes/no question and return true if they confirm (Y/yes/empty).
@@ -4928,18 +4977,7 @@ fn run_confirm(config: &Config, message: &Option<String>) -> bool {
     if config.bulk_silent {
         println!("{}", line);
     }
-    let prompt = match message {
-        Some(msg) => {
-            // Add ? [Y/n] suffix if message doesn't already end with ?
-            if msg.ends_with('?') {
-                format!("{} [Y/n]", msg)
-            } else {
-                format!("{}? [Y/n]", msg)
-            }
-        }
-        None => "Continue? [Y/n]".to_string(),
-    };
-    ask_yes_no(&prompt)
+    ask_yes_no(&format!("{} [Y/n]", confirm_prompt_text(message)))
 }
 
 /// Poll `request` every `interval` until it stops being truthy (falsy, when
@@ -6438,41 +6476,52 @@ fn handle_key_event(
                 let input = state.input.trim().to_string();
                 let input = if input.is_empty() { "GET /".to_string() } else { input };
 
-                let segments = split_request_chain(&input);
-                let is_chain = segments.len() > 1;
-
-                parse_input(state, if is_chain { &segments[0].1 } else { &input });
-
-                // If method expects a body but none provided and no infile, enter body input mode.
-                // Never mid-chain: opening the multi-line editor between segments
-                // would strand the rest of the chain.
-                if !is_chain
-                    && state.body.is_empty()
-                    && state.config.outfile.is_empty()
-                    && ["POST", "PUT", "PATCH"].contains(&state.method.as_str())
-                {
-                    state.body_input_mode = true;
-                    state.body_input_buffer.clear();
-                    state.body_input_method = state.method.clone();
-                    state.body_input_uri = state.uri.clone();
-                    render(stdout, state)?;
-                } else {
-                    // History keeps the whole chain, so up-arrow returns what was typed.
+                if is_program_line(&input) {
+                    // A directive (`confirm`, `sleep`, `assert`, `url`) or an
+                    // included .api file — same syntax as a batch file. Without
+                    // this, an unknown first word left method and URI untouched
+                    // and silently re-sent the previous request.
                     state.history.push(input.clone());
                     append_history(&input);
                     state.history_idx = -1;
-                    state.prev_method = state.method.clone();
-                    state.prev_uri = state.uri.clone();
-                    state.prev_body = state.body.clone();
-                    state.prev_outfile = state.config.outfile.clone();
+                    run_program_line(state, stdout, &input)?;
+                } else {
+                    let segments = split_request_chain(&input);
+                    let is_chain = segments.len() > 1;
 
-                    if is_chain {
-                        // The per-segment restore keeps the full chain on the
-                        // input line throughout, so it can be re-sent or edited
-                        // without retyping — no post-hoc restore needed.
-                        execute_request_chain(state, stdout, &segments, &input)?;
+                    parse_input(state, if is_chain { &segments[0].1 } else { &input });
+
+                    // If method expects a body but none provided and no infile, enter body input mode.
+                    // Never mid-chain: opening the multi-line editor between segments
+                    // would strand the rest of the chain.
+                    if !is_chain
+                        && state.body.is_empty()
+                        && state.config.outfile.is_empty()
+                        && ["POST", "PUT", "PATCH"].contains(&state.method.as_str())
+                    {
+                        state.body_input_mode = true;
+                        state.body_input_buffer.clear();
+                        state.body_input_method = state.method.clone();
+                        state.body_input_uri = state.uri.clone();
+                        render(stdout, state)?;
                     } else {
-                        execute_request(state, stdout)?;
+                        // History keeps the whole chain, so up-arrow returns what was typed.
+                        state.history.push(input.clone());
+                        append_history(&input);
+                        state.history_idx = -1;
+                        state.prev_method = state.method.clone();
+                        state.prev_uri = state.uri.clone();
+                        state.prev_body = state.body.clone();
+                        state.prev_outfile = state.config.outfile.clone();
+
+                        if is_chain {
+                            // The per-segment restore keeps the full chain on the
+                            // input line throughout, so it can be re-sent or edited
+                            // without retyping — no post-hoc restore needed.
+                            execute_request_chain(state, stdout, &segments, &input)?;
+                        } else {
+                            execute_request(state, stdout)?;
+                        }
                     }
                 }
             }
@@ -7163,18 +7212,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
 
         // Update input with last command (chain-aware, outfile marker included)
         restore_input_after_send(state);
-
-        // Clear input area, print output, render new input (stay in raw mode)
-        let clear_lines = 2 + state.prev_input_lines;
-        queue!(stdout, cursor::Hide, cursor::MoveUp(clear_lines.min(state.height.saturating_sub(1))), cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
-        // Print output with \r\n line endings for raw mode
-        let raw_output = display_output.replace('\n', "\r\n");
-        queue!(stdout, Print(&raw_output))?;
-        let input_lines = visual_line_count(&state.input, state.width as usize);
-        for _ in 0..(2 + input_lines) { queue!(stdout, Print("\r\n"))?; }
-        state.prev_input_lines = input_lines;
-        // No flush here — render() will flush everything atomically
-        render(stdout, state)?;
+        print_output_and_rerender(state, stdout, &display_output)?;
         // The @file couldn't be read, so nothing was sent.
         return Ok(RequestOutcome::Errored);
     }
@@ -7369,6 +7407,14 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
         Some(Err(_)) | None => RequestOutcome::Errored,
     };
 
+    // A check (`assert`, `sleep while`) may need to say why it failed.
+    if state.config.check_only || state.config.quiet {
+        state.config.last_response = match &response_opt {
+            Some(Ok((status, body, _))) => Some((status.as_u16(), body.clone())),
+            _ => None,
+        };
+    }
+
     match response_opt {
         Some(Ok((status, body_text, delivery))) => {
             let elapsed = start.elapsed();
@@ -7505,6 +7551,20 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
         state.mapped_types = names;
     }
 
+    // A `sleep while` poll prints nothing unless it errored — then the block
+    // is the explanation of why the wait stopped. `assert` keeps the request
+    // and status lines but never the body: the answer is a verdict, not data.
+    if state.config.quiet && outcome != RequestOutcome::Errored {
+        restore_input_after_send(state);
+        // Clear any spinner left in the hint line.
+        render(stdout, state)?;
+        return Ok(outcome);
+    }
+    if state.config.check_only && block.has_body() {
+        block.strip_body();
+        block.head.push('\n');
+    }
+
     // Render once, then store the parts so a resize can re-fit the request line.
     let display_output = block.render(state.width as usize);
     push_output_block(state, block);
@@ -7512,27 +7572,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     // Update input with last command — or, mid-chain, keep the full chain on
     // the line so it doesn't flash the just-sent segment between requests.
     restore_input_after_send(state);
-
-    // Now clear input area, print output, and render new input - all at once
-    let clear_lines = 2 + state.prev_input_lines;
-    queue!(
-        stdout,
-        cursor::Hide,
-        cursor::MoveUp(clear_lines.min(state.height.saturating_sub(1))),
-        cursor::MoveToColumn(0),
-        Clear(ClearType::FromCursorDown)
-    )?;
-
-    // Print output with \r\n line endings (stay in raw mode to avoid flash)
-    let raw_output = display_output.replace('\n', "\r\n");
-    queue!(stdout, Print(&raw_output))?;
-
-    // Print placeholder lines and render input area
-    let input_lines = visual_line_count(&state.input, state.width as usize);
-    for _ in 0..(2 + input_lines) { queue!(stdout, Print("\r\n"))?; }
-    state.prev_input_lines = input_lines;
-    // No flush here — render() will flush everything atomically
-    render(stdout, state)?;
+    print_output_and_rerender(state, stdout, &display_output)?;
 
     Ok(outcome)
 }
@@ -7542,19 +7582,23 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
 ///
 /// Each segment prints its own block, so the log reads the same as if the
 /// requests had been sent one at a time.
+///
+/// Returns `false` when a segment errored or was aborted — the chain was cut
+/// short rather than answered — so a program running it can stop too.
 fn execute_request_chain(
     state: &mut AppState,
     stdout: &mut io::Stdout,
     segments: &[(ChainOp, String)],
     full_chain: &str,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     // Published so every per-segment input restore shows the whole chain.
     state.chain_input = Some(full_chain.to_string());
-    let result: io::Result<usize> = (|| {
+    let result: io::Result<(usize, bool)> = (|| {
         // Outcome of the last EXECUTED segment; skipped segments leave it
         // alone (that's what makes `a && b || c` an if-then-else).
         let mut prev: Option<RequestOutcome> = None;
         let mut skipped = 0usize;
+        let mut cut_short = false;
         for (i, (op, segment)) in segments.iter().enumerate() {
             if !chain_segment_should_run(prev, *op) {
                 skipped += 1;
@@ -7568,23 +7612,311 @@ fn execute_request_chain(
                 // NOT catch it. The reason is already on screen.
                 RequestOutcome::Errored | RequestOutcome::Aborted => {
                     skipped += segments.len() - i - 1;
+                    cut_short = true;
                     break;
                 }
             }
         }
-        Ok(skipped)
+        Ok((skipped, cut_short))
     })();
     // Cleared on every exit, including an Err from execute_request — a stale
     // Some() would make the NEXT single request restore the old chain.
     state.chain_input = None;
-    let skipped = result?;
+    let (skipped, cut_short) = result?;
     if skipped > 0 {
         let plural = if skipped == 1 { "request" } else { "requests" };
         state.status_msg = format!("↳ skipped {} {}", skipped, plural);
         state.status_msg_at = Some(Instant::now());
         render(stdout, state)?;
     }
+    Ok(!cut_short)
+}
+
+/// Whether a prompt line is `.api` program syntax rather than a request: its
+/// first word is neither an HTTP method nor a `/path`. Such a line goes
+/// through the bulk parser, so directives (`confirm`, `sleep`, `assert`,
+/// `url`) and includes work at the prompt exactly as they do in a file.
+fn is_program_line(input: &str) -> bool {
+    let methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+    match input.split_whitespace().next() {
+        None => false,
+        Some(first) => {
+            !first.starts_with('/') && !methods.contains(&first.to_uppercase().as_str())
+        }
+    }
+}
+
+/// What the hint line says when a program line can't be parsed. An unknown
+/// word falls through to include handling, whose "not found" would suggest
+/// the user meant a file; usually they mistyped a request.
+fn describe_program_error(input: &str, err: &str) -> String {
+    if err.starts_with("include not found:") {
+        let word = input.split_whitespace().next().unwrap_or(input);
+        format!("not a request or .api file: {}", word)
+    } else {
+        err.to_string()
+    }
+}
+
+/// Run a `.api` program typed at the prompt: parse the line with the bulk
+/// parser (so includes expand), gate on `url`, then execute every step in
+/// order with the interactive sender. The typed line stays on the input line
+/// throughout and is restored afterwards, like a `&&` chain. A failed assert,
+/// a declined confirm, an errored request, or esc stops the remaining steps.
+fn run_program_line(state: &mut AppState, stdout: &mut io::Stdout, line: &str) -> io::Result<()> {
+    let program = match split_bulk_requests(line, None) {
+        Ok(p) => p,
+        Err(e) => return show_program_status(state, stdout, describe_program_error(line, &e)),
+    };
+    if let Err(e) = evaluate_url_gate(&program.url_conditions, &state.config.base_uri) {
+        return show_program_status(state, stdout, e);
+    }
+
+    // Published so every per-request input restore shows the typed line.
+    state.chain_input = Some(line.to_string());
+    let result = run_program_steps(state, stdout, &program.steps);
+    state.chain_input = None;
+    state.config.quiet = false;
+    state.config.check_only = false;
+    result?;
+
+    state.input = line.to_string();
+    state.cursor_pos = char_len(&state.input);
+    state.completions.clear();
+    state.last_tab_input.clear();
+    render(stdout, state)
+}
+
+/// Put a one-line verdict in the hint line and redraw.
+fn show_program_status(state: &mut AppState, stdout: &mut io::Stdout, msg: String) -> io::Result<()> {
+    state.status_msg = msg;
+    state.status_msg_at = Some(Instant::now());
+    render(stdout, state)
+}
+
+/// The step loop of `run_program_line`. Returns as soon as a step says stop.
+fn run_program_steps(state: &mut AppState, stdout: &mut io::Stdout, steps: &[BulkStep]) -> io::Result<()> {
+    for step in steps {
+        let keep_going = match step {
+            BulkStep::Request(request) => {
+                parse_input(state, request);
+                matches!(
+                    execute_request(state, stdout)?,
+                    RequestOutcome::Truthy | RequestOutcome::Falsy
+                )
+            }
+            BulkStep::Chain(segments) => {
+                let full = state.chain_input.clone().unwrap_or_default();
+                let ok = execute_request_chain(state, stdout, segments, &full)?;
+                // The chain runner clears this on exit; the program still needs it.
+                state.chain_input = Some(full);
+                ok
+            }
+            BulkStep::Sleep(d) => {
+                log_directive_line(state, stdout, format!("sleep {}", format_duration(*d)).dimmed().to_string())?;
+                wait_interruptible(state, stdout, *d, "sleeping")?
+            }
+            BulkStep::SleepWhile { interval, negate, request } => {
+                run_sleep_while_interactive(state, stdout, *interval, *negate, request)?
+            }
+            BulkStep::Assert { negate, request } => {
+                run_assert_interactive(state, stdout, *negate, request)?
+            }
+            BulkStep::Confirm(message) => {
+                let prompt = confirm_prompt_text(message);
+                let yes = confirm_in_hint(stdout, &prompt)?;
+                let answer = if yes { "y" } else { "n" };
+                log_directive_line(
+                    state,
+                    stdout,
+                    format!("{} {}", format_confirm(message), answer.dimmed()),
+                )?;
+                if !yes {
+                    state.status_msg = "aborted".to_string();
+                    state.status_msg_at = Some(Instant::now());
+                    render(stdout, state)?;
+                }
+                yes
+            }
+        };
+        if !keep_going {
+            break;
+        }
+    }
     Ok(())
+}
+
+/// The question a `confirm [message]` asks, without the `[Y/n]` marker — the
+/// caller adds whichever marker fits its prompt style.
+fn confirm_prompt_text(message: &Option<String>) -> String {
+    match message {
+        Some(msg) if msg.ends_with('?') => msg.clone(),
+        Some(msg) => format!("{}?", msg),
+        None => "Continue?".to_string(),
+    }
+}
+
+/// `assert` at the prompt: the request and status lines are logged, the body
+/// isn't. A failure or an unanswerable request goes in the hint line and
+/// stops the program.
+fn run_assert_interactive(
+    state: &mut AppState,
+    stdout: &mut io::Stdout,
+    negate: bool,
+    request: &str,
+) -> io::Result<bool> {
+    let line = format_assert(negate, request);
+    parse_input(state, request);
+    state.config.check_only = true;
+    state.config.last_response = None;
+    let outcome = execute_request(state, stdout)?;
+    state.config.check_only = false;
+    let response = state.config.last_response.take();
+
+    let verdict = match outcome {
+        RequestOutcome::Truthy if !negate => return Ok(true),
+        RequestOutcome::Falsy if negate => return Ok(true),
+        RequestOutcome::Truthy | RequestOutcome::Falsy => {
+            let why = response
+                .map(|(status, body)| describe_check_response(status, &body))
+                .unwrap_or_default();
+            format!("assertion failed: {} ({})", line, why)
+        }
+        RequestOutcome::Errored => format!("{} — could not be evaluated", line),
+        RequestOutcome::Aborted => return Ok(false),
+    };
+    show_program_status(state, stdout, verdict)?;
+    Ok(false)
+}
+
+/// `sleep while` at the prompt: polls print nothing; one line when the wait
+/// starts and one when it ends, like `-sa`. Esc cancels; an errored poll
+/// prints its block (the reason) and stops.
+fn run_sleep_while_interactive(
+    state: &mut AppState,
+    stdout: &mut io::Stdout,
+    interval: Duration,
+    negate: bool,
+    request: &str,
+) -> io::Result<bool> {
+    log_directive_line(state, stdout, format_sleep_while(interval, negate, request).dimmed().to_string())?;
+    let start = Instant::now();
+    let mut checks = 0usize;
+    loop {
+        checks += 1;
+        parse_input(state, request);
+        state.config.quiet = true;
+        let outcome = execute_request(state, stdout)?;
+        state.config.quiet = false;
+        let done = match outcome {
+            RequestOutcome::Truthy => negate,
+            RequestOutcome::Falsy => !negate,
+            RequestOutcome::Errored => {
+                return show_program_status(
+                    state,
+                    stdout,
+                    format!("{} — could not be evaluated", format_sleep_while(interval, negate, request)),
+                )
+                .map(|_| false);
+            }
+            RequestOutcome::Aborted => return Ok(false),
+        };
+        if done {
+            break;
+        }
+        if !wait_interruptible(state, stdout, interval, "waiting")? {
+            return Ok(false);
+        }
+    }
+    let plural = if checks == 1 { "check" } else { "checks" };
+    log_directive_line(
+        state,
+        stdout,
+        format!("↳ waited {} ({} {})", format_elapsed(start.elapsed()), checks, plural)
+            .dimmed()
+            .to_string(),
+    )?;
+    Ok(true)
+}
+
+/// Sleep for `d` while staying responsive: esc or ctrl+c cancels (returns
+/// false, with a note in the hint line). After half a second a spinner with
+/// `label` takes over the hint line, like a slow request's.
+fn wait_interruptible(
+    state: &mut AppState,
+    stdout: &mut io::Stdout,
+    d: Duration,
+    label: &str,
+) -> io::Result<bool> {
+    let start = Instant::now();
+    let mut frame_idx = 0usize;
+    let mut showing_spinner = false;
+    while start.elapsed() < d {
+        let remaining = d - start.elapsed();
+        if event::poll(remaining.min(Duration::from_millis(80)))? {
+            if let Event::Key(key) = event::read()? {
+                let ctrl_c = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+                if ctrl_c || key.code == KeyCode::Esc {
+                    show_program_status(state, stdout, format!("{} cancelled", label))?;
+                    return Ok(false);
+                }
+            }
+        }
+        if start.elapsed() >= Duration::from_millis(500) {
+            showing_spinner = true;
+            let frame = SPINNER_FRAMES[frame_idx % SPINNER_FRAMES.len()];
+            execute!(
+                stdout,
+                cursor::MoveToColumn(0),
+                Clear(ClearType::CurrentLine),
+                Print(format!("  {}", format!("{} {} {}...", frame, label, format_duration(d)).dimmed()))
+            )?;
+            stdout.flush()?;
+            frame_idx += 1;
+        }
+    }
+    if showing_spinner {
+        render(stdout, state)?;
+    }
+    Ok(true)
+}
+
+/// Ask a yes/no question in the hint line (where the cursor rests after a
+/// render) and wait for a key. Enter and y accept; n and esc decline. The
+/// line is redrawn by whatever the caller prints next.
+fn confirm_in_hint(stdout: &mut io::Stdout, prompt: &str) -> io::Result<bool> {
+    execute!(
+        stdout,
+        cursor::MoveToColumn(0),
+        Clear(ClearType::CurrentLine),
+        Print(format!("  {} ", format!("{} (Y/n)", prompt).bold()))
+    )?;
+    stdout.flush()?;
+    loop {
+        if event::poll(Duration::from_millis(100))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind != event::KeyEventKind::Press {
+                    continue;
+                }
+                if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
+                    return Ok(false);
+                }
+                if let Some(answer) = yes_no_from_key(&key) {
+                    return Ok(answer);
+                }
+            }
+        }
+    }
+}
+
+/// The key → answer mapping shared by every raw-mode yes/no prompt: enter/y
+/// accept, n/esc decline, anything else is ignored.
+fn yes_no_from_key(key: &KeyEvent) -> Option<bool> {
+    match key.code {
+        KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => Some(true),
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(false),
+        _ => None,
+    }
 }
 
 /// Byte range `[start, end)` of the `&&` chain segment containing `byte_pos` —
@@ -8137,16 +8469,9 @@ fn confirm_inline(stdout: &mut io::Stdout, prompt: &str) -> io::Result<bool> {
                     terminal::disable_raw_mode()?;
                     std::process::exit(0);
                 }
-                match key.code {
-                    KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
-                        execute!(stdout, Print("y\r\n"))?;
-                        return Ok(true);
-                    }
-                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                        execute!(stdout, Print("n\r\n"))?;
-                        return Ok(false);
-                    }
-                    _ => {}
+                if let Some(answer) = yes_no_from_key(&key) {
+                    execute!(stdout, Print(if answer { "y\r\n" } else { "n\r\n" }))?;
+                    return Ok(answer);
                 }
             }
         }
@@ -12895,6 +13220,57 @@ mod tests {
     }
 
     #[test]
+    fn is_program_line_only_for_non_request_first_words() {
+        // Requests, implied GETs, and chains starting with one are not programs.
+        assert!(!is_program_line("GET /people"));
+        assert!(!is_program_line("get /people"));
+        assert!(!is_program_line("/people~count"));
+        assert!(!is_program_line("PUT /people {\"a\":1} && GET /people"));
+        assert!(!is_program_line(""));
+        // Directives and includes are.
+        assert!(is_program_line("confirm"));
+        assert!(is_program_line("confirm Move on?"));
+        assert!(is_program_line("sleep 2"));
+        assert!(is_program_line("assert /companies/x"));
+        assert!(is_program_line("url has localhost"));
+        assert!(is_program_line("seed.api"));
+        // A typo'd request is a program too — it must reach the parser and be
+        // reported, not silently re-send the previous request.
+        assert!(is_program_line("peple"));
+    }
+
+    #[test]
+    fn describe_program_error_names_the_typo() {
+        assert_eq!(
+            describe_program_error("peple", "include not found: peple"),
+            "not a request or .api file: peple"
+        );
+        assert_eq!(
+            describe_program_error("sleep abc", "invalid sleep duration: `abc`"),
+            "invalid sleep duration: `abc`"
+        );
+        // The bulk parser really does route an unknown word to include handling.
+        let err = split_bulk_requests("peple", None).unwrap_err();
+        assert!(err.starts_with("include not found:"), "{err}");
+    }
+
+    #[test]
+    fn confirm_prompt_text_adds_a_question_mark_once() {
+        assert_eq!(confirm_prompt_text(&None), "Continue?");
+        assert_eq!(confirm_prompt_text(&Some("Ready?".to_string())), "Ready?");
+        assert_eq!(confirm_prompt_text(&Some("Move on".to_string())), "Move on?");
+    }
+
+    #[test]
+    fn directive_output_block_renders_verbatim_with_a_blank_line() {
+        let block = OutputBlock::directive("sleep 2s".to_string());
+        assert_eq!(block.render(80), "sleep 2s\n\n");
+        assert!(!block.has_body());
+        // Width is irrelevant to a directive line.
+        assert_eq!(block.render(10), "sleep 2s\n\n");
+    }
+
+    #[test]
     fn split_bulk_requests_recognises_confirm() {
         let src = "confirm\nGET /a\nconfirm Ready?\n";
         let prog = split_bulk_requests(src, None).unwrap();
@@ -14018,6 +14394,7 @@ mod tests {
             outfile_append: false,
             head: "HTTP/1.1 200 OK 0.08s\n".to_string(),
             tail: "\n{\n  \"ok\": true\n}\n\n".to_string(),
+            raw_line: None,
         }
     }
 
@@ -14099,6 +14476,7 @@ mod tests {
             outfile_append: false,
             head: "HTTP/1.1 200 OK 0.08s\n> out.json\n\n".to_string(),
             tail: String::new(),
+            raw_line: None,
         };
 
         let rendered = block.render(80);
