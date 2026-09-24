@@ -313,16 +313,30 @@ POST /deploy { "go": true }
 - If no terminal is available and stdin can't be read, the batch aborts with
   `aborted (could not read confirmation)` and exit 0, matching declined previews.
 
-### Directives at the interactive prompt
+### The same syntax at the prompt and on the command line
 
-Every line in this section, and an include, can also be typed at the interactive
-prompt. A line whose first word is neither a method nor a `/path` is parsed as
-`.api` syntax and run in the session: `confirm` asks in the hint line (`y`/enter
-or `n`/esc), `sleep` and `sleep while` show a spinner and stop on esc, `assert`
-logs the request and status but not the body, `url` checks the current
-connection, and `seed.api` runs the file with each request logged as if typed.
-A stopped program (failed assert, declined confirm, errored request, esc) leaves
-the session open. A mistyped request reports `not a request or .api file`.
+Every line in this section, a chain, and an include can also be typed at the
+interactive prompt or passed as one-shot arguments. The three entry points read
+the same grammar.
+
+**Interactive prompt.** A line whose first word is neither a method nor a
+`/path` is parsed as `.api` syntax and run in the session: `confirm` asks in the
+hint line (`y`/enter or `n`/esc), `sleep` and `sleep while` show a spinner and
+stop on esc, `assert` logs the request and status but not the body, `url` checks
+the current connection, and `seed.api` runs the file with each request logged as
+if typed. A stopped program (failed assert, declined confirm, errored request,
+esc) leaves the session open.
+
+**One-shot arguments.** The positional arguments are joined into one line. A
+directive, an include, a `&&`/`||` chain, or a whole line in a single quoted
+argument runs through the batch runner exactly like a one-line `-a` file, so
+`api assert /companies/x` exits 1 on failure and `api seed.api` is `api -a
+seed.api`. Quote the `&&` or the whole line so the shell doesn't take it. A plain
+`METHOD URI [BODY]` is sent as before.
+
+In both places a mistyped request reports `not a request or .api file`, where
+it used to be sent as a GET to a nonsense path or silently re-send the previous
+request.
 
 ### `url has <text>` / `url is <url>`
 

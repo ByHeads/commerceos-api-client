@@ -963,6 +963,61 @@ fn assert_not_inverts_and_reports_the_falsy_body() {
     assert_eq!(server.join().unwrap().len(), 3);
 }
 
+// One-shot arguments accept the same syntax as a .api line: directives,
+// chains, and a whole line in one argument all go through the batch runner.
+
+#[test]
+fn one_shot_chain_runs_both_segments_split_or_quoted() {
+    let (port, server) = flipping_server(vec!["1"]);
+    // Split by the shell into separate arguments…
+    api_against_port(port).args(["-s", "GET", "/a", "&&", "GET", "/b"]).assert().success();
+    // …or quoted as one line.
+    api_against_port(port).args(["-s", "GET /c && GET /d"]).assert().success();
+    let seen = server.join().unwrap();
+    let paths: Vec<&str> = seen.iter().map(|r| r.split_whitespace().nth(1).unwrap_or("")).collect();
+    assert_eq!(paths, ["/api/v1/a", "/api/v1/b", "/api/v1/c", "/api/v1/d"], "{seen:?}");
+}
+
+#[test]
+fn one_shot_assert_exits_one_on_failure_and_zero_on_success() {
+    let (port, server) = flipping_server(vec!["213", "213"]);
+    api_against_port(port).args(["assert", "/people~count"]).assert().success();
+    let assert = api_against_port(port).args(["assert", "not", "/people~count"]).assert().failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(stderr.contains("assertion failed: assert not GET /people~count (213)"), "{stderr}");
+    assert_eq!(server.join().unwrap().len(), 2);
+}
+
+#[test]
+fn one_shot_unknown_word_is_an_error_not_a_request() {
+    // Before: `api peple` sent nothing and opened the TUI, and `api sleep 2`
+    // sent GET /2. Both are now reported without touching the server.
+    let (port, server) = flipping_server(vec!["{}"]);
+    let assert = api_against_port(port).arg("peple").assert().failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(stderr.contains("not a request or .api file: peple"), "{stderr}");
+    let assert = api_against_port(port).args(["sleep", "abc"]).assert().failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(stderr.contains("invalid sleep duration"), "{stderr}");
+    // Unblock the server's accept loop with one real request, then check
+    // that it was the only one.
+    api_against_port(port).args(["-s", "GET", "/only"]).assert().success();
+    let seen = server.join().unwrap();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+}
+
+#[test]
+fn one_shot_runs_an_api_file_named_as_the_argument() {
+    let (port, server) = flipping_server(vec!["{}"]);
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("seed.api"), "GET /from-file\n").unwrap();
+    // Relative to the working directory, like an include. An absolute path
+    // starts with `/` and is a URI, in a file and on the command line alike.
+    api_against_port(port).current_dir(dir.path()).arg("seed.api").assert().success();
+    let seen = server.join().unwrap();
+    assert!(seen.iter().any(|r| r.contains("GET /api/v1/from-file")), "{seen:?}");
+}
+
 #[test]
 fn sleep_while_aborts_on_error_status() {
     require_local_cos();

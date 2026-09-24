@@ -62,6 +62,19 @@ api PATCH /people/123                         # terminal stdin: prompts for the 
 
 The URI may omit its leading slash and the `/api/v1` prefix, so a path copied from a browser or a log works as-is.
 
+The arguments are read as one `.api` line, so everything a batch file accepts works here too:
+
+```sh
+api "GET /people/123 || PUT /people/123 {\"name\":\"Joe\"}"   # chain, quoted whole
+api GET /people/123 "||" PUT /people/123 '{"name":"Joe"}'    # or with the separator quoted
+api assert /companies/com.heads.seedID=ours                  # exit 1 unless truthy
+api sleep 5 while not /imports~count                         # poll until it flips
+api seed.api                                                 # run a file, same as -a seed.api
+```
+
+A first word that is neither a method nor a path is an error (`not a request or .api file`),
+not a request to a nonsense path.
+
 ### Bodies
 
 - `@file` reads the body from a file. Content type follows the extension (`.json`, `.csv`, `.ndjson`).
@@ -107,7 +120,8 @@ GET /people/123 || PUT /people/123 { "name": "Joe" }                       # cre
 GET /people~where(givenName=X)~count && DELETE /people~where(givenName=X)  # delete only if any
 ```
 
-One-shot arguments are not chained; pipe the line into `api -a` instead.
+One-shot arguments chain too, as long as the shell doesn't eat the separator: quote the whole
+line or the `&&` itself (see [One-shot requests](#one-shot-requests)).
 
 ### Streaming
 

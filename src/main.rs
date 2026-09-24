@@ -133,7 +133,8 @@ struct Args {
     #[arg(short = 'v', long = "version")]
     version: bool,
 
-    /// HTTP method (GET, POST, PUT, PATCH, DELETE)
+    /// HTTP method (GET, POST, PUT, PATCH, DELETE), or a whole .api line
+    /// (a directive, a && chain, or a file to run)
     #[arg(value_name = "METHOD")]
     method: Option<String>,
 
@@ -141,9 +142,9 @@ struct Args {
     #[arg(value_name = "URI")]
     uri: Option<String>,
 
-    /// Request body (JSON)
-    #[arg(value_name = "BODY")]
-    body: Option<String>,
+    /// Request body (JSON); further words are joined into the .api line
+    #[arg(value_name = "BODY", num_args = 0..)]
+    body: Vec<String>,
 
     /// Base URI
     #[arg(short = 'b', long = "base-uri")]
@@ -2775,8 +2776,13 @@ fn main() {
         }
     }
 
+    // A directive, chain, include, or whole line in one argument runs through
+    // the batch runner — same syntax as a `.api` file and the interactive prompt.
+    let program_line = one_shot_program_line(&args.method, &args.uri, &args.body);
+
     // Parse positional args like bash client
-    let (method, uri, mut body) = parse_positional_args(args.method, args.uri, args.body);
+    let body_arg = if args.body.is_empty() { None } else { Some(args.body.join(" ")) };
+    let (method, uri, mut body) = parse_positional_args(args.method, args.uri, body_arg);
 
     // `-t` used to take a bearer token and now means --stream, so an old
     // invocation leaves the token sitting in the method slot. Say so rather
@@ -2790,7 +2796,7 @@ fn main() {
     }
 
     // Read from stdin if available and no body provided (and not bulk mode)
-    if body.is_empty() && args.all.is_none() && !atty::is(Stream::Stdin) {
+    if body.is_empty() && args.all.is_none() && program_line.is_none() && !atty::is(Stream::Stdin) {
         let mut stdin_content = String::new();
         if io::stdin().read_to_string(&mut stdin_content).is_ok() {
             body = stdin_content.trim().to_string();
@@ -2799,6 +2805,7 @@ fn main() {
 
     // If method expects a body but none provided, read interactively from stdin
     if body.is_empty()
+        && program_line.is_none()
         && atty::is(Stream::Stdin)
         && ["POST", "PUT", "PATCH"].contains(&method.as_str())
         && !uri.is_empty()
@@ -3121,6 +3128,32 @@ fn main() {
         return;
     }
 
+    // One-shot .api line: `api assert /x`, `api "GET /a && PUT /b {…}"`,
+    // `api seed.api`. Runs like `-a` on a one-line file, so a failed assert
+    // exits 1 and a chain chains. Includes resolve against the working
+    // directory.
+    if let Some(line) = program_line {
+        if let Some(selector) = &op_selector {
+            match get_1password_credentials(selector) {
+                Ok((base_uri, api_key)) => {
+                    config.base_uri = base_uri;
+                    config.api_key = api_key;
+                }
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        // A mistyped request would otherwise be reported as a missing include.
+        if let Err(e) = split_bulk_requests(&line, None) {
+            eprintln!("error: {}", describe_program_error(&line, &e));
+            std::process::exit(1);
+        }
+        run_bulk_from_str(&mut config, &line, None);
+        return;
+    }
+
     // Non-interactive mode if URI provided
     if !uri.is_empty() {
         // Non-interactive still blocks on 1Password (needs creds before request)
@@ -3166,6 +3199,33 @@ fn looks_like_bearer_token(method: &str) -> bool {
         && method
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+}
+
+/// The positional arguments as one `.api` line, when they should be run by the
+/// batch runner rather than sent as a single request: a directive or include
+/// (`api assert /x`, `api seed.api`), a `&&`/`||` chain (`api GET /a "&&" PUT
+/// /b`), or a whole line in one argument (`api "GET /about"`). A plain
+/// `METHOD URI [BODY]` returns `None` and takes the one-shot path unchanged.
+///
+/// Rejoining with single spaces loses the shell's original spacing, which
+/// matters only inside a body — and a body that cares is a quoted argument
+/// anyway, which survives verbatim.
+fn one_shot_program_line(method: &Option<String>, uri: &Option<String>, body: &[String]) -> Option<String> {
+    let first = method.as_deref()?.trim();
+    if first.is_empty() {
+        return None;
+    }
+    let line: Vec<&str> = std::iter::once(first)
+        .chain(uri.as_deref())
+        .chain(body.iter().map(String::as_str))
+        .collect();
+    let line = line.join(" ");
+    let whole_line_in_first_arg = first.contains(char::is_whitespace);
+    if is_program_line(&line) || whole_line_in_first_arg || split_request_chain(&line).len() > 1 {
+        Some(line)
+    } else {
+        None
+    }
 }
 
 fn parse_positional_args(
@@ -13237,6 +13297,47 @@ mod tests {
         // A typo'd request is a program too — it must reach the parser and be
         // reported, not silently re-send the previous request.
         assert!(is_program_line("peple"));
+    }
+
+    #[test]
+    fn one_shot_program_line_routes_only_what_the_one_shot_path_cannot_send() {
+        let s = |v: &str| Some(v.to_string());
+        let words = |v: &[&str]| v.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+
+        // Plain requests keep the one-shot path.
+        assert_eq!(one_shot_program_line(&s("GET"), &s("/about"), &[]), None);
+        assert_eq!(one_shot_program_line(&s("/about"), &None, &[]), None);
+        assert_eq!(one_shot_program_line(&s("PUT"), &s("/p"), &words(&["{\"a\":1}"])), None);
+        assert_eq!(one_shot_program_line(&s("GET"), &s("/about > /tmp/x.json"), &[]), None);
+        // No positionals at all → interactive, not a program.
+        assert_eq!(one_shot_program_line(&None, &None, &[]), None);
+        assert_eq!(one_shot_program_line(&s(""), &None, &[]), None);
+
+        // Directives, includes, and typos.
+        assert_eq!(one_shot_program_line(&s("assert"), &s("/x"), &[]), s("assert /x"));
+        assert_eq!(one_shot_program_line(&s("confirm"), &None, &[]), s("confirm"));
+        assert_eq!(
+            one_shot_program_line(&s("confirm"), &s("Move"), &words(&["on"])),
+            s("confirm Move on")
+        );
+        assert_eq!(one_shot_program_line(&s("seed.api"), &None, &[]), s("seed.api"));
+        assert_eq!(one_shot_program_line(&s("peple"), &None, &[]), s("peple"));
+
+        // Chains, split by the shell or quoted whole.
+        assert_eq!(
+            one_shot_program_line(&s("GET"), &s("/a"), &words(&["&&", "GET", "/b"])),
+            s("GET /a && GET /b")
+        );
+        assert_eq!(one_shot_program_line(&s("GET"), &s("/a && GET /b"), &[]), s("GET /a && GET /b"));
+        assert_eq!(one_shot_program_line(&s("GET /a && GET /b"), &None, &[]), s("GET /a && GET /b"));
+
+        // A whole request in one argument used to fall into interactive mode.
+        assert_eq!(one_shot_program_line(&s("GET /about"), &None, &[]), s("GET /about"));
+        // A `&&` inside a body is not a chain.
+        assert_eq!(
+            one_shot_program_line(&s("PUT"), &s("/p"), &words(&["{\"q\":\"a && b\"}"])),
+            None
+        );
     }
 
     #[test]
