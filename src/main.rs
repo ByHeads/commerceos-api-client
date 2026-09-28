@@ -5,6 +5,7 @@ use std::fs;
 use std::io::{self, BufRead, Read as IoRead, Write};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -3810,6 +3811,266 @@ fn file_len(path: &str) -> u64 {
     fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
+/// `TransferProgress::total` when the response carries no length.
+const TOTAL_UNKNOWN: u64 = u64::MAX;
+
+/// How long a request runs before the progress line appears, so a fast one
+/// never flickers.
+const PROGRESS_DELAY: Duration = Duration::from_millis(500);
+
+/// How often the progress line is redrawn.
+const PROGRESS_TICK: Duration = Duration::from_millis(80);
+
+/// Where an in-flight request stands. Written by the thread doing the I/O,
+/// read by the one drawing the progress line.
+struct TransferProgress {
+    /// 0 until the response headers arrive.
+    status: AtomicU16,
+    received: AtomicU64,
+    total: AtomicU64,
+}
+
+/// One consistent reading of a `TransferProgress`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ProgressSnapshot {
+    /// `None` while still waiting for the response headers.
+    status: Option<u16>,
+    received: u64,
+    /// `None` when the server sent no length, which is every chunked response.
+    total: Option<u64>,
+}
+
+impl TransferProgress {
+    fn new() -> Arc<Self> {
+        Arc::new(TransferProgress {
+            status: AtomicU16::new(0),
+            received: AtomicU64::new(0),
+            total: AtomicU64::new(TOTAL_UNKNOWN),
+        })
+    }
+
+    fn headers_arrived(&self, resp: &reqwest::blocking::Response) {
+        self.total
+            .store(resp.content_length().unwrap_or(TOTAL_UNKNOWN), Ordering::Relaxed);
+        self.status.store(resp.status().as_u16(), Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> ProgressSnapshot {
+        let status = self.status.load(Ordering::Relaxed);
+        let total = self.total.load(Ordering::Relaxed);
+        ProgressSnapshot {
+            status: (status != 0).then_some(status),
+            received: self.received.load(Ordering::Relaxed),
+            total: (total != TOTAL_UNKNOWN).then_some(total),
+        }
+    }
+}
+
+/// The progress line without its spinner: `waiting for response... 4s`, then
+/// `200 OK, received 12.4 MB of 47.1 MB (26%)`. `show_status` is off where the
+/// status line is already on screen above.
+fn progress_text(snapshot: &ProgressSnapshot, elapsed: Duration, show_status: bool) -> String {
+    let Some(status) = snapshot.status else {
+        return if elapsed.as_secs() == 0 {
+            "waiting for response...".to_string()
+        } else {
+            format!("waiting for response... {}", format_elapsed(elapsed))
+        };
+    };
+
+    let mut text = String::new();
+    if show_status {
+        let reason = reqwest::StatusCode::from_u16(status)
+            .ok()
+            .and_then(|s| s.canonical_reason())
+            .unwrap_or("");
+        text.push_str(format!("{} {}", status, reason).trim_end());
+        text.push_str(", ");
+    }
+    text.push_str(&format!("received {}", format_byte_size(snapshot.received)));
+    if let Some(total) = snapshot.total.filter(|t| *t > 0) {
+        let percent = snapshot.received.min(total) as u128 * 100 / total as u128;
+        text.push_str(&format!(" of {} ({}%)", format_byte_size(total), percent));
+    }
+    text
+}
+
+/// Counts the bytes read through it into a `TransferProgress`.
+struct CountingReader<'a, R> {
+    inner: R,
+    progress: &'a TransferProgress,
+}
+
+impl<'a, R: IoRead> CountingReader<'a, R> {
+    fn new(inner: R, progress: &'a TransferProgress) -> Self {
+        CountingReader { inner, progress }
+    }
+}
+
+impl<R: IoRead> IoRead for CountingReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.progress.received.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
+/// The `charset` parameter of a `Content-Type` value, if it names one.
+fn charset_of(content_type: &str) -> Option<&str> {
+    content_type.split(';').skip(1).find_map(|param| {
+        let (name, value) = param.split_once('=')?;
+        name.trim()
+            .eq_ignore_ascii_case("charset")
+            .then(|| value.trim().trim_matches('"'))
+    })
+}
+
+/// Decode a body as reqwest's `text()` would: the declared charset, UTF-8
+/// when there is none, a leading byte-order mark dropped.
+fn decode_body(bytes: &[u8], content_type: Option<&str>) -> String {
+    let encoding = content_type
+        .and_then(charset_of)
+        .and_then(|label| encoding_rs::Encoding::for_label(label.as_bytes()))
+        .unwrap_or(encoding_rs::UTF_8);
+    let (text, _, _) = encoding.decode(bytes);
+    text.into_owned()
+}
+
+/// Read a whole response body, counting it into `progress` as it arrives.
+fn read_body_text(resp: reqwest::blocking::Response, progress: &TransferProgress) -> io::Result<String> {
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let mut bytes = Vec::new();
+    CountingReader::new(resp, progress).read_to_end(&mut bytes)?;
+    Ok(decode_body(&bytes, content_type.as_deref()))
+}
+
+/// Whether a failed body read was the client's own timeout, which reqwest
+/// hands to `Read` wrapped in an `io::Error`.
+fn io_error_is_timeout(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::TimedOut
+        || e.get_ref()
+            .and_then(|inner| inner.downcast_ref::<reqwest::Error>())
+            .map(|inner| inner.is_timeout())
+            .unwrap_or(false)
+}
+
+/// Why a request produced no response to show.
+struct RequestFailure {
+    timed_out: bool,
+}
+
+impl From<reqwest::Error> for RequestFailure {
+    fn from(e: reqwest::Error) -> Self {
+        RequestFailure { timed_out: e.is_timeout() }
+    }
+}
+
+impl From<io::Error> for RequestFailure {
+    fn from(e: io::Error) -> Self {
+        RequestFailure { timed_out: io_error_is_timeout(&e) }
+    }
+}
+
+/// Draws the progress line on stderr from a side thread while the caller
+/// blocks on the request. The line erases itself, so nothing of it is left in
+/// the scrollback.
+struct ProgressTicker {
+    shared: Arc<TickerShared>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+struct TickerShared {
+    progress: Arc<TransferProgress>,
+    started: Instant,
+    stopped: AtomicBool,
+    /// Whether the line is on screen. Held while stderr is drawn or erased.
+    drawn: std::sync::Mutex<bool>,
+}
+
+fn erase_progress_line() {
+    let mut stderr = io::stderr();
+    let _ = execute!(stderr, cursor::MoveToColumn(0), Clear(ClearType::CurrentLine));
+}
+
+impl ProgressTicker {
+    /// A disabled ticker draws nothing and costs no thread.
+    fn start(progress: Arc<TransferProgress>, enabled: bool) -> Self {
+        let shared = Arc::new(TickerShared {
+            progress,
+            started: Instant::now(),
+            stopped: AtomicBool::new(false),
+            drawn: std::sync::Mutex::new(false),
+        });
+        let handle = enabled.then(|| {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || {
+                let mut frame = 0;
+                loop {
+                    thread::park_timeout(PROGRESS_TICK);
+                    if shared.stopped.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if shared.started.elapsed() < PROGRESS_DELAY {
+                        continue;
+                    }
+                    let mut drawn = shared.drawn.lock().unwrap();
+                    if shared.stopped.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let line = format!(
+                        "{} {}",
+                        SPINNER_FRAMES[frame % SPINNER_FRAMES.len()],
+                        progress_text(&shared.progress.snapshot(), shared.started.elapsed(), false)
+                    );
+                    let mut stderr = io::stderr();
+                    let _ = execute!(
+                        stderr,
+                        cursor::MoveToColumn(0),
+                        Clear(ClearType::CurrentLine),
+                        Print(line.dimmed())
+                    );
+                    *drawn = true;
+                    frame += 1;
+                }
+            })
+        });
+        ProgressTicker { shared, handle }
+    }
+
+    /// Print something of the caller's own with the progress line out of the
+    /// way. The next tick draws it again underneath.
+    fn interrupt(&self, print: impl FnOnce()) {
+        let mut drawn = self.shared.drawn.lock().unwrap();
+        if *drawn {
+            erase_progress_line();
+            *drawn = false;
+        }
+        print();
+    }
+
+    fn stop(&mut self) {
+        let Some(handle) = self.handle.take() else { return };
+        self.shared.stopped.store(true, Ordering::Relaxed);
+        handle.thread().unpark();
+        let _ = handle.join();
+        let mut drawn = self.shared.drawn.lock().unwrap();
+        if *drawn {
+            erase_progress_line();
+            *drawn = false;
+        }
+    }
+}
+
+impl Drop for ProgressTicker {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// What a streamed copy left behind, since the body itself was never held.
 struct StreamedBody {
     /// The leading `CLASSIFY_PREFIX_BYTES` of the body.
@@ -5357,10 +5618,18 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
 
     let start = Instant::now();
 
+    // Drawn on stderr, so it needs a terminal there; a poll prints nothing at all.
+    let progress = TransferProgress::new();
+    let mut ticker = ProgressTicker::start(
+        Arc::clone(&progress),
+        atty::is(Stream::Stderr) && !config.silent && !config.quiet,
+    );
+
     match request.send() {
         Ok(resp) => {
             let status = resp.status();
             let elapsed = start.elapsed();
+            progress.headers_arrived(&resp);
 
             // `> clipboard` is a special outfile target — route to system clipboard.
             let is_clipboard = display_outfile
@@ -5389,31 +5658,40 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
             if !config.silent && (!config.quiet || status_is_error(status.as_u16())) {
                 let status_str = format_status(status, config.expect_falsy);
 
-                if config.bulk_silent {
-                    // Bulk silent mode: print compact status to stdout with box-draw prefix
-                    println!(
-                        "{}HTTP/1.1 {} {}",
-                        "└─".dimmed(),
-                        status_str,
-                        format!("{:.2}s", elapsed.as_secs_f64()).dimmed()
-                    );
-                } else {
-                    eprintln!(
-                        "HTTP/1.1 {} {}",
-                        status_str,
-                        format!("{:.2}s", elapsed.as_secs_f64()).dimmed()
-                    );
-                    // The body follows straight under the status line; the
-                    // "> outfile" line, when there is one, takes its place.
-                }
+                ticker.interrupt(|| {
+                    if config.bulk_silent {
+                        // Bulk silent mode: print compact status to stdout with box-draw prefix
+                        println!(
+                            "{}HTTP/1.1 {} {}",
+                            "└─".dimmed(),
+                            status_str,
+                            format!("{:.2}s", elapsed.as_secs_f64()).dimmed()
+                        );
+                    } else {
+                        eprintln!(
+                            "HTTP/1.1 {} {}",
+                            status_str,
+                            format!("{:.2}s", elapsed.as_secs_f64()).dimmed()
+                        );
+                        // The body follows straight under the status line; the
+                        // "> outfile" line, when there is one, takes its place.
+                    }
+                });
             }
 
             if stream_body {
+                // A body printed live to the terminal would fight the progress
+                // line for the same screen.
+                if outfile.is_none() && !config.bulk_silent && is_tty {
+                    ticker.stop();
+                }
+                let resp = CountingReader::new(resp, &progress);
                 let streamed = if let Some(ref file_path) = outfile {
                     match fs::File::create(file_path) {
                         Ok(file) => {
                             let mut writer = io::BufWriter::new(file);
                             let res = stream_to_sink(resp, &mut writer);
+                            ticker.stop();
                             if let (Ok(body), false, false) = (&res, config.silent, config.bulk_silent) {
                                 // Match the buffered path: status line, then `> outfile`.
                                 let display = display_outfile.as_deref().unwrap_or(file_path);
@@ -5431,6 +5709,7 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                     let stdout = io::stdout();
                     let mut lock = stdout.lock();
                     let res = stream_to_sink(resp, &mut lock);
+                    ticker.stop();
                     // Match the buffered path's trailing newline (and the blank
                     // separator line on a TTY) so piping gives identical bytes.
                     if let Ok(ref body) = res {
@@ -5445,6 +5724,7 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                     res
                 };
 
+                ticker.stop();
                 return match streamed {
                     Ok(body) => {
                         classify_streamed(status.as_u16(), &body.prefix, body.overflowed)
@@ -5460,7 +5740,8 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
 
             // Read once, up front: the outcome depends on the body, and the
             // branches below each need it (or would drain it anyway).
-            let body_text = resp.text().unwrap_or_default();
+            let body_text = read_body_text(resp, &progress).unwrap_or_default();
+            ticker.stop();
             let outcome = classify_response(status.as_u16(), &body_text);
 
             // A poll or assert wants the verdict only; the body has been drained
@@ -5570,6 +5851,7 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
             outcome
         }
         Err(e) => {
+            ticker.stop();
             eprintln!();
             if e.is_timeout() {
                 eprintln!(
@@ -7344,19 +7626,22 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
 
     // Run HTTP request + body read in a thread so we can handle spinner and ctrl+c
     // Both send() and text() can block — send() waits for headers, text() reads the full body
-    let response_result: Arc<std::sync::Mutex<Option<Result<(reqwest::StatusCode, String, BodyDelivery), reqwest::Error>>>> =
+    let response_result: Arc<std::sync::Mutex<Option<Result<(reqwest::StatusCode, String, BodyDelivery), RequestFailure>>>> =
         Arc::new(std::sync::Mutex::new(None));
     let response_result_clone = Arc::clone(&response_result);
+    let progress = TransferProgress::new();
+    let thread_progress = Arc::clone(&progress);
     let request_handle = thread::spawn(move || {
-        let result = request.send().and_then(|resp| {
+        let result = request.send().map_err(RequestFailure::from).and_then(|resp| {
             let status = resp.status();
+            thread_progress.headers_arrived(&resp);
             if let Some(path) = stream_outfile {
                 if status.is_success() {
                     // Stream straight to the file. An io failure here is
                     // reported through BodyDelivery — it isn't a request error.
                     let streamed = fs::File::create(&path).and_then(|file| {
                         let mut writer = io::BufWriter::new(file);
-                        stream_to_sink(resp, &mut writer)
+                        stream_to_sink(CountingReader::new(resp, &thread_progress), &mut writer)
                     });
                     return Ok(match streamed {
                         Ok(body) => (
@@ -7380,7 +7665,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
                     });
                 }
             }
-            let body = resp.text()?;
+            let body = read_body_text(resp, &thread_progress)?;
             Ok((status, body, BodyDelivery::Buffered))
         });
         *response_result_clone.lock().unwrap() = Some(result);
@@ -7414,16 +7699,17 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
             }
         }
 
-        // Show spinner after 0.5 seconds in the hint area (bottom line)
-        if start.elapsed() >= Duration::from_millis(500) {
+        // Show progress after 0.5 seconds in the hint area (bottom line)
+        if start.elapsed() >= PROGRESS_DELAY {
             showing_spinner = true;
             let frame = SPINNER_FRAMES[frame_idx % SPINNER_FRAMES.len()];
-            // Overwrite the hint line with spinner
+            let text = progress_text(&progress.snapshot(), start.elapsed(), true);
+            // Overwrite the hint line with the progress
             execute!(
                 stdout,
                 cursor::MoveToColumn(0),
                 Clear(ClearType::CurrentLine),
-                Print(format!("  {}", format!("{} waiting for response...", frame).dimmed()))
+                Print(format!("  {}", format!("{} {}", frame, text).dimmed()))
             )?;
             stdout.flush()?;
             frame_idx += 1;
@@ -7630,7 +7916,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
             }
         }
         Some(Err(e)) => {
-            block.head = if e.is_timeout() {
+            block.head = if e.timed_out {
                 format!(
                     "\nTimed out after {} — raise it with --timeout <seconds> (0 = no timeout)\n\n",
                     describe_timeout(state.config.timeout_secs)
@@ -15363,6 +15649,126 @@ mod tests {
                 "streamed verdict diverged for {body}"
             );
         }
+    }
+
+    #[test]
+    fn progress_text_counts_the_wait_until_headers_arrive() {
+        let waiting = ProgressSnapshot { status: None, received: 0, total: None };
+        assert_eq!(
+            progress_text(&waiting, Duration::from_millis(600), true),
+            "waiting for response..."
+        );
+        assert_eq!(
+            progress_text(&waiting, Duration::from_secs(4), true),
+            "waiting for response... 4s"
+        );
+        assert_eq!(
+            progress_text(&waiting, Duration::from_secs(100), false),
+            "waiting for response... 1m40s"
+        );
+    }
+
+    #[test]
+    fn progress_text_shows_bytes_and_a_percentage_only_with_a_length() {
+        let elapsed = Duration::from_secs(2);
+        let chunked = ProgressSnapshot { status: Some(200), received: 13_002_342, total: None };
+        assert_eq!(progress_text(&chunked, elapsed, true), "200 OK, received 12.4 MB");
+
+        let sized = ProgressSnapshot {
+            status: Some(200),
+            received: 13_002_342,
+            total: Some(49_388_954),
+        };
+        assert_eq!(
+            progress_text(&sized, elapsed, true),
+            "200 OK, received 12.4 MB of 47.1 MB (26%)"
+        );
+        // The batch sender has the status line on screen already.
+        assert_eq!(
+            progress_text(&sized, elapsed, false),
+            "received 12.4 MB of 47.1 MB (26%)"
+        );
+
+        let not_found = ProgressSnapshot { status: Some(404), received: 102, total: Some(102) };
+        assert_eq!(
+            progress_text(&not_found, elapsed, true),
+            "404 Not Found, received 102 B of 102 B (100%)"
+        );
+    }
+
+    #[test]
+    fn progress_text_survives_odd_lengths_and_statuses() {
+        let elapsed = Duration::from_secs(2);
+        // A declared length of zero leaves nothing to take a percentage of.
+        let empty = ProgressSnapshot { status: Some(204), received: 0, total: Some(0) };
+        assert_eq!(progress_text(&empty, elapsed, true), "204 No Content, received 0 B");
+        // More than promised never reads as more than all of it.
+        let over = ProgressSnapshot { status: Some(200), received: 300, total: Some(200) };
+        assert_eq!(
+            progress_text(&over, elapsed, true),
+            "200 OK, received 300 B of 200 B (100%)"
+        );
+        // A status with no canonical reason leaves no stray space.
+        let odd = ProgressSnapshot { status: Some(299), received: 5, total: None };
+        assert_eq!(progress_text(&odd, elapsed, true), "299, received 5 B");
+    }
+
+    #[test]
+    fn transfer_progress_starts_out_waiting_with_no_length() {
+        let progress = TransferProgress::new();
+        assert_eq!(
+            progress.snapshot(),
+            ProgressSnapshot { status: None, received: 0, total: None }
+        );
+    }
+
+    #[test]
+    fn counting_reader_counts_what_it_passes_through() {
+        let progress = TransferProgress::new();
+        let body = vec![b'x'; 100_000];
+        let mut sink = Vec::new();
+        let streamed =
+            stream_to_sink(CountingReader::new(&body[..], &progress), &mut sink).unwrap();
+        assert_eq!(sink, body);
+        assert_eq!(streamed.bytes, 100_000);
+        assert_eq!(progress.snapshot().received, 100_000);
+    }
+
+    #[test]
+    fn charset_of_reads_the_content_type_parameter() {
+        assert_eq!(charset_of("application/json"), None);
+        assert_eq!(charset_of("application/json; charset=utf-8"), Some("utf-8"));
+        assert_eq!(charset_of("text/html;Charset=\"ISO-8859-1\""), Some("ISO-8859-1"));
+        assert_eq!(charset_of("application/json;stream=true; charset=UTF-8"), Some("UTF-8"));
+        // Only a parameter counts, not the word in the media type.
+        assert_eq!(charset_of("text/charset=x"), None);
+    }
+
+    #[test]
+    fn decode_body_matches_what_reqwest_text_would_give() {
+        assert_eq!(decode_body("{\"name\":\"Åsa\"}".as_bytes(), None), "{\"name\":\"Åsa\"}");
+        // A byte-order mark is dropped, as `text()` drops it.
+        assert_eq!(decode_body(b"\xEF\xBB\xBF[1]", Some("application/json")), "[1]");
+        // A declared charset is honoured.
+        assert_eq!(decode_body(b"\xC5sa", Some("text/plain; charset=iso-8859-1")), "Åsa");
+        // An unknown one falls back to UTF-8, invalid bytes replaced rather than fatal.
+        assert_eq!(decode_body(b"a\xFFb", Some("text/plain; charset=nonsense")), "a\u{FFFD}b");
+    }
+
+    #[test]
+    fn io_error_is_timeout_recognises_a_timed_out_read() {
+        assert!(io_error_is_timeout(&io::Error::new(io::ErrorKind::TimedOut, "slow")));
+        assert!(!io_error_is_timeout(&io::Error::new(io::ErrorKind::ConnectionReset, "gone")));
+    }
+
+    #[test]
+    fn a_disabled_ticker_starts_no_thread() {
+        let mut ticker = ProgressTicker::start(TransferProgress::new(), false);
+        assert!(ticker.handle.is_none());
+        let mut printed = false;
+        ticker.interrupt(|| printed = true);
+        assert!(printed, "the caller's own output still runs");
+        ticker.stop();
     }
 
     #[test]

@@ -17,6 +17,9 @@ clap = { version = "4", features = ["derive"] }
 # HTTP client (using rustls for cross-compilation without system OpenSSL)
 reqwest = { version = "0.11", features = ["blocking", "json", "rustls-tls"], default-features = false }
 
+# Body decoding, the way reqwest's own `text()` does it (already in its tree)
+encoding_rs = "0.8"
+
 # JSON handling
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

@@ -469,6 +469,10 @@ GET /people > out.json
 Use this when you only care that requests succeeded or want a tidy log of a
 seeding run.
 
+A slow request shows a self-erasing progress line (`⠙ received 12.4 MB`) on
+stderr, but only when stderr is a terminal. Captured or piped output never
+contains it, so a log holds the same lines however long a request took.
+
 ## 9. A complete example
 
 `workshop.api`:

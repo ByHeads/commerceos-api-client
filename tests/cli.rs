@@ -1026,6 +1026,136 @@ fn status_server(statuses: Vec<&'static str>) -> (u16, std::thread::JoinHandle<V
     (port, handle)
 }
 
+/// A server that takes its time: it waits before the headers, then sends the
+/// body in pieces with pauses between, long enough for a progress line to
+/// have been due. `chunked` picks the transfer encoding, so both the
+/// known-length and the unknown-length read are covered.
+fn slow_server(body: &'static str, chunked: bool) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let handle = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        loop {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let accepted = loop {
+                match listener.accept() {
+                    Ok(pair) => break Some(pair),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() > deadline {
+                            break None;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("accept: {e}"),
+                }
+            };
+            let Some((mut stream, _)) = accepted else { break };
+            stream.set_nonblocking(false).unwrap();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            seen.push(String::from_utf8_lossy(&buf[..n]).to_string());
+
+            let pause = std::time::Duration::from_millis(250);
+            std::thread::sleep(pause);
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n";
+            let framing = if chunked {
+                "Transfer-Encoding: chunked\r\n\r\n".to_string()
+            } else {
+                format!("Content-Length: {}\r\n\r\n", body.len())
+            };
+            let _ = stream.write_all(format!("{head}{framing}").as_bytes());
+            let _ = stream.flush();
+            for piece in body.as_bytes().chunks(body.len().div_ceil(3)) {
+                std::thread::sleep(pause);
+                if chunked {
+                    let _ = stream.write_all(format!("{:x}\r\n", piece.len()).as_bytes());
+                    let _ = stream.write_all(piece);
+                    let _ = stream.write_all(b"\r\n");
+                } else {
+                    let _ = stream.write_all(piece);
+                }
+                let _ = stream.flush();
+            }
+            if chunked {
+                let _ = stream.write_all(b"0\r\n\r\n");
+            }
+            let _ = stream.flush();
+        }
+        seen
+    });
+    (port, handle)
+}
+
+const SLOW_BODY: &str = r#"[{"id":1,"name":"Åsa"},{"id":2,"name":"Björn"},{"id":3,"name":"Örjan"}]"#;
+
+/// The progress line is drawn only on a terminal. A test's pipes are not one,
+/// so whatever a slow request prints here is what an agent or a CI log sees.
+fn assert_no_progress_in(stderr: &str) {
+    assert!(!stderr.contains("waiting for response"), "progress leaked into a pipe: {stderr:?}");
+    assert!(!stderr.contains("received"), "progress leaked into a pipe: {stderr:?}");
+    assert!(!stderr.contains('\r'), "a redraw leaked into a pipe: {stderr:?}");
+}
+
+#[test]
+fn a_slow_body_arrives_whole_and_prints_no_progress_when_piped() {
+    for chunked in [false, true] {
+        let (port, handle) = slow_server(SLOW_BODY, chunked);
+        let out = api_against_port(port).args(["GET", "/x", "-r"]).output().expect("spawn api");
+        let _ = handle.join();
+        assert!(out.status.success(), "chunked={chunked}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim_end(),
+            SLOW_BODY,
+            "chunked={chunked}: the body must survive being read in pieces"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("200 OK"), "status line still printed: {stderr}");
+        assert_no_progress_in(&stderr);
+    }
+}
+
+#[test]
+fn a_slow_streamed_outfile_is_complete_and_prints_no_progress_when_piped() {
+    for chunked in [false, true] {
+        let (port, handle) = slow_server(SLOW_BODY, chunked);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("slow.json");
+        let line = format!("GET /x > {}", target.display());
+        let out = api_against_port(port).args(["--stream", &line]).output().expect("spawn api");
+        let _ = handle.join();
+        assert!(out.status.success(), "chunked={chunked}");
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("outfile written"),
+            SLOW_BODY,
+            "chunked={chunked}"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&format!("({} B)", SLOW_BODY.len())),
+            "marker reports the bytes written: {stderr}"
+        );
+        assert_no_progress_in(&stderr);
+    }
+}
+
+#[test]
+fn a_slow_batch_run_logs_only_request_and_status_lines() {
+    let (port, handle) = slow_server(SLOW_BODY, true);
+    let out = api_against_port(port)
+        .args(["-sa", "-"])
+        .write_stdin("GET /x\nassert GET /x\n")
+        .output()
+        .expect("spawn api");
+    let _ = handle.join();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout.matches("200 OK").count(), 2, "{stdout}");
+    assert_no_progress_in(&stdout);
+    assert_no_progress_in(&String::from_utf8_lossy(&out.stderr));
+}
+
 const ORANGE_404: &str = "\x1b[38;5;208m404 Not Found";
 const RED_404: &str = "\x1b[31m404 Not Found";
 

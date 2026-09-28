@@ -138,6 +138,26 @@ A streamed `> file.json` holds the server's bytes verbatim, not pretty-printed. 
 response commits to its status before the body exists, so a `200` can still carry an error in
 the payload.
 
+### Progress
+
+A request that takes longer than half a second shows a progress line until it is done:
+
+```
+⠋ waiting for response... 4s
+⠙ 200 OK, received 12.4 MB
+⠹ 200 OK, received 12.4 MB of 47.1 MB (26%)
+```
+
+The percentage needs a `Content-Length`, which CommerceOS itself does not send, so against
+it the line counts bytes. Without `--stream` the server prepares the whole body before it
+answers and most of the time is spent waiting; with `--stream` the status arrives early and
+the count runs for as long as the body is being produced.
+
+In interactive mode the line sits in the hint area, and `esc` or `ctrl+c` aborts at any point.
+One-shot and batch runs draw it on stderr and erase it again, leaving the log as it was. It is
+only drawn when stderr is a terminal, never with `-s`, and not while a streamed body is being
+printed to the terminal.
+
 ## Batch files
 
 `api -a file.api` runs the requests in a file top to bottom; `-a -` or a pipe reads stdin.
