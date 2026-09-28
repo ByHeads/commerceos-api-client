@@ -288,6 +288,10 @@ PUT /people [ … ]
   no `&&`/`||`, no `> outfile`.
 - The status line is printed like any request's; the body never is, so an
   assert can't pollute a batch's stdout.
+- A status the line was prepared for prints orange instead of red: the 404
+  that lets `assert not` pass, and a 404 on any chain segment that has another
+  after it (`GET /x || PUT /x {…}`). Red is kept for a "no" nobody asked for
+  and for 401/403/408/429/5xx, which are never an answer.
 - Failure exits 1 before anything else runs, naming the reason — the status
   (`assertion failed: assert GET /companies/x (404 Not Found)`) or the falsy
   body (`(0)`, `(null)`). A 401/403, 5xx, or timeout also exits 1.

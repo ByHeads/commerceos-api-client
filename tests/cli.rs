@@ -533,18 +533,38 @@ fn streamed_stdout_matches_buffered_stdout() {
 fn streaming_still_writes_an_outfile_for_a_chain() {
     require_local_cos();
     // The chain's truthiness comes from the retained prefix, so a streamed
-    // first segment must still let the second one run.
+    // first segment must still let the second one run. The first segment
+    // echoes a body back so its answer is truthy; a bare GET echoes `null`,
+    // which rightly stops a `&&` chain.
     let dir = tempdir().unwrap();
     let out = dir.path().join("chained.json");
     api()
         .args([
             "--stream",
-            "GET",
-            &format!("/echo-all && GET /echo-all > {}", out.display()),
+            "PUT",
+            "/echo-all",
+            &format!("{{\"a\":1}} && GET /echo-all > {}", out.display()),
         ])
         .assert()
         .success();
     assert!(out.exists(), "second segment should have run");
+}
+
+#[test]
+fn one_shot_chain_stops_on_a_falsy_first_segment() {
+    require_local_cos();
+    // Before one-shot chains existed this line went out as ONE request to a
+    // garbled path, which wrote the file. Now `GET /echo-all` answers `null`
+    // and `&&` skips the rest.
+    let dir = tempdir().unwrap();
+    let out = dir.path().join("skipped.json");
+    let assert = api()
+        .args(["GET", &format!("/echo-all && GET /echo-all > {}", out.display())])
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(!out.exists(), "second segment must not run after a falsy first");
+    assert!(stderr.contains("skipped 1 request"), "{stderr}");
 }
 
 #[test]
@@ -961,6 +981,121 @@ fn assert_not_inverts_and_reports_the_falsy_body() {
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
     assert!(stderr.contains("assertion failed: assert not GET /people~count (213)"), "{stderr}");
     assert_eq!(server.join().unwrap().len(), 3);
+}
+
+/// A server that answers each request with the next status in `statuses`
+/// (repeating the last), an empty JSON object as the body. Returns the
+/// request heads it saw once the client has gone quiet.
+fn status_server(statuses: Vec<&'static str>) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let handle = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        for i in 0.. {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let accepted = loop {
+                match listener.accept() {
+                    Ok(pair) => break Some(pair),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() > deadline {
+                            break None;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("accept: {e}"),
+                }
+            };
+            let Some((mut stream, _)) = accepted else { break };
+            stream.set_nonblocking(false).unwrap();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            seen.push(String::from_utf8_lossy(&buf[..n]).to_string());
+            let status = statuses[i.min(statuses.len() - 1)];
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{{}}"
+                )
+                .as_bytes(),
+            );
+            let _ = stream.flush();
+        }
+        seen
+    });
+    (port, handle)
+}
+
+const ORANGE_404: &str = "\x1b[38;5;208m404 Not Found";
+const RED_404: &str = "\x1b[31m404 Not Found";
+
+/// `api_against_port` with colours forced on, since the test's pipes would
+/// otherwise turn them off.
+fn api_in_colour(port: u16) -> Command {
+    let mut cmd = api_against_port(port);
+    cmd.env("CLICOLOR_FORCE", "1").env_remove("NO_COLOR");
+    cmd
+}
+
+#[test]
+fn assert_not_prints_its_expected_404_in_orange() {
+    let (port, server) = status_server(vec!["404 Not Found"]);
+    let dir = tempdir().unwrap();
+    let req = dir.path().join("expected.api");
+    std::fs::write(&req, "assert not GET /mapped-types/x\n").unwrap();
+    let assert = api_in_colour(port).args(["-sa"]).arg(&req).assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    assert!(stdout.contains(ORANGE_404), "{stdout:?}");
+    assert!(!stdout.contains(RED_404), "{stdout:?}");
+    server.join().unwrap();
+}
+
+#[test]
+fn a_404_nobody_asked_for_stays_red() {
+    // A failing `assert`, and a plain request.
+    let (port, server) = status_server(vec!["404 Not Found"]);
+    let dir = tempdir().unwrap();
+    let req = dir.path().join("plain.api");
+    std::fs::write(&req, "GET /people/1\nassert GET /people/1\n").unwrap();
+    let assert = api_in_colour(port).args(["-sa"]).arg(&req).assert().failure();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    assert_eq!(stdout.matches(RED_404).count(), 2, "{stdout:?}");
+    assert!(!stdout.contains(ORANGE_404), "{stdout:?}");
+    server.join().unwrap();
+}
+
+#[test]
+fn an_error_status_is_red_even_under_assert_not() {
+    let (port, server) = status_server(vec!["500 Internal Server Error"]);
+    let dir = tempdir().unwrap();
+    let req = dir.path().join("error.api");
+    std::fs::write(&req, "assert not GET /people/1\n").unwrap();
+    let assert = api_in_colour(port).args(["-sa"]).arg(&req).assert().failure();
+    let out = assert.get_output();
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(all.contains("\x1b[31m500 Internal Server Error"), "{all:?}");
+    assert!(!all.contains("\x1b[38;5;208m"), "{all:?}");
+    server.join().unwrap();
+}
+
+#[test]
+fn a_chain_condition_prints_its_404_in_orange_but_the_last_segment_in_red() {
+    // `GET || PUT`: the GET's 404 is what sends the chain on, so it's
+    // expected. The PUT is the point of the line, so its 404 is not.
+    let (port, server) = status_server(vec!["404 Not Found"]);
+    let dir = tempdir().unwrap();
+    let req = dir.path().join("chain.api");
+    std::fs::write(&req, "GET /people/1 || PUT /people/1 {\"name\":\"Joe\"}\n").unwrap();
+    let assert = api_in_colour(port).args(["-sa"]).arg(&req).assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    let orange = stdout.find(ORANGE_404).unwrap_or_else(|| panic!("no orange 404: {stdout:?}"));
+    let red = stdout.find(RED_404).unwrap_or_else(|| panic!("no red 404: {stdout:?}"));
+    assert!(orange < red, "condition first, then the write: {stdout:?}");
+    assert_eq!(server.join().unwrap().len(), 2);
 }
 
 // One-shot arguments accept the same syntax as a .api line: directives,

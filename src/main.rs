@@ -261,6 +261,10 @@ struct Config {
     /// Status and body of the last response taken in `quiet`/`check_only`
     /// mode, so the caller can say *why* a check failed.
     last_response: Option<(u16, String)>,
+    /// A "no" is an acceptable answer to this request: it's an `assert not`,
+    /// or a chain segment with something after it. A 404 then prints orange
+    /// rather than red — see `status_tone`.
+    expect_falsy: bool,
 }
 
 impl Default for Config {
@@ -287,6 +291,7 @@ impl Default for Config {
             quiet: false,
             check_only: false,
             last_response: None,
+            expect_falsy: false,
         }
     }
 }
@@ -4046,6 +4051,52 @@ fn status_is_error(status: u16) -> bool {
     matches!(status, 401 | 403 | 408 | 429) || status >= 500
 }
 
+/// How a status line should read at a glance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusTone {
+    /// 2xx — green.
+    Ok,
+    /// A "no" that the line asking was prepared for — orange. The 404 that
+    /// lets `assert not GET /x` pass, or that sends `GET /x || PUT /x` on to
+    /// its second half.
+    Expected,
+    /// Everything else — red.
+    Bad,
+}
+
+/// The tone for `status`. Only a definite "no" can be expected: an error
+/// status (401/403/408/429/5xx) means the question went unanswered, which no
+/// line is ever prepared for, so it stays red whatever was expected.
+fn status_tone(status: u16, expect_falsy: bool) -> StatusTone {
+    if (200..300).contains(&status) {
+        StatusTone::Ok
+    } else if expect_falsy && !status_is_error(status) {
+        StatusTone::Expected
+    } else {
+        StatusTone::Bad
+    }
+}
+
+/// 256-colour orange. Not `truecolor()`: without `COLORTERM` the crate
+/// degrades that to plain yellow, and Terminal.app never sets it.
+const ORANGE_FG: &str = "\x1b[38;5;208m";
+
+/// `404 Not Found`, coloured by tone. Shared by the batch and interactive
+/// senders so the two can't drift apart.
+fn format_status(status: reqwest::StatusCode, expect_falsy: bool) -> String {
+    let text = format!("{} {}", status.as_u16(), status.canonical_reason().unwrap_or(""));
+    match status_tone(status.as_u16(), expect_falsy) {
+        StatusTone::Ok => text.green().to_string(),
+        // Honours NO_COLOR, CLICOLOR_FORCE and piped output like the crate's
+        // own colours do.
+        StatusTone::Expected if colored::control::SHOULD_COLORIZE.should_colorize() => {
+            format!("{}{}\x1b[0m", ORANGE_FG, text)
+        }
+        StatusTone::Expected => text,
+        StatusTone::Bad => text.red().to_string(),
+    }
+}
+
 /// Classify a completed response the way JavaScript coerces a value, so
 /// `~count` chains read naturally: `false`, `0`, `""`, and `null` are falsy;
 /// `[]`, `{}`, and everything else are truthy.
@@ -4959,12 +5010,17 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
                 // it alone (that's what makes `a && b || c` an if-then-else).
                 let mut prev: Option<RequestOutcome> = None;
                 let mut skipped = 0usize;
-                for (op, segment) in segments.iter() {
+                for (i, (op, segment)) in segments.iter().enumerate() {
                     if !chain_segment_should_run(prev, *op) {
                         skipped += 1;
                         continue;
                     }
-                    match run_bulk_request(config, segment) {
+                    // A segment with something after it is a condition, and a
+                    // condition may answer "no". The last one is just a request.
+                    config.expect_falsy = i + 1 < segments.len();
+                    let outcome = run_bulk_request(config, segment);
+                    config.expect_falsy = false;
+                    match outcome {
                         // Unparseable segment (comment-like or malformed): skipped,
                         // matching how a standalone bad line is tolerated. Doesn't
                         // count as executed, so it doesn't update the outcome.
@@ -5005,9 +5061,13 @@ fn run_assert(config: &mut Config, negate: bool, request: &str) -> bool {
     }
 
     config.check_only = true;
+    // `assert not` is asking for a "no", so the 404 that satisfies it isn't
+    // an alarm.
+    config.expect_falsy = negate;
     config.last_response = None;
     let outcome = run_non_interactive(config, &method, &uri, &body);
     config.check_only = false;
+    config.expect_falsy = false;
     let response = config.last_response.take();
 
     match outcome {
@@ -5327,15 +5387,7 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
             // Print status. A quiet poll only speaks up when the status is an
             // error, so the abort that follows has a reason next to it.
             if !config.silent && (!config.quiet || status_is_error(status.as_u16())) {
-                let status_str = if status.is_success() {
-                    format!("{} {}", status.as_u16(), status.canonical_reason().unwrap_or(""))
-                        .green()
-                        .to_string()
-                } else {
-                    format!("{} {}", status.as_u16(), status.canonical_reason().unwrap_or(""))
-                        .red()
-                        .to_string()
-                };
+                let status_str = format_status(status, config.expect_falsy);
 
                 if config.bulk_silent {
                     // Bulk silent mode: print compact status to stdout with box-draw prefix
@@ -7479,15 +7531,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
         Some(Ok((status, body_text, delivery))) => {
             let elapsed = start.elapsed();
 
-            let status_str = if status.is_success() {
-                format!("{} {}", status.as_u16(), status.canonical_reason().unwrap_or(""))
-                    .green()
-                    .to_string()
-            } else {
-                format!("{} {}", status.as_u16(), status.canonical_reason().unwrap_or(""))
-                    .red()
-                    .to_string()
-            };
+            let status_str = format_status(status, state.config.expect_falsy);
 
             // Handle outfile — including the `> clipboard` special target.
             if is_clipboard_target(&state.display_outfile) && state.config.outfile_append {
@@ -7665,7 +7709,12 @@ fn execute_request_chain(
                 continue;
             }
             parse_input(state, segment);
-            let outcome = execute_request(state, stdout)?;
+            // A segment with something after it is a condition, and a
+            // condition may answer "no". The last one is just a request.
+            state.config.expect_falsy = i + 1 < segments.len();
+            let outcome = execute_request(state, stdout);
+            state.config.expect_falsy = false;
+            let outcome = outcome?;
             match outcome {
                 RequestOutcome::Truthy | RequestOutcome::Falsy => prev = Some(outcome),
                 // Errored or aborted ends the chain — a following `||` does
@@ -7828,9 +7877,12 @@ fn run_assert_interactive(
     let line = format_assert(negate, request);
     parse_input(state, request);
     state.config.check_only = true;
+    state.config.expect_falsy = negate;
     state.config.last_response = None;
-    let outcome = execute_request(state, stdout)?;
+    let outcome = execute_request(state, stdout);
     state.config.check_only = false;
+    state.config.expect_falsy = false;
+    let outcome = outcome?;
     let response = state.config.last_response.take();
 
     let verdict = match outcome {
@@ -13277,6 +13329,32 @@ mod tests {
             format_confirm(&Some("Move forward".to_string())),
             "confirm Move forward"
         );
+    }
+
+    #[test]
+    fn status_tone_is_orange_only_for_an_expected_no() {
+        use StatusTone::*;
+        // 2xx is green whatever was expected.
+        assert_eq!(status_tone(200, false), Ok);
+        assert_eq!(status_tone(204, true), Ok);
+        // A plain "no": red by default, orange when the line was asking for it.
+        assert_eq!(status_tone(404, false), Bad);
+        assert_eq!(status_tone(404, true), Expected);
+        assert_eq!(status_tone(400, true), Expected);
+        assert_eq!(status_tone(409, true), Expected);
+        // An unanswered question is never expected.
+        for status in [401, 403, 408, 429, 500, 502, 503] {
+            assert_eq!(status_tone(status, true), Bad, "{status}");
+            assert_eq!(status_tone(status, false), Bad, "{status}");
+        }
+    }
+
+    #[test]
+    fn format_status_keeps_the_text_whatever_the_tone() {
+        let not_found = reqwest::StatusCode::NOT_FOUND;
+        assert!(format_status(not_found, true).contains("404 Not Found"));
+        assert!(format_status(not_found, false).contains("404 Not Found"));
+        assert!(format_status(reqwest::StatusCode::OK, false).contains("200 OK"));
     }
 
     #[test]
