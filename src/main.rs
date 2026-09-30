@@ -7675,6 +7675,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     let mut frame_idx = 0;
     let mut showing_spinner = false;
     let mut aborted = false;
+    let mut stream_pulse = StreamPulse::new();
 
     loop {
         // Check if request completed
@@ -7703,13 +7704,15 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
         if start.elapsed() >= PROGRESS_DELAY {
             showing_spinner = true;
             let frame = SPINNER_FRAMES[frame_idx % SPINNER_FRAMES.len()];
-            let text = progress_text(&progress.snapshot(), start.elapsed(), true);
+            let snapshot = progress.snapshot();
+            let text = format!("{} {}", frame, progress_text(&snapshot, start.elapsed(), true));
+            let pulse = stream_pulse.observe(snapshot.received, Instant::now());
             // Overwrite the hint line with the progress
             execute!(
                 stdout,
                 cursor::MoveToColumn(0),
                 Clear(ClearType::CurrentLine),
-                Print(format!("  {}", format!("{} {}", frame, text).dimmed()))
+                Print(transient_hint_line(state, &text, pulse))
             )?;
             stdout.flush()?;
             frame_idx += 1;
@@ -7726,7 +7729,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
             stdout,
             cursor::MoveToColumn(0),
             Clear(ClearType::CurrentLine),
-            Print(format!("  {}", state.status_msg.dimmed()))
+            Print(transient_hint_line(state, &state.status_msg, None))
         )?;
         stdout.flush()?;
         return Ok(RequestOutcome::Aborted);
@@ -8267,7 +8270,11 @@ fn wait_interruptible(
                 stdout,
                 cursor::MoveToColumn(0),
                 Clear(ClearType::CurrentLine),
-                Print(format!("  {}", format!("{} {} {}...", frame, label, format_duration(d)).dimmed()))
+Print(transient_hint_line(
+                    state,
+                    &format!("{} {} {}...", frame, label, format_duration(d)),
+                    None
+                ))
             )?;
             stdout.flush()?;
             frame_idx += 1;
@@ -9330,16 +9337,9 @@ const STREAMING_INDICATOR_MARGIN: usize = 2;
 /// Auto-wrap is disabled around this block, so even writing to the final column
 /// is safe — no phantom line appears.
 fn streaming_indicator(state: &AppState, left_width: usize) -> String {
-    if !state.config.streaming {
+    let Some(pad) = streaming_indicator_pad(state, left_width) else {
         return String::new();
-    }
-    let width = state.width as usize;
-    let used = 2 + left_width + STREAMING_INDICATOR.len() + STREAMING_INDICATOR_MARGIN;
-    if width < used + 1 {
-        // Not enough room — the left-hand text is the more useful of the two.
-        return String::new();
-    }
-    let pad = width - used;
+    };
 
     // Pulse white on activation, using the same two-beat envelope as status
     // messages but reaching full white so it reads as a state change.
@@ -9369,6 +9369,85 @@ fn streaming_indicator(state: &AppState, left_width: usize) -> String {
     // No trailing spaces needed — render clears the area first, so the margin is
     // simply columns we decline to write into.
     format!("{}{}", " ".repeat(pad), styled)
+}
+
+/// Spaces between the left-hand text and the `streaming` marker, or `None`
+/// when streaming is off or the line can't hold both.
+fn streaming_indicator_pad(state: &AppState, left_width: usize) -> Option<usize> {
+    if !state.config.streaming {
+        return None;
+    }
+    let width = state.width as usize;
+    let used = 2 + left_width + STREAMING_INDICATOR.len() + STREAMING_INDICATOR_MARGIN;
+    // Not enough room — the left-hand text is the more useful of the two.
+    (width >= used + 1).then(|| width - used)
+}
+
+/// One full dim-white-dim swing of the marker while data is arriving.
+const STREAM_PULSE_PERIOD: Duration = Duration::from_millis(1000);
+
+/// How long after the last byte the marker keeps pulsing. Longer than a
+/// redraw tick, so a steady transfer doesn't flicker between the two states.
+const STREAM_PULSE_LINGER: Duration = Duration::from_millis(300);
+
+/// 256-colour grey for the marker `since` into a pulse: dim (240) at the
+/// start of each period, white (255) halfway through.
+fn stream_pulse_shade(since: Duration) -> u16 {
+    let phase = (since.as_millis() % STREAM_PULSE_PERIOD.as_millis()) as f32
+        / STREAM_PULSE_PERIOD.as_millis() as f32;
+    240 + ((phase * std::f32::consts::PI).sin() * 15.0).round() as u16
+}
+
+/// Decides, from successive byte counts, whether data is arriving right now.
+struct StreamPulse {
+    last_received: u64,
+    last_growth: Option<Instant>,
+    /// When the current run of arriving data began.
+    pulse_start: Option<Instant>,
+}
+
+impl StreamPulse {
+    fn new() -> Self {
+        StreamPulse { last_received: 0, last_growth: None, pulse_start: None }
+    }
+
+    /// Feed the latest byte count. Returns how far into a pulse the marker
+    /// is, or `None` when nothing has arrived lately.
+    fn observe(&mut self, received: u64, now: Instant) -> Option<Duration> {
+        if received > self.last_received {
+            self.last_received = received;
+            self.last_growth = Some(now);
+            self.pulse_start.get_or_insert(now);
+        }
+        match self.last_growth {
+            Some(at) if now.duration_since(at) <= STREAM_PULSE_LINGER => {
+                self.pulse_start.map(|start| now.duration_since(start))
+            }
+            _ => {
+                self.pulse_start = None;
+                None
+            }
+        }
+    }
+}
+
+/// A transient hint line (spinner, progress, abort notice) with the
+/// `streaming` marker kept in its usual place. `pulse` is how far into a
+/// pulse the marker is; `None` leaves it steady.
+fn transient_hint_line(state: &AppState, text: &str, pulse: Option<Duration>) -> String {
+    let mut line = format!("  {}", text.dimmed());
+    if let Some(pad) = streaming_indicator_pad(state, text.chars().count()) {
+        line.push_str(&" ".repeat(pad));
+        match pulse {
+            Some(since) => line.push_str(&format!(
+                "\x1b[38;5;{}m{}\x1b[0m",
+                stream_pulse_shade(since),
+                STREAMING_INDICATOR
+            )),
+            None => line.push_str(&STREAMING_INDICATOR.dimmed().to_string()),
+        }
+    }
+    line
 }
 
 /// Put the streaming caveat on the footer. Shown on every activation, not once
@@ -15570,6 +15649,87 @@ mod tests {
                 <= 80,
             "notice + indicator must fit on one 80-column line"
         );
+    }
+
+    #[test]
+    fn stream_pulse_shade_swings_dim_white_dim_each_period() {
+        assert_eq!(stream_pulse_shade(Duration::ZERO), 240);
+        assert_eq!(stream_pulse_shade(STREAM_PULSE_PERIOD / 2), 255);
+        assert_eq!(stream_pulse_shade(STREAM_PULSE_PERIOD), 240);
+        assert_eq!(stream_pulse_shade(STREAM_PULSE_PERIOD * 3 / 2), 255);
+        for ms in (0..3000).step_by(40) {
+            let shade = stream_pulse_shade(Duration::from_millis(ms));
+            assert!((240..=255).contains(&shade), "{ms}ms gave {shade}");
+        }
+    }
+
+    #[test]
+    fn stream_pulse_runs_only_while_bytes_keep_arriving() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut pulse = StreamPulse::new();
+
+        // Waiting for headers: nothing has arrived, so no pulse.
+        assert_eq!(pulse.observe(0, at(0)), None);
+        assert_eq!(pulse.observe(0, at(80)), None);
+
+        // Data arrives: the pulse starts from zero and runs on.
+        assert_eq!(pulse.observe(100, at(160)), Some(Duration::ZERO));
+        assert_eq!(pulse.observe(200, at(240)), Some(Duration::from_millis(80)));
+        // A tick with no new bytes is inside the linger, so no flicker.
+        assert_eq!(pulse.observe(200, at(320)), Some(Duration::from_millis(160)));
+
+        // A stall past the linger settles the marker.
+        assert_eq!(pulse.observe(200, at(240) + STREAM_PULSE_LINGER + Duration::from_millis(1)), None);
+
+        // Resuming starts a fresh pulse rather than jumping mid-swing.
+        assert_eq!(pulse.observe(300, at(2000)), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn transient_hint_line_keeps_the_streaming_marker_in_place() {
+        let mut state = AppState::new(Config::default());
+        state.width = 80;
+        let text = "⠙ 200 OK, received 12.4 MB";
+        let plain_of = |line: &str| -> String {
+            let mut out = String::new();
+            let mut in_escape = false;
+            for c in line.chars() {
+                match (in_escape, c) {
+                    (true, 'm') => in_escape = false,
+                    (true, _) => {}
+                    (false, '\x1b') => in_escape = true,
+                    (false, c) => out.push(c),
+                }
+            }
+            out
+        };
+
+        // Streaming off: the text alone.
+        let off = transient_hint_line(&state, text, None);
+        assert!(!off.contains(STREAMING_INDICATOR));
+
+        // On: the marker ends at the same column as on the idle hint line,
+        // however wide the spinner glyph is in bytes.
+        state.config.streaming = true;
+        let steady = transient_hint_line(&state, text, None);
+        let plain = plain_of(&steady);
+        assert!(plain.ends_with(STREAMING_INDICATOR));
+        assert_eq!(plain.chars().count(), 80 - STREAMING_INDICATOR_MARGIN);
+        assert!(plain.starts_with("  ⠙ 200 OK, received 12.4 MB "));
+
+        // Pulsing: same place, brighter.
+        let bright = transient_hint_line(&state, text, Some(STREAM_PULSE_PERIOD / 2));
+        assert!(bright.contains("\x1b[38;5;255mstreaming"), "{bright:?}");
+        assert_eq!(
+            plain_of(&bright),
+            plain,
+            "the pulse changes colour only"
+        );
+
+        // Too narrow for both: the progress text wins.
+        state.width = (2 + text.chars().count() + STREAMING_INDICATOR.len() + STREAMING_INDICATOR_MARGIN) as u16;
+        assert!(!transient_hint_line(&state, text, None).contains(STREAMING_INDICATOR));
     }
 
     #[test]

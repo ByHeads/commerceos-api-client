@@ -154,6 +154,8 @@ answers and most of the time is spent waiting; with `--stream` the status arrive
 the count runs for as long as the body is being produced.
 
 In interactive mode the line sits in the hint area, and `esc` or `ctrl+c` aborts at any point.
+With streaming on, the `streaming` label stays at the right of that line and pulses while
+bytes are arriving; it sits still while waiting and when the transfer stalls.
 One-shot and batch runs draw it on stderr and erase it again, leaving the log as it was. It is
 only drawn when stderr is a terminal, never with `-s`, and not while a streamed body is being
 printed to the terminal.
