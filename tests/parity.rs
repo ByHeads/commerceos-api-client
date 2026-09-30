@@ -629,3 +629,47 @@ fn the_prompt_reads_the_same_lines() {
         check(&case, "prompt", &got, &shown, &expected);
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn tab_completes_an_include_at_the_prompt() {
+    use pty::{plain, Prompt};
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    prepare(dir.path());
+
+    let mut prompt = Prompt::open(api(server.port, dir.path()));
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+
+    // Each entry is typed key by key; `\t` is Tab. `body.json` also starts
+    // with a letter of its own but is never offered, not being a `.api` file.
+    let lines: [(&[&str], &str, &[&str]); 3] = [
+        (&["se", "\t"], "seed.api", &["GET /inc1", "GET /inc2"]),
+        (&["in", "\t", "b", "\t"], "inc/b.api", &["GET /g2"]),
+        (&["./in", "\t", "\t", "a", "\t"], "./inc/a.api", &["GET /g1"]),
+    ];
+    for (keys, completed, sent) in lines {
+        prompt.send(b"\x15");
+        prompt.pump(Duration::from_millis(60));
+        let mark = prompt.screen.len();
+        for key in keys {
+            prompt.send(key.as_bytes());
+            prompt.pump(Duration::from_millis(80));
+        }
+        let shown = plain(&prompt.screen[mark..]);
+        assert!(shown.contains(completed), "{completed} not on the input line:\n{shown}");
+
+        server.take();
+        prompt.send(b"\r");
+        // Done once the server has been quiet for a moment.
+        let start = Instant::now();
+        let mut quiet = 0;
+        while quiet < 2 && start.elapsed() < Duration::from_secs(4) {
+            let before = server.seen();
+            prompt.pump(Duration::from_millis(120));
+            quiet = if server.seen() == before { quiet + 1 } else { 0 };
+        }
+        assert_eq!(server.take(), sent, "after completing to {completed}");
+    }
+}

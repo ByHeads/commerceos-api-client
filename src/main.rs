@@ -9264,8 +9264,15 @@ fn render_input_content(state: &mut AppState, width: usize) -> (String, u16, Str
     // Inside the view, "cursor at end" means at the end of the cursor's SEGMENT
     // (e.g. just before ` && …`), so editing an earlier segment gets the same
     // ghosts as a standalone line.
+    let chained = chain_segment_bounds_at(&state.input, 0) != (0, state.input.len());
     let ghost = with_chain_segment_view(state, |state| {
-        let in_file_mode = extract_file_path_context(&state.input, state.cursor_pos).is_some();
+        let file_ctx = extract_file_path_context(&state.input, state.cursor_pos);
+        // The view shows one segment as a whole line, which would make a
+        // chain's bare word look like an include. A chain can't hold one.
+        if chained && file_ctx.as_ref().is_some_and(|ctx| ctx.is_include) {
+            return String::new();
+        }
+        let in_file_mode = file_ctx.is_some();
         let at_segment_end = state.cursor_pos == char_len(&state.input);
         if at_segment_end
             && (in_file_mode || (state.config.complete && !state.endpoints.is_empty()))
@@ -11035,10 +11042,11 @@ fn handle_file_tab_completion(state: &mut AppState) {
         Some(ctx) => ctx,
         None => return,
     };
-    let FilePathContext { path_start, path_end, partial, is_outfile, is_append } = ctx;
+    let (path_start, path_end) = (ctx.path_start, ctx.path_end);
+    let partial = &ctx.partial;
 
     // Check for ~ operator on body file argument
-    if let Some(tilde_idx) = partial.rfind('~') {
+    if let Some(tilde_idx) = partial.rfind('~').filter(|_| !ctx.is_include) {
         let file_part = partial[..tilde_idx].to_string();
         let after_tilde = partial[tilde_idx + 1..].to_string();
         if after_tilde.starts_with("map(") {
@@ -11097,13 +11105,7 @@ fn handle_file_tab_completion(state: &mut AppState) {
     };
 
     if !is_cycling {
-        // Append targets get plain file completions — the virtual `clipboard`
-        // entry only makes sense for `>`, where it can be overwritten.
-        state.completions = if is_outfile && !is_append {
-            get_outfile_completions(&partial)
-        } else {
-            get_file_completions(&partial)
-        };
+        state.completions = file_completions_for(&ctx);
         state.completion_idx = 0;
         state.last_tab_input = state.input.clone();
     }
@@ -11123,7 +11125,7 @@ fn handle_file_tab_completion_reverse(state: &mut AppState) {
         Some(ctx) => ctx,
         None => return,
     };
-    let FilePathContext { path_start, path_end, partial, .. } = ctx;
+    let FilePathContext { path_start, path_end, partial, is_include, .. } = ctx;
 
     if state.completion_idx == 0 {
         state.completion_idx = state.completions.len() - 1;
@@ -11134,7 +11136,7 @@ fn handle_file_tab_completion_reverse(state: &mut AppState) {
     let completion = state.completions[state.completion_idx].clone();
 
     // Handle ~map() completions: reconstruct with file path prefix
-    if let Some(tilde_idx) = partial.rfind('~') {
+    if let Some(tilde_idx) = partial.rfind('~').filter(|_| !is_include) {
         let file_part = partial[..tilde_idx].to_string();
         let after_tilde = &partial[tilde_idx + 1..];
         if after_tilde.starts_with("map(") {
@@ -11326,9 +11328,12 @@ fn get_completion_ghost(state: &AppState) -> String {
 
     // File completion ghost text (works even without API completion)
     if let Some(ctx) = extract_file_path_context(&state.input, state.cursor_pos) {
-        let partial = ctx.partial;
+        let partial = &ctx.partial;
+        if ctx.is_include && could_become_a_keyword(partial) {
+            return String::new();
+        }
         // Check for ~ operator on body file argument
-        if let Some(tilde_idx) = partial.rfind('~') {
+        if let Some(tilde_idx) = partial.rfind('~').filter(|_| !ctx.is_include) {
             let after_tilde = &partial[tilde_idx + 1..];
             if after_tilde.starts_with("map(") {
                 let inside_raw = &after_tilde[4..]; // after "map("
@@ -11355,15 +11360,11 @@ fn get_completion_ghost(state: &AppState) -> String {
         let completions = if !state.completions.is_empty() && state.last_tab_input == state.input {
             &state.completions
         } else {
-            fresh = if ctx.is_outfile && !ctx.is_append {
-                get_outfile_completions(&partial)
-            } else {
-                get_file_completions(&partial)
-            };
+            fresh = file_completions_for(&ctx);
             &fresh
         };
         if let Some(first) = completions.first() {
-            if first.starts_with(&partial) {
+            if first.starts_with(partial.as_str()) {
                 let partial_chars = partial.chars().count();
                 let ghost: String = first.chars().skip(partial_chars).collect();
                 if !ghost.is_empty() {
@@ -11546,6 +11547,49 @@ struct FilePathContext {
     is_outfile: bool,
     /// `>> outfile` — append mode; `clipboard` is not a valid target there.
     is_append: bool,
+    /// The line itself is a path to a `.api` file to run.
+    is_include: bool,
+}
+
+const DIRECTIVES: [&str; 4] = ["sleep", "assert", "confirm", "url"];
+
+/// The include path being typed, when the line can only be one: a single line
+/// that is no chain and whose first word is no method, directive or `/path`.
+/// The whole line is the path, as the bulk parser reads it. A glob is left as
+/// typed, and an absolute path is not offered because until its `.api` suffix
+/// is there it reads as a URI.
+fn include_path_context(input: &str, seg_start: usize, seg_end: usize) -> Option<FilePathContext> {
+    if seg_start != 0 || seg_end != input.len() || input.contains('\n') {
+        return None;
+    }
+    let partial = input.trim();
+    let first_word = partial.split_whitespace().next()?;
+    if starts_a_request(first_word)
+        || first_word.starts_with('/')
+        || DIRECTIVES.iter().any(|d| first_word.eq_ignore_ascii_case(d))
+        || partial.contains(['*', '?', '['])
+    {
+        return None;
+    }
+    let path_start = input.len() - input.trim_start().len();
+    Some(FilePathContext {
+        path_start,
+        path_end: path_start + partial.len(),
+        partial: partial.to_string(),
+        is_outfile: false,
+        is_append: false,
+        is_include: true,
+    })
+}
+
+/// Whether `partial` may still be the start of a method or a directive, in
+/// which case no include is suggested until the user asks with Tab.
+fn could_become_a_keyword(partial: &str) -> bool {
+    let typed = partial.to_ascii_lowercase();
+    ["get", "post", "put", "patch", "delete", "head", "options"]
+        .iter()
+        .chain(DIRECTIVES.iter())
+        .any(|keyword| keyword.starts_with(&typed))
 }
 
 /// Find the file-path region at the cursor, scoped to the cursor's `&&`
@@ -11576,10 +11620,11 @@ fn extract_file_path_context(input: &str, cursor_pos: usize) -> Option<FilePathC
                 partial: partial.to_string(),
                 is_outfile,
                 is_append,
+                is_include: false,
             });
         }
     }
-    None
+    include_path_context(input, seg_start, seg_end)
 }
 
 /// Get file/directory completions for a partial path.
@@ -11674,6 +11719,30 @@ fn get_outfile_completions(partial: &str) -> Vec<String> {
         results.insert(0, "clipboard".to_string());
     }
     results
+}
+
+/// Completions for an include: what `get_file_completions` finds, narrowed to
+/// directories and `.api` files.
+fn get_include_completions(partial: &str) -> Vec<String> {
+    if partial == "~" {
+        return vec!["~/".to_string()];
+    }
+    get_file_completions(partial)
+        .into_iter()
+        .filter(|c| c.ends_with('/') || names_api_file(c))
+        .collect()
+}
+
+fn file_completions_for(ctx: &FilePathContext) -> Vec<String> {
+    if ctx.is_include {
+        get_include_completions(&ctx.partial)
+    } else if ctx.is_outfile && !ctx.is_append {
+        // Append targets get plain file completions — the virtual `clipboard`
+        // entry only makes sense for `>`, where it can be overwritten.
+        get_outfile_completions(&ctx.partial)
+    } else {
+        get_file_completions(&ctx.partial)
+    }
 }
 
 fn get_completions(state: &AppState, uri: &str) -> Vec<String> {
@@ -14541,6 +14610,124 @@ mod tests {
         assert_eq!(is_outfile("GET /foo >"), Some(true));
         assert_eq!(is_outfile("PUT /foo @cl"), Some(false));
         assert_eq!(is_outfile("GET /foo"), None);
+    }
+
+    #[test]
+    fn include_context_is_a_line_that_can_only_be_a_path() {
+        let include = |s: &str| {
+            extract_file_path_context(s, char_len(s)).filter(|c| c.is_include).map(|c| c.partial)
+        };
+        assert_eq!(include("se"), Some("se".to_string()));
+        assert_eq!(include("shared/se"), Some("shared/se".to_string()));
+        assert_eq!(include("~/seeds/"), Some("~/seeds/".to_string()));
+        assert_eq!(include("../se"), Some("../se".to_string()));
+        // The whole line is the path, as the bulk parser reads it.
+        assert_eq!(include("my seeds/se"), Some("my seeds/se".to_string()));
+        // A file named after a keyword is still a file.
+        assert_eq!(include("sleep.api"), Some("sleep.api".to_string()));
+        assert_eq!(include("get.api"), Some("get.api".to_string()));
+
+        // Leading whitespace is not part of the path.
+        let ctx = extract_file_path_context("  se ", 4).unwrap();
+        assert_eq!((ctx.path_start, ctx.path_end), (2, 4));
+
+        for line in [
+            "", "   ", "GET", "get /x", "PUT /x {}", "/people", "/tmp/seed.api",
+            "sleep 2", "assert /x", "confirm", "URL has localhost",
+            "shared/*.api", "se?d.api", "se && GET /x", "GET /x || se", "se\nGET /x",
+        ] {
+            assert_eq!(include(line), None, "{:?}", line);
+        }
+
+        // A request's own file regions are untouched.
+        let ctx = extract_file_path_context("PUT /x @da", 10).unwrap();
+        assert!(!ctx.is_include && !ctx.is_outfile);
+    }
+
+    #[test]
+    fn no_include_is_suggested_while_a_keyword_is_still_possible() {
+        for typed in ["g", "PU", "pat", "sl", "asser", "u", "options"] {
+            assert!(could_become_a_keyword(typed), "{}", typed);
+        }
+        for typed in ["pub", "se", "shared/", "get.api", "~/"] {
+            assert!(!could_become_a_keyword(typed), "{}", typed);
+        }
+    }
+
+    /// `dir` as the path from the working directory, since an include is not
+    /// completed from an absolute path.
+    #[cfg(unix)]
+    fn relative_to_cwd(dir: &std::path::Path) -> String {
+        let cwd = std::env::current_dir().unwrap();
+        let ups = "../".repeat(cwd.components().count() - 1);
+        format!("{}{}", ups, dir.display().to_string().trim_start_matches('/'))
+    }
+
+    #[test]
+    fn include_completions_are_directories_and_api_files() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("seed.api"), "GET /about").unwrap();
+        fs::write(dir.path().join("SEED2.API"), "GET /about").unwrap();
+        fs::write(dir.path().join("seed.json"), "{}").unwrap();
+        fs::write(dir.path().join(".hidden.api"), "GET /about").unwrap();
+        fs::create_dir(dir.path().join("seeds")).unwrap();
+        let base = dir.path().display().to_string();
+
+        assert_eq!(
+            get_include_completions(&format!("{}/", base)),
+            vec![format!("{}/seeds/", base), format!("{}/SEED2.API", base), format!("{}/seed.api", base)],
+        );
+        assert_eq!(get_include_completions(&format!("{}/seed.", base)), vec![format!("{}/seed.api", base)]);
+        assert_eq!(get_include_completions(&format!("{}/.h", base)), vec![format!("{}/.hidden.api", base)]);
+        assert!(get_include_completions(&format!("{}/nothing", base)).is_empty());
+        assert_eq!(get_include_completions("~"), vec!["~/".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tab_completes_and_cycles_an_include() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("seed.api"), "GET /about").unwrap();
+        fs::write(dir.path().join("seed.json"), "{}").unwrap();
+        fs::create_dir(dir.path().join("seeds")).unwrap();
+        let base = relative_to_cwd(dir.path());
+
+        let mut state = test_state();
+        state.input = format!("{}/se", base);
+        state.cursor_pos = char_len(&state.input);
+        assert_eq!(get_completion_ghost(&state), "eds/");
+        assert!(render_input_content(&mut state, 200).0.contains("ds/"));
+
+        // A chain can't hold an include, so its first word gets no suggestion.
+        let mut chained = test_state();
+        chained.input = format!("{}/se && GET /x", base);
+        chained.cursor_pos = char_len(&state.input);
+        assert!(!render_input_content(&mut chained, 200).0.contains("ds/"));
+        handle_file_tab_completion(&mut chained);
+        assert_eq!(chained.input, format!("{}/se && GET /x", base));
+
+        handle_file_tab_completion(&mut state);
+        assert_eq!(state.input, format!("{}/seeds/", base));
+        assert_eq!(state.cursor_pos, char_len(&state.input));
+        handle_file_tab_completion(&mut state);
+        assert_eq!(state.input, format!("{}/seed.api", base));
+        handle_file_tab_completion(&mut state);
+        assert_eq!(state.input, format!("{}/seeds/", base));
+        handle_file_tab_completion_reverse(&mut state);
+        assert_eq!(state.input, format!("{}/seed.api", base));
+
+        // The completed line is one the parser reads as that file.
+        assert_eq!(split_bulk_requests(&state.input, None).unwrap().steps.len(), 1);
+    }
+
+    #[test]
+    fn a_tilde_in_an_include_is_the_home_directory_not_a_map_operator() {
+        let mut state = test_state();
+        state.input = "~".to_string();
+        state.cursor_pos = 1;
+        assert_eq!(get_completion_ghost(&state), "/");
+        handle_file_tab_completion(&mut state);
+        assert_eq!(state.input, "~/");
     }
 
     #[test]

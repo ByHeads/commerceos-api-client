@@ -337,7 +337,9 @@ anything else runs in the session: `confirm` asks in the hint line (`y`/enter or
 `n`/esc), `sleep` and `sleep while` show a spinner and stop on esc, `assert`
 logs the request and status but not the body, `url` checks the current
 connection, and `seed.api` runs the file with each request logged as if typed.
-A pasted block of several lines runs line by line, as a file would. A stopped
+A pasted block of several lines runs line by line, as a file would. Tab on a
+line that is a path (`se`, `shared/`, `~/seeds/`) completes it to a directory
+or a `.api` file; a path starting with `/` completes as a URI. A stopped
 program (failed assert, declined confirm, errored request, esc) leaves the
 session open.
 

@@ -217,6 +217,9 @@ one-shot mode, with tab completion for endpoints, operators, properties, and fil
   of several lines runs line by line. `esc` stops a wait; a failed assert or a declined confirm
   stops the rest of the line. A mistyped request says `not a request or .api file` instead of
   re-sending the last one.
+- **`tab` completes the file to run.** On a line that is a path (`se`, `shared/`, `~/seeds/`,
+  `../`) it offers directories and `.api` files. A path starting with `/` completes as a URI,
+  so reach an absolute file through `~/` or a relative path.
 
 ### Copy and paste identifiers
 
