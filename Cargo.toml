@@ -53,6 +53,8 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "linux-
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+# Pseudo-terminal for driving the interactive prompt in tests
+libc = "0.2"
 
 # Fast release builds for development (cargo build --release)
 [profile.release]

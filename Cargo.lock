@@ -76,6 +76,7 @@ dependencies = [
  "encoding_rs",
  "glob",
  "keyring",
+ "libc",
  "predicates",
  "reqwest",
  "serde",

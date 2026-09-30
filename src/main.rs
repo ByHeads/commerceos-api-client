@@ -2788,7 +2788,7 @@ fn main() {
 
     // Parse positional args like bash client
     let body_arg = if args.body.is_empty() { None } else { Some(args.body.join(" ")) };
-    let (method, uri, mut body) = parse_positional_args(args.method, args.uri, body_arg);
+    let (method, uri, body) = parse_positional_args(args.method, args.uri, body_arg);
 
     // `-t` used to take a bearer token and now means --stream, so an old
     // invocation leaves the token sitting in the method slot. Say so rather
@@ -2800,6 +2800,29 @@ fn main() {
         );
         std::process::exit(1);
     }
+
+    // The arguments as one line, read the way a `.api` file reads it: a body
+    // comment, a raw newline in a string, or a `> file` in an argument of its
+    // own means the same thing here as there.
+    let (method, uri, mut body) = if program_line.is_none() && !method.is_empty() {
+        // A `> file` given in the URI argument with the body after it
+        // (`api PUT "/x > out.json" '{…}'`) goes last, where a line keeps it.
+        let (uri, redirect) = match uri.find(" >") {
+            Some(i) => (uri[..i].trim().to_string(), uri[i..].to_string()),
+            None => (uri, String::new()),
+        };
+        let joined = format!("{} {} {}{}", method, uri, body, redirect);
+        match normalize_request_text(&joined).map(|t| parse_request_line(&t)) {
+            Ok(Some(parts)) => parts,
+            Ok(None) => (method, uri, body),
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        (method, uri, body)
+    };
 
     // Read from stdin if available and no body provided (and not bulk mode)
     if body.is_empty() && args.all.is_none() && program_line.is_none() && !atty::is(Stream::Stdin) {
@@ -3153,7 +3176,7 @@ fn main() {
         }
         // A mistyped request would otherwise be reported as a missing include.
         if let Err(e) = split_bulk_requests(&line, None) {
-            eprintln!("error: {}", describe_program_error(&line, &e));
+            eprintln!("error: {}", describe_program_error(&e));
             std::process::exit(1);
         }
         run_bulk_from_str(&mut config, &line, None);
@@ -3534,6 +3557,31 @@ fn check_connection(config: &Config) -> Result<(bool, bool, bool), u16> {
 /// Parse a single request line — same semantics as the interactive client's `parse_input`.
 /// Returns (method, uri_with_outfile_suffix, body) where the URI includes ` > outfile`
 /// if present, so run_non_interactive parses it the same way.
+/// Whether `word`, the first word of a line, opens a request: an HTTP method
+/// or a `/path`. A `/path` that names a `.api` file is an include instead —
+/// that suffix is the only thing telling an absolute include from a URI.
+fn starts_a_request(word: &str) -> bool {
+    let methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+    methods.contains(&word.to_uppercase().as_str())
+        || (word.starts_with('/') && !names_api_file(word))
+}
+
+fn names_api_file(word: &str) -> bool {
+    word.to_ascii_lowercase().ends_with(".api")
+}
+
+/// One request's text the way a `.api` file holds it: body comments stripped
+/// and raw newlines inside JSON strings escaped. The prompt and the one-shot
+/// arguments go through this too, so the same text means the same request
+/// wherever it is written.
+fn normalize_request_text(text: &str) -> Result<String, String> {
+    let (cleaned, depth) = strip_body_comments_and_count(text);
+    if depth > 0 {
+        return Err(format!("unclosed body (depth {})", depth));
+    }
+    Ok(escape_newlines_in_strings(&cleaned))
+}
+
 fn parse_request_line(line: &str) -> Option<(String, String, String)> {
     let mut working = line.trim().to_string();
     if working.is_empty() || working.starts_with('#') {
@@ -3575,7 +3623,7 @@ fn parse_request_line(line: &str) -> Option<(String, String, String)> {
             let body = after_method[uri_end..].trim_start_matches(|c: char| c == ' ' || c == '\t').to_string();
             (first_upper, uri, body)
         }
-    } else if first_word.starts_with('/') {
+    } else if starts_a_request(first_word) {
         let uri = first_word.to_string();
         let body = working[first_end..].trim_start_matches(|c: char| c == ' ' || c == '\t').to_string();
         ("GET".to_string(), uri, body)
@@ -4799,7 +4847,6 @@ fn split_bulk_requests_inner(
     chain: &mut std::collections::HashSet<std::path::PathBuf>,
     program: &mut BulkProgram,
 ) -> Result<(), String> {
-    let methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
     let mut current = String::new();
 
     for line in contents.lines() {
@@ -4811,11 +4858,7 @@ fn split_bulk_requests_inner(
             }
             // Decide: request line, directive (sleep/url), or include?
             let first_word = trimmed.split_whitespace().next().unwrap_or("");
-            let first_upper = first_word.to_uppercase();
-            let is_request =
-                methods.contains(&first_upper.as_str()) || first_word.starts_with('/');
-
-            if !is_request {
+            if !starts_a_request(first_word) {
                 // `sleep N` — timing directive.
                 if first_word.eq_ignore_ascii_case("sleep") {
                     let rest = trimmed["sleep".len()..].trim();
@@ -4875,6 +4918,13 @@ fn split_bulk_requests_inner(
             // multi-line body of its own.
             let assembled = escape_newlines_in_strings(&cleaned);
             let segments = split_request_chain(&assembled);
+            if segments.len() > 1 {
+                // A directive can't be chained: it would otherwise be dropped
+                // on the quiet, or worse, taken for the previous request.
+                if let Some((_, bad)) = segments.iter().find(|(_, s)| parse_request_line(s).is_none()) {
+                    return Err(format!("chain segment is not a request: `{}`", bad.trim()));
+                }
+            }
             program.steps.push(if segments.len() > 1 {
                 BulkStep::Chain(segments)
             } else {
@@ -5182,7 +5232,7 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
     let program = match split_bulk_requests(contents, base_dir) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("error: {}", e);
+            eprintln!("error: {}", describe_program_error(&e));
             std::process::exit(1);
         }
     };
@@ -5541,6 +5591,7 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
         "PATCH" => client.patch(&url),
         "DELETE" => client.delete(&url),
         "HEAD" => client.head(&url),
+        "OPTIONS" => client.request(reqwest::Method::OPTIONS, &url),
         _ => client.get(&url),
     };
 
@@ -6321,6 +6372,8 @@ fn handle_key_event(
                 } else {
                     format!("{} {} {}", method, uri, body)
                 };
+                // Comments and raw newlines, as a `.api` file would have them.
+                let input = normalize_request_text(&input).unwrap_or(input);
                 parse_input(state, &input);
                 state.history.push(input.clone());
                 append_history(&input);
@@ -6870,20 +6923,26 @@ fn handle_key_event(
                 let input = state.input.trim().to_string();
                 let input = if input.is_empty() { "GET /".to_string() } else { input };
 
-                if is_program_line(&input) {
-                    // A directive (`confirm`, `sleep`, `assert`, `url`) or an
-                    // included .api file — same syntax as a batch file. Without
-                    // this, an unknown first word left method and URI untouched
-                    // and silently re-sent the previous request.
-                    state.history.push(input.clone());
-                    append_history(&input);
-                    state.history_idx = -1;
-                    run_program_line(state, stdout, &input)?;
-                } else {
-                    let segments = split_request_chain(&input);
-                    let is_chain = segments.len() > 1;
+                // The line is read the way a `.api` file is read, so the same
+                // text means the same thing here. One request keeps the
+                // prompt's own handling (the body editor); a chain runs as a
+                // chain; anything else — a directive, an include, several
+                // lines at once, a typo — runs as a program.
+                let (request, segments) = match classify_prompt_line(&input) {
+                    PromptLine::Request(r) => (r, Vec::new()),
+                    PromptLine::Chain(s) => (s[0].1.clone(), s),
+                    PromptLine::Program => {
+                        state.history.push(input.clone());
+                        append_history(&input);
+                        state.history_idx = -1;
+                        run_program_line(state, stdout, &input)?;
+                        return Ok((false, None));
+                    }
+                };
+                {
+                    let is_chain = !segments.is_empty();
 
-                    parse_input(state, if is_chain { &segments[0].1 } else { &input });
+                    parse_input(state, &request);
 
                     // If method expects a body but none provided and no infile, enter body input mode.
                     // Never mid-chain: opening the multi-line editor between segments
@@ -7449,7 +7508,7 @@ fn parse_input(state: &mut AppState, input: &str) {
             let body = after_uri.trim_start_matches(|c: char| c == ' ' || c == '\t');
             state.body = if body.trim().is_empty() { String::new() } else { body.to_string() };
         }
-    } else if first_word.starts_with('/') {
+    } else if starts_a_request(first_word) {
         state.method = "GET".to_string();
         state.uri = first_word.to_string();
         // Body is everything after URI; trim leading spaces/tabs but preserve newlines
@@ -7521,6 +7580,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
         "PATCH" => client.patch(&url),
         "DELETE" => client.delete(&url),
         "HEAD" => client.head(&url),
+        "OPTIONS" => client.request(reqwest::Method::OPTIONS, &url),
         _ => client.get(&url),
     };
 
@@ -7768,6 +7828,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
                     "PATCH" => client.patch(&url),
                     "DELETE" => client.delete(&url),
                     "HEAD" => client.head(&url),
+                    "OPTIONS" => client.request(reqwest::Method::OPTIONS, &url),
                     _ => client.get(&url),
                 };
 
@@ -8030,30 +8091,63 @@ fn execute_request_chain(
     Ok(!cut_short)
 }
 
+/// What a prompt line is once read as `.api` syntax.
+enum PromptLine {
+    /// Exactly one request, its text normalised as a file's would be.
+    Request(String),
+    /// Exactly one `&&`/`||` chain.
+    Chain(Vec<(ChainOp, String)>),
+    /// Anything else, including a line that doesn't parse — `run_program_line`
+    /// reports that.
+    Program,
+}
+
+fn classify_prompt_line(input: &str) -> PromptLine {
+    match split_bulk_requests(input, None) {
+        Ok(mut program) if program.url_conditions.is_empty() && program.steps.len() == 1 => {
+            match program.steps.pop() {
+                Some(BulkStep::Request(r)) => PromptLine::Request(r),
+                Some(BulkStep::Chain(s)) => PromptLine::Chain(s),
+                _ => PromptLine::Program,
+            }
+        }
+        _ => PromptLine::Program,
+    }
+}
+
 /// Whether a prompt line is `.api` program syntax rather than a request: its
 /// first word is neither an HTTP method nor a `/path`. Such a line goes
 /// through the bulk parser, so directives (`confirm`, `sleep`, `assert`,
 /// `url`) and includes work at the prompt exactly as they do in a file.
 fn is_program_line(input: &str) -> bool {
-    let methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
     match input.split_whitespace().next() {
         None => false,
-        Some(first) => {
-            !first.starts_with('/') && !methods.contains(&first.to_uppercase().as_str())
-        }
+        Some(first) => !starts_a_request(first),
     }
 }
 
-/// What the hint line says when a program line can't be parsed. An unknown
-/// word falls through to include handling, whose "not found" would suggest
-/// the user meant a file; usually they mistyped a request.
-fn describe_program_error(input: &str, err: &str) -> String {
-    if err.starts_with("include not found:") {
-        let word = input.split_whitespace().next().unwrap_or(input);
-        format!("not a request or .api file: {}", word)
-    } else {
-        err.to_string()
+/// A parse error as reported to the user, wherever the line came from. An
+/// unknown word falls through to include handling, whose "not found" would
+/// suggest the user meant a file; unless the word looks like one, they
+/// mistyped a request.
+fn describe_program_error(err: &str) -> String {
+    let first_word = err
+        .strip_prefix("include not found: ")
+        .and_then(|spec| spec.split_whitespace().next());
+    match first_word {
+        Some(word) if !looks_like_a_path(word) => {
+            format!("not a request or .api file: {}", word)
+        }
+        _ => err.to_string(),
     }
+}
+
+fn looks_like_a_path(word: &str) -> bool {
+    names_api_file(word)
+        || word.contains('/')
+        || word.contains('\\')
+        || word.starts_with('~')
+        || word.starts_with('.')
 }
 
 /// Run a `.api` program typed at the prompt: parse the line with the bulk
@@ -8064,7 +8158,7 @@ fn describe_program_error(input: &str, err: &str) -> String {
 fn run_program_line(state: &mut AppState, stdout: &mut io::Stdout, line: &str) -> io::Result<()> {
     let program = match split_bulk_requests(line, None) {
         Ok(p) => p,
-        Err(e) => return show_program_status(state, stdout, describe_program_error(line, &e)),
+        Err(e) => return show_program_status(state, stdout, describe_program_error(&e)),
     };
     if let Err(e) = evaluate_url_gate(&program.url_conditions, &state.config.base_uri) {
         return show_program_status(state, stdout, e);
@@ -13740,6 +13834,81 @@ mod tests {
         // A typo'd request is a program too — it must reach the parser and be
         // reported, not silently re-send the previous request.
         assert!(is_program_line("peple"));
+        // An absolute path to a .api file is an include, not a URI.
+        assert!(is_program_line("/tmp/seed.api"));
+        assert!(is_program_line("/Users/me/seeds/*.api"));
+        assert!(!is_program_line("/tmp/seed.apiary"));
+    }
+
+    #[test]
+    fn starts_a_request_tells_a_uri_from_an_absolute_include() {
+        assert!(starts_a_request("GET"));
+        assert!(starts_a_request("options"));
+        assert!(starts_a_request("/people"));
+        assert!(starts_a_request("/people~where(name=x.api)"));
+        assert!(!starts_a_request("/tmp/seed.api"));
+        assert!(!starts_a_request("/tmp/SEED.API"));
+        assert!(!starts_a_request("seed.api"));
+        assert!(!starts_a_request("sleep"));
+        assert!(!starts_a_request("~/seed.api"));
+    }
+
+    #[test]
+    fn normalize_request_text_matches_the_file_parser() {
+        // Comments go, raw newlines in strings become escapes, structure stays.
+        let text = "PUT /a {\n  \"x\": \"l1\nl2\", // note\n  \"y\": 2 /* two */\n}";
+        let normalized = normalize_request_text(text).unwrap();
+        let program = split_bulk_requests(text, None).unwrap();
+        assert_eq!(program.steps, vec![BulkStep::Request(normalized.clone())]);
+        assert!(!normalized.contains("note") && !normalized.contains("two"), "{normalized}");
+        assert!(normalized.contains("l1\\nl2"), "{normalized}");
+        // Outside a body nothing is touched — a URI may contain `#` or `//`.
+        assert_eq!(
+            normalize_request_text("GET /a~where(url=http://x/y#z)").unwrap(),
+            "GET /a~where(url=http://x/y#z)"
+        );
+        assert!(normalize_request_text("PUT /a {\"x\": 1").is_err());
+    }
+
+    #[test]
+    fn a_chain_segment_must_be_a_request() {
+        for line in ["GET /a && sleep 1", "GET /a || peple", "assert /a && GET /b"] {
+            let err = match split_bulk_requests(line, None) {
+                Err(e) => e,
+                Ok(p) => panic!("{line} parsed as {:?}", p.steps),
+            };
+            assert!(
+                err.contains("chain segment is not a request") || err.contains("can't be a"),
+                "{line}: {err}"
+            );
+        }
+        // The real thing still parses.
+        assert!(matches!(
+            split_bulk_requests("GET /a && PUT /b {\"x\":1}", None).unwrap().steps[..],
+            [BulkStep::Chain(_)]
+        ));
+    }
+
+    #[test]
+    fn classify_prompt_line_keeps_one_request_or_chain_apart_from_programs() {
+        assert!(matches!(classify_prompt_line("GET /a"), PromptLine::Request(r) if r == "GET /a"));
+        assert!(matches!(
+            classify_prompt_line("PUT /a {\"x\":1 // c\n}"),
+            PromptLine::Request(r) if !r.contains("// c")
+        ));
+        assert!(matches!(classify_prompt_line("GET /a && GET /b"), PromptLine::Chain(s) if s.len() == 2));
+        for program in ["sleep 1", "GET /a\nGET /b", "peple", "url has x\nGET /a", "# note", "/tmp/x.api"] {
+            assert!(matches!(classify_prompt_line(program), PromptLine::Program), "{program}");
+        }
+    }
+
+    #[test]
+    fn parse_request_line_reads_an_absolute_api_path_as_no_request() {
+        assert_eq!(parse_request_line("/tmp/seed.api"), None);
+        assert_eq!(
+            parse_request_line("/tmp/seed"),
+            Some(("GET".to_string(), "/tmp/seed".to_string(), String::new()))
+        );
     }
 
     #[test]
@@ -13764,6 +13933,7 @@ mod tests {
             s("confirm Move on")
         );
         assert_eq!(one_shot_program_line(&s("seed.api"), &None, &[]), s("seed.api"));
+        assert_eq!(one_shot_program_line(&s("/abs/seed.api"), &None, &[]), s("/abs/seed.api"));
         assert_eq!(one_shot_program_line(&s("peple"), &None, &[]), s("peple"));
 
         // Chains, split by the shell or quoted whole.
@@ -13786,11 +13956,22 @@ mod tests {
     #[test]
     fn describe_program_error_names_the_typo() {
         assert_eq!(
-            describe_program_error("peple", "include not found: peple"),
+            describe_program_error("include not found: peple"),
+            "not a request or .api file: peple"
+        );
+        // Something that was clearly meant as a file keeps the file message.
+        for path in ["seed.api", "shared/seeds", "~/x", "./x", "/abs/seed.api"] {
+            assert_eq!(
+                describe_program_error(&format!("include not found: {path}")),
+                format!("include not found: {path}")
+            );
+        }
+        assert_eq!(
+            describe_program_error("include not found: peple /a"),
             "not a request or .api file: peple"
         );
         assert_eq!(
-            describe_program_error("sleep abc", "invalid sleep duration: `abc`"),
+            describe_program_error("invalid sleep duration: `abc`"),
             "invalid sleep duration: `abc`"
         );
         // The bulk parser really does route an unknown word to include handling.

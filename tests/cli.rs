@@ -1277,7 +1277,7 @@ fn one_shot_runs_an_api_file_named_as_the_argument() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("seed.api"), "GET /from-file\n").unwrap();
     // Relative to the working directory, like an include. An absolute path
-    // starts with `/` and is a URI, in a file and on the command line alike.
+    // works too, told from a URI by its `.api` suffix — see tests/parity.rs.
     api_against_port(port).current_dir(dir.path()).arg("seed.api").assert().success();
     let seen = server.join().unwrap();
     assert!(seen.iter().any(|r| r.contains("GET /api/v1/from-file")), "{seen:?}");

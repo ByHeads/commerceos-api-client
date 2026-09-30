@@ -73,7 +73,8 @@ api seed.api                                                 # run a file, same 
 ```
 
 A first word that is neither a method nor a path is an error (`not a request or .api file`),
-not a request to a nonsense path.
+not a request to a nonsense path. Bodies are read as in a batch file, comments stripped and
+raw newlines inside strings escaped, and a `> file` may sit in any argument.
 
 ### Bodies
 
@@ -212,9 +213,10 @@ one-shot mode, with tab completion for endpoints, operators, properties, and fil
 - **Enter on a body method without a body** opens a multi-line editor: `ctrl+d` sends, `esc` cancels.
 - **Batch-file syntax works at the prompt too.** A line that isn't a request is read as `.api`
   syntax: `confirm Ready?` asks in the hint line, `sleep 5 while not /imports~count` polls,
-  `assert /companies/x` checks, and `seed.api` runs the file, includes and all. `esc` stops a
-  wait; a failed assert or a declined confirm stops the rest of the line. A mistyped request
-  says `not a request or .api file` instead of re-sending the last one.
+  `assert /companies/x` checks, and `seed.api` runs the file, includes and all. A pasted block
+  of several lines runs line by line. `esc` stops a wait; a failed assert or a declined confirm
+  stops the rest of the line. A mistyped request says `not a request or .api file` instead of
+  re-sending the last one.
 
 ### Copy and paste identifiers
 
@@ -307,8 +309,12 @@ Usage: api [OPTIONS] [METHOD] [URI] [BODY]
 
 ```sh
 cargo test --bin api                                     # unit tests
+cargo test --test parity                                 # one table of lines through file, arguments and prompt
 API_TEST_BASE_URI=http://localhost:5000 API_TEST_KEY=… cargo test --test cli   # end-to-end, needs a local COS
 ```
+
+The parity tests need no server: they drive the binary, prompt included, against a
+recording server of their own.
 
 The end-to-end tests go through `/echo-all`, so nothing is persisted. Without the two
 variables they use the default saved connection and prompt for keychain access.

@@ -204,6 +204,8 @@ GET /people~where(givenName=Test)~count && DELETE /people~where(givenName=Test)
   `||` never catches an error.
 - `&&`/`||` inside a JSON string or body are not separators. Multi-line bodies
   work in any segment, and a `> outfile` belongs to the segment it follows.
+- Every segment must be a request. A directive or an include in a chain
+  (`GET /a && sleep 2`) is an error, not a step that is quietly dropped.
 
 The same truthiness rule drives `sleep while` and `assert` below.
 
@@ -211,7 +213,8 @@ The same truthiness rule drives `sleep while` and `assert` below.
 
 A line that isn't a comment, isn't blank, and doesn't start with a method or `/`
 is treated as an **include**: the named file is loaded and its requests are
-inlined at that point.
+inlined at that point. A `/path` that ends in `.api` is an include too — that
+suffix is what tells `/tmp/seed.api` from a URI.
 
 ```
 # parent.api
@@ -224,7 +227,8 @@ PATCH /people/com.heads.foo=123 { "name": "after seeds" }
 ```
 
 - Paths resolve **relative to the file doing the including**.
-- `~/path/file.api` and absolute paths work.
+- `~/path/file.api` and absolute paths work, as long as the file is named
+  `.api` (any case).
 - Glob includes work: `shared/*.api` includes all matching files in sorted order.
 - Recursive includes are supported. Loops are detected and reported as errors.
 
@@ -321,22 +325,31 @@ POST /deploy { "go": true }
 
 Every line in this section, a chain, and an include can also be typed at the
 interactive prompt or passed as one-shot arguments. The three entry points read
-the same grammar.
+the same grammar with one parser, so a line means the same request wherever it
+is written: body comments are stripped and raw newlines inside strings escaped
+everywhere, an absolute `.api` path is an include everywhere, and a chain
+segment that isn't a request is an error everywhere. `tests/parity.rs` runs one
+table of lines through all three and compares what reached the server.
 
-**Interactive prompt.** A line whose first word is neither a method nor a
-`/path` is parsed as `.api` syntax and run in the session: `confirm` asks in the
-hint line (`y`/enter or `n`/esc), `sleep` and `sleep while` show a spinner and
-stop on esc, `assert` logs the request and status but not the body, `url` checks
-the current connection, and `seed.api` runs the file with each request logged as
-if typed. A stopped program (failed assert, declined confirm, errored request,
-esc) leaves the session open.
+**Interactive prompt.** The line is read as `.api` syntax. One request is sent
+as typed (a body-less `PUT` opens the body editor, which is the prompt's own);
+anything else runs in the session: `confirm` asks in the hint line (`y`/enter or
+`n`/esc), `sleep` and `sleep while` show a spinner and stop on esc, `assert`
+logs the request and status but not the body, `url` checks the current
+connection, and `seed.api` runs the file with each request logged as if typed.
+A pasted block of several lines runs line by line, as a file would. A stopped
+program (failed assert, declined confirm, errored request, esc) leaves the
+session open.
 
 **One-shot arguments.** The positional arguments are joined into one line. A
 directive, an include, a `&&`/`||` chain, or a whole line in a single quoted
 argument runs through the batch runner exactly like a one-line `-a` file, so
 `api assert /companies/x` exits 1 on failure and `api seed.api` is `api -a
 seed.api`. Quote the `&&` or the whole line so the shell doesn't take it. A plain
-`METHOD URI [BODY]` is sent as before.
+`METHOD URI [BODY]` is sent directly, after the same reading: a `> file` may sit
+in any argument (`api GET /people ">" out.json`, `api GET /people "> out.json"`,
+`api "GET /people > out.json"` are the same), and a body may carry comments or
+raw newlines just as in a file.
 
 In both places a mistyped request reports `not a request or .api file`, where
 it used to be sent as a GET to a nonsense path or silently re-send the previous
