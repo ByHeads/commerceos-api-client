@@ -630,6 +630,40 @@ fn the_prompt_reads_the_same_lines() {
     }
 }
 
+/// A terminal sends a pasted newline as `\r`. Pasted over the `GET /` the
+/// prompt starts with, a block of directive lines must still arrive as a
+/// block and run line by line, not as one request to `/assert GET /a…`.
+#[cfg(unix)]
+#[test]
+fn a_pasted_block_with_carriage_returns_runs_line_by_line() {
+    use pty::{plain, Prompt};
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    prepare(dir.path());
+
+    let mut prompt = Prompt::open(api(server.port, dir.path()));
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+
+    // No ctrl+u: the default `GET /` is on the line, as it is for a user who
+    // pastes right after starting the client.
+    server.take();
+    prompt.paste("assert GET /a\rassert GET /b\rassert GET /c\r");
+    prompt.pump(Duration::from_millis(80));
+    let mark = prompt.screen.len();
+    prompt.send(b"\r");
+    let start = Instant::now();
+    let mut quiet = 0;
+    while quiet < 2 && start.elapsed() < Duration::from_secs(4) {
+        let before = server.seen();
+        prompt.pump(Duration::from_millis(120));
+        quiet = if server.seen() == before { quiet + 1 } else { 0 };
+    }
+    assert_eq!(server.take(), ["GET /a", "GET /b", "GET /c"]);
+    let shown = plain(&prompt.screen[mark..]);
+    assert!(!shown.contains("/assert"), "the block was sent as one request:\n{shown}");
+}
+
 #[cfg(unix)]
 #[test]
 fn tab_completes_an_include_at_the_prompt() {

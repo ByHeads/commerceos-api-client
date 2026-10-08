@@ -7302,9 +7302,17 @@ fn paste_in_index_mode(input: &str, cursor_pos: usize) -> bool {
     current_token.contains('/')
 }
 
+/// Terminals hand a pasted newline over as a carriage return — xterm.js,
+/// Terminal.app and iTerm2 all rewrite `\n` to `\r` inside a bracketed paste —
+/// so `\r\n` and a lone `\r` are both read as line breaks. Left in, a `\r` is
+/// an invisible character that sends the terminal cursor back to column 0 when
+/// the line is drawn.
+fn normalize_paste_newlines(paste: &str) -> String {
+    paste.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 /// True if `paste` begins with an HTTP method token followed by whitespace
-/// (e.g. "GET /people..."), meaning it's a full request line that should replace
-/// the current input rather than be inserted at the cursor.
+/// (e.g. "GET /people...").
 fn paste_starts_with_method(paste: &str) -> bool {
     let trimmed = paste.trim_start();
     let methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
@@ -7312,6 +7320,28 @@ fn paste_starts_with_method(paste: &str) -> bool {
         Some((first, _rest)) => methods.contains(&first.to_uppercase().as_str()),
         None => false,
     }
+}
+
+/// True if `paste` is `.api` text that stands on its own, so it replaces the
+/// input rather than being inserted at the cursor: a full request line
+/// (`GET /people`), a directive (`assert /x`, `confirm`, `sleep 2`, `url has`),
+/// a comment, a `.api` file to run, or a block of several lines. Pasted over the
+/// `GET /` the prompt starts with, such text would otherwise end up as
+/// `GET /assert GET /x`. A body (`{…`, `[…`, `@file`), a redirect (`> file`), and
+/// a bare `/path` are not program text and are inserted where the cursor is,
+/// however many lines they span.
+fn paste_is_api_text(paste: &str) -> bool {
+    if paste_starts_with_method(paste) {
+        return true;
+    }
+    let trimmed = paste.trim_start();
+    let Some(first) = trimmed.split_whitespace().next() else {
+        return false;
+    };
+    first.starts_with('#')
+        || DIRECTIVES.iter().any(|d| first.eq_ignore_ascii_case(d))
+        || names_api_file(first)
+        || (first.starts_with('/') && trimmed.trim_end().contains('\n'))
 }
 
 /// Uppercase the leading method token of a request line (e.g. `get /x` →
@@ -7342,14 +7372,25 @@ fn handle_paste<W: Write>(
 ) -> io::Result<()> {
     let inside_body = cursor_inside_brackets(&state.input, state.cursor_pos);
 
-    // Pasting a full request line (starts with an HTTP method) outside a JSON body
-    // replaces the entire input rather than inserting at the cursor — so pasting
-    // "GET /people..." over a "GET /" prompt yields the pasted line, not a
-    // duplicated method. Method detection is skipped inside a body so a JSON
-    // string beginning with "GET " is pasted verbatim.
-    if !inside_body && paste_starts_with_method(paste) {
+    let normalized = normalize_paste_newlines(paste);
+    // A copied line usually brings its newline along. Outside a body it would
+    // only leave the cursor on an empty second line, so it goes; a paste never
+    // sends anything by itself, Enter still does that. Inside a body every
+    // newline is content.
+    let paste = if inside_body { normalized.as_str() } else { normalized.trim_end_matches('\n') };
+
+    // Pasting `.api` text (a request line, a directive, a block of lines)
+    // outside a JSON body replaces the entire input rather than inserting at
+    // the cursor — so pasting "GET /people..." or "assert /x" over a "GET /"
+    // prompt yields the pasted text, not "GET /assert /x". Detection is skipped
+    // inside a body so a JSON string beginning with "GET " is pasted verbatim.
+    if !inside_body && paste_is_api_text(paste) {
         // Normalize the method to uppercase, like typed promotion does.
-        state.input = uppercase_method_token(paste.trim_end());
+        state.input = if paste_starts_with_method(paste) {
+            uppercase_method_token(paste.trim_end())
+        } else {
+            paste.trim_end().to_string()
+        };
         state.cursor_pos = char_len(&state.input);
         // Pasting a full request line is an explicit method choice.
         state.method_auto_promoted = false;
@@ -13466,6 +13507,85 @@ mod tests {
     }
 
     #[test]
+    fn handle_paste_directive_replaces_the_line() {
+        // The user's case: `assert …` pasted over the prompt's `GET /` must not
+        // become `GET /assert …`.
+        let mut state = test_state();
+        state.input = "GET /".to_string();
+        state.cursor_pos = char_len(&state.input);
+        let mut out = sink();
+        let line = "assert GET /receipts/receiptID=HLH00000003733~where(no.omnium.returnSynced)";
+        handle_paste(&mut state, line, &mut out).unwrap();
+        assert_eq!(state.input, line);
+        assert_eq!(state.cursor_pos, char_len(&state.input));
+
+        for text in ["confirm", "sleep 2", "url has localhost", "# a note", "seed.api", "~/x/seed.api"] {
+            let mut state = test_state();
+            state.input = "GET /people".to_string();
+            state.cursor_pos = char_len(&state.input);
+            handle_paste(&mut state, text, &mut sink()).unwrap();
+            assert_eq!(state.input, text, "pasting {text:?}");
+        }
+    }
+
+    #[test]
+    fn handle_paste_reads_carriage_returns_as_line_breaks() {
+        // Terminals send a pasted newline as `\r`. Three lines joined that way
+        // are three lines, and a copied line's trailing newline is dropped so
+        // the cursor stays on the line it belongs to.
+        let mut state = test_state();
+        state.input = "GET /".to_string();
+        state.cursor_pos = char_len(&state.input);
+        let mut out = sink();
+        handle_paste(&mut state, "assert /a\rassert /b\r\nassert /c\r", &mut out).unwrap();
+        assert_eq!(state.input, "assert /a\nassert /b\nassert /c");
+        assert_eq!(state.cursor_pos, char_len(&state.input));
+        assert!(matches!(classify_prompt_line(&state.input), PromptLine::Program));
+
+        // A single copied line, newline and all, over the default prompt.
+        let mut state = test_state();
+        state.input = "GET /".to_string();
+        state.cursor_pos = char_len(&state.input);
+        handle_paste(&mut state, "GET /people~take(5)\r", &mut out).unwrap();
+        assert_eq!(state.input, "GET /people~take(5)");
+        assert_eq!(state.cursor_pos, char_len(&state.input));
+
+        // A path pasted after `GET /` is still inserted, minus its newline.
+        let mut state = test_state();
+        state.input = "GET /".to_string();
+        state.cursor_pos = char_len(&state.input);
+        handle_paste(&mut state, "/people\r", &mut out).unwrap();
+        assert_eq!(state.input, "GET /people");
+
+        // Several `/path` lines are a block and replace the line.
+        let mut state = test_state();
+        state.input = "GET /".to_string();
+        state.cursor_pos = char_len(&state.input);
+        handle_paste(&mut state, "/a\r/b\r", &mut out).unwrap();
+        assert_eq!(state.input, "/a\n/b");
+    }
+
+    #[test]
+    fn handle_paste_multiline_body_is_still_inserted() {
+        // A JSON body spanning lines is a body, not a block of requests: it
+        // lands at the cursor and promotes the method as a typed body would.
+        let mut state = test_state();
+        state.input = "GET /people/com.test=1 ".to_string();
+        state.cursor_pos = char_len(&state.input);
+        let mut out = sink();
+        handle_paste(&mut state, "{\r  \"name\": \"Joe\"\r}\r", &mut out).unwrap();
+        assert_eq!(state.input, "PUT /people/com.test=1 {\n  \"name\": \"Joe\"\n}");
+        assert_eq!(state.method, "PUT");
+
+        // Inside a body a `\r` is a line break too, and a trailing one is kept.
+        let mut state = test_state();
+        state.input = "PUT /x {\n  \"a\": 1".to_string();
+        state.cursor_pos = char_len(&state.input);
+        handle_paste(&mut state, ",\r  \"b\": 2\r", &mut out).unwrap();
+        assert_eq!(state.input, "PUT /x {\n  \"a\": 1,\n  \"b\": 2\n");
+    }
+
+    #[test]
     fn handle_paste_body_paste_promotes_get() {
         // Pasting a JSON body at the body position promotes GET → PUT.
         let mut state = test_state();
@@ -13578,19 +13698,18 @@ mod tests {
 
     #[test]
     fn handle_paste_array_wrap_multiline_and_trailing_ws() {
-        // Multi-line pasted JSON wraps around the whole block; a trailing
-        // newline stays outside the `]`. Non-ASCII content keeps the cursor math
-        // correct (char vs byte).
+        // Multi-line pasted JSON wraps around the whole block; the trailing
+        // newline a copied block brings along is dropped, so the cursor ends
+        // right after the `]`. Non-ASCII content keeps the cursor math correct
+        // (char vs byte).
         let mut state = test_state();
         state.array_endpoints.insert("/people".to_string());
         state.input = "GET /people ".to_string();
         state.cursor_pos = char_len(&state.input);
         let mut out = sink();
         handle_paste(&mut state, "{\n  \"name\": \"Zoë\"\n}\n", &mut out).unwrap();
-        assert_eq!(state.input, "PUT /people [{\n  \"name\": \"Zoë\"\n}]\n");
-        // Cursor sits right after the `]`.
-        let after_bracket = state.input.rfind(']').unwrap() + 1;
-        assert_eq!(state.cursor_pos, char_len(&state.input[..after_bracket]));
+        assert_eq!(state.input, "PUT /people [{\n  \"name\": \"Zoë\"\n}]");
+        assert_eq!(state.cursor_pos, char_len(&state.input));
     }
 
     #[test]
@@ -14808,6 +14927,31 @@ mod tests {
         assert!(!paste_starts_with_method("GET"));               // no following space/URI
         assert!(!paste_starts_with_method("{\"a\":1}"));         // JSON body
         assert!(!paste_starts_with_method(""));
+    }
+
+    #[test]
+    fn paste_is_api_text_detection() {
+        assert!(paste_is_api_text("GET /people"));
+        assert!(paste_is_api_text("assert /x"));
+        assert!(paste_is_api_text("ASSERT not /x~count"));
+        assert!(paste_is_api_text("confirm"));
+        assert!(paste_is_api_text("sleep 5 while /imports~count"));
+        assert!(paste_is_api_text("url is http://localhost:5000"));
+        assert!(paste_is_api_text("# comment"));
+        assert!(paste_is_api_text("shared/seed.api"));
+        assert!(paste_is_api_text("/tmp/seed.API"));
+        assert!(paste_is_api_text("/a\n/b"));          // a block of requests
+        assert!(paste_is_api_text("  /a\n/b\n"));
+        // Inserted at the cursor instead:
+        assert!(!paste_is_api_text("/people/com.test=1"));   // one bare path
+        assert!(!paste_is_api_text("/people\n"));            // one path, newline and all
+        assert!(!paste_is_api_text("{\"a\":1}"));            // JSON body
+        assert!(!paste_is_api_text("{\n  \"a\": 1\n}"));     // multi-line body
+        assert!(!paste_is_api_text("@people/*.json"));
+        assert!(!paste_is_api_text("> out.json"));
+        assert!(!paste_is_api_text("urls"));                  // not a directive
+        assert!(!paste_is_api_text("GET"));
+        assert!(!paste_is_api_text(""));
     }
 
     #[test]
