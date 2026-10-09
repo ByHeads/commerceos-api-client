@@ -213,7 +213,9 @@ one-shot mode, with tab completion for endpoints, operators, properties, and fil
 - **Enter on a body method without a body** opens a multi-line editor: `ctrl+d` sends, `esc` cancels.
 - **Batch-file syntax works at the prompt too.** A line that isn't a request is read as `.api`
   syntax: `confirm Ready?` asks in the hint line, `sleep 5 while not /imports~count` polls,
-  `assert /companies/x` checks, and `seed.api` runs the file, includes and all. A pasted block
+  `assert /companies/x` checks (logged as `assert GET /companies/x`, with
+  `↳ assertion failed (404 Not Found)` under the status line when it fails), and `seed.api`
+  runs the file, includes and all. A pasted block
   of several lines runs line by line. Pasting a request line, a directive or a block replaces
   whatever is on the line, so a paste over the starting `GET /` is just the paste. `esc` stops a wait; a failed assert or a declined confirm
   stops the rest of the line. A mistyped request says `not a request or .api file` instead of

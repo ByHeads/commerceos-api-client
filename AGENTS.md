@@ -335,7 +335,9 @@ table of lines through all three and compares what reached the server.
 as typed (a body-less `PUT` opens the body editor, which is the prompt's own);
 anything else runs in the session: `confirm` asks in the hint line (`y`/enter or
 `n`/esc), `sleep` and `sleep while` show a spinner and stop on esc, `assert`
-logs the request and status but not the body, `url` checks the current
+logs the line as typed (`assert GET /x`) with its status but not the body and
+leaves `↳ assertion failed (null)` under the status line when it fails, `url`
+checks the current
 connection, and `seed.api` runs the file with each request logged as if typed.
 A pasted block of several lines runs line by line, as a file would; pasting a
 request line, a directive or a block replaces whatever is on the line, so a

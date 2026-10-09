@@ -664,6 +664,57 @@ fn a_pasted_block_with_carriage_returns_runs_line_by_line() {
     assert!(!shown.contains("/assert"), "the block was sent as one request:\n{shown}");
 }
 
+/// A failed `assert` leaves its verdict in the scrollback, under a request
+/// line that says it was an assert. The hint line fades; the log must not.
+#[cfg(unix)]
+#[test]
+fn a_failed_assert_at_the_prompt_is_logged_as_one() {
+    use pty::{plain, Prompt};
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    prepare(dir.path());
+
+    let mut prompt = Prompt::open(api(server.port, dir.path()));
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+
+    let lines: [(&str, &str, &[&str]); 3] = [
+        ("assert /zero", "↳ assertion failed (0)", &["assert GET /zero"]),
+        ("assert not /a", "↳ assertion failed (", &["assert not GET /a"]),
+        // A passing assert is logged with its prefix and no note.
+        ("assert /a", "", &["assert GET /a"]),
+    ];
+    for (line, note, logged) in lines {
+        prompt.send(b"\x15");
+        prompt.pump(Duration::from_millis(60));
+        server.take();
+        prompt.paste(line);
+        prompt.pump(Duration::from_millis(60));
+        let mark = prompt.screen.len();
+        prompt.send(b"\r");
+        let start = Instant::now();
+        let mut quiet = 0;
+        while quiet < 2 && start.elapsed() < Duration::from_secs(4) {
+            let before = server.seen();
+            prompt.pump(Duration::from_millis(120));
+            quiet = if server.seen() == before { quiet + 1 } else { 0 };
+        }
+        assert_eq!(server.seen(), 1, "{line}");
+        let shown = plain(&prompt.screen[mark..]);
+        for l in logged {
+            assert!(shown.contains(l), "{line}: {l:?} not logged:\n{shown}");
+        }
+        if note.is_empty() {
+            assert!(!shown.contains("↳"), "{line}: unexpected note:\n{shown}");
+        } else {
+            let at = shown.find(note).unwrap_or_else(|| panic!("{line}: {note:?} not shown:\n{shown}"));
+            // The note follows the status line, not the hint line.
+            let status = shown.find("HTTP/1.1").unwrap();
+            assert!(at > status, "{line}: note before the status line:\n{shown}");
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn tab_completes_an_include_at_the_prompt() {

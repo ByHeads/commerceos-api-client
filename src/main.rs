@@ -645,6 +645,9 @@ struct AppState {
     height: u16,
     prev_width: u16,
     output_history: Vec<OutputBlock>,  // Logged requests, re-rendered on resize
+    /// Printed before the next request's log line (`assert `), see
+    /// `OutputBlock::prefix`. Taken by `execute_request`.
+    log_prefix: String,
     // Tab completion
     spec: Option<ApiSpec>,
     endpoints: Vec<String>,
@@ -726,6 +729,7 @@ impl AppState {
             height: 24,
             prev_width: 80,
             output_history: Vec::new(),
+            log_prefix: String::new(),
             spec: None,
             endpoints: Vec::new(),
             schema_props: HashMap::new(),
@@ -5037,6 +5041,9 @@ struct OutputBlock {
     /// A directive log line (`sleep 2s`, `confirm Ready? y`) printed verbatim
     /// in place of the request line. Not width-dependent.
     raw_line: Option<String>,
+    /// What stood before the request on the line it came from (`assert `,
+    /// `assert not `), so the log shows the check and not just its request.
+    prefix: String,
 }
 
 impl OutputBlock {
@@ -5056,16 +5063,34 @@ impl OutputBlock {
     fn render(&self, width: usize) -> String {
         let line = match &self.raw_line {
             Some(raw) => raw.clone(),
-            None => format_request_log_line(
-                &self.method,
-                &self.uri,
-                &self.body,
-                &self.display_outfile,
-                self.outfile_append,
-                width,
+            None => format!(
+                "{}{}",
+                self.prefix,
+                format_request_log_line(
+                    &self.method,
+                    &self.uri,
+                    &self.body,
+                    &self.display_outfile,
+                    self.outfile_append,
+                    width.saturating_sub(char_len(&self.prefix)),
+                )
             ),
         };
         format!("{}\n{}{}", line, self.head, self.tail)
+    }
+
+    /// Add a note under the status line — the verdict of a check, say — before
+    /// the blank line that closes the block, so it reads as part of the block.
+    fn push_note(&mut self, note: &str) {
+        let closed = self.tail.is_empty() && self.head.ends_with("\n\n");
+        if closed {
+            self.head.pop();
+        }
+        self.head.push_str(note);
+        self.head.push('\n');
+        if closed {
+            self.head.push('\n');
+        }
     }
 
     fn has_body(&self) -> bool {
@@ -5105,7 +5130,18 @@ fn print_output_and_rerender(
     stdout: &mut io::Stdout,
     display_output: &str,
 ) -> io::Result<()> {
-    let clear_lines = 2 + state.prev_input_lines;
+    print_above_input(state, stdout, display_output, 0)
+}
+
+/// `print_output_and_rerender`, first taking back `reclaim` rows of what was
+/// printed last — the blank line closing a block, when a note is to go there.
+fn print_above_input(
+    state: &mut AppState,
+    stdout: &mut io::Stdout,
+    display_output: &str,
+    reclaim: u16,
+) -> io::Result<()> {
+    let clear_lines = 2 + state.prev_input_lines + reclaim;
     queue!(
         stdout,
         cursor::Hide,
@@ -5132,6 +5168,19 @@ fn log_directive_line(state: &mut AppState, stdout: &mut io::Stdout, line: Strin
     let display_output = block.render(state.width as usize);
     push_output_block(state, block);
     print_output_and_rerender(state, stdout, &display_output)
+}
+
+/// Put a note under the block just printed (`↳ assertion failed (null)`),
+/// on screen and in the history a resize replays. The block's closing blank
+/// line is taken back so the note sits right under the status line.
+fn note_last_block(state: &mut AppState, stdout: &mut io::Stdout, note: &str) -> io::Result<()> {
+    let Some(block) = state.output_history.last_mut() else {
+        return Ok(());
+    };
+    let closed = block.tail.is_empty() && block.head.ends_with("\n\n");
+    block.push_note(note);
+    let output = if closed { format!("{}\n\n", note) } else { format!("{}\n", note) };
+    print_above_input(state, stdout, &output, closed as u16)
 }
 
 /// Ask the user a yes/no question and return true if they confirm (Y/yes/empty).
@@ -7606,6 +7655,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
         body: state.body.clone(),
         display_outfile: state.display_outfile.clone(),
         outfile_append: state.config.outfile_append,
+        prefix: std::mem::take(&mut state.log_prefix),
         ..Default::default()
     };
 
@@ -8300,27 +8350,37 @@ fn run_assert_interactive(
 ) -> io::Result<bool> {
     let line = format_assert(negate, request);
     parse_input(state, request);
+    // The log shows the check as typed, `assert GET /x`, not a bare GET.
+    state.log_prefix = if negate { "assert not " } else { "assert " }.to_string();
     state.config.check_only = true;
     state.config.expect_falsy = negate;
     state.config.last_response = None;
     let outcome = execute_request(state, stdout);
+    state.log_prefix.clear();
     state.config.check_only = false;
     state.config.expect_falsy = false;
     let outcome = outcome?;
     let response = state.config.last_response.take();
 
-    let verdict = match outcome {
+    // The verdict goes in the hint line for the moment and under the status
+    // line for good: the hint fades in seconds, and without the note a
+    // failed assert would leave nothing but a 200 OK in the scrollback.
+    let (verdict, note) = match outcome {
         RequestOutcome::Truthy if !negate => return Ok(true),
         RequestOutcome::Falsy if negate => return Ok(true),
         RequestOutcome::Truthy | RequestOutcome::Falsy => {
             let why = response
                 .map(|(status, body)| describe_check_response(status, &body))
                 .unwrap_or_default();
-            format!("assertion failed: {} ({})", line, why)
+            (format!("assertion failed: {} ({})", line, why), format!("↳ assertion failed ({})", why))
         }
-        RequestOutcome::Errored => format!("{} — could not be evaluated", line),
+        RequestOutcome::Errored => (
+            format!("{} — could not be evaluated", line),
+            "↳ could not be evaluated".to_string(),
+        ),
         RequestOutcome::Aborted => return Ok(false),
     };
+    note_last_block(state, stdout, &note.red().to_string())?;
     show_program_status(state, stdout, verdict)?;
     Ok(false)
 }
@@ -15451,6 +15511,7 @@ mod tests {
             head: "HTTP/1.1 200 OK 0.08s\n".to_string(),
             tail: "\n{\n  \"ok\": true\n}\n\n".to_string(),
             raw_line: None,
+            prefix: String::new(),
         }
     }
 
@@ -15533,6 +15594,7 @@ mod tests {
             head: "HTTP/1.1 200 OK 0.08s\n> out.json\n\n".to_string(),
             tail: String::new(),
             raw_line: None,
+            prefix: String::new(),
         };
 
         let rendered = block.render(80);
@@ -15541,6 +15603,51 @@ mod tests {
         assert!(rendered.contains("> out.json"), "outfile note lost: {rendered:?}");
         // No response body was printed, so ctrl+j has nothing to erase.
         assert!(!block.has_body());
+    }
+
+    #[test]
+    fn output_block_prefix_leads_the_request_line_within_the_width() {
+        let block = OutputBlock {
+            method: "GET".to_string(),
+            uri: "/zero".to_string(),
+            prefix: "assert not ".to_string(),
+            head: "HTTP/1.1 200 OK\n\n".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(block.render(80), "assert not GET /zero\nHTTP/1.1 200 OK\n\n");
+
+        // The prefix counts against the row: a long body is cut so the whole
+        // line, prefix included, still fits.
+        let block = OutputBlock {
+            method: "PUT".to_string(),
+            uri: "/people".to_string(),
+            body: "x".repeat(200),
+            prefix: "assert ".to_string(),
+            ..Default::default()
+        };
+        let line = block.render(60).lines().next().unwrap().to_string();
+        assert!(line.starts_with("assert PUT /people "), "{line:?}");
+        assert_eq!(char_len(&line), 60, "{line:?}");
+    }
+
+    #[test]
+    fn output_block_note_sits_under_the_status_line() {
+        // A bodyless block: the note goes before the closing blank line.
+        let mut block = OutputBlock {
+            head: "HTTP/1.1 200 OK\n\n".to_string(),
+            ..Default::default()
+        };
+        block.push_note("↳ assertion failed (null)");
+        assert_eq!(block.head, "HTTP/1.1 200 OK\n↳ assertion failed (null)\n\n");
+        assert!(!block.has_body());
+
+        // A head without a closing blank line just gets the note appended.
+        let mut block = OutputBlock {
+            head: "Request failed\n".to_string(),
+            ..Default::default()
+        };
+        block.push_note("↳ could not be evaluated");
+        assert_eq!(block.head, "Request failed\n↳ could not be evaluated\n");
     }
 
     #[test]
