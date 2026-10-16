@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **A slow request reads the same while it runs and once it is done.** The progress line counted `waiting for response... 1m2s` while the finished status line then said `200 OK 153.38s`, so the two never matched past a minute. The status line now switches to the same `2m33s` shape at sixty seconds, keeping hundredths (`0.02s`, `45.38s`) below that, where they mean something. Both read `1h2m3s` from an hour up instead of `62m3s`. A fractional `sleep 1.5s` is echoed in `-p` previews and the `-sa` log as written, `1.5s`, not `1500ms`.
+
 ## 3.2.1
 
 - **Pasting at the prompt reads what the terminal sends.** A terminal hands a pasted newline over as a carriage return; the prompt inserted it as a character, so a copied line drew its cursor at column 0 and a block of lines overprinted itself and was sent as one garbled request. Every paste now reads `\r\n` and `\r` as line breaks, and the trailing newline a copied line brings along is dropped outside a body. Pasting `.api` text that stands on its own — a request line, a directive, a comment, a `.api` file, or a block of lines — replaces the input instead of landing at the cursor, so `assert /x` pasted over the starting `GET /` no longer becomes `GET /assert /x`. A body, a `> file` redirect, and a single bare `/path` are still inserted where the cursor is.

@@ -4744,7 +4744,8 @@ fn format_confirm(message: &Option<String>) -> String {
     }
 }
 
-/// Human-friendly elapsed time for the `sleep while` summary: `800ms`, `12s`, `1m40s`.
+/// Human-friendly elapsed time for a wait in progress and the `sleep while`
+/// summary: `800ms`, `12s`, `1m40s`, `1h2m3s`.
 fn format_elapsed(d: Duration) -> String {
     let secs = d.as_secs();
     if secs == 0 {
@@ -4752,7 +4753,32 @@ fn format_elapsed(d: Duration) -> String {
     } else if secs < 60 {
         format!("{}s", secs)
     } else {
+        format_minutes(secs)
+    }
+}
+
+/// `XmYs`, or `XhYmZs` from an hour up. Shared by the live progress line and
+/// the finished status line so a request reads the same while it runs and once
+/// it is done.
+fn format_minutes(secs: u64) -> String {
+    if secs < 3600 {
         format!("{}m{}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{}m{}s", secs / 3600, (secs % 3600) / 60, secs % 60)
+    }
+}
+
+/// How long a finished request took, next to its status: `0.02s`, `45.38s`,
+/// then `2m33s` from a minute up, in the same shape as the progress line that
+/// was counting while it ran. Hundredths matter for a quick request and are
+/// noise for a slow one.
+fn format_latency(d: Duration) -> String {
+    // Round to hundredths first so 59.999s reads `1m0s`, not `60.00s`.
+    let hundredths = (d.as_secs_f64() * 100.0).round() as u64;
+    if hundredths < 60 * 100 {
+        format!("{}.{:02}s", hundredths / 100, hundredths % 100)
+    } else {
+        format_minutes(hundredths / 100)
     }
 }
 
@@ -5544,13 +5570,17 @@ fn note_skipped_chain(config: &Config, skipped: usize) {
     }
 }
 
-/// Format a Duration for display: whole seconds as `Ns`, sub-second as `Nms`.
+/// A `sleep` interval as the file would write it: whole seconds as `Ns`,
+/// sub-second as `Nms`, anything in between with its fraction (`1.5s`).
 fn format_duration(d: Duration) -> String {
     let ms = d.as_millis();
     if ms % 1000 == 0 {
         format!("{}s", ms / 1000)
-    } else {
+    } else if ms < 1000 {
         format!("{}ms", ms)
+    } else {
+        let s = format!("{:.3}", d.as_secs_f64());
+        format!("{}s", s.trim_end_matches('0').trim_end_matches('.'))
     }
 }
 
@@ -5765,13 +5795,13 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                             "{}HTTP/1.1 {} {}",
                             "└─".dimmed(),
                             status_str,
-                            format!("{:.2}s", elapsed.as_secs_f64()).dimmed()
+                            format_latency(elapsed).dimmed()
                         );
                     } else {
                         eprintln!(
                             "HTTP/1.1 {} {}",
                             status_str,
-                            format!("{:.2}s", elapsed.as_secs_f64()).dimmed()
+                            format_latency(elapsed).dimmed()
                         );
                         // The body follows straight under the status line; the
                         // "> outfile" line, when there is one, takes its place.
@@ -7994,7 +8024,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
                             block.head = format!(
                                 "HTTP/1.1 {} {}\n{}\n\n",
                                 status_str,
-                                format!("{:.2}s", elapsed.as_secs_f64()).dimmed(),
+                                format_latency(elapsed).dimmed(),
                                 outfile_marker("clipboard", copied, false).dimmed()
                             );
                         }
@@ -8036,7 +8066,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
                         block.head = format!(
                             "HTTP/1.1 {} {}\n{}\n\n",
                             status_str,
-                            format!("{:.2}s", elapsed.as_secs_f64()).dimmed(),
+                            format_latency(elapsed).dimmed(),
                             outfile_marker(&state.display_outfile, written, state.config.outfile_append).dimmed()
                         );
                     }
@@ -8049,7 +8079,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
                     block.head = format!(
                         "HTTP/1.1 {} {}\n",
                         status_str,
-                        format!("{:.2}s", elapsed.as_secs_f64()).dimmed()
+                        format_latency(elapsed).dimmed()
                     );
                 }
 
@@ -14275,7 +14305,37 @@ mod tests {
         );
         assert_eq!(format_elapsed(Duration::from_millis(800)), "800ms");
         assert_eq!(format_elapsed(Duration::from_millis(12_400)), "12s");
+        assert_eq!(format_elapsed(Duration::from_secs(60)), "1m0s");
         assert_eq!(format_elapsed(Duration::from_secs(100)), "1m40s");
+        assert_eq!(format_elapsed(Duration::from_secs(3600)), "1h0m0s");
+        assert_eq!(format_elapsed(Duration::from_secs(3723)), "1h2m3s");
+    }
+
+    /// A finished request keeps hundredths under a minute and switches to the
+    /// progress line's `XmYs` shape above it, so the two never disagree.
+    #[test]
+    fn format_latency_matches_progress_line_past_a_minute() {
+        assert_eq!(format_latency(Duration::from_millis(20)), "0.02s");
+        assert_eq!(format_latency(Duration::from_millis(45_380)), "45.38s");
+        assert_eq!(format_latency(Duration::from_millis(59_999)), "1m0s");
+        assert_eq!(format_latency(Duration::from_millis(59_994)), "59.99s");
+        assert_eq!(format_latency(Duration::from_secs(60)), "1m0s");
+        assert_eq!(format_latency(Duration::from_millis(153_380)), "2m33s");
+        assert_eq!(format_latency(Duration::from_secs(3723)), "1h2m3s");
+        assert_eq!(
+            format_latency(Duration::from_millis(153_380)),
+            format_elapsed(Duration::from_millis(153_380))
+        );
+    }
+
+    /// `sleep` is echoed the way the file wrote it, fractions included.
+    #[test]
+    fn format_duration_keeps_fractional_seconds() {
+        assert_eq!(format_duration(Duration::from_millis(500)), "500ms");
+        assert_eq!(format_duration(Duration::from_secs(2)), "2s");
+        assert_eq!(format_duration(Duration::from_millis(1500)), "1.5s");
+        assert_eq!(format_duration(Duration::from_millis(2250)), "2.25s");
+        assert_eq!(format_duration(Duration::from_millis(1001)), "1.001s");
     }
 
     #[test]
