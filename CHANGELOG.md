@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 3.2.2
 
 - **A slow request reads the same while it runs and once it is done.** The progress line counted `waiting for response... 1m2s` while the finished status line then said `200 OK 153.38s`, so the two never matched past a minute. The status line now switches to the same `2m33s` shape at sixty seconds, keeping hundredths (`0.02s`, `45.38s`) below that, where they mean something. Both read `1h2m3s` from an hour up instead of `62m3s`. A fractional `sleep 1.5s` is echoed in `-p` previews and the `-sa` log as written, `1.5s`, not `1500ms`.
 
