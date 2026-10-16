@@ -1,6 +1,6 @@
 [package]
 name = "api-rust"
-version = "3.2.1"
+version = "3.2.2"
 edition = "2021"
 description = "Interactive CLI client for CommerceOS API"
 repository = "https://github.com/byheads/commerceos-api-client"
