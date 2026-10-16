@@ -1,0 +1,3 @@
+GET /a
+assert /b
+GET /c
