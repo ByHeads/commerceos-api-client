@@ -758,3 +758,78 @@ fn tab_completes_an_include_at_the_prompt() {
         assert_eq!(server.take(), sent, "after completing to {completed}");
     }
 }
+
+/// The rows the client's last cursor move climbed before clearing downwards:
+/// what it took off the screen on its way out.
+#[cfg(unix)]
+fn last_move_up(screen: &str) -> Option<u16> {
+    let mut last = None;
+    let mut rest = screen;
+    while let Some(i) = rest.find("\x1b[") {
+        rest = &rest[i + 2..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if rest[digits.len()..].starts_with('A') {
+            last = digits.parse().ok();
+        }
+    }
+    last
+}
+
+/// Press ctrl+c twice and collect what the client prints while it leaves.
+#[cfg(unix)]
+fn quit(prompt: &mut pty::Prompt) {
+    prompt.send(b"\x03");
+    prompt.wait_for("ctrl+c again to exit", Duration::from_secs(3));
+    prompt.send(b"\x03");
+    prompt.pump(Duration::from_millis(400));
+}
+
+/// A session that was only opened and closed takes its splash with it: the
+/// final clear starts above the box, not just above the input area.
+#[cfg(unix)]
+#[test]
+fn closing_an_unused_prompt_clears_the_splash() {
+    use pty::Prompt;
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    prepare(dir.path());
+
+    let mut prompt = Prompt::open(api(server.port, dir.path()));
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    assert!(prompt.screen.contains("CommerceOS API Client"), "no splash:\n{}", prompt.screen);
+
+    quit(&mut prompt);
+    // ruler + input line + hint, then the five splash lines above them
+    assert_eq!(last_move_up(&prompt.screen), Some(3 + 5), "exit clear:\n{}", pty::plain(&prompt.screen));
+}
+
+/// Once a request has been sent, its output stays in the scrollback like a
+/// shell session's history: leaving clears only the input area.
+#[cfg(unix)]
+#[test]
+fn closing_a_used_prompt_keeps_its_history() {
+    use pty::Prompt;
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    prepare(dir.path());
+
+    let mut prompt = Prompt::open(api(server.port, dir.path()));
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+
+    prompt.send(b"\x15");
+    prompt.pump(Duration::from_millis(60));
+    prompt.paste("GET /a");
+    prompt.pump(Duration::from_millis(60));
+    prompt.send(b"\r");
+    let start = Instant::now();
+    while server.seen() == 0 && start.elapsed() < Duration::from_secs(4) {
+        prompt.pump(Duration::from_millis(120));
+    }
+    assert_eq!(server.take(), vec!["GET /a".to_string()]);
+    prompt.pump(Duration::from_millis(300));
+
+    quit(&mut prompt);
+    assert_eq!(last_move_up(&prompt.screen), Some(3), "exit clear:\n{}", pty::plain(&prompt.screen));
+}

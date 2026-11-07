@@ -6310,8 +6310,9 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
                         let _ = execute!(stdout, PopKeyboardEnhancementFlags);
                     }
                     let _ = execute!(stdout, DisableBracketedPaste);
-                    // Move up to top of splash and clear from there down
-                    let total_up = state.prev_input_lines + 7;
+                    // Move up to top of splash and clear from there down:
+                    // hint + input + ruler, then the splash itself.
+                    let total_up = 2 + state.prev_input_lines + splash_line_count(state.width);
                     execute!(
                         stdout,
                         cursor::MoveUp(total_up.min(state.height.saturating_sub(1))),
@@ -6407,9 +6408,14 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
         }
     }
 
-    // Clear input area before exiting (move up and clear to end)
+    // Clear input area before exiting (move up and clear to end). When nothing
+    // was ever printed, the splash is all that sits above it: take that too,
+    // so a session that only opened and closed leaves the shell as it found it.
     let help_lines: u16 = help_line_count(&state);
-    let lines_to_clear: u16 = if state.show_help { help_lines } else { 2 + state.prev_input_lines };
+    let mut lines_to_clear: u16 = if state.show_help { help_lines } else { 2 + state.prev_input_lines };
+    if state.output_history.is_empty() {
+        lines_to_clear += splash_line_count(state.width);
+    }
     execute!(
         stdout,
         cursor::MoveUp(lines_to_clear.min(state.height.saturating_sub(1))),
@@ -9995,7 +10001,7 @@ fn render<W: Write>(stdout: &mut W, state: &mut AppState) -> io::Result<()> {
 
 fn print_splash_with_width(config: &Config, term_width: u16) {
     let full_width = 60usize;
-    let min_width = 36usize; // Minimum to show title properly
+    let min_width = SPLASH_MIN_WIDTH; // Minimum to show title properly
     let hint_section_width = 20usize; // " │ ctrl+b for docs │" length
 
     let term_w = term_width as usize;
@@ -10067,6 +10073,16 @@ fn print_splash_with_width(config: &Config, term_width: u16) {
     println!("{}", format!("╰{}╯", "─".repeat(actual_width - 2)).dimmed());
     println!();
 }
+
+/// How many lines `print_splash_with_width` prints at this width: the box
+/// with a blank line above and below, or just the blank line when the
+/// terminal is too narrow for the box.
+fn splash_line_count(term_width: u16) -> u16 {
+    if (term_width as usize) < SPLASH_MIN_WIDTH { 1 } else { 5 }
+}
+
+/// Narrower than this, the splash box is not drawn at all.
+const SPLASH_MIN_WIDTH: usize = 36;
 
 fn print_splash(config: &Config) {
     // Default to 80 width when called without terminal size
