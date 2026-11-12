@@ -701,6 +701,118 @@ fn the_prompt_reads_the_same_lines() {
     }
 }
 
+/// `-f` means the same from a file, from stdin and as arguments: the run
+/// stops at the first response of 400 or above, exits 1, and the body of
+/// that response is the last thing on stdout.
+#[test]
+fn fail_fast_stops_the_same_way_in_a_file_from_stdin_and_as_arguments() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    prepare(dir.path());
+    let run = |args: &[&str], stdin: Option<&str>| {
+        server.take();
+        let mut cmd = api(server.port, dir.path());
+        cmd.args(args);
+        if stdin.is_some() {
+            cmd.stdin(std::process::Stdio::piped());
+        }
+        cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn api");
+        if let Some(text) = stdin {
+            child.stdin.take().unwrap().write_all(text.as_bytes()).unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        server.settle(Duration::from_millis(150), Duration::from_secs(3));
+        (server.take(), out.status.success(), String::from_utf8_lossy(&out.stdout).to_string())
+    };
+
+    // (the lines, what is sent, whether the run succeeds)
+    let cases: [(&str, &[&str], bool); 6] = [
+        // The recording server answers `/missing` with a 404 and `/boom` with a 500.
+        ("GET /a\nGET /missing\nGET /b", &["GET /a", "GET /missing"], false),
+        ("GET /boom\nGET /b", &["GET /boom"], false),
+        // A question answered "no" is not a failure…
+        ("GET /missing || PUT /made {\"x\":1}\nGET /b", &["GET /missing", "PUT /made {\"x\":1}", "GET /b"], true),
+        ("assert not GET /missing\nGET /b", &["GET /missing", "GET /b"], true),
+        // …the last request of a chain is one.
+        ("GET /a && GET /missing\nGET /b", &["GET /a", "GET /missing"], false),
+        ("seed.api\nGET /missing\nGET /b", &["GET /inc1", "GET /inc2", "GET /missing"], false),
+    ];
+    for (lines, sent, ok) in cases {
+        std::fs::write(dir.path().join("case.api"), format!("{lines}\n")).unwrap();
+        let from_file = run(&["-sfa", "case.api"], None);
+        let from_stdin = run(&["-sfa"], Some(lines));
+        let quoted = run(&["-sf", lines], None);
+        for (how, got) in [("file", &from_file), ("stdin", &from_stdin), ("one quoted argument", &quoted)] {
+            assert_eq!(got.0, sent, "{how}: {lines:?}");
+            assert_eq!(got.1, ok, "{how}: {lines:?}");
+            // The failing body, `{}` from this server, ends stdout.
+            assert_eq!(got.2.ends_with("\n{}\n"), !ok, "{how}: {lines:?}\n{}", got.2);
+        }
+        // Without the flag every line is sent and the run succeeds.
+        let unflagged = run(&["-sa", "case.api"], None);
+        assert!(unflagged.1 && unflagged.0.len() >= sent.len(), "{lines:?}: {unflagged:?}");
+    }
+
+    // One request, split by the shell or not.
+    for args in [&["-f", "GET", "/missing"][..], &["-f", "GET /missing"], &["GET", "/missing", "-f"]] {
+        let got = run(args, None);
+        assert_eq!((got.0, got.1, got.2.as_str()), (vec!["GET /missing".to_string()], false, "{}\n"), "{args:?}");
+    }
+}
+
+/// At the prompt `-f` stops the program that was running, not the session.
+#[cfg(unix)]
+#[test]
+fn fail_fast_at_the_prompt_stops_a_pasted_block_and_keeps_the_session() {
+    use pty::{plain, Prompt};
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    prepare(dir.path());
+
+    let mut cmd = api(server.port, dir.path());
+    cmd.arg("-f");
+    let mut prompt = Prompt::open(cmd);
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+
+    let mut run = |paste: &str| {
+        prompt.send(b"\x15");
+        prompt.pump(Duration::from_millis(60));
+        server.take();
+        prompt.paste(paste);
+        prompt.pump(Duration::from_millis(80));
+        let mark = prompt.screen.len();
+        prompt.send(b"\r");
+        let start = Instant::now();
+        let mut quiet = 0;
+        while quiet < 2 && start.elapsed() < Duration::from_secs(4) {
+            let before = server.seen();
+            prompt.pump(Duration::from_millis(120));
+            quiet = if server.seen() == before { quiet + 1 } else { 0 };
+        }
+        (server.take(), plain(&prompt.screen[mark..]))
+    };
+
+    let (sent, shown) = run("GET /a\rGET /missing\rGET /b\r");
+    assert_eq!(sent, ["GET /a", "GET /missing"]);
+    assert!(shown.contains("stopped at 404 (--fail-fast)"), "{shown}");
+
+    // A question answered "no" lets the block run on.
+    let (sent, shown) = run("GET /missing || PUT /made {\"x\":1}\rGET /b\r");
+    assert_eq!(sent, ["GET /missing", "PUT /made {\"x\":1}", "GET /b"]);
+    assert!(!shown.contains("--fail-fast"), "{shown}");
+
+    // A file run from the prompt stops the same way, and the session is
+    // still there for the next line.
+    std::fs::write(dir.path().join("failing.api"), "GET /boom\nGET /b\n").unwrap();
+    let (sent, shown) = run("failing.api");
+    assert_eq!(sent, ["GET /boom"]);
+    assert!(shown.contains("stopped at 500 (--fail-fast)"), "{shown}");
+    let (sent, _) = run("GET /a");
+    assert_eq!(sent, ["GET /a"]);
+}
+
 /// A terminal sends a pasted newline as `\r`. Pasted over the `GET /` the
 /// prompt starts with, a block of directive lines must still arrive as a
 /// block and run line by line, not as one request to `/assert GET /a…`.

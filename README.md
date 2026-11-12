@@ -300,6 +300,7 @@ Usage: api [OPTIONS] [METHOD] [URI] [BODY]
   -a, --all [FILE]                Run requests from FILE (stdin if omitted or `-`)
   -s, --silent                    No status output; with -a, one status line per request
   -p, --preview                   Show the request(s) and confirm before sending
+  -f, --fail-fast                 Stop at the first response of 400 or above: print its body, exit 1
   -r, --raw                       No pretty-printing
   -i, --include-nulls             Include null values in the response
       --ndjson                    NDJSON request and response

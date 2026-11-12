@@ -524,7 +524,48 @@ cat parent.api | api -a               # from stdin (the dash is implicit)
 api -a -                              # explicit stdin
 api -sa parent.api                    # silent batch mode (see below)
 api -spa parent.api                   # preview the requests, confirm before sending
+api -sfa parent.api                   # stop at the first failed request (see below)
 ```
+
+### Stopping at the first failure (`-f`, `--fail-fast`)
+
+Without `-f` a batch carries on past a request that fails: a 404, a 409 or a
+500 on a plain request line prints its status and the next line runs, and the
+exit code is 0. With `-f` the first response of **400 or above** ends the run:
+
+```sh
+api -sfa seed.api
+```
+
+```
+[http://localhost:5000]
+PUT /people/com.mi6.id=007 {"name":"James Bond"}
+└─HTTP/1.1 200 OK 0.02s
+GET /assert/…
+└─HTTP/1.1 409 Conflict 0.01s
+{ …the 409's body, as the server sent it… }
+```
+
+- Nothing after the failing request is sent, and the exit code is 1.
+- **The failing response's body is the last thing on stdout**, exactly as the
+  server sent it, with `-sa` too (where bodies are otherwise not printed). A
+  tool driving the client reads the reason from there; the status line stays
+  where it always is (stdout in `-sa`, stderr otherwise).
+- This is how to check a condition with the `/assert` endpoint: a failed
+  assertion answers 409, which `-f` turns into a stopped batch with the
+  explanation on stdout. The `assert` keyword still works and still reports
+  its own failures, with or without `-f`.
+- **A question may still be answered "no".** A chain segment with another
+  after it (`GET /x || PUT /x {…}`), `assert not`, and a `sleep while` poll
+  ask something, and a 404 or 409 is their answer, so they don't trip `-f`.
+  The last request of a chain is a plain request and does. A status that is
+  never an answer (401/403/408/429/5xx) ends the run from anywhere.
+- An error is not written to a `> outfile`: under `-f` the file is left
+  alone and the body goes to stdout.
+- It works for one request too: `api -f GET /assert/…` exits 1 on a 4xx or
+  5xx where it otherwise exits 0. At the interactive prompt, `api -f` makes a
+  pasted block or a `seed.api` run stop at the failing request and says
+  `stopped at 409 (--fail-fast)`; the session stays open.
 
 ### Credentials from disk (`--no-keychain`)
 
@@ -678,6 +719,7 @@ Run it: `api -sa workshop.api`.
 - **An archive URL without `sha256`** → downloaded again on every run, and whatever it serves that day is what runs. Add the `sha256` from the `import …` log line to pin it.
 - **`"token_env": "<the token>"`** → rejected or reported as an unset variable. It takes the *name* of an environment variable, so the secret stays out of the file.
 - **`import dir cl { "path": "cl" }`** → `import alias … clashes`. An alias can't share its name with a file or directory next to the `.api` file; name the alias something else.
+- **Expecting a failed request to stop a batch** → it doesn't, unless the line is an `assert`, a chain or a poll, or the run has `-f`. A plain `GET /assert/…` that answers 409 is logged and the next line runs. Run with `-f`.
 - **`assert` on a list endpoint** → `[]` is truthy, so `assert GET /people~where(x)` passes even when nothing matches. Assert a `~count` or a single item by identifier instead.
 - **A slashless URI on its own line in a `.api` file** → `api/v1/people` alone is read as an *include* path and fails with "could not read include". Write `GET api/v1/people`, or lead with the slash: `/api/v1/people`.
 - **`sleep while` that never ends** → `[]` and `{}` are truthy, so `sleep while GET /people~where(x)` loops forever once the list is merely empty. Poll a `~count` (or a single scalar field) instead, so the answer can become `0`/`null`.
@@ -691,4 +733,5 @@ Run it: `api -sa workshop.api`.
 - For repeated boilerplate, factor it into a `shared/` directory and use includes.
 - When generating files programmatically, prefer compact single-line JSON bodies — they're easier to grep and diff.
 - Use silent batch mode (`-sa`) when you want to verify that a long seeding script worked without drowning in response bodies.
+- Add `-f` (`-sfa`) so a failed request stops the batch: check the exit code, and on failure read the last line of stdout for the error body. Without it a batch exits 0 however many plain requests failed.
 - Run with `--no-keychain` and an absolute `API_CREDENTIALS_FILE` so nothing depends on an unlocked keychain or on the working directory.

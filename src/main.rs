@@ -204,6 +204,10 @@ struct Args {
     #[arg(short = 'p', long = "preview")]
     preview: bool,
 
+    /// Stop at the first response of 400 or above: print its body and exit 1
+    #[arg(short = 'f', long = "fail-fast")]
+    fail_fast: bool,
+
     /// Stream the response body instead of buffering it (also: API_STREAMING=1)
     #[arg(short = 't', long = "stream")]
     stream: bool,
@@ -266,6 +270,10 @@ struct Config {
     /// or a chain segment with something after it. A 404 then prints orange
     /// rather than red — see `status_tone`.
     expect_falsy: bool,
+    /// `-f`: a response of 400 or above ends the run. See `fail_fast_trips`.
+    fail_fast: bool,
+    /// The status of the last response the prompt received, for `-f` there.
+    last_status: Option<u16>,
 }
 
 impl Default for Config {
@@ -293,6 +301,8 @@ impl Default for Config {
             check_only: false,
             last_response: None,
             expect_falsy: false,
+            fail_fast: false,
+            last_status: None,
         }
     }
 }
@@ -2760,6 +2770,7 @@ fn main() {
         config.timeout_secs = secs;
     }
     config.preview = args.preview;
+    config.fail_fast = args.fail_fast;
 
     if args.me {
         config.api_path = "/api/me/v1".to_string();
@@ -4362,6 +4373,38 @@ enum RequestOutcome {
 /// when the real problem is expired credentials or a broken server.
 fn status_is_error(status: u16) -> bool {
     matches!(status, 401 | 403 | 408 | 429) || status >= 500
+}
+
+/// Whether a response with `status` ends the run under `-f`.
+///
+/// Any status of 400 or above does, with two kinds of request left alone. A
+/// request asked as a question (a chain segment with another after it,
+/// `assert not`) may be answered "no", so its 404 or 409 is an answer and the
+/// run goes on; 401/403/408/429/5xx are never an answer and still end it. A
+/// poll and an `assert` report their own failure, with the reason, and are
+/// not `-f`'s to cut short.
+fn fail_fast_trips(config: &Config, status: u16) -> bool {
+    config.fail_fast
+        && status >= 400
+        && !config.quiet
+        && !config.check_only
+        && (!config.expect_falsy || status_is_error(status))
+}
+
+/// End a `-f` run on the response that tripped it: the body goes to stdout
+/// exactly as the server sent it, the last thing there, so whatever is
+/// driving the client can read why (the 409 of a failed `/assert`, say).
+/// This holds in `-sa` mode too, where bodies are otherwise not printed. The
+/// status line is already out.
+fn fail_fast_exit(body: &str) -> ! {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    let _ = out.write_all(body.as_bytes());
+    if !body.is_empty() && !body.ends_with('\n') {
+        let _ = out.write_all(b"\n");
+    }
+    let _ = out.flush();
+    std::process::exit(1);
 }
 
 /// How a status line should read at a glance.
@@ -6978,6 +7021,12 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                 return outcome;
             }
 
+            // `-f`: this response ends the run. Nothing is written to an
+            // outfile; the error is not the data the file was meant to hold.
+            if fail_fast_trips(config, status.as_u16()) {
+                fail_fast_exit(&body_text);
+            }
+
             // Get response body — in bulk_silent mode, only write to outfile (no stdout)
             if config.bulk_silent {
                 if let Some(ref file_path) = outfile {
@@ -9093,6 +9142,11 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
         Some(Err(_)) | None => RequestOutcome::Errored,
     };
 
+    state.config.last_status = match &response_opt {
+        Some(Ok((status, _, _))) => Some(status.as_u16()),
+        _ => None,
+    };
+
     // A check (`assert`, `sleep while`) may need to say why it failed.
     if state.config.check_only || state.config.quiet {
         state.config.last_response = match &response_opt {
@@ -9271,12 +9325,13 @@ fn execute_request_chain(
 ) -> io::Result<bool> {
     // Published so every per-segment input restore shows the whole chain.
     state.chain_input = Some(full_chain.to_string());
-    let result: io::Result<(usize, bool)> = (|| {
+    let result: io::Result<(usize, bool, bool)> = (|| {
         // Outcome of the last EXECUTED segment; skipped segments leave it
         // alone (that's what makes `a && b || c` an if-then-else).
         let mut prev: Option<RequestOutcome> = None;
         let mut skipped = 0usize;
         let mut cut_short = false;
+        let mut fail_fast = false;
         for (i, (op, segment)) in segments.iter().enumerate() {
             if !chain_segment_should_run(prev, *op) {
                 skipped += 1;
@@ -9287,8 +9342,16 @@ fn execute_request_chain(
             // condition may answer "no". The last one is just a request.
             state.config.expect_falsy = i + 1 < segments.len();
             let outcome = execute_request(state, stdout);
+            let tripped = fail_fast_tripped_at_prompt(&state.config);
             state.config.expect_falsy = false;
             let outcome = outcome?;
+            if tripped {
+                // `-f`: the chain's last request failed, so the program this
+                // chain is part of stops here.
+                cut_short = true;
+                fail_fast = true;
+                break;
+            }
             match outcome {
                 RequestOutcome::Truthy | RequestOutcome::Falsy => prev = Some(outcome),
                 // Errored or aborted ends the chain — a following `||` does
@@ -9300,13 +9363,15 @@ fn execute_request_chain(
                 }
             }
         }
-        Ok((skipped, cut_short))
+        Ok((skipped, cut_short, fail_fast))
     })();
     // Cleared on every exit, including an Err from execute_request — a stale
     // Some() would make the NEXT single request restore the old chain.
     state.chain_input = None;
-    let (skipped, cut_short) = result?;
-    if skipped > 0 {
+    let (skipped, cut_short, fail_fast) = result?;
+    if fail_fast {
+        show_fail_fast_stop(state, stdout)?;
+    } else if skipped > 0 {
         let plural = if skipped == 1 { "request" } else { "requests" };
         state.status_msg = format!("↳ skipped {} {}", skipped, plural);
         state.status_msg_at = Some(Instant::now());
@@ -9418,6 +9483,18 @@ fn run_program_line(state: &mut AppState, stdout: &mut io::Stdout, line: &str) -
     render(stdout, state)
 }
 
+/// Whether the response the prompt just received ends a program under `-f`.
+/// Read before `expect_falsy` is reset, so a chain's condition is exempt.
+fn fail_fast_tripped_at_prompt(config: &Config) -> bool {
+    config.last_status.is_some_and(|status| fail_fast_trips(config, status))
+}
+
+/// Say in the hint line why the rest of a program did not run.
+fn show_fail_fast_stop(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<()> {
+    let status = state.config.last_status.unwrap_or_default();
+    show_program_status(state, stdout, format!("stopped at {} (--fail-fast)", status))
+}
+
 /// Put a one-line verdict in the hint line and redraw.
 fn show_program_status(state: &mut AppState, stdout: &mut io::Stdout, msg: String) -> io::Result<()> {
     state.status_msg = msg;
@@ -9431,10 +9508,16 @@ fn run_program_steps(state: &mut AppState, stdout: &mut io::Stdout, steps: &[Bul
         let keep_going = match step {
             BulkStep::Request(request) => {
                 parse_input(state, request);
-                matches!(
+                let answered = matches!(
                     execute_request(state, stdout)?,
                     RequestOutcome::Truthy | RequestOutcome::Falsy
-                )
+                );
+                // `-f` at the prompt stops the program, not the session.
+                let tripped = fail_fast_tripped_at_prompt(&state.config);
+                if tripped {
+                    show_fail_fast_stop(state, stdout)?;
+                }
+                answered && !tripped
             }
             BulkStep::Chain(segments) => {
                 let full = state.chain_input.clone().unwrap_or_default();
@@ -18441,6 +18524,41 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
         assert_eq!(inside, vec!["a.api".to_string()]);
+    }
+
+    #[test]
+    fn fail_fast_trips_on_any_error_status_except_an_answer_to_a_question() {
+        let plain = Config { fail_fast: true, ..Config::default() };
+        for status in [400, 401, 404, 409, 422, 429, 500, 503] {
+            assert!(fail_fast_trips(&plain, status), "{status}");
+        }
+        for status in [200, 201, 204, 301, 304, 399] {
+            assert!(!fail_fast_trips(&plain, status), "{status}");
+        }
+        // Off unless asked for.
+        assert!(!fail_fast_trips(&Config::default(), 500));
+
+        // A question may be answered "no"…
+        let question = Config { fail_fast: true, expect_falsy: true, ..Config::default() };
+        for status in [400, 404, 409, 422] {
+            assert!(!fail_fast_trips(&question, status), "{status}");
+        }
+        // …but a status that is never an answer still ends the run.
+        for status in [401, 403, 408, 429, 500, 502] {
+            assert!(fail_fast_trips(&question, status), "{status}");
+        }
+
+        // A poll and an `assert` report their own failures.
+        let poll = Config { fail_fast: true, quiet: true, ..Config::default() };
+        let check = Config { fail_fast: true, check_only: true, ..Config::default() };
+        assert!(!fail_fast_trips(&poll, 500));
+        assert!(!fail_fast_trips(&check, 404));
+
+        // At the prompt the rule is applied to the last status received.
+        let seen = |status| Config { fail_fast: true, last_status: status, ..Config::default() };
+        assert!(fail_fast_tripped_at_prompt(&seen(Some(409))));
+        assert!(!fail_fast_tripped_at_prompt(&seen(Some(200))));
+        assert!(!fail_fast_tripped_at_prompt(&seen(None)));
     }
 
     #[test]

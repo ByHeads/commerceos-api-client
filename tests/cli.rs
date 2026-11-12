@@ -1912,6 +1912,283 @@ fn timeout_expiry_reports_the_timeout_not_a_dead_server() {
     );
 }
 
+// ----- -f / --fail-fast -----
+
+/// A server that answers each request with the next `(status, body)` of
+/// `answers` (repeating the last one) and reports what it received.
+fn answering_server(answers: Vec<(&'static str, &'static str)>) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let handle = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        for i in 0.. {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let accepted = loop {
+                match listener.accept() {
+                    Ok(pair) => break Some(pair),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() > deadline {
+                            break None;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("accept: {e}"),
+                }
+            };
+            let Some((mut stream, _)) = accepted else { break };
+            stream.set_nonblocking(false).unwrap();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            seen.push(request.lines().next().unwrap_or("").replace(" HTTP/1.1", "").replace("/api/v1", ""));
+            let (status, body) = answers[i.min(answers.len() - 1)];
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            let _ = stream.flush();
+        }
+        seen
+    });
+    (port, handle)
+}
+
+/// A stand-in for what a failed `/assert` answers: a 409 with a body that
+/// says what didn't hold. The body's shape is the server's business; the
+/// client passes it on untouched.
+const ASSERT_FAILED: (&str, &str) =
+    ("409 Conflict", r#"{"@type":"conflict","error":"Assertion failed","details":"expected 3, got 2"}"#);
+const OK: (&str, &str) = ("200 OK", r#"{"ok":true}"#);
+const NOT_FOUND: (&str, &str) = ("404 Not Found", r#"{"@type":"not found"}"#);
+
+struct FailFastRun {
+    ok: bool,
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    seen: Vec<String>,
+}
+
+/// Run `batch` as a file with `flags` against a server giving `answers`.
+fn run_fail_fast(flags: &str, batch: &str, answers: Vec<(&'static str, &'static str)>) -> FailFastRun {
+    let (port, server) = answering_server(answers);
+    let dir = tempdir().unwrap();
+    let file = dir.path().join("batch.api");
+    std::fs::write(&file, batch).unwrap();
+    let out = api_against_port(port)
+        .env("NO_COLOR", "1")
+        .current_dir(dir.path())
+        .arg(flags)
+        .arg(&file)
+        .output()
+        .expect("api runs");
+    FailFastRun {
+        ok: out.status.success(),
+        code: out.status.code(),
+        stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+        seen: server.join().expect("server thread"),
+    }
+}
+
+const ASSERT_BATCH: &str = "GET /before\nGET /assert/people~count/==3\nGET /never\n";
+
+#[test]
+fn without_fail_fast_a_failed_request_does_not_stop_a_batch() {
+    let run = run_fail_fast("-sa", ASSERT_BATCH, vec![OK, ASSERT_FAILED, OK]);
+    assert!(run.ok, "{}", run.stderr);
+    assert_eq!(run.seen, vec!["GET /before", "GET /assert/people~count/==3", "GET /never"]);
+    // And `-sa` prints no bodies, the failed one included.
+    assert!(!run.stdout.contains("Assertion failed"), "{}", run.stdout);
+}
+
+#[test]
+fn fail_fast_stops_a_silent_batch_at_a_failed_assert_and_ends_stdout_with_its_body() {
+    let run = run_fail_fast("-sfa", ASSERT_BATCH, vec![OK, ASSERT_FAILED, OK]);
+    assert!(!run.ok);
+    assert_eq!(run.code, Some(1));
+    assert_eq!(run.seen, vec!["GET /before", "GET /assert/people~count/==3"]);
+
+    let lines: Vec<&str> = run.stdout.lines().collect();
+    // The log up to the failure, the status line of the request that failed…
+    assert!(lines.contains(&"GET /assert/people~count/==3"), "{}", run.stdout);
+    assert!(lines[lines.len() - 2].contains("HTTP/1.1 409 Conflict"), "{}", run.stdout);
+    // …and, last, the body exactly as the server sent it, for tooling to read.
+    assert_eq!(lines[lines.len() - 1], ASSERT_FAILED.1, "{}", run.stdout);
+    assert!(run.stdout.ends_with("}\n"), "{:?}", run.stdout);
+    assert!(!run.stdout.contains("GET /never"), "{}", run.stdout);
+    // The body of the request that worked is still not printed in `-sa`.
+    assert!(!run.stdout.contains(r#"{"ok":true}"#), "{}", run.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(lines[lines.len() - 1]).unwrap();
+    assert_eq!(parsed["details"], "expected 3, got 2");
+}
+
+#[test]
+fn fail_fast_in_a_plain_batch_prints_the_bodies_so_far_then_the_failing_one() {
+    let run = run_fail_fast("-fa", ASSERT_BATCH, vec![OK, ASSERT_FAILED, OK]);
+    assert!(!run.ok);
+    assert_eq!(run.seen.len(), 2);
+    assert_eq!(run.stdout, format!("{}\n{}\n", OK.1, ASSERT_FAILED.1));
+    // The status lines are on stderr, as without `-f`.
+    assert!(run.stderr.contains("HTTP/1.1 200 OK") && run.stderr.contains("HTTP/1.1 409 Conflict"), "{}", run.stderr);
+}
+
+#[test]
+fn fail_fast_trips_on_every_status_from_400_up() {
+    for answer in [
+        ("400 Bad Request", "bad"),
+        ("401 Unauthorized", "who"),
+        NOT_FOUND,
+        ("422 Unprocessable Entity", "{}"),
+        ("500 Internal Server Error", "boom"),
+        ("503 Service Unavailable", ""),
+    ] {
+        let run = run_fail_fast("-sfa", "PUT /x {\"a\":1}\nGET /never\n", vec![answer, OK]);
+        assert!(!run.ok, "{}", answer.0);
+        assert_eq!(run.seen, vec!["PUT /x"], "{}", answer.0);
+        // A body that isn't JSON, or has no newline of its own, is still
+        // passed on as it came, with one newline to end the line. An empty
+        // body adds nothing.
+        let last = run.stdout.lines().last().unwrap_or_default();
+        if answer.1.is_empty() {
+            assert!(last.contains(&format!("HTTP/1.1 {}", answer.0)), "{}: {:?}", answer.0, run.stdout);
+        } else {
+            assert_eq!(last, answer.1, "{}: {:?}", answer.0, run.stdout);
+        }
+        assert!(run.stdout.ends_with('\n') && !run.stdout.ends_with("\n\n"), "{}: {:?}", answer.0, run.stdout);
+    }
+    // Below 400 nothing trips, whatever the body says.
+    let run = run_fail_fast("-sfa", "GET /a\nGET /b\n", vec![("200 OK", "false"), ("204 No Content", "")]);
+    assert!(run.ok, "{}", run.stderr);
+    assert_eq!(run.seen.len(), 2);
+}
+
+#[test]
+fn fail_fast_leaves_questions_alone() {
+    // Every request here is a question that is answered "no": a chain
+    // condition, an `assert not`, and a poll. None of them ends the run.
+    let batch = "GET /people/1 || PUT /people/1 {\"name\":\"Ann\"}\n\
+                 assert not GET /people/2\n\
+                 sleep 10ms while GET /imports/running\n\
+                 GET /after\n";
+    let run = run_fail_fast("-sfa", batch, vec![NOT_FOUND, OK, NOT_FOUND, NOT_FOUND, OK]);
+    assert!(run.ok, "{}\n{}", run.stdout, run.stderr);
+    assert_eq!(
+        run.seen,
+        vec!["GET /people/1", "PUT /people/1", "GET /people/2", "GET /imports/running", "GET /after"]
+    );
+}
+
+#[test]
+fn fail_fast_trips_on_the_last_request_of_a_chain() {
+    let batch = "GET /people/1 && PUT /people/1 {\"name\":\"Ann\"}\nGET /never\n";
+    let run = run_fail_fast("-sfa", batch, vec![OK, ASSERT_FAILED, OK]);
+    assert!(!run.ok);
+    assert_eq!(run.seen, vec!["GET /people/1", "PUT /people/1"]);
+    assert!(run.stdout.ends_with(&format!("{}\n", ASSERT_FAILED.1)), "{:?}", run.stdout);
+}
+
+#[test]
+fn fail_fast_prints_the_body_of_a_condition_that_could_not_be_answered() {
+    // A 500 is not a "no". The chain aborted on it before `-f` too; with it,
+    // the body says why.
+    let batch = "GET /people/1 || PUT /people/1 {\"name\":\"Ann\"}\nGET /never\n";
+    let run = run_fail_fast("-sfa", batch, vec![("500 Internal Server Error", "database is down"), OK]);
+    assert!(!run.ok);
+    assert_eq!(run.seen, vec!["GET /people/1"]);
+    assert!(run.stdout.ends_with("database is down\n"), "{:?}", run.stdout);
+}
+
+#[test]
+fn the_assert_keyword_still_reports_its_own_failure_under_fail_fast() {
+    let run = run_fail_fast("-sfa", "assert GET /people/1\nGET /never\n", vec![NOT_FOUND, OK]);
+    assert!(!run.ok);
+    assert_eq!(run.seen, vec!["GET /people/1"]);
+    assert!(run.stderr.contains("assertion failed: assert GET /people/1 (404 Not Found)"), "{}", run.stderr);
+    // An assert is a verdict: its body is not printed, with or without `-f`.
+    assert!(!run.stdout.contains("not found"), "{}", run.stdout);
+}
+
+#[test]
+fn fail_fast_does_not_write_an_error_into_an_outfile() {
+    let batch = "GET /export > out.json\nGET /never\n";
+    for (flags, expect_file) in [("-sa", true), ("-sfa", false)] {
+        let (port, server) = answering_server(vec![NOT_FOUND, OK]);
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("batch.api"), batch).unwrap();
+        let out = api_against_port(port)
+            .env("NO_COLOR", "1")
+            .current_dir(dir.path())
+            .args([flags, "batch.api"])
+            .output()
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(dir.path().join("out.json").exists(), expect_file, "{flags}");
+        assert_eq!(out.status.success(), expect_file, "{flags}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(stdout.contains(NOT_FOUND.1), !expect_file, "{flags}: {stdout}");
+    }
+}
+
+#[test]
+fn fail_fast_makes_a_one_shot_request_exit_one_with_the_body() {
+    for (flags, ok, status_shown) in [
+        (vec![], true, true),
+        (vec!["-f"], false, true),
+        (vec!["--fail-fast"], false, true),
+        (vec!["-sf"], false, false),
+    ] {
+        let (port, server) = answering_server(vec![ASSERT_FAILED]);
+        let out = api_against_port(port)
+            .env("NO_COLOR", "1")
+            .args(&flags)
+            .args(["GET", "/assert/people~count/==3"])
+            .output()
+            .unwrap();
+        assert_eq!(server.join().unwrap().len(), 1, "{flags:?}");
+        assert_eq!(out.status.success(), ok, "{flags:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), format!("{}\n", ASSERT_FAILED.1), "{flags:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(stderr.contains("409 Conflict"), status_shown, "{flags:?}: {stderr}");
+    }
+    // A request that works is untouched by the flag.
+    let (port, server) = answering_server(vec![OK]);
+    let out = api_against_port(port).args(["-f", "GET", "/people"]).output().unwrap();
+    server.join().unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), format!("{}\n", OK.1));
+}
+
+#[test]
+fn fail_fast_stops_a_one_shot_program_line_and_a_batch_on_stdin() {
+    let (port, server) = answering_server(vec![ASSERT_FAILED, OK]);
+    let out = api_against_port(port)
+        .env("NO_COLOR", "1")
+        .args(["-sf", "GET /assert/x && GET /never"])
+        .output()
+        .unwrap();
+    assert_eq!(server.join().unwrap(), vec!["GET /assert/x"]);
+    // The condition said no, which is an answer: the chain is cut short, not
+    // the run.
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let (port, server) = answering_server(vec![ASSERT_FAILED, OK]);
+    let out = api_against_port(port)
+        .env("NO_COLOR", "1")
+        .args(["-sfa", "-"])
+        .write_stdin("GET /assert/x\nGET /never\n")
+        .output()
+        .unwrap();
+    assert_eq!(server.join().unwrap(), vec!["GET /assert/x"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).ends_with(&format!("{}\n", ASSERT_FAILED.1)));
+}
+
 // ----- import git -----
 
 fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
