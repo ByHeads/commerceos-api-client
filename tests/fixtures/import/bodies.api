@@ -1,0 +1,14 @@
+# Every kind of body, each read from the import itself.
+PUT /bodies/inline {
+  // a comment the client strips
+  "name": "Ann",
+  "note": "two
+lines"
+}
+
+# A glob: objects become elements, arrays are flattened, in sorted order.
+PUT /bodies/people @data/people/*.json
+
+PUT /bodies/events @data/events.ndjson
+
+PUT /bodies/rows @data/rows.csv~map(com.heads.test-rows)

@@ -1,0 +1,9 @@
+# A nested import: this file, itself imported, imports a repository of its
+# own. Needs the network: it fetches this client's repository from GitHub at a
+# release that holds example3.api (a poll, then a write).
+import git examples {
+  "url": "https://github.com/byheads/commerceos-api-client",
+  "ref": "3.2.2"
+}
+
+examples/example3.api

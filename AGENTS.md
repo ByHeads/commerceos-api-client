@@ -351,7 +351,9 @@ import archive cl {
   bodies resolve relative to the imported file itself, and one that points
   outside (`@/etc/hosts`, `@~/…`, `../../x.api`) is an error. Its own
   `import dir` may only name a directory inside the same import. Symlinks in
-  a repository or an archive are not followed.
+  a repository or an archive are not followed. `path` only says where the
+  alias starts: the boundary is still the whole repository or archive, so a
+  file under `path` may include or send a file above it.
 - **An imported `url` line can only narrow.** The `url` lines of an import
   form a gate of their own that must pass *as well as* yours. An import can
   refuse to run somewhere; it can never add an environment to your allowlist.

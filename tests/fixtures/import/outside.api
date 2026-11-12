@@ -1,0 +1,4 @@
+# An include that climbs out of the import. As a directory import of this
+# repository's working tree, the file it names exists, three levels up.
+GET /outside/never
+../../../example1.api

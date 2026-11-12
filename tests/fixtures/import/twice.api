@@ -1,0 +1,5 @@
+# An alias can be declared once per file.
+import dir p { "path": "parts" }
+import dir p { "path": "data" }
+
+GET /twice/never

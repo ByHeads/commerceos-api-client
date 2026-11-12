@@ -1,0 +1,6 @@
+# The same nested import as nested-git.api, from the release tarball.
+import archive examples {
+  "url": "https://github.com/byheads/commerceos-api-client/archive/refs/tags/3.2.2.tar.gz"
+}
+
+examples/example3.api

@@ -1,0 +1,16 @@
+# Directives and chains in an imported file. The test server answers `1`
+# to everything except a path containing `missing`, which is a 404.
+sleep 10ms
+
+assert GET /directives/exists
+assert not GET /directives/missing
+
+# Truthy at the first check, so the wait is over at once.
+sleep 10ms while not GET /directives/ready
+
+# Found: the fallback is skipped. Missing: it runs.
+GET /directives/found || PUT /directives/unneeded { "made": false }
+GET /directives/missing || PUT /directives/create { "made": true }
+
+# If-then-else, taking the first branch.
+GET /directives/found && PATCH /directives/update { "seen": true } || POST /directives/unreached { "seen": false }

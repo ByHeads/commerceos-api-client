@@ -1,0 +1,5 @@
+# Includes of an imported file resolve next to that file, at any depth, and
+# may climb as long as they stay inside the import.
+GET /nested/index
+deep/leaf.api
+../parts/a.api

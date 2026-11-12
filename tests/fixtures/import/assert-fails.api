@@ -1,0 +1,4 @@
+# A failed assert in an imported file stops the whole batch.
+GET /assert/before
+assert GET /assert/missing
+GET /assert/never

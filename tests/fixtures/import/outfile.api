@@ -1,0 +1,3 @@
+# An outfile in an imported file is not confined to the import: it is written
+# where it says, relative to the directory the batch is run from.
+GET /outfile/export > import-out.json

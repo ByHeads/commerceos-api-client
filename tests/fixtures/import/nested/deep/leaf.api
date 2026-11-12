@@ -1,0 +1,2 @@
+GET /nested/deep/leaf
+PUT /nested/deep/body @../../data/body.json

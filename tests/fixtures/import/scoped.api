@@ -1,0 +1,4 @@
+# An alias belongs to the file that declares it. The batch that imports this
+# directory as `lib` can say `lib/parts/a.api`; this file cannot.
+GET /scoped/never
+lib/parts/a.api
