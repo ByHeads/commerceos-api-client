@@ -4886,12 +4886,28 @@ struct ImportNote {
     stale: bool,
 }
 
-/// What an `import git` line asks for.
+/// Where an import's files come from.
+#[derive(Debug, PartialEq)]
+enum ImportSource {
+    /// `import git`: a repository at a tag, a branch or a commit.
+    Git { url: String, git_ref: String },
+    /// `import dir`: a directory on this machine, used where it is.
+    Dir { path: String },
+    /// `import archive`: a downloaded `.tar.gz`, `.tar` or `.zip`.
+    Archive {
+        url: String,
+        sha256: Option<String>,
+        /// The environment variable holding a bearer token for the download.
+        token_env: Option<String>,
+    },
+}
+
+/// What an `import` line asks for.
 #[derive(Debug, PartialEq)]
 struct ImportSpec {
     alias: String,
-    url: String,
-    git_ref: String,
+    source: ImportSource,
+    /// A subdirectory of a repository or an archive for the alias to stand for.
     path: Option<String>,
 }
 
@@ -4918,7 +4934,7 @@ fn split_first_word(s: &str) -> (&str, &str) {
     }
 }
 
-const IMPORT_USAGE: &str = "expected `import git <alias> { \"url\": …, \"ref\": … }` or `import git <alias> @file.json`";
+const IMPORT_USAGE: &str = "expected `import <git|dir|archive> <alias> { … }` or `import <git|dir|archive> <alias> @file.json`";
 
 /// Parse an assembled `import …` directive (comments stripped, brackets
 /// balanced). `file_dir` and `within` are the file it stands in, when that
@@ -4934,9 +4950,13 @@ fn parse_import_directive(
     if kind.is_empty() || alias.is_empty() || body.is_empty() {
         return Err(format!("incomplete import: {}", IMPORT_USAGE));
     }
-    if !kind.eq_ignore_ascii_case("git") {
-        return Err(format!("unknown import kind `{}` (only `git` is supported)", kind));
-    }
+    let kind_lower = kind.to_ascii_lowercase();
+    let allowed: &[&str] = match kind_lower.as_str() {
+        "git" => &["url", "ref", "path"],
+        "dir" => &["path"],
+        "archive" => &["url", "sha256", "token_env", "path"],
+        _ => return Err(format!("unknown import kind `{}` (expected `git`, `dir` or `archive`)", kind)),
+    };
     let reserved = starts_a_request(alias)
         || DIRECTIVES.iter().any(|d| alias.eq_ignore_ascii_case(d));
     if reserved || !alias.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
@@ -4971,11 +4991,12 @@ fn parse_import_directive(
 
     let value: Value = serde_json::from_str(json.trim())
         .map_err(|e| format!("import {}: invalid JSON: {}", alias, e))?;
+    let keys = allowed.iter().map(|k| format!("`{}`", k)).collect::<Vec<_>>().join(", ");
     let Some(object) = value.as_object() else {
-        return Err(format!("import {}: expected a JSON object with `url` and `ref`", alias));
+        return Err(format!("import {}: expected a JSON object with {}", alias, keys));
     };
-    if let Some(unknown) = object.keys().find(|k| !["url", "ref", "path"].contains(&k.as_str())) {
-        return Err(format!("import {}: unknown key `{}` (expected `url`, `ref`, `path`)", alias, unknown));
+    if let Some(unknown) = object.keys().find(|k| !allowed.contains(&k.as_str())) {
+        return Err(format!("import {}: unknown key `{}` (expected {})", alias, unknown, keys));
     }
     let text_of = |key: &str| -> Result<Option<String>, String> {
         match object.get(key) {
@@ -4984,26 +5005,82 @@ fn parse_import_directive(
             Some(_) => Err(format!("import {}: `{}` must be a non-empty string", alias, key)),
         }
     };
-    let url = text_of("url")?.ok_or_else(|| format!("import {}: `url` is required", alias))?;
-    let git_ref = text_of("ref")?.ok_or_else(|| {
-        format!("import {}: `ref` is required (a tag, a branch or a commit SHA)", alias)
-    })?;
-    let path = text_of("path")?;
+    let required = |key: &str| -> Result<String, String> {
+        text_of(key)?.ok_or_else(|| format!("import {}: `{}` is required", alias, key))
+    };
 
-    validate_import_url(&url).map_err(|e| format!("import {}: {}", alias, e))?;
-    if git_ref.starts_with('-') || git_ref.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        return Err(format!("import {}: invalid ref `{}`", alias, git_ref));
-    }
+    let source = match kind_lower.as_str() {
+        "git" => {
+            let url = required("url")?;
+            let git_ref = required("ref")?;
+            validate_import_url(&url).map_err(|e| format!("import {}: {}", alias, e))?;
+            if git_ref.starts_with('-') || git_ref.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                return Err(format!("import {}: invalid ref `{}`", alias, git_ref));
+            }
+            ImportSource::Git { url, git_ref }
+        }
+        // The directory itself is `path`; there is no subdirectory to pick.
+        "dir" => return Ok(ImportSpec {
+            alias: alias.to_string(),
+            source: ImportSource::Dir { path: required("path")? },
+            path: None,
+        }),
+        _ => {
+            let url = required("url")?;
+            validate_archive_url(&url).map_err(|e| format!("import {}: {}", alias, e))?;
+            let sha256 = text_of("sha256")?.map(|s| s.to_ascii_lowercase());
+            if sha256.as_ref().is_some_and(|s| s.len() != 64 || !s.chars().all(|c| c.is_ascii_hexdigit())) {
+                return Err(format!("import {}: `sha256` must be 64 hexadecimal characters", alias));
+            }
+            let token_env = text_of("token_env")?;
+            let is_env_name = |name: &String| {
+                !name.starts_with(|c: char| c.is_ascii_digit())
+                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            };
+            if token_env.as_ref().is_some_and(|name| !is_env_name(name)) {
+                return Err(format!(
+                    "import {}: `token_env` names an environment variable, not the token itself",
+                    alias
+                ));
+            }
+            ImportSource::Archive { url, sha256, token_env }
+        }
+    };
+
+    let path = text_of("path")?;
     if let Some(p) = &path {
         let stays_inside = !p.starts_with('~')
             && std::path::Path::new(p).components().all(|c| {
                 matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir)
             });
         if !stays_inside {
-            return Err(format!("import {}: `path` must be a relative path inside the repository", alias));
+            return Err(format!("import {}: `path` must be a relative path inside the import", alias));
         }
     }
-    Ok(ImportSpec { alias: alias.to_string(), url, git_ref, path })
+    Ok(ImportSpec { alias: alias.to_string(), source, path })
+}
+
+/// An archive is downloaded over `https://`, or read from `file://`. Plain
+/// `http://` is accepted for this machine only, as the client's own
+/// connections are.
+fn validate_archive_url(url: &str) -> Result<(), String> {
+    let unsupported = || format!("unsupported url `{}` (use https:// or file://)", url);
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(unsupported());
+    }
+    if let Some(path) = url.strip_prefix("file://") {
+        return if path.starts_with('/') { Ok(()) } else { Err(unsupported()) };
+    }
+    let parsed = reqwest::Url::parse(url).map_err(|_| unsupported())?;
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" if is_loopback_url(&parsed) => Ok(()),
+        _ => Err(unsupported()),
+    }
+}
+
+fn is_loopback_url(url: &reqwest::Url) -> bool {
+    matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
 }
 
 /// Only transports that reach a repository: `https://`, `ssh://` (or the
@@ -5125,13 +5202,7 @@ fn is_full_sha(s: &str) -> bool {
 /// The work happens in a scratch directory that is renamed into place, so an
 /// interrupted fetch leaves nothing that looks like a checkout.
 fn fetch_into_cache(url: &str, fetch_name: &str, repo_cache: &std::path::Path) -> Result<String, String> {
-    fs::create_dir_all(repo_cache)
-        .map_err(|e| format!("could not create {}: {}", repo_cache.display(), e))?;
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let scratch = repo_cache.join(format!(".tmp-{}-{}", std::process::id(), nanos));
+    let scratch = cache_scratch_dir(repo_cache)?;
 
     let fetched = (|| -> Result<String, String> {
         let mut init = git_command(None);
@@ -5158,15 +5229,296 @@ fn fetch_into_cache(url: &str, fetch_name: &str, repo_cache: &std::path::Path) -
             return Err(e);
         }
     };
-    let dest = repo_cache.join(&sha);
-    if dest.is_dir() || fs::rename(&scratch, &dest).is_err() {
-        // Another run got there first, or the rename failed.
-        let _ = fs::remove_dir_all(&scratch);
+    move_into_cache(&scratch, &repo_cache.join(&sha))?;
+    Ok(sha)
+}
+
+/// A path for work in progress under `parent` (created if need be), named so
+/// two runs never share one. The directory itself is not created.
+fn cache_scratch_dir(parent: &std::path::Path) -> Result<PathBuf, String> {
+    fs::create_dir_all(parent).map_err(|e| format!("could not create {}: {}", parent.display(), e))?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    Ok(parent.join(format!(".tmp-{}-{}-{}", std::process::id(), nanos, n)))
+}
+
+/// Give finished work in `scratch` its place in the cache. If `dest` is
+/// already there, another run got to it first and its copy is kept.
+fn move_into_cache(scratch: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
+    if dest.is_dir() || fs::rename(scratch, dest).is_err() {
+        let _ = fs::remove_dir_all(scratch);
         if !dest.is_dir() {
-            return Err(format!("could not move the checkout into {}", dest.display()));
+            return Err(format!("could not move the import into {}", dest.display()));
         }
     }
-    Ok(sha)
+    Ok(())
+}
+
+/// SHA-256 of `bytes`, as lowercase hex.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes).iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// The most an archive may unpack to. An import holds `.api` files and their
+/// bodies; anything near this is a mistake or an attack.
+const ARCHIVE_UNPACKED_LIMIT: u64 = 1024 * 1024 * 1024;
+
+/// Where an archive entry named `name` goes under `dest`, or an error if the
+/// name would put it anywhere else.
+fn archive_entry_dest(name: &std::path::Path, dest: &std::path::Path) -> Result<PathBuf, String> {
+    let inside = name.components().all(|c| {
+        matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir)
+    });
+    if !inside {
+        return Err(format!("archive entry leaves the archive: {}", name.display()));
+    }
+    Ok(dest.join(name))
+}
+
+/// Write one archive entry's bytes to `path`, counting them against what the
+/// whole archive may still unpack to.
+fn write_archive_file(
+    mut from: impl io::Read,
+    path: &std::path::Path,
+    remaining: &mut u64,
+) -> Result<(), String> {
+    let failed = |e: io::Error| format!("could not unpack {}: {}", path.display(), e);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(failed)?;
+    }
+    let mut file = fs::File::create(path).map_err(failed)?;
+    let written = io::copy(&mut (&mut from).take(*remaining + 1), &mut file).map_err(failed)?;
+    if written > *remaining {
+        return Err("archive unpacks to more than 1 GB".to_string());
+    }
+    *remaining -= written;
+    Ok(())
+}
+
+/// Unpack a `.zip`, `.tar.gz` or `.tar` (told apart by content, not by name)
+/// into `dest`. Only files and directories are written: links and device
+/// entries are skipped, and an entry named outside the archive is an error.
+fn unpack_archive(bytes: &[u8], dest: &std::path::Path) -> Result<(), String> {
+    let mut remaining = ARCHIVE_UNPACKED_LIMIT;
+    fs::create_dir_all(dest).map_err(|e| format!("could not create {}: {}", dest.display(), e))?;
+
+    if bytes.starts_with(b"PK\x03\x04") {
+        let mut zip = zip::ZipArchive::new(io::Cursor::new(bytes))
+            .map_err(|e| format!("could not read the zip archive: {}", e))?;
+        for i in 0..zip.len() {
+            let entry = zip.by_index(i).map_err(|e| format!("could not read the zip archive: {}", e))?;
+            let Some(name) = entry.enclosed_name() else {
+                return Err(format!("archive entry leaves the archive: {}", entry.name()));
+            };
+            let path = archive_entry_dest(&name, dest)?;
+            if entry.is_dir() {
+                fs::create_dir_all(&path).map_err(|e| format!("could not unpack {}: {}", path.display(), e))?;
+            } else if entry.is_file() {
+                write_archive_file(entry, &path, &mut remaining)?;
+            }
+        }
+        return Ok(());
+    }
+
+    let gzipped = bytes.starts_with(&[0x1f, 0x8b]);
+    let plain_tar = bytes.len() > 262 && &bytes[257..262] == b"ustar";
+    if !gzipped && !plain_tar {
+        return Err("not a .tar.gz, .tar or .zip archive".to_string());
+    }
+    let reader: Box<dyn io::Read + '_> = if gzipped {
+        Box::new(flate2::read::GzDecoder::new(bytes))
+    } else {
+        Box::new(bytes)
+    };
+    let mut tar = tar::Archive::new(reader);
+    let unreadable = |e: io::Error| format!("could not read the tar archive: {}", e);
+    for entry in tar.entries().map_err(unreadable)? {
+        let entry = entry.map_err(unreadable)?;
+        let kind = entry.header().entry_type();
+        if !kind.is_dir() && !kind.is_file() {
+            continue;
+        }
+        let name = entry.path().map_err(unreadable)?.into_owned();
+        let path = archive_entry_dest(&name, dest)?;
+        if kind.is_dir() {
+            fs::create_dir_all(&path).map_err(|e| format!("could not unpack {}: {}", path.display(), e))?;
+        } else {
+            write_archive_file(entry, &path, &mut remaining)?;
+        }
+    }
+    Ok(())
+}
+
+/// Download an archive. `token` goes along as a bearer token; the client's
+/// own API credentials never do. A redirect is followed only to `https://`
+/// (or to this machine), so a download can't be steered onto plain http.
+fn download_archive(url: &str, token: Option<&str>) -> Result<Vec<u8>, String> {
+    if let Some(path) = url.strip_prefix("file://") {
+        return fs::read(path).map_err(|e| e.to_string());
+    }
+    let client = Client::builder()
+        .timeout(Duration::from_secs(300))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            let secure = attempt.url().scheme() == "https" || is_loopback_url(attempt.url());
+            if attempt.previous().len() > 10 {
+                attempt.error("too many redirects")
+            } else if !secure {
+                attempt.error("redirected to a url that is not https")
+            } else {
+                attempt.follow()
+            }
+        }))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut request = client.get(url);
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().map_err(|e| describe_download_error(&e))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(status.to_string());
+    }
+    response.bytes().map(|b| b.to_vec()).map_err(|e| describe_download_error(&e))
+}
+
+/// A download failure without the URL in it (the caller names the import)
+/// and with the cause that reqwest keeps one level down.
+fn describe_download_error(e: &reqwest::Error) -> String {
+    let mut text = e.to_string();
+    if let Some(url) = e.url() {
+        text = text.replace(&format!(" for url ({})", url), "");
+    }
+    match std::error::Error::source(e) {
+        Some(cause) => format!("{}: {}", text, cause),
+        None => text,
+    }
+}
+
+/// Make the archive at `url` available locally and return where it was
+/// unpacked.
+///
+/// With a `sha256`, the cache is asked first and a hit needs no network; a
+/// download whose hash differs is an error. Without one the archive is
+/// downloaded on every run, since the URL may serve something new, and if it
+/// can't be reached the copy it last served is used, marked stale.
+fn fetch_archive_import(
+    url: &str,
+    sha256: Option<&str>,
+    token_env: Option<&str>,
+) -> Result<FetchedImport, String> {
+    type Memo = std::sync::Mutex<HashMap<(PathBuf, String, Option<String>), FetchedImport>>;
+    static MEMO: std::sync::OnceLock<Memo> = std::sync::OnceLock::new();
+    let archives = import_cache_dir()?.join("archives");
+    let memo_key = (archives.clone(), url.to_string(), sha256.map(str::to_string));
+    let memo = MEMO.get_or_init(Default::default);
+    if let Some(known) = memo.lock().unwrap().get(&memo_key) {
+        return Ok(known.clone());
+    }
+    let found = |sha: String, stale: bool| {
+        let checkout = archives.join(&sha);
+        FetchedImport { checkout: checkout.canonicalize().unwrap_or(checkout), sha, stale }
+    };
+
+    let pinned_in_cache = sha256.filter(|sha| archives.join(sha).is_dir());
+    let fetched = if let Some(sha) = pinned_in_cache {
+        found(sha.to_string(), false)
+    } else {
+        let token = match token_env {
+            Some(name) => Some(std::env::var(name).ok().filter(|t| !t.is_empty()).ok_or_else(|| {
+                format!("import archive {}: environment variable {} is not set", url, name)
+            })?),
+            None => None,
+        };
+        let last_served = archives.join("refs").join(import_cache_key(url));
+        match download_archive(url, token.as_deref()) {
+            Ok(bytes) => {
+                let sha = sha256_hex(&bytes);
+                if let Some(expected) = sha256.filter(|expected| *expected != sha) {
+                    return Err(format!(
+                        "import archive {}: sha256 mismatch (expected {}, got {})",
+                        url, expected, sha
+                    ));
+                }
+                if !archives.join(&sha).is_dir() {
+                    let scratch = cache_scratch_dir(&archives)?;
+                    if let Err(e) = unpack_archive(&bytes, &scratch) {
+                        let _ = fs::remove_dir_all(&scratch);
+                        return Err(format!("import archive {}: {}", url, e));
+                    }
+                    move_into_cache(&scratch, &archives.join(&sha))?;
+                }
+                if sha256.is_none() {
+                    // Remembered for the day the url can't be reached.
+                    let _ = fs::create_dir_all(archives.join("refs"));
+                    let _ = fs::write(&last_served, &sha);
+                }
+                found(sha, false)
+            }
+            Err(e) => {
+                let cached = fs::read_to_string(&last_served)
+                    .ok()
+                    .map(|sha| sha.trim().to_string())
+                    .filter(|sha| sha256.is_none() && sha.len() == 64 && archives.join(sha).is_dir());
+                match cached {
+                    Some(sha) => found(sha, true),
+                    None => return Err(format!("could not reach import {}: {}", url, e)),
+                }
+            }
+        }
+    };
+    memo.lock().unwrap().insert(memo_key, fetched.clone());
+    Ok(fetched)
+}
+
+/// The directory an unpacked archive's files start in: the one directory at
+/// its top when that is all there is (`cloddy-2.1.0/…`, the way a release
+/// tarball is packed), otherwise the top itself.
+fn archive_top_dir(checkout: &std::path::Path) -> PathBuf {
+    let mut entries = match fs::read_dir(checkout) {
+        Ok(entries) => entries.flatten().map(|e| e.path()).filter(|p| !is_os_junk(p)),
+        Err(_) => return checkout.to_path_buf(),
+    };
+    match (entries.next(), entries.next()) {
+        (Some(only), None) if only.is_dir() => only,
+        _ => checkout.to_path_buf(),
+    }
+}
+
+/// The directory `import dir` names. From a file of the batch's own it is a
+/// path like an include's: relative to that file, `~/` or absolute. From an
+/// imported file it must stay inside that file's import.
+fn resolve_import_dir(
+    alias: &str,
+    raw: &str,
+    base_dir: Option<&std::path::Path>,
+    within: Option<&ImportedRepo>,
+) -> Result<PathBuf, String> {
+    let dir = match within {
+        Some(repo) => PathBuf::from(rebase_import_path(raw, base_dir, repo).map_err(|_| {
+            format!("import {}: `path` must be a relative path inside the import", alias)
+        })?),
+        None => {
+            let expanded = match (raw.strip_prefix("~/"), dirs::home_dir()) {
+                (Some(rest), Some(home)) => home.join(rest),
+                _ if raw == "~" => dirs::home_dir().unwrap_or_else(|| PathBuf::from(raw)),
+                _ => PathBuf::from(raw),
+            };
+            match base_dir {
+                Some(base) if expanded.is_relative() => base.join(expanded),
+                _ => expanded,
+            }
+        }
+    };
+    if !dir.is_dir() {
+        return Err(format!("import {}: not a directory: {}", alias, raw));
+    }
+    dir.canonicalize().map_err(|e| format!("import {}: {}: {}", alias, raw, e))
 }
 
 /// Make `git_ref` of `url` available locally and return its checkout.
@@ -5256,7 +5608,7 @@ fn rebase_import_path(
     file_dir: Option<&std::path::Path>,
     repo: &ImportedRepo,
 ) -> Result<String, String> {
-    let outside = || format!("import {}: `@{}` must be a relative path inside the repository", repo.alias, raw);
+    let outside = || format!("import {}: `@{}` must be a relative path inside the import", repo.alias, raw);
     if raw.starts_with('~') || std::path::Path::new(raw).is_absolute() {
         return Err(outside());
     }
@@ -5306,7 +5658,7 @@ fn ensure_inside_import(path: &std::path::Path, repo: &ImportedRepo, spec: &str)
     if canonical.starts_with(&repo.checkout) {
         Ok(())
     } else {
-        Err(format!("import {}: include leaves the repository: {}", repo.alias, spec))
+        Err(format!("import {}: include leaves the import: {}", repo.alias, spec))
     }
 }
 
@@ -5338,39 +5690,55 @@ fn declare_import(
         ));
     }
 
-    let fetched = fetch_git_import(&spec.url, &spec.git_ref)?;
+    // The directory the alias's files live under (which nothing in them may
+    // leave), where the alias starts, and how the log describes the import.
+    let (checkout, top, described, stale) = match &spec.source {
+        ImportSource::Git { url, git_ref } => {
+            let fetched = fetch_git_import(url, git_ref)?;
+            let short_sha: String = fetched.sha.chars().take(7).collect();
+            let described = format!("{} {} ({}", url, git_ref, short_sha);
+            (fetched.checkout.clone(), fetched.checkout, described, fetched.stale)
+        }
+        ImportSource::Dir { path } => {
+            let dir = resolve_import_dir(&spec.alias, path, base_dir, within)?;
+            (dir.clone(), dir.clone(), dir.display().to_string(), false)
+        }
+        ImportSource::Archive { url, sha256, token_env } => {
+            let fetched = fetch_archive_import(url, sha256.as_deref(), token_env.as_deref())?;
+            let short_sha: String = fetched.sha.chars().take(7).collect();
+            let top = archive_top_dir(&fetched.checkout);
+            (fetched.checkout, top, format!("{} (sha256 {}", url, short_sha), fetched.stale)
+        }
+    };
     let root = match &spec.path {
-        Some(path) => fetched.checkout.join(path),
-        None => fetched.checkout.clone(),
+        Some(path) => top.join(path),
+        None => top,
     };
     if !root.is_dir() {
         return Err(format!(
-            "import {}: no directory `{}` in {} {}",
+            "import {}: no directory `{}` in {}",
             spec.alias,
             spec.path.as_deref().unwrap_or("."),
-            spec.url,
-            spec.git_ref
+            described.split(" (").next().unwrap_or(&described)
         ));
     }
 
-    let short_sha: String = fetched.sha.chars().take(7).collect();
+    // A git or archive description is left open at `(…` for the stale remark.
+    let closing = match (&spec.source, stale) {
+        (ImportSource::Dir { .. }, _) => "",
+        (_, true) => ", cached copy: remote unreachable)",
+        (_, false) => ")",
+    };
     let note = ImportNote {
-        text: format!(
-            "import {} {} {} ({}{})",
-            spec.alias,
-            spec.url,
-            spec.git_ref,
-            short_sha,
-            if fetched.stale { ", cached copy: remote unreachable" } else { "" }
-        ),
-        stale: fetched.stale,
+        text: format!("import {} {}{}", spec.alias, described, closing),
+        stale,
     };
     if !program.import_notes.contains(&note) {
         program.import_notes.push(note);
     }
     aliases.insert(
         spec.alias.clone(),
-        ImportedRepo { root, checkout: fetched.checkout, alias: spec.alias },
+        ImportedRepo { root, checkout, alias: spec.alias },
     );
     Ok(())
 }
@@ -12535,7 +12903,7 @@ fn get_include_completions(partial: &str) -> Vec<String> {
     }
     let runnable = |c: &String| c.ends_with('/') || names_api_file(c);
     let imports = session_imports().lock().unwrap();
-    // `cl/…` completes inside the repository imported as `cl`.
+    // `cl/…` completes inside whatever was imported as `cl`.
     if let Some((repo, rest)) = alias_include(partial, &imports) {
         let root = format!("{}/", repo.root.display());
         return get_file_completions(&format!("{}{}", root, rest))
@@ -17541,11 +17909,46 @@ mod tests {
             spec,
             ImportSpec {
                 alias: "cl".to_string(),
-                url: "https://github.com/Polyjuice/cloddy".to_string(),
-                git_ref: "2.1.0".to_string(),
+                source: ImportSource::Git {
+                    url: "https://github.com/Polyjuice/cloddy".to_string(),
+                    git_ref: "2.1.0".to_string(),
+                },
                 path: Some("seeds".to_string()),
             }
         );
+        assert_eq!(
+            parse_import_directive(r#"import dir cl { "path": "~/Source/cloddy" }"#, None, None).unwrap(),
+            ImportSpec {
+                alias: "cl".to_string(),
+                source: ImportSource::Dir { path: "~/Source/cloddy".to_string() },
+                path: None,
+            }
+        );
+        let sha = "9F2C".repeat(16);
+        assert_eq!(
+            parse_import_directive(
+                &format!(
+                    r#"import ARCHIVE cl {{ "url": "https://example.com/c.tar.gz", "sha256": "{sha}", "token_env": "ARTIFACT_TOKEN", "path": "seeds" }}"#
+                ),
+                None,
+                None
+            )
+            .unwrap(),
+            ImportSpec {
+                alias: "cl".to_string(),
+                source: ImportSource::Archive {
+                    url: "https://example.com/c.tar.gz".to_string(),
+                    sha256: Some(sha.to_lowercase()),
+                    token_env: Some("ARTIFACT_TOKEN".to_string()),
+                },
+                path: Some("seeds".to_string()),
+            }
+        );
+        // Plain http is for this machine only.
+        for url in ["http://localhost:8080/c.zip", "http://127.0.0.1/c.zip", "file:///tmp/c.zip"] {
+            let line = format!(r#"import archive cl {{ "url": "{url}" }}"#);
+            assert!(parse_import_directive(&line, None, None).is_ok(), "{url}");
+        }
         // The scp-like spelling of ssh is a URL too.
         assert!(parse_import_directive(
             r#"import git cl { "url": "git@github.com:Polyjuice/cloddy.git", "ref": "main" }"#,
@@ -17579,6 +17982,17 @@ mod tests {
             (r#"import git cl { "url": "https://example.com/r", "ref": "1.0", "path": "../x" }"#.to_string(), "`path` must be a relative path"),
             (r#"import git cl { "url": "https://example.com/r", "ref": "1.0", "path": "/etc" }"#.to_string(), "`path` must be a relative path"),
             ("import git cl @imports/*.json".to_string(), "reads one JSON file"),
+            (r#"import dir cl { "url": "https://example.com/r" }"#.to_string(), "unknown key `url` (expected `path`)"),
+            (r#"import dir cl {}"#.to_string(), "`path` is required"),
+            (r#"import archive cl { "sha256": "ab" }"#.to_string(), "`url` is required"),
+            (r#"import archive cl { "url": "https://example.com/c.zip", "ref": "1.0" }"#.to_string(), "unknown key `ref`"),
+            (r#"import archive cl { "url": "http://example.com/c.zip" }"#.to_string(), "unsupported url"),
+            (r#"import archive cl { "url": "ftp://example.com/c.zip" }"#.to_string(), "unsupported url"),
+            (r#"import archive cl { "url": "git@example.com:c.zip" }"#.to_string(), "unsupported url"),
+            (r#"import archive cl { "url": "file://relative/c.zip" }"#.to_string(), "unsupported url"),
+            (r#"import archive cl { "url": "https://example.com/c.zip", "sha256": "abc123" }"#.to_string(), "`sha256` must be 64 hexadecimal characters"),
+            (r#"import archive cl { "url": "https://example.com/c.zip", "token_env": "ghp_secret-value" }"#.to_string(), "names an environment variable"),
+            (r#"import archive cl { "url": "https://example.com/c.zip", "path": "../x" }"#.to_string(), "`path` must be a relative path"),
             ("import git cl @cloddy.json~map(x)".to_string(), "takes no `~map(…)` suffix"),
         ] {
             let err = parse_import_directive(&line, None, None).unwrap_err();
@@ -17751,10 +18165,10 @@ mod tests {
         let import = format!("import git cl {{ \"url\": \"{url}\", \"ref\": \"1.0\" }}\n");
         for file in ["abs.api", "home.api", "up.api", "glob.api"] {
             let err = split_bulk_requests(&format!("{import}cl/{file}\n"), Some(dir.path())).unwrap_err();
-            assert!(err.contains("must be a relative path inside the repository"), "{file}: {err}");
+            assert!(err.contains("must be a relative path inside the import"), "{file}: {err}");
         }
         let err = split_bulk_requests(&format!("{import}cl/include.api\n"), Some(dir.path())).unwrap_err();
-        assert!(err.contains("include not found") || err.contains("leaves the repository"), "{err}");
+        assert!(err.contains("include not found") || err.contains("leaves the import"), "{err}");
 
         // Nor can the alias be used to climb out of it.
         fs::write(dir.path().join("outside.api"), "GET /outside\n").unwrap();
@@ -17764,7 +18178,7 @@ mod tests {
         };
         let climb = pathdiff_up(&checkout, &dir.path().canonicalize().unwrap().join("outside.api"));
         let err = split_bulk_requests(&format!("{import}cl/{climb}\n"), Some(dir.path())).unwrap_err();
-        assert!(err.contains("leaves the repository"), "{err}");
+        assert!(err.contains("leaves the import"), "{err}");
     }
 
     /// The single checkout of `url` in the test cache.
@@ -17839,5 +18253,267 @@ mod tests {
         // Unclosed JSON is reported like an unclosed body.
         let err = split_bulk_requests("import git cl {\n  \"url\": \"x\"\n", None).unwrap_err();
         assert!(err.starts_with("unclosed body"), "{err}");
+    }
+
+    // ----- import dir -----
+
+    #[test]
+    fn import_dir_uses_a_directory_where_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let lib = base.join("elsewhere/lib");
+        fs::create_dir_all(lib.join("data")).unwrap();
+        fs::write(lib.join("sv.api"), "url has localhost\nGET /sv\nPUT /sv @data/sv.json\n").unwrap();
+        fs::write(lib.join("data/sv.json"), "{}").unwrap();
+        fs::write(lib.join("escape.api"), "PUT /x @../outside.json\n").unwrap();
+        fs::write(base.join("elsewhere/outside.json"), "{}").unwrap();
+        let project = base.join("project");
+        fs::create_dir_all(&project).unwrap();
+
+        // Relative to the declaring file, like an include.
+        let src = "import dir cl { \"path\": \"../elsewhere/lib\" }\ncl/sv.api\n";
+        let program = split_bulk_requests(src, Some(&project)).unwrap();
+        assert_eq!(
+            requests_of(&program),
+            vec!["GET /sv".to_string(), format!("PUT /sv @{}", lib.join("data/sv.json").display())]
+        );
+        // Nothing is fetched or copied: the log names the directory itself.
+        assert_eq!(
+            program.import_notes,
+            vec![ImportNote { text: format!("import cl {}", lib.display()), stale: false }]
+        );
+        // The same rules as any import: its `url` line only narrows…
+        assert!(program.url_conditions.is_empty());
+        assert!(evaluate_program_gates(&program, "https://api.heads.com").is_err());
+        // …and its files stay inside it.
+        let err = split_bulk_requests(
+            "import dir cl { \"path\": \"../elsewhere/lib\" }\ncl/escape.api\n",
+            Some(&project),
+        )
+        .unwrap_err();
+        assert!(err.contains("must be a relative path inside the import"), "{err}");
+
+        // An absolute path works from anywhere.
+        let src = format!("import dir cl {{ \"path\": \"{}\" }}\ncl/sv.api\n", lib.display());
+        assert_eq!(requests_of(&split_bulk_requests(&src, Some(&project)).unwrap()).len(), 2);
+
+        let err = split_bulk_requests("import dir cl { \"path\": \"../nope\" }\n", Some(&project)).unwrap_err();
+        assert_eq!(err, "import cl: not a directory: ../nope");
+        let err = split_bulk_requests(
+            "import dir cl { \"path\": \"../elsewhere/lib/sv.api\" }\n",
+            Some(&project),
+        )
+        .unwrap_err();
+        assert_eq!(err, "import cl: not a directory: ../elsewhere/lib/sv.api");
+    }
+
+    #[test]
+    fn an_imported_file_may_import_a_directory_of_its_own_import_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let lib = base.join("lib");
+        fs::create_dir_all(lib.join("parts")).unwrap();
+        fs::write(lib.join("parts/p.api"), "GET /part\n").unwrap();
+        fs::write(lib.join("ok.api"), "import dir parts_of { \"path\": \"parts\" }\nparts_of/p.api\n").unwrap();
+        fs::write(lib.join("up.api"), "import dir out { \"path\": \"..\" }\n").unwrap();
+        fs::write(lib.join("abs.api"), "import dir out { \"path\": \"/etc\" }\n").unwrap();
+        fs::write(lib.join("home.api"), "import dir out { \"path\": \"~/\" }\n").unwrap();
+        let import = format!("import dir lib {{ \"path\": \"{}\" }}\n", lib.display());
+
+        // Run from a directory that has no `lib` of its own next to it.
+        let project = base.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let program = split_bulk_requests(&format!("{import}lib/ok.api\n"), Some(&project)).unwrap();
+        assert_eq!(requests_of(&program), vec!["GET /part".to_string()]);
+        for file in ["up.api", "abs.api", "home.api"] {
+            let err = split_bulk_requests(&format!("{import}lib/{file}\n"), Some(&project)).unwrap_err();
+            assert_eq!(err, "import out: `path` must be a relative path inside the import", "{file}");
+        }
+    }
+
+    #[test]
+    fn a_directory_import_that_leads_back_to_its_file_is_an_include_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        fs::write(base.join("root.api"), "import dir me { \"path\": \".\" }\nGET /once\nme/root.api\n").unwrap();
+        let err = split_bulk_requests("root.api\n", Some(&base)).unwrap_err();
+        assert_eq!(err, format!("include loop detected: {}", base.join("root.api").display()));
+    }
+
+    // ----- import archive -----
+
+    /// A `.tar.gz` of `files`, with whatever else `extra` appends to it.
+    fn tar_gz(files: &[(&str, &str)], extra: impl FnOnce(&mut tar::Builder<flate2::write::GzEncoder<Vec<u8>>>)) -> Vec<u8> {
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut builder = tar::Builder::new(gz);
+        for (name, contents) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, name, contents.as_bytes()).unwrap();
+        }
+        extra(&mut builder);
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    fn zip_of(files: &[(&str, &str)]) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        for (name, contents) in files {
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(contents.as_bytes()).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    /// Write `bytes` to a file of its own and return its guard and `file://` url.
+    fn archive_file(bytes: &[u8], name: &str) -> (tempfile::TempDir, String) {
+        use_test_import_cache();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap().join(name);
+        fs::write(&path, bytes).unwrap();
+        (dir, format!("file://{}", path.display()))
+    }
+
+    #[test]
+    fn import_archive_unpacks_a_release_tarball_under_its_alias() {
+        // Packed the way a release is: everything under one directory.
+        let bytes = tar_gz(
+            &[
+                ("cloddy-2.1.0/sv.api", "url has localhost\nGET /sv\nPUT /sv @data/sv.json\n"),
+                ("cloddy-2.1.0/data/sv.json", "{\"a\":1}"),
+                ("cloddy-2.1.0/seeds/a.api", "GET /a\n"),
+            ],
+            |_| {},
+        );
+        let sha = sha256_hex(&bytes);
+        let (_guard, url) = archive_file(&bytes, "cloddy-2.1.0.tar.gz");
+        let dir = tempfile::tempdir().unwrap();
+
+        let src = format!("import archive cl {{ \"url\": \"{url}\" }}\ncl/sv.api\n");
+        let program = split_bulk_requests(&src, Some(dir.path())).unwrap();
+        let top = import_cache_dir().unwrap().canonicalize().unwrap().join("archives").join(&sha).join("cloddy-2.1.0");
+        assert_eq!(
+            requests_of(&program),
+            vec!["GET /sv".to_string(), format!("PUT /sv @{}", top.join("data/sv.json").display())]
+        );
+        assert_eq!(
+            program.import_notes,
+            vec![ImportNote { text: format!("import cl {url} (sha256 {})", &sha[..7]), stale: false }]
+        );
+        assert_eq!(program.import_gates[0].conditions, vec![UrlCondition::Has("localhost".to_string())]);
+
+        // `path` picks a subdirectory, under the single top directory.
+        let src = format!("import archive s {{ \"url\": \"{url}\", \"path\": \"seeds\" }}\ns/*.api\n");
+        assert_eq!(requests_of(&split_bulk_requests(&src, Some(dir.path())).unwrap()), vec!["GET /a".to_string()]);
+        let src = format!("import archive s {{ \"url\": \"{url}\", \"path\": \"nope\" }}\n");
+        let err = split_bulk_requests(&src, Some(dir.path())).unwrap_err();
+        assert_eq!(err, format!("import s: no directory `nope` in {url}"));
+    }
+
+    #[test]
+    fn import_archive_checks_a_sha256_and_then_needs_no_download() {
+        let bytes = zip_of(&[("sv.api", "GET /zipped\n"), ("more/b.api", "GET /b\n")]);
+        let sha = sha256_hex(&bytes);
+        let (guard, url) = archive_file(&bytes, "lib.zip");
+        let dir = tempfile::tempdir().unwrap();
+
+        // The wrong hash is an error, and nothing is unpacked for it.
+        let wrong = "0".repeat(64);
+        let src = format!("import archive z {{ \"url\": \"{url}\", \"sha256\": \"{wrong}\" }}\n");
+        let err = split_bulk_requests(&src, Some(dir.path())).unwrap_err();
+        assert_eq!(err, format!("import archive {url}: sha256 mismatch (expected {wrong}, got {sha})"));
+        assert!(!import_cache_dir().unwrap().join("archives").join(&wrong).exists());
+
+        // Upper case is the same hash. A zip with no single top directory
+        // starts at its top.
+        let src = format!(
+            "import archive z {{ \"url\": \"{url}\", \"sha256\": \"{}\" }}\nz/sv.api\nz/more/b.api\n",
+            sha.to_uppercase()
+        );
+        let program = split_bulk_requests(&src, Some(dir.path())).unwrap();
+        assert_eq!(requests_of(&program), vec!["GET /zipped".to_string(), "GET /b".to_string()]);
+
+        // Pinned and cached: the same hash from a url that no longer answers
+        // (and was never asked before) is served from the cache.
+        drop(guard);
+        let gone = format!("{url}.moved");
+        let src = format!("import archive z {{ \"url\": \"{gone}\", \"sha256\": \"{sha}\" }}\nz/sv.api\n");
+        let program = split_bulk_requests(&src, Some(dir.path())).unwrap();
+        assert_eq!(requests_of(&program), vec!["GET /zipped".to_string()]);
+        assert!(!program.import_notes[0].stale);
+
+        // Pinned and not cached: unreachable is an error.
+        let other = "1".repeat(64);
+        let src = format!("import archive z {{ \"url\": \"{gone}\", \"sha256\": \"{other}\" }}\n");
+        let err = split_bulk_requests(&src, Some(dir.path())).unwrap_err();
+        assert!(err.starts_with(&format!("could not reach import {gone}:")), "{err}");
+    }
+
+    #[test]
+    fn unpack_archive_writes_files_only_and_refuses_to_leave_its_directory() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Links are skipped; a plain .tar is read as well as a .tar.gz.
+        let bytes = tar_gz(&[("a.api", "GET /a\n")], |builder| {
+            let mut link = tar::Header::new_gnu();
+            link.set_entry_type(tar::EntryType::Symlink);
+            link.set_size(0);
+            builder.append_link(&mut link, "passwd", "/etc/passwd").unwrap();
+        });
+        let dest = dir.path().join("links");
+        unpack_archive(&bytes, &dest).unwrap();
+        assert!(dest.join("a.api").is_file());
+        assert!(fs::symlink_metadata(dest.join("passwd")).is_err());
+
+        let mut plain = Vec::new();
+        io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&bytes[..]), &mut plain).unwrap();
+        let dest = dir.path().join("plain");
+        unpack_archive(&plain, &dest).unwrap();
+        assert!(dest.join("a.api").is_file());
+
+        // An entry named outside the archive, in either format. The tar
+        // builder refuses to write such a name, so the header is set by hand.
+        let bytes = tar_gz(&[], |builder| {
+            let mut header = tar::Header::new_gnu();
+            let name = b"../escaped.api";
+            header.as_gnu_mut().unwrap().name[..name.len()].copy_from_slice(name);
+            header.set_size(2);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, &b"hi"[..]).unwrap();
+        });
+        let dest = dir.path().join("sub/tar");
+        let err = unpack_archive(&bytes, &dest).unwrap_err();
+        assert_eq!(err, "archive entry leaves the archive: ../escaped.api");
+        assert!(!dir.path().join("sub/escaped.api").exists());
+
+        let bytes = zip_of(&[("../escaped.api", "hi"), ("ok.api", "GET /ok\n")]);
+        let dest = dir.path().join("sub/zip");
+        let err = unpack_archive(&bytes, &dest).unwrap_err();
+        assert_eq!(err, "archive entry leaves the archive: ../escaped.api");
+        assert!(!dir.path().join("sub/escaped.api").exists());
+
+        let err = unpack_archive(b"GET /not-an-archive\n", &dir.path().join("text")).unwrap_err();
+        assert_eq!(err, "not a .tar.gz, .tar or .zip archive");
+    }
+
+    #[test]
+    fn import_archive_reports_a_file_that_is_no_archive_and_a_missing_token() {
+        let (_guard, url) = archive_file(b"GET /just-a-file\n", "sv.api");
+        let dir = tempfile::tempdir().unwrap();
+        let src = format!("import archive x {{ \"url\": \"{url}\" }}\n");
+        let err = split_bulk_requests(&src, Some(dir.path())).unwrap_err();
+        assert_eq!(err, format!("import archive {url}: not a .tar.gz, .tar or .zip archive"));
+
+        let src = format!(
+            "import archive x {{ \"url\": \"{url}\", \"token_env\": \"API_TEST_TOKEN_THAT_IS_NOT_SET\" }}\n"
+        );
+        let err = split_bulk_requests(&src, Some(dir.path())).unwrap_err();
+        assert_eq!(
+            err,
+            format!("import archive {url}: environment variable API_TEST_TOKEN_THAT_IS_NOT_SET is not set")
+        );
     }
 }

@@ -227,6 +227,15 @@ fn prepare(dir: &Path) {
             .expect("git runs");
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     }
+    // A directory to import as it is, and a zip of another.
+    std::fs::create_dir_all(dir.join("libdir")).unwrap();
+    std::fs::write(dir.join("libdir/d.api"), "GET /dir1\nPUT /dir2 @body.json\n").unwrap();
+    std::fs::write(dir.join("libdir/body.json"), r#"{"from":"dir"}"#).unwrap();
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(dir.join("lib.zip")).unwrap());
+    zip.start_file("lib-1.0/z.api", zip::write::SimpleFileOptions::default()).unwrap();
+    zip.write_all(b"GET /zip1\n").unwrap();
+    zip.finish().unwrap();
+
     std::fs::write(
         dir.join("cloddy.json"),
         format!(r#"{{ "url": "{}", "ref": "1.0" }}"#, repo_url(dir)),
@@ -253,6 +262,11 @@ fn cases(dir: &Path) -> Vec<Case> {
     let import_json = format!(r#"{{"url":"{}","ref":"1.0"}}"#, repo_url(dir));
     let import_inline = format!("import git cl {import_json}");
     let import_and_include = format!("import git cl {{\n  \"url\": \"{}\", // pinned\n  \"ref\": \"1.0\"\n}}\ncl/sv.api", repo_url(dir));
+    let import_dir = "import dir d {\"path\":\"libdir\"}\nd/d.api";
+    let import_archive = format!(
+        "import archive z {{\"url\":\"file://{}\"}}\nz/z.api",
+        dir.canonicalize().unwrap().join("lib.zip").display()
+    );
     let import_missing_ref = format!(r#"import git cl {{"url":"{}","ref":"9.9"}}"#, repo_url(dir));
     vec![
         // Requests
@@ -399,6 +413,10 @@ fn cases(dir: &Path) -> Vec<Case> {
             None,
             &["GET /imp1", r#"PUT /imp2 {"from":"repo"}"#],
         ),
+        case("import of a directory", import_dir, None, &["GET /dir1", r#"PUT /dir2 {"from":"dir"}"#]),
+        case("import of an archive", &import_archive, None, &["GET /zip1"]),
+        case("import of an unknown kind", r#"import svn x {"url":"https://example.com/r"}"#, None, &[])
+            .fails("unknown import kind `svn`"),
         case("import of a missing ref", &import_missing_ref, None, &[]).fails("import ref not found: 9.9"),
         case("import without a ref", r#"import git cl {"url":"https://example.com/r"}"#, None, &[])
             .fails("`ref` is required"),

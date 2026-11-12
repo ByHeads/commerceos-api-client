@@ -232,10 +232,10 @@ PATCH /people/com.heads.foo=123 { "name": "after seeds" }
 - Glob includes work: `shared/*.api` includes all matching files in sorted order.
 - Recursive includes are supported. Loops are detected and reported as errors.
 
-### Importing a git repository (`import git`)
+### Imports (`import git`, `import dir`, `import archive`)
 
-`import git <alias> <json>` fetches a git repository and makes its files
-includable under the alias, as if the alias were a directory next to the file:
+`import <kind> <alias> <json>` makes `.api` files that live somewhere else
+includable under an alias, as if the alias were a directory next to the file:
 
 ```
 import git cl {
@@ -247,11 +247,14 @@ cl/sv.api
 cl/seeds/*.api
 ```
 
-| Key | |
-|---|---|
-| `url` | required. `https://…`, `ssh://…`, `git@host:path`, or `file://…` |
-| `ref` | required. A tag, a branch, or a full 40-character commit SHA |
-| `path` | optional. A subdirectory of the repository for the alias to stand for |
+There are three kinds. Whichever one an alias comes from, it is used the same
+way, so a batch can swap one `import` line for another and keep its includes.
+
+| Kind | Where the files come from | Keys |
+|---|---|---|
+| `git` | a git repository | `url`, `ref`, optional `path` |
+| `dir` | a directory on this machine, used where it is | `path` |
+| `archive` | a downloaded `.tar.gz`, `.tar` or `.zip` | `url`, optional `sha256`, `token_env`, `path` |
 
 The JSON may also come from a file, read exactly like a request's `@file` body
 (so the path is relative to the **working directory**, and `~/` expands):
@@ -260,34 +263,100 @@ The JSON may also come from a file, read exactly like a request's `@file` body
 import git cl @cloddy.json
 ```
 
-- **Fetched before anything runs.** Every import is resolved while the file is
+#### `import git`
+
+| Key | |
+|---|---|
+| `url` | required. `https://…`, `ssh://…`, `git@host:path`, or `file://…` |
+| `ref` | required. A tag, a branch, or a full 40-character commit SHA |
+| `path` | optional. A subdirectory of the repository for the alias to stand for |
+
+- Fetching uses the `git` on the `PATH` and your normal git credentials; it
+  never stops to ask for a password.
+- A commit SHA already in the cache needs no network. A tag or a branch costs
+  one `git ls-remote` per run and is fetched only when it points at a new
+  commit. A branch is therefore looked up again on every run: pin a tag or a
+  SHA when the batch must be repeatable.
+
+#### `import dir`
+
+```
+import dir cl { "path": "../cloddy" }
+```
+
+| Key | |
+|---|---|
+| `path` | required. The directory: relative to the file that declares it (like an include), `~/…`, or absolute |
+
+- Nothing is fetched, copied or cached; the files are read where they are, so
+  an edit shows up on the next run. This is the kind to use while writing
+  files that others will `import git`: point the alias at your working copy.
+- At the prompt and in one-shot arguments, a relative `path` is relative to
+  the working directory.
+
+#### `import archive`
+
+```
+import archive cl {
+  "url": "https://example.com/releases/cloddy-2.1.0.tar.gz",
+  "sha256": "9f2c…"
+}
+```
+
+| Key | |
+|---|---|
+| `url` | required. `https://…` or `file:///…`. Plain `http://` only for `localhost`/`127.0.0.1` |
+| `sha256` | optional. The archive's SHA-256, 64 hex characters |
+| `token_env` | optional. The **name** of an environment variable whose value is sent as `Authorization: Bearer …` |
+| `path` | optional. A subdirectory of the archive for the alias to stand for |
+
+- Needs no `git`. The format is told from the content, not from the name.
+- **With `sha256`** the archive is pinned, like a commit: a download whose
+  hash differs is an error, and once it is in the cache a run needs no
+  network (and no token). **Without it** the URL is treated like a branch:
+  downloaded on every run, with the hash it had printed in the log.
+- An archive that holds exactly one directory at its top (`cloddy-2.1.0/…`,
+  the way release tarballs are packed) starts inside that directory, so
+  `cl/sv.api` is `cloddy-2.1.0/sv.api`. `path` applies below it.
+- The token goes only to the archive's host. The client's own API key is
+  never sent there, and the token is never sent to the API. Keep the token
+  itself out of the file: `token_env` takes a variable name, and a missing
+  variable is an error.
+- Only files and directories are unpacked. Links are skipped, an entry named
+  outside the archive (`../x`) is an error, and so is an archive that unpacks
+  to more than 1 GB.
+
+#### Rules for every kind
+
+- **Resolved before anything runs.** Every import is fetched while the file is
   read, ahead of the `url` gate, the `-p` preview and the first request. A bad
-  URL, a missing ref or a failed login stops the batch with exit 1 and nothing
-  sent. Fetching uses the `git` on the `PATH` and your normal git credentials;
-  it never stops to ask for a password.
-- **The log names the commit.** In `-sa` mode each import prints one line,
-  `import cl https://github.com/Polyjuice/cloddy 2.1.0 (a1b2c3d)`, and `-p`
-  lists it above the requests. A branch is looked up again on every run, so
-  that SHA is how you know what a run used. Pin a tag or a SHA when the batch
-  must be repeatable.
-- **Cached by commit.** Checkouts live in `~/.cache/api/imports` (override with
-  `API_IMPORT_CACHE`). A commit SHA already there needs no network. A tag or a
-  branch costs one `git ls-remote` per run and is fetched only when it points
-  at a new commit. If the remote can't be reached, the commit the ref last
-  resolved to is used and the log line says `cached copy: remote unreachable`.
+  URL, a missing ref, a wrong hash or a failed login stops the batch with exit
+  1 and nothing sent.
+- **The log says what was used.** In `-sa` mode each import prints one line,
+  and `-p` lists it above the requests:
+  `import cl https://github.com/Polyjuice/cloddy 2.1.0 (a1b2c3d)` for git,
+  `import cl https://example.com/cloddy.tar.gz (sha256 9f2c1ab)` for an
+  archive, `import cl /Users/me/Source/cloddy` for a directory.
+- **Cached by content.** Git checkouts and unpacked archives live in
+  `~/.cache/api/imports` (override with `API_IMPORT_CACHE`), keyed by commit
+  or by SHA-256. If a remote can't be reached, the copy that a tag, a branch
+  or an unpinned archive URL last resolved to is used, and the log line says
+  `cached copy: remote unreachable`.
 - **An alias belongs to the file that declares it**, from that line down. An
-  included file doesn't see it and declares its own; an imported repository
-  may import others. Declaring an alias twice in one file is an error, and so
-  is an alias that names a real file or directory next to the `.api` file,
-  since `cl/sv.api` could then mean either.
-- **An imported file stays inside its repository.** Its includes and its
-  `@file` bodies resolve relative to the imported file itself, and one that
-  points outside the checkout (`@/etc/hosts`, `@~/…`, `../../x.api`) is an
-  error. Symlinks in the repository are not followed.
-- **An imported `url` line can only narrow.** The `url` lines of an imported
-  repository form a gate of their own that must pass *as well as* yours. An
-  import can refuse to run somewhere; it can never add an environment to your
-  allowlist.
+  included file doesn't see it and declares its own; an imported file may
+  import too. Declaring an alias twice in one file is an error, and so is an
+  alias that names a real file or directory next to the `.api` file, since
+  `cl/sv.api` could then mean either.
+- **An imported file stays inside its import.** Its includes and its `@file`
+  bodies resolve relative to the imported file itself, and one that points
+  outside (`@/etc/hosts`, `@~/…`, `../../x.api`) is an error. Its own
+  `import dir` may only name a directory inside the same import. Symlinks in
+  a repository or an archive are not followed.
+- **An imported `url` line can only narrow.** The `url` lines of an import
+  form a gate of their own that must pass *as well as* yours. An import can
+  refuse to run somewhere; it can never add an environment to your allowlist.
+- **Circular imports are an error.** An import that leads back to a file
+  already being read is reported as `include loop detected`.
 - **`> outfile` in an imported file is not restricted** and writes where it
   says, relative to the working directory. Read an import with `-p` before
   running it for the first time: it sends requests with your credentials.
@@ -592,6 +661,9 @@ Run it: `api -sa workshop.api`.
 - **`import … @cloddy.json` run from another directory** → the `@` path is relative to the working directory, like every `@file`, not to the `.api` file. Run from the directory that holds the JSON, or give an absolute or `~/` path.
 - **An alias used in an included file** → `include not found: cl/sv.api`. Aliases don't carry into includes; repeat the `import` in the file that uses it.
 - **Importing a branch and expecting yesterday's run** → a branch is re-resolved every run. Pin a tag or a SHA, and check the commit in the `import …` log line.
+- **An archive URL without `sha256`** → downloaded again on every run, and whatever it serves that day is what runs. Add the `sha256` from the `import …` log line to pin it.
+- **`"token_env": "<the token>"`** → rejected or reported as an unset variable. It takes the *name* of an environment variable, so the secret stays out of the file.
+- **`import dir cl { "path": "cl" }`** → `import alias … clashes`. An alias can't share its name with a file or directory next to the `.api` file; name the alias something else.
 - **`assert` on a list endpoint** → `[]` is truthy, so `assert GET /people~where(x)` passes even when nothing matches. Assert a `~count` or a single item by identifier instead.
 - **A slashless URI on its own line in a `.api` file** → `api/v1/people` alone is read as an *include* path and fails with "could not read include". Write `GET api/v1/people`, or lead with the slash: `/api/v1/people`.
 - **`sleep while` that never ends** → `[]` and `{}` are truthy, so `sleep while GET /people~where(x)` loops forever once the list is merely empty. Poll a `~count` (or a single scalar field) instead, so the answer can become `0`/`null`.

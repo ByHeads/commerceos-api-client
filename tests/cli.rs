@@ -2045,3 +2045,204 @@ fn an_imported_url_gate_stops_the_batch_before_any_request() {
     assert!(stderr.contains("url has production.example.com"), "{stderr}");
     assert!(seen.is_empty(), "nothing may be sent: {seen:?}");
 }
+
+// ----- import archive -----
+
+/// A `.tar.gz` holding `files`.
+fn tar_gz(files: &[(&str, &str)]) -> Vec<u8> {
+    let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut builder = tar::Builder::new(gz);
+    for (name, contents) in files {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, name, contents.as_bytes()).unwrap();
+    }
+    builder.into_inner().unwrap().finish().unwrap()
+}
+
+/// A server that is both the place an archive is downloaded from and the API
+/// the batch then runs against: `/lib.tar.gz` answers with `archive` (401
+/// unless the request carries `Bearer <token>`, when a token is asked for),
+/// anything else answers `1`. Returns every request it saw, headers included.
+fn archive_server(archive: Vec<u8>, token: Option<&'static str>) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let handle = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        loop {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let accepted = loop {
+                match listener.accept() {
+                    Ok(pair) => break Some(pair),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() > deadline {
+                            break None;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("accept: {e}"),
+                }
+            };
+            let Some((mut stream, _)) = accepted else { break };
+            stream.set_nonblocking(false).unwrap();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let authorised = token.is_none_or(|t| {
+                request.to_ascii_lowercase().contains(&format!("authorization: bearer {t}").to_ascii_lowercase())
+            });
+            let (status, kind, body): (&str, &str, &[u8]) = if !request.starts_with("GET /lib.tar.gz") {
+                ("200 OK", "application/json", b"1")
+            } else if authorised {
+                ("200 OK", "application/gzip", &archive)
+            } else {
+                ("401 Unauthorized", "text/plain", b"no")
+            };
+            seen.push(request);
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            let _ = stream.write_all(body);
+            let _ = stream.flush();
+        }
+        seen
+    });
+    (port, handle)
+}
+
+/// Run `batch` in `dir` with `-sa` against the server on `port`, with the
+/// import cache kept in `dir`. Returns (success, stdout, stderr).
+fn run_archive_batch(dir: &std::path::Path, port: u16, batch: &str, token: Option<&str>) -> (bool, String, String) {
+    let file = dir.join("batch.api");
+    std::fs::write(&file, batch).unwrap();
+    let mut cmd = api_against_port(port);
+    cmd.env("API_IMPORT_CACHE", dir.join(".import-cache"))
+        .env("NO_COLOR", "1")
+        .env_remove("IMPORT_TEST_TOKEN")
+        .current_dir(dir)
+        .args(["-sa"])
+        .arg(&file);
+    if let Some(token) = token {
+        cmd.env("IMPORT_TEST_TOKEN", token);
+    }
+    let out = cmd.output().expect("api runs");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+#[test]
+fn import_archive_downloads_with_its_own_token_and_never_the_api_key() {
+    let dir = tempdir().unwrap();
+    let dir = dir.path().canonicalize().unwrap();
+    let archive = tar_gz(&[("lib-1.0/sv.api", "GET /from-archive\n")]);
+    let (port, server) = archive_server(archive, Some("s3cret"));
+    let batch = format!(
+        "import archive cl {{ \"url\": \"http://127.0.0.1:{port}/lib.tar.gz\", \"token_env\": \"IMPORT_TEST_TOKEN\" }}\ncl/sv.api\n"
+    );
+
+    // The wrong token: the download is refused, and nothing is sent.
+    let (ok, _, stderr) = run_archive_batch(&dir, port, &batch, Some("wrong"));
+    assert!(!ok);
+    assert!(stderr.contains("could not reach import") && stderr.contains("401 Unauthorized"), "{stderr}");
+    // No token at all is a mistake in the setup, said as one.
+    let (ok, _, stderr) = run_archive_batch(&dir, port, &batch, None);
+    assert!(!ok);
+    assert!(stderr.contains("environment variable IMPORT_TEST_TOKEN is not set"), "{stderr}");
+
+    let (ok, stdout, stderr) = run_archive_batch(&dir, port, &batch, Some("s3cret"));
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains(&format!("import cl http://127.0.0.1:{port}/lib.tar.gz (sha256 ")), "{stdout}");
+
+    let seen = server.join().expect("server thread");
+    let downloads: Vec<&String> = seen.iter().filter(|r| r.starts_with("GET /lib.tar.gz")).collect();
+    assert_eq!(downloads.len(), 2, "{seen:?}");
+    for download in &downloads {
+        let lower = download.to_ascii_lowercase();
+        assert!(lower.contains("authorization: bearer "), "{download}");
+        assert!(!lower.contains("authorization: basic"), "the API key went to the archive host: {download}");
+    }
+    // Only the good run reached the API, and it did so with the API key.
+    let api: Vec<&String> = seen.iter().filter(|r| r.starts_with("GET /api/v1/from-archive")).collect();
+    assert_eq!(api.len(), 1, "{seen:?}");
+    assert!(api[0].to_ascii_lowercase().contains("authorization: basic"), "{}", api[0]);
+    assert!(!api[0].contains("s3cret"), "the import's token went to the API: {}", api[0]);
+}
+
+#[test]
+fn an_unpinned_archive_is_downloaded_every_run_and_a_pinned_one_once() {
+    let dir = tempdir().unwrap();
+    let dir = dir.path().canonicalize().unwrap();
+    let archive = tar_gz(&[("sv.api", "GET /from-archive\n")]);
+    let sha = {
+        use sha2::Digest;
+        sha2::Sha256::digest(&archive).iter().map(|b| format!("{b:02x}")).collect::<String>()
+    };
+    let (port, server) = archive_server(archive, None);
+    let url = format!("http://127.0.0.1:{port}/lib.tar.gz");
+    let unpinned = format!("import archive cl {{ \"url\": \"{url}\" }}\ncl/sv.api\n");
+    let pinned = format!("import archive cl {{ \"url\": \"{url}\", \"sha256\": \"{sha}\" }}\ncl/sv.api\n");
+
+    for batch in [&unpinned, &unpinned, &pinned, &pinned] {
+        let (ok, stdout, stderr) = run_archive_batch(&dir, port, batch, None);
+        assert!(ok, "{stderr}");
+        assert!(stdout.contains(&format!("(sha256 {})", &sha[..7])), "{stdout}");
+    }
+    let seen = server.join().expect("server thread");
+    // Twice for the unpinned runs; the pinned ones found the hash in the cache.
+    assert_eq!(seen.iter().filter(|r| r.starts_with("GET /lib.tar.gz")).count(), 2, "{seen:?}");
+    assert_eq!(seen.iter().filter(|r| r.starts_with("GET /api/v1/from-archive")).count(), 4, "{seen:?}");
+
+    // The archive's server is gone now. Unpinned falls back to the copy it
+    // last served and says so; the batch itself still runs.
+    let (api_port, api_server) = flipping_server(vec!["1"]);
+    let (ok, stdout, stderr) = run_archive_batch(&dir, api_port, &unpinned, None);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("cached copy: remote unreachable"), "{stdout}");
+    let seen = api_server.join().expect("server thread");
+    assert!(seen.iter().any(|r| r.contains("GET /api/v1/from-archive")), "{seen:?}");
+}
+
+#[test]
+fn a_download_that_is_no_archive_fails_cleanly() {
+    let dir = tempdir().unwrap();
+    let dir = dir.path().canonicalize().unwrap();
+    let (port, server) = archive_server(b"<html>not found</html>".to_vec(), None);
+    let batch = format!("import archive cl {{ \"url\": \"http://127.0.0.1:{port}/lib.tar.gz\" }}\nGET /never\n");
+    let (ok, _, stderr) = run_archive_batch(&dir, port, &batch, None);
+    assert!(!ok);
+    assert!(stderr.contains("not a .tar.gz, .tar or .zip archive"), "{stderr}");
+    let seen = server.join().expect("server thread");
+    assert!(!seen.iter().any(|r| r.contains("/never")), "{seen:?}");
+    // Nothing half-unpacked is left in the cache.
+    let archives = dir.join(".import-cache/archives");
+    let left: Vec<String> = std::fs::read_dir(&archives)
+        .map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect())
+        .unwrap_or_default();
+    assert!(left.iter().all(|name| name == "refs"), "{left:?}");
+}
+
+#[test]
+fn import_dir_runs_a_local_directory_and_logs_where_it_is() {
+    let dir = tempdir().unwrap();
+    let dir = dir.path().canonicalize().unwrap();
+    std::fs::create_dir_all(dir.join("shared-lib")).unwrap();
+    std::fs::write(dir.join("shared-lib/sv.api"), "GET /from-dir\n").unwrap();
+    let (ok, stdout, stderr, seen) =
+        run_import_batch(&dir, "import dir cl { \"path\": \"shared-lib\" }\ncl/sv.api\n");
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains(&format!("import cl {}", dir.join("shared-lib").display())), "{stdout}");
+    assert!(seen.iter().any(|r| r.contains("GET /api/v1/from-dir")), "{seen:?}");
+    // Used in place: there is nothing to cache.
+    assert!(!dir.join(".import-cache").exists());
+}

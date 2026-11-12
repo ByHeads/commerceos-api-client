@@ -196,6 +196,8 @@ GET /people~take(5) > /tmp/people.json
 | `# …` | comment; `//`, `#`, and `/* */` also work inside JSON bodies |
 | `path/to/file.api` | include, relative to the including file; globs allowed |
 | `import git <alias> {"url":…,"ref":…}` | fetch a git repository (tag, branch or SHA) and include from it as `alias/file.api`; the JSON may be `@file.json` |
+| `import dir <alias> {"path":…}` | the same for a local directory, used where it is |
+| `import archive <alias> {"url":…,"sha256":…}` | the same for a downloaded `.tar.gz`, `.tar` or `.zip`; `sha256` pins it, `token_env` names a bearer-token variable |
 | `sleep N` | pause (`2`, `500ms`, `1.5s`) |
 | `sleep [N] while [not] <request>` | poll every N seconds (default 5) until the answer flips |
 | `assert [not] <request>` | exit 1 unless the answer is truthy (falsy with `not`) |
