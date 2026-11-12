@@ -541,9 +541,9 @@ api -sfa seed.api
 [http://localhost:5000]
 PUT /people/com.mi6.id=007 {"name":"James Bond"}
 └─HTTP/1.1 200 OK 0.02s
-GET /assert/…
+PUT /assert {"api/v1/people~count":{"is":3}}
 └─HTTP/1.1 409 Conflict 0.01s
-{ …the 409's body, as the server sent it… }
+{"@type":"failed assertion","error":"One or more assertions failed.","details":"1 of 1 assertions failed.","failures":{"api/v1/people~count":{"was":2,"expected":{"is":3}}}}
 ```
 
 - Nothing after the failing request is sent, and the exit code is 1.
@@ -551,10 +551,29 @@ GET /assert/…
   server sent it, with `-sa` too (where bodies are otherwise not printed). A
   tool driving the client reads the reason from there; the status line stays
   where it always is (stdout in `-sa`, stderr otherwise).
-- This is how to check a condition with the `/assert` endpoint: a failed
-  assertion answers 409, which `-f` turns into a stopped batch with the
-  explanation on stdout. The `assert` keyword still works and still reports
-  its own failures, with or without `-f`.
+- This is how to check conditions with the `/assert` endpoint. `PUT /assert`
+  takes a body that maps API paths, written from the base (`api/v1/…`), to
+  what they should hold (`is`, `is not`), any number of them in one request:
+
+  ```
+  PUT /assert {
+    "api/v1/people~count": { "is": 3 },
+    "api/v1/people/com.mi6.id=007/givenName": { "is": "James" },
+    "api/v1/people/com.mi6.id=006/personalNumber": { "is not": null }
+  }
+  ```
+
+  Every assertion holding answers `200` with `null` and the batch goes on. A
+  failed one answers `409` `failed assertion`, with an entry per failed path
+  under `failures` (`was`, `expected`, and a `suggestion` where there is
+  one); a request the server can't read answers `400`. `-f` turns both into
+  a stopped batch with that body on stdout.
+- **Put `PUT /assert` on a line of its own.** A pass is `200` with `null`,
+  and `null` is falsy to `&&`/`||`, to `sleep while` and to the `assert`
+  keyword. So `PUT /assert {…} && PUT /x {…}` never runs the write, and
+  `assert PUT /assert {…}` fails when the assertions hold.
+- The `assert` keyword still works and still reports its own failures, with
+  or without `-f`.
 - **A question may still be answered "no".** A chain segment with another
   after it (`GET /x || PUT /x {…}`), `assert not`, and a `sleep while` poll
   ask something, and a 404 or 409 is their answer, so they don't trip `-f`.
@@ -562,8 +581,8 @@ GET /assert/…
   never an answer (401/403/408/429/5xx) ends the run from anywhere.
 - An error is not written to a `> outfile`: under `-f` the file is left
   alone and the body goes to stdout.
-- It works for one request too: `api -f GET /assert/…` exits 1 on a 4xx or
-  5xx where it otherwise exits 0. At the interactive prompt, `api -f` makes a
+- It works for one request too: `api -f PUT /assert '{…}'` exits 1 on a 4xx
+  or 5xx where it otherwise exits 0. At the interactive prompt, `api -f` makes a
   pasted block or a `seed.api` run stop at the failing request and says
   `stopped at 409 (--fail-fast)`; the session stays open.
 
@@ -719,7 +738,8 @@ Run it: `api -sa workshop.api`.
 - **An archive URL without `sha256`** → downloaded again on every run, and whatever it serves that day is what runs. Add the `sha256` from the `import …` log line to pin it.
 - **`"token_env": "<the token>"`** → rejected or reported as an unset variable. It takes the *name* of an environment variable, so the secret stays out of the file.
 - **`import dir cl { "path": "cl" }`** → `import alias … clashes`. An alias can't share its name with a file or directory next to the `.api` file; name the alias something else.
-- **Expecting a failed request to stop a batch** → it doesn't, unless the line is an `assert`, a chain or a poll, or the run has `-f`. A plain `GET /assert/…` that answers 409 is logged and the next line runs. Run with `-f`.
+- **Expecting a failed request to stop a batch** → it doesn't, unless the line is an `assert`, a chain or a poll, or the run has `-f`. A plain `PUT /assert {…}` that answers 409 is logged and the next line runs. Run with `-f`.
+- **Chaining on `PUT /assert`** → a passing `/assert` answers `200` with `null`, which is falsy, so `PUT /assert {…} && …` skips what follows and `assert PUT /assert {…}` fails on a pass. Write it on its own line and run with `-f`.
 - **`assert` on a list endpoint** → `[]` is truthy, so `assert GET /people~where(x)` passes even when nothing matches. Assert a `~count` or a single item by identifier instead.
 - **A slashless URI on its own line in a `.api` file** → `api/v1/people` alone is read as an *include* path and fails with "could not read include". Write `GET api/v1/people`, or lead with the slash: `/api/v1/people`.
 - **`sleep while` that never ends** → `[]` and `{}` are truthy, so `sleep while GET /people~where(x)` loops forever once the list is merely empty. Poll a `~count` (or a single scalar field) instead, so the answer can become `0`/`null`.
