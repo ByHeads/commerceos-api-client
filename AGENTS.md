@@ -232,6 +232,66 @@ PATCH /people/com.heads.foo=123 { "name": "after seeds" }
 - Glob includes work: `shared/*.api` includes all matching files in sorted order.
 - Recursive includes are supported. Loops are detected and reported as errors.
 
+### Importing a git repository (`import git`)
+
+`import git <alias> <json>` fetches a git repository and makes its files
+includable under the alias, as if the alias were a directory next to the file:
+
+```
+import git cl {
+  "url": "https://github.com/Polyjuice/cloddy",
+  "ref": "2.1.0"
+}
+
+cl/sv.api
+cl/seeds/*.api
+```
+
+| Key | |
+|---|---|
+| `url` | required. `https://…`, `ssh://…`, `git@host:path`, or `file://…` |
+| `ref` | required. A tag, a branch, or a full 40-character commit SHA |
+| `path` | optional. A subdirectory of the repository for the alias to stand for |
+
+The JSON may also come from a file, read exactly like a request's `@file` body
+(so the path is relative to the **working directory**, and `~/` expands):
+
+```
+import git cl @cloddy.json
+```
+
+- **Fetched before anything runs.** Every import is resolved while the file is
+  read, ahead of the `url` gate, the `-p` preview and the first request. A bad
+  URL, a missing ref or a failed login stops the batch with exit 1 and nothing
+  sent. Fetching uses the `git` on the `PATH` and your normal git credentials;
+  it never stops to ask for a password.
+- **The log names the commit.** In `-sa` mode each import prints one line,
+  `import cl https://github.com/Polyjuice/cloddy 2.1.0 (a1b2c3d)`, and `-p`
+  lists it above the requests. A branch is looked up again on every run, so
+  that SHA is how you know what a run used. Pin a tag or a SHA when the batch
+  must be repeatable.
+- **Cached by commit.** Checkouts live in `~/.cache/api/imports` (override with
+  `API_IMPORT_CACHE`). A commit SHA already there needs no network. A tag or a
+  branch costs one `git ls-remote` per run and is fetched only when it points
+  at a new commit. If the remote can't be reached, the commit the ref last
+  resolved to is used and the log line says `cached copy: remote unreachable`.
+- **An alias belongs to the file that declares it**, from that line down. An
+  included file doesn't see it and declares its own; an imported repository
+  may import others. Declaring an alias twice in one file is an error, and so
+  is an alias that names a real file or directory next to the `.api` file,
+  since `cl/sv.api` could then mean either.
+- **An imported file stays inside its repository.** Its includes and its
+  `@file` bodies resolve relative to the imported file itself, and one that
+  points outside the checkout (`@/etc/hosts`, `@~/…`, `../../x.api`) is an
+  error. Symlinks in the repository are not followed.
+- **An imported `url` line can only narrow.** The `url` lines of an imported
+  repository form a gate of their own that must pass *as well as* yours. An
+  import can refuse to run somewhere; it can never add an environment to your
+  allowlist.
+- **`> outfile` in an imported file is not restricted** and writes where it
+  says, relative to the working directory. Read an import with `-p` before
+  running it for the first time: it sends requests with your credentials.
+
 ## 7. Directives: `sleep`, `sleep while`, `assert`, `confirm`, `url`
 
 Besides requests and includes, a few control lines are recognised. `sleep while`
@@ -529,6 +589,9 @@ Run it: `api -sa workshop.api`.
 - **Unclosed brackets** → the whole run fails with `"unclosed body at end of bulk file"`. If a body looks wrong, check that `{}` and `[]` balance.
 - **Glob with no matches** → hard error. Check the directory and pattern.
 - **Include loops** → `a.api` including `b.api` which includes `a.api` is detected and refused.
+- **`import … @cloddy.json` run from another directory** → the `@` path is relative to the working directory, like every `@file`, not to the `.api` file. Run from the directory that holds the JSON, or give an absolute or `~/` path.
+- **An alias used in an included file** → `include not found: cl/sv.api`. Aliases don't carry into includes; repeat the `import` in the file that uses it.
+- **Importing a branch and expecting yesterday's run** → a branch is re-resolved every run. Pin a tag or a SHA, and check the commit in the `import …` log line.
 - **`assert` on a list endpoint** → `[]` is truthy, so `assert GET /people~where(x)` passes even when nothing matches. Assert a `~count` or a single item by identifier instead.
 - **A slashless URI on its own line in a `.api` file** → `api/v1/people` alone is read as an *include* path and fails with "could not read include". Write `GET api/v1/people`, or lead with the slash: `/api/v1/people`.
 - **`sleep while` that never ends** → `[]` and `{}` are truthy, so `sleep while GET /people~where(x)` loops forever once the list is merely empty. Poll a `~count` (or a single scalar field) instead, so the answer can become `0`/`null`.

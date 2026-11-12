@@ -195,6 +195,7 @@ GET /people~take(5) > /tmp/people.json
 | `METHOD URI [BODY] [> file]` | a request; multi-line bodies continue until brackets balance |
 | `# …` | comment; `//`, `#`, and `/* */` also work inside JSON bodies |
 | `path/to/file.api` | include, relative to the including file; globs allowed |
+| `import git <alias> {"url":…,"ref":…}` | fetch a git repository (tag, branch or SHA) and include from it as `alias/file.api`; the JSON may be `@file.json` |
 | `sleep N` | pause (`2`, `500ms`, `1.5s`) |
 | `sleep [N] while [not] <request>` | poll every N seconds (default 5) until the answer flips |
 | `assert [not] <request>` | exit 1 unless the answer is truthy (falsy with `not`) |
@@ -215,7 +216,8 @@ one-shot mode, with tab completion for endpoints, operators, properties, and fil
   syntax: `confirm Ready?` asks in the hint line, `sleep 5 while not /imports~count` polls,
   `assert /companies/x` checks (logged as `assert GET /companies/x`, with
   `↳ assertion failed (404 Not Found)` under the status line when it fails), and `seed.api`
-  runs the file, includes and all. A pasted block
+  runs the file, includes and all. `import git cl {…}` keeps its alias for the session, so
+  `cl/sv.api` runs on a later line and `tab` completes inside the repository. A pasted block
   of several lines runs line by line. Pasting a request line, a directive or a block replaces
   whatever is on the line, so a paste over the starting `GET /` is just the paste. `esc` stops a wait; a failed assert or a declined confirm
   stops the rest of the line. A mistyped request says `not a request or .api file` instead of

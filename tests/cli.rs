@@ -1911,3 +1911,137 @@ fn timeout_expiry_reports_the_timeout_not_a_dead_server() {
         "a timeout must not be reported as a dead server: {stderr}"
     );
 }
+
+// ----- import git -----
+
+fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false"])
+        .args(args)
+        .output()
+        .expect("git runs");
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Commit `files` into the repository at `repo` (created on first use) and
+/// return the new commit.
+fn commit_files(repo: &std::path::Path, files: &[(&str, &str)]) -> String {
+    if !repo.join(".git").exists() {
+        std::fs::create_dir_all(repo).unwrap();
+        git_in(repo, &["init", "-q", "-b", "main"]);
+    }
+    for (name, contents) in files {
+        std::fs::write(repo.join(name), contents).unwrap();
+    }
+    git_in(repo, &["add", "-A"]);
+    git_in(repo, &["commit", "-q", "-m", "change"]);
+    git_in(repo, &["rev-parse", "HEAD"])
+}
+
+/// Run `batch` in `dir` with `-sa` against a throwaway server, with the
+/// import cache kept in `dir`. Returns (success, stdout, stderr, requests).
+fn run_import_batch(dir: &std::path::Path, batch: &str) -> (bool, String, String, Vec<String>) {
+    let (port, server) = flipping_server(vec!["1"]);
+    let file = dir.join("batch.api");
+    std::fs::write(&file, batch).unwrap();
+    let out = api_against_port(port)
+        .env("API_IMPORT_CACHE", dir.join(".import-cache"))
+        .env("NO_COLOR", "1")
+        .current_dir(dir)
+        .args(["-sa"])
+        .arg(&file)
+        .output()
+        .expect("api runs");
+    let seen = server.join().expect("server thread");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+        seen,
+    )
+}
+
+#[test]
+fn import_follows_a_branch_and_logs_the_commit_it_ran() {
+    let dir = tempdir().unwrap();
+    let dir = dir.path().canonicalize().unwrap();
+    let repo = dir.join("gitrepo");
+    let first = commit_files(&repo, &[("sv.api", "GET /first\n")]);
+    let batch = format!(
+        "import git cl {{ \"url\": \"file://{}\", \"ref\": \"main\" }}\ncl/sv.api\n",
+        repo.display()
+    );
+
+    let (ok, stdout, stderr, seen) = run_import_batch(&dir, &batch);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains(&format!("main ({})", &first[..7])), "{stdout}");
+    assert!(seen.iter().any(|r| r.contains("GET /api/v1/first")), "{seen:?}");
+
+    // The branch moves; the next run is the new commit, and says so.
+    let second = commit_files(&repo, &[("sv.api", "GET /second\n")]);
+    let (ok, stdout, stderr, seen) = run_import_batch(&dir, &batch);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains(&format!("main ({})", &second[..7])), "{stdout}");
+    assert!(seen.iter().any(|r| r.contains("GET /api/v1/second")), "{seen:?}");
+    assert!(!seen.iter().any(|r| r.contains("/first")), "{seen:?}");
+}
+
+#[test]
+fn import_falls_back_to_its_cached_copy_when_the_remote_is_gone() {
+    let dir = tempdir().unwrap();
+    let dir = dir.path().canonicalize().unwrap();
+    let repo = dir.join("gitrepo");
+    let sha = commit_files(&repo, &[("sv.api", "GET /cached\n")]);
+    git_in(&repo, &["tag", "1.0"]);
+    let by_tag = format!(
+        "import git cl {{ \"url\": \"file://{}\", \"ref\": \"1.0\" }}\ncl/sv.api\n",
+        repo.display()
+    );
+    let by_sha = format!(
+        "import git cl {{ \"url\": \"file://{}\", \"ref\": \"{sha}\" }}\ncl/sv.api\n",
+        repo.display()
+    );
+    let (ok, _, stderr, _) = run_import_batch(&dir, &by_tag);
+    assert!(ok, "{stderr}");
+
+    std::fs::remove_dir_all(&repo).unwrap();
+
+    // A tag has to be looked up, so the log says the lookup failed.
+    let (ok, stdout, stderr, seen) = run_import_batch(&dir, &by_tag);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("cached copy: remote unreachable"), "{stdout}");
+    assert!(seen.iter().any(|r| r.contains("GET /api/v1/cached")), "{seen:?}");
+
+    // A commit already in the cache needs no remote at all.
+    let (ok, stdout, stderr, seen) = run_import_batch(&dir, &by_sha);
+    assert!(ok, "{stderr}");
+    assert!(!stdout.contains("cached copy"), "{stdout}");
+    assert!(seen.iter().any(|r| r.contains("GET /api/v1/cached")), "{seen:?}");
+
+    // Nothing cached for this ref: that is an error, before any request.
+    let never_seen = by_tag.replace("\"1.0\"", "\"2.0\"");
+    let (ok, _, stderr, seen) = run_import_batch(&dir, &never_seen);
+    assert!(!ok);
+    assert!(stderr.contains("could not reach import"), "{stderr}");
+    assert!(seen.is_empty(), "{seen:?}");
+}
+
+#[test]
+fn an_imported_url_gate_stops_the_batch_before_any_request() {
+    let dir = tempdir().unwrap();
+    let dir = dir.path().canonicalize().unwrap();
+    let repo = dir.join("gitrepo");
+    commit_files(&repo, &[("sv.api", "url has production.example.com\nGET /gated\n")]);
+    let batch = format!(
+        "url has 127.0.0.1\nimport git cl {{ \"url\": \"file://{}\", \"ref\": \"main\" }}\nGET /own\ncl/sv.api\n",
+        repo.display()
+    );
+    let (ok, _, stderr, seen) = run_import_batch(&dir, &batch);
+    assert!(!ok);
+    assert!(stderr.contains("import cl: URL gate failed"), "{stderr}");
+    assert!(stderr.contains("url has production.example.com"), "{stderr}");
+    assert!(seen.is_empty(), "nothing may be sent: {seen:?}");
+}

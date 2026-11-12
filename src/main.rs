@@ -4573,6 +4573,28 @@ impl UrlCondition {
 struct BulkProgram {
     steps: Vec<BulkStep>,
     url_conditions: Vec<UrlCondition>,
+    /// `url` lines found in imported repositories, one gate per repository.
+    import_gates: Vec<ImportGate>,
+    /// The imports the program made, in the order they were declared.
+    import_notes: Vec<ImportNote>,
+}
+
+impl BulkProgram {
+    /// The gate collecting the `url` lines of `repo`.
+    fn import_gate(&mut self, repo: &ImportedRepo) -> &mut Vec<UrlCondition> {
+        let at = match self.import_gates.iter().position(|g| g.checkout == repo.checkout) {
+            Some(at) => at,
+            None => {
+                self.import_gates.push(ImportGate {
+                    alias: repo.alias.clone(),
+                    checkout: repo.checkout.clone(),
+                    conditions: Vec::new(),
+                });
+                self.import_gates.len() - 1
+            }
+        };
+        &mut self.import_gates[at].conditions
+    }
 }
 
 /// Parse a `sleep <value>` directive into a Duration. Accepts a bare number
@@ -4824,19 +4846,569 @@ fn evaluate_url_gate(conditions: &[UrlCondition], url: &str) -> Result<(), Strin
     Err(msg)
 }
 
+// ---------------------------------------------------------------------------
+// `import git <alias> {…}`: .api files from a git repository
+// ---------------------------------------------------------------------------
+
+/// A repository an `import` made available, as the file that declared it
+/// sees it.
+#[derive(Debug, Clone, PartialEq)]
+struct ImportedRepo {
+    /// The directory the alias stands for: the checkout, or its `path`
+    /// subdirectory.
+    root: PathBuf,
+    /// The checkout itself, canonical. Nothing an imported file names may
+    /// leave it.
+    checkout: PathBuf,
+    /// The alias it was declared under, for messages.
+    alias: String,
+}
+
+/// The aliases one file declared. An included file starts with none: an
+/// alias is visible only in the file that declares it.
+type ImportAliases = HashMap<String, ImportedRepo>;
+
+/// The `url` lines of one imported repository. They form a gate of their own
+/// that must pass as well, so an import can narrow where a batch may run but
+/// never widen it.
+#[derive(Debug)]
+struct ImportGate {
+    alias: String,
+    checkout: PathBuf,
+    conditions: Vec<UrlCondition>,
+}
+
+/// One import as the run log shows it: `import cl <url> 2.1.0 (a1b2c3d)`.
+#[derive(Debug, Clone, PartialEq)]
+struct ImportNote {
+    text: String,
+    /// The remote could not be reached and a cached copy was used instead.
+    stale: bool,
+}
+
+/// What an `import git` line asks for.
+#[derive(Debug, PartialEq)]
+struct ImportSpec {
+    alias: String,
+    url: String,
+    git_ref: String,
+    path: Option<String>,
+}
+
+/// A checkout in the import cache.
+#[derive(Debug, Clone)]
+struct FetchedImport {
+    checkout: PathBuf,
+    sha: String,
+    stale: bool,
+}
+
+/// Aliases declared at the interactive prompt, which live for the session.
+fn session_imports() -> &'static std::sync::Mutex<ImportAliases> {
+    static SESSION: std::sync::OnceLock<std::sync::Mutex<ImportAliases>> = std::sync::OnceLock::new();
+    SESSION.get_or_init(Default::default)
+}
+
+/// Split off the first whitespace-delimited word.
+fn split_first_word(s: &str) -> (&str, &str) {
+    let s = s.trim_start();
+    match s.find(char::is_whitespace) {
+        Some(i) => (&s[..i], s[i..].trim_start()),
+        None => (s, ""),
+    }
+}
+
+const IMPORT_USAGE: &str = "expected `import git <alias> { \"url\": …, \"ref\": … }` or `import git <alias> @file.json`";
+
+/// Parse an assembled `import …` directive (comments stripped, brackets
+/// balanced). `file_dir` and `within` are the file it stands in, when that
+/// file is itself imported: its `@file` is then read from its own repository.
+fn parse_import_directive(
+    text: &str,
+    file_dir: Option<&std::path::Path>,
+    within: Option<&ImportedRepo>,
+) -> Result<ImportSpec, String> {
+    let (_, rest) = split_first_word(text);
+    let (kind, rest) = split_first_word(rest);
+    let (alias, body) = split_first_word(rest);
+    if kind.is_empty() || alias.is_empty() || body.is_empty() {
+        return Err(format!("incomplete import: {}", IMPORT_USAGE));
+    }
+    if !kind.eq_ignore_ascii_case("git") {
+        return Err(format!("unknown import kind `{}` (only `git` is supported)", kind));
+    }
+    let reserved = starts_a_request(alias)
+        || DIRECTIVES.iter().any(|d| alias.eq_ignore_ascii_case(d));
+    if reserved || !alias.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err(format!(
+            "invalid import alias `{}` (letters, digits, `-` and `_`; not a method or directive)",
+            alias
+        ));
+    }
+
+    let json = if body.starts_with('@') {
+        let (file_body, functions) = parse_body_functions(body);
+        if !functions.is_empty() {
+            return Err("an import's `@file` takes no `~map(…)` suffix".to_string());
+        }
+        let raw = file_body.trim_start_matches('@').trim();
+        if raw.is_empty() || raw.contains(['*', '?', '[']) {
+            return Err(format!("an import reads one JSON file, not `@{}`", raw));
+        }
+        let path = match within {
+            Some(repo) => rebase_import_path(raw, file_dir, repo)?,
+            None => raw.to_string(),
+        };
+        let contents = resolve_at_file_body(&path)?.contents;
+        let text = String::from_utf8(contents)
+            .map_err(|_| format!("import file is not UTF-8 text: {}", raw))?;
+        normalize_request_text(&text).map_err(|e| format!("import file {}: {}", raw, e))?
+    } else if body.starts_with('{') {
+        body.to_string()
+    } else {
+        return Err(format!("invalid import: {}", IMPORT_USAGE));
+    };
+
+    let value: Value = serde_json::from_str(json.trim())
+        .map_err(|e| format!("import {}: invalid JSON: {}", alias, e))?;
+    let Some(object) = value.as_object() else {
+        return Err(format!("import {}: expected a JSON object with `url` and `ref`", alias));
+    };
+    if let Some(unknown) = object.keys().find(|k| !["url", "ref", "path"].contains(&k.as_str())) {
+        return Err(format!("import {}: unknown key `{}` (expected `url`, `ref`, `path`)", alias, unknown));
+    }
+    let text_of = |key: &str| -> Result<Option<String>, String> {
+        match object.get(key) {
+            None => Ok(None),
+            Some(Value::String(s)) if !s.trim().is_empty() => Ok(Some(s.trim().to_string())),
+            Some(_) => Err(format!("import {}: `{}` must be a non-empty string", alias, key)),
+        }
+    };
+    let url = text_of("url")?.ok_or_else(|| format!("import {}: `url` is required", alias))?;
+    let git_ref = text_of("ref")?.ok_or_else(|| {
+        format!("import {}: `ref` is required (a tag, a branch or a commit SHA)", alias)
+    })?;
+    let path = text_of("path")?;
+
+    validate_import_url(&url).map_err(|e| format!("import {}: {}", alias, e))?;
+    if git_ref.starts_with('-') || git_ref.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(format!("import {}: invalid ref `{}`", alias, git_ref));
+    }
+    if let Some(p) = &path {
+        let stays_inside = !p.starts_with('~')
+            && std::path::Path::new(p).components().all(|c| {
+                matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir)
+            });
+        if !stays_inside {
+            return Err(format!("import {}: `path` must be a relative path inside the repository", alias));
+        }
+    }
+    Ok(ImportSpec { alias: alias.to_string(), url, git_ref, path })
+}
+
+/// Only transports that reach a repository: `https://`, `ssh://` (or the
+/// `user@host:path` spelling of it) and `file://`. Anything else, an option
+/// in disguise included, is refused before git ever sees it.
+fn validate_import_url(url: &str) -> Result<(), String> {
+    let scp_like = || {
+        let Some((user_host, path)) = url.split_once(':') else { return false };
+        let Some((user, host)) = user_host.split_once('@') else { return false };
+        let plain = |s: &str| {
+            !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+        };
+        plain(user) && plain(host) && !path.is_empty() && !path.starts_with("//")
+    };
+    let ok = !url.starts_with('-')
+        && !url.chars().any(|c| c.is_whitespace() || c.is_control())
+        && (["https://", "ssh://", "file://"].iter().any(|scheme| url.starts_with(scheme)) || scp_like());
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("unsupported url `{}` (use https://, ssh://, user@host:path or file://)", url))
+    }
+}
+
+/// Where fetched repositories are kept: `API_IMPORT_CACHE`, or
+/// `~/.cache/api/imports`.
+fn import_cache_dir() -> Result<PathBuf, String> {
+    if let Some(dir) = std::env::var_os("API_IMPORT_CACHE").filter(|d| !d.is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
+    dirs::home_dir()
+        .map(|home| home.join(".cache").join("api").join("imports"))
+        .ok_or_else(|| "no home directory for the import cache; set API_IMPORT_CACHE".to_string())
+}
+
+/// A directory name for `name`: readable, and unique through a hash of the
+/// exact text (FNV-1a, so it is the same name on every run and every build).
+fn import_cache_key(name: &str) -> String {
+    let mut readable = String::new();
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+            readable.push(c);
+        } else if !readable.ends_with('_') {
+            readable.push('_');
+        }
+    }
+    let readable: String = readable.trim_matches('_').chars().take(80).collect();
+    let hash = name
+        .bytes()
+        .fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+    format!("{}-{:016x}", readable, hash)
+}
+
+/// A git command that can't stop to ask for anything and can't be steered
+/// onto another transport. Symlinks are checked out as plain files, so a
+/// repository can't point at a file outside itself.
+fn git_command(dir: Option<&std::path::Path>) -> Command {
+    let mut cmd = Command::new("git");
+    if let Some(dir) = dir {
+        cmd.arg("-C").arg(dir);
+    }
+    cmd.args(["-c", "core.symlinks=false", "-c", "advice.detachedHead=false"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_LFS_SKIP_SMUDGE", "1")
+        .env("GIT_ALLOW_PROTOCOL", "https:ssh:file")
+        .stdin(std::process::Stdio::null());
+    if std::env::var_os("GIT_SSH_COMMAND").is_none() && std::env::var_os("GIT_SSH").is_none() {
+        cmd.env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
+    }
+    cmd
+}
+
+/// Run a git command, returning its stdout or the reason it failed.
+fn run_git(mut cmd: Command) -> Result<String, String> {
+    let output = cmd.output().map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            "an import needs `git` on the PATH".to_string()
+        } else {
+            format!("could not run git: {}", e)
+        }
+    })?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let reason = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("; ");
+    Err(if reason.is_empty() { format!("git exited with {}", output.status) } else { reason })
+}
+
+/// From `git ls-remote` output, the commit `git_ref` names and the full ref
+/// to fetch it by. A tag wins over a branch of the same name, and an
+/// annotated tag resolves to the commit it points at.
+fn pick_remote_ref(listing: &str, git_ref: &str) -> Option<(String, String)> {
+    let refs: Vec<(&str, &str)> = listing
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .map(|(sha, name)| (sha.trim(), name.trim()))
+        .collect();
+    let wanted = [
+        format!("refs/tags/{}^{{}}", git_ref),
+        format!("{}^{{}}", git_ref),
+        format!("refs/tags/{}", git_ref),
+        format!("refs/heads/{}", git_ref),
+        git_ref.to_string(),
+    ];
+    wanted.iter().find_map(|name| {
+        refs.iter()
+            .find(|(_, n)| n == name)
+            .map(|(sha, n)| (sha.to_string(), n.trim_end_matches("^{}").to_string()))
+    })
+}
+
+fn is_full_sha(s: &str) -> bool {
+    s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Fetch `fetch_name` (a full ref name or a commit SHA) of `url` into the
+/// cache directory `repo_cache`, returning the commit it turned out to be.
+/// The work happens in a scratch directory that is renamed into place, so an
+/// interrupted fetch leaves nothing that looks like a checkout.
+fn fetch_into_cache(url: &str, fetch_name: &str, repo_cache: &std::path::Path) -> Result<String, String> {
+    fs::create_dir_all(repo_cache)
+        .map_err(|e| format!("could not create {}: {}", repo_cache.display(), e))?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let scratch = repo_cache.join(format!(".tmp-{}-{}", std::process::id(), nanos));
+
+    let fetched = (|| -> Result<String, String> {
+        let mut init = git_command(None);
+        init.arg("init").arg("-q").arg(&scratch);
+        run_git(init)?;
+        let mut fetch = git_command(Some(&scratch));
+        fetch.args(["fetch", "-q", "--depth", "1", "--no-tags", "--", url, fetch_name]);
+        run_git(fetch)?;
+        let mut rev = git_command(Some(&scratch));
+        rev.args(["rev-parse", "--verify", "FETCH_HEAD^{commit}"]);
+        let sha = run_git(rev)?.trim().to_string();
+        let mut checkout = git_command(Some(&scratch));
+        checkout.args(["checkout", "-q", "FETCH_HEAD"]);
+        run_git(checkout)?;
+        // Only the files are kept; the history is not needed again.
+        let _ = fs::remove_dir_all(scratch.join(".git"));
+        Ok(sha)
+    })();
+
+    let sha = match fetched {
+        Ok(sha) => sha,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&scratch);
+            return Err(e);
+        }
+    };
+    let dest = repo_cache.join(&sha);
+    if dest.is_dir() || fs::rename(&scratch, &dest).is_err() {
+        // Another run got there first, or the rename failed.
+        let _ = fs::remove_dir_all(&scratch);
+        if !dest.is_dir() {
+            return Err(format!("could not move the checkout into {}", dest.display()));
+        }
+    }
+    Ok(sha)
+}
+
+/// Make `git_ref` of `url` available locally and return its checkout.
+///
+/// A commit SHA already in the cache costs nothing. A tag or a branch is
+/// resolved with one `git ls-remote` and fetched only when it points at a
+/// commit the cache doesn't hold. If the remote can't be reached, the commit
+/// the ref last resolved to is used, marked stale.
+fn fetch_git_import(url: &str, git_ref: &str) -> Result<FetchedImport, String> {
+    /// Cache directory, URL and ref, to the checkout they gave.
+    type Memo = std::sync::Mutex<HashMap<(PathBuf, String, String), FetchedImport>>;
+    static MEMO: std::sync::OnceLock<Memo> = std::sync::OnceLock::new();
+    let cache_dir = import_cache_dir()?;
+    let memo_key = (cache_dir.clone(), url.to_string(), git_ref.to_string());
+    let memo = MEMO.get_or_init(Default::default);
+    // One process asks once: a line is parsed more than once on some paths.
+    if let Some(known) = memo.lock().unwrap().get(&memo_key) {
+        return Ok(known.clone());
+    }
+
+    let repo_cache = cache_dir.join(import_cache_key(url));
+    let last_resolved = repo_cache.join("refs").join(import_cache_key(git_ref));
+    let mut stale = false;
+    let (mut sha, fetch_name) = if is_full_sha(git_ref) {
+        (git_ref.to_ascii_lowercase(), git_ref.to_string())
+    } else {
+        let mut ls = git_command(None);
+        ls.args(["ls-remote", "--", url, git_ref]);
+        match run_git(ls) {
+            Ok(listing) => pick_remote_ref(&listing, git_ref)
+                .ok_or_else(|| format!("import ref not found: {} in {}", git_ref, url))?,
+            Err(e) => {
+                let cached = fs::read_to_string(&last_resolved)
+                    .ok()
+                    .map(|sha| sha.trim().to_string())
+                    .filter(|sha| is_full_sha(sha) && repo_cache.join(sha).is_dir());
+                match cached {
+                    Some(sha) => {
+                        stale = true;
+                        (sha, String::new())
+                    }
+                    None => return Err(format!("could not reach import {}: {}", url, e)),
+                }
+            }
+        }
+    };
+
+    if !repo_cache.join(&sha).is_dir() {
+        sha = fetch_into_cache(url, &fetch_name, &repo_cache)
+            .map_err(|e| format!("could not fetch import {} {}: {}", url, git_ref, e))?;
+    }
+    if !is_full_sha(git_ref) && !stale {
+        // Remembered for the day the remote can't be reached.
+        let _ = fs::create_dir_all(repo_cache.join("refs"));
+        let _ = fs::write(&last_resolved, &sha);
+    }
+    let checkout = repo_cache.join(&sha);
+    let fetched = FetchedImport {
+        checkout: checkout.canonicalize().unwrap_or(checkout),
+        sha,
+        stale,
+    };
+    memo.lock().unwrap().insert(memo_key, fetched.clone());
+    Ok(fetched)
+}
+
+/// `path` with its `.` and `..` components resolved by name alone.
+fn normalize_path_lexically(path: &std::path::Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// The path an imported file's `@path` stands for: relative to that file,
+/// and inside its repository. An imported file can't reach for a file on the
+/// machine that runs it.
+fn rebase_import_path(
+    raw: &str,
+    file_dir: Option<&std::path::Path>,
+    repo: &ImportedRepo,
+) -> Result<String, String> {
+    let outside = || format!("import {}: `@{}` must be a relative path inside the repository", repo.alias, raw);
+    if raw.starts_with('~') || std::path::Path::new(raw).is_absolute() {
+        return Err(outside());
+    }
+    let resolved = normalize_path_lexically(&file_dir.unwrap_or(&repo.root).join(raw));
+    if !resolved.starts_with(&repo.checkout) {
+        return Err(outside());
+    }
+    Ok(resolved.to_string_lossy().to_string())
+}
+
+/// A request from an imported file with its `@file` body, if it has one,
+/// pointed at the repository the file came from. Any other request is
+/// returned as it is.
+fn rebase_at_body(
+    request: &str,
+    file_dir: Option<&std::path::Path>,
+    repo: &ImportedRepo,
+) -> Result<String, String> {
+    let Some((method, uri_and_outfile, body)) = parse_request_line(request) else {
+        return Ok(request.to_string());
+    };
+    if !body.starts_with('@') {
+        return Ok(request.to_string());
+    }
+    let (file_body, _) = parse_body_functions(&body);
+    let functions = &body[file_body.len()..];
+    let raw = file_body.trim_start_matches('@').trim();
+    let path = rebase_import_path(raw, file_dir, repo)?;
+    let (uri, outfile) = match uri_and_outfile.find(" >") {
+        Some(i) => uri_and_outfile.split_at(i),
+        None => (uri_and_outfile.as_str(), ""),
+    };
+    Ok(format!("{} {} @{}{}{}", method, uri, path, functions, outfile))
+}
+
+/// An include that starts with a declared alias (`cl/sv.api`): the repository
+/// it names and the path inside it.
+fn alias_include<'a>(spec: &'a str, aliases: &'a ImportAliases) -> Option<(&'a ImportedRepo, &'a str)> {
+    let (alias, rest) = spec.split_once('/')?;
+    aliases.get(alias).map(|repo| (repo, rest))
+}
+
+/// Refuse an include that an imported file (or an alias path) points outside
+/// its repository.
+fn ensure_inside_import(path: &std::path::Path, repo: &ImportedRepo, spec: &str) -> Result<(), String> {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if canonical.starts_with(&repo.checkout) {
+        Ok(())
+    } else {
+        Err(format!("import {}: include leaves the repository: {}", repo.alias, spec))
+    }
+}
+
+/// Handle an assembled `import` directive: fetch the repository and bind the
+/// alias for the rest of the file.
+fn declare_import(
+    text: &str,
+    base_dir: Option<&std::path::Path>,
+    within: Option<&ImportedRepo>,
+    aliases: &mut ImportAliases,
+    declared: &mut std::collections::HashSet<String>,
+    program: &mut BulkProgram,
+) -> Result<(), String> {
+    let spec = parse_import_directive(text, base_dir, within)?;
+    if !declared.insert(spec.alias.clone()) {
+        return Err(format!("import alias `{}` is declared twice", spec.alias));
+    }
+    // `cl/sv.api` must mean one thing: a directory of that name next to the
+    // file would make it two.
+    let local = match base_dir {
+        Some(dir) => dir.join(&spec.alias),
+        None => PathBuf::from(&spec.alias),
+    };
+    if local.exists() {
+        return Err(format!(
+            "import alias `{}` clashes with {} (pick another alias)",
+            spec.alias,
+            local.display()
+        ));
+    }
+
+    let fetched = fetch_git_import(&spec.url, &spec.git_ref)?;
+    let root = match &spec.path {
+        Some(path) => fetched.checkout.join(path),
+        None => fetched.checkout.clone(),
+    };
+    if !root.is_dir() {
+        return Err(format!(
+            "import {}: no directory `{}` in {} {}",
+            spec.alias,
+            spec.path.as_deref().unwrap_or("."),
+            spec.url,
+            spec.git_ref
+        ));
+    }
+
+    let short_sha: String = fetched.sha.chars().take(7).collect();
+    let note = ImportNote {
+        text: format!(
+            "import {} {} {} ({}{})",
+            spec.alias,
+            spec.url,
+            spec.git_ref,
+            short_sha,
+            if fetched.stale { ", cached copy: remote unreachable" } else { "" }
+        ),
+        stale: fetched.stale,
+    };
+    if !program.import_notes.contains(&note) {
+        program.import_notes.push(note);
+    }
+    aliases.insert(
+        spec.alias.clone(),
+        ImportedRepo { root, checkout: fetched.checkout, alias: spec.alias },
+    );
+    Ok(())
+}
+
+/// Evaluate every gate of a program: the batch's own `url` lines, then each
+/// imported repository's. All of them must pass.
+fn evaluate_program_gates(program: &BulkProgram, url: &str) -> Result<(), String> {
+    evaluate_url_gate(&program.url_conditions, url)?;
+    for gate in &program.import_gates {
+        evaluate_url_gate(&gate.conditions, url).map_err(|e| format!("import {}: {}", gate.alias, e))?;
+    }
+    Ok(())
+}
+
 /// Resolve an include directive into the actual file paths to load.
 fn resolve_include_paths(
     include_spec: &str,
     base_dir: Option<&std::path::Path>,
 ) -> Result<Vec<std::path::PathBuf>, String> {
-    let expanded = if include_spec.starts_with("~/") {
+    resolve_include_paths_as(include_spec, base_dir, include_spec)
+}
+
+/// `resolve_include_paths` for a path that was written another way: `path`
+/// is looked up, `include_spec` is what the messages quote (`cl/sv.api` for a
+/// file inside an imported repository).
+fn resolve_include_paths_as(
+    path: &str,
+    base_dir: Option<&std::path::Path>,
+    include_spec: &str,
+) -> Result<Vec<std::path::PathBuf>, String> {
+    let expanded = if path.starts_with("~/") {
         if let Some(home) = dirs::home_dir() {
-            format!("{}{}", home.display(), &include_spec[1..])
+            format!("{}{}", home.display(), &path[1..])
         } else {
-            include_spec.to_string()
+            path.to_string()
         }
     } else {
-        include_spec.to_string()
+        path.to_string()
     };
 
     let path_buf = std::path::PathBuf::from(&expanded);
@@ -4874,10 +5446,18 @@ fn resolve_include_paths(
 fn split_bulk_requests_inner(
     contents: &str,
     base_dir: Option<&std::path::Path>,
+    // The repository this file was imported from, if it was.
+    within: Option<&ImportedRepo>,
+    // The aliases this file has declared so far.
+    aliases: &mut ImportAliases,
     chain: &mut std::collections::HashSet<std::path::PathBuf>,
     program: &mut BulkProgram,
 ) -> Result<(), String> {
     let mut current = String::new();
+    // Whether `current` is an `import` directive rather than a request. Its
+    // JSON may span lines, so it is assembled the way a request body is.
+    let mut importing = false;
+    let mut declared = std::collections::HashSet::new();
 
     for line in contents.lines() {
         let trimmed = line.trim();
@@ -4888,7 +5468,8 @@ fn split_bulk_requests_inner(
             }
             // Decide: request line, directive (sleep/url), or include?
             let first_word = trimmed.split_whitespace().next().unwrap_or("");
-            if !starts_a_request(first_word) {
+            importing = first_word.eq_ignore_ascii_case("import");
+            if !importing && !starts_a_request(first_word) {
                 // `sleep N` — timing directive.
                 if first_word.eq_ignore_ascii_case("sleep") {
                     let rest = trimmed["sleep".len()..].trim();
@@ -4910,13 +5491,29 @@ fn split_bulk_requests_inner(
                 // `url has`/`url is` — environment gate, collected globally.
                 if first_word.eq_ignore_ascii_case("url") {
                     if let Some(cond) = parse_url_condition(trimmed)? {
-                        program.url_conditions.push(cond);
+                        // An imported file's gate is its repository's own:
+                        // it can stop the batch, but not allow it.
+                        match within {
+                            Some(repo) => program.import_gate(repo).push(cond),
+                            None => program.url_conditions.push(cond),
+                        }
                         continue;
                     }
                 }
                 // Otherwise treat as include directive (load and inline another file).
-                let paths = resolve_include_paths(trimmed, base_dir)?;
+                // `alias/…` names a file in an imported repository; anything
+                // else is a path next to this file.
+                let (paths, repo) = match alias_include(trimmed, aliases) {
+                    Some((repo, rest)) => (
+                        resolve_include_paths_as(rest, Some(&repo.root), trimmed)?,
+                        Some(repo.clone()),
+                    ),
+                    None => (resolve_include_paths(trimmed, base_dir)?, within.cloned()),
+                };
                 for path in paths {
+                    if let Some(repo) = &repo {
+                        ensure_inside_import(&path, repo, trimmed)?;
+                    }
                     let canonical = path.canonicalize().unwrap_or(path.clone());
                     if chain.contains(&canonical) {
                         return Err(format!("include loop detected: {}", path.display()));
@@ -4928,6 +5525,8 @@ fn split_bulk_requests_inner(
                     split_bulk_requests_inner(
                         &included,
                         new_base.as_deref(),
+                        repo.as_ref(),
+                        &mut ImportAliases::new(),
                         chain,
                         program,
                     )?;
@@ -4947,7 +5546,19 @@ fn split_bulk_requests_inner(
             // included) has been assembled, so a chained segment can carry a
             // multi-line body of its own.
             let assembled = escape_newlines_in_strings(&cleaned);
-            let segments = split_request_chain(&assembled);
+            if importing {
+                importing = false;
+                current.clear();
+                declare_import(&assembled, base_dir, within, aliases, &mut declared, program)?;
+                continue;
+            }
+            let mut segments = split_request_chain(&assembled);
+            // A file body in an imported file is a file in its repository.
+            if let Some(repo) = within {
+                for (_, segment) in segments.iter_mut() {
+                    *segment = rebase_at_body(segment, base_dir, repo)?;
+                }
+            }
             if segments.len() > 1 {
                 // A directive can't be chained: it would otherwise be dropped
                 // on the quiet, or worse, taken for the previous request.
@@ -4958,7 +5569,10 @@ fn split_bulk_requests_inner(
             program.steps.push(if segments.len() > 1 {
                 BulkStep::Chain(segments)
             } else {
-                BulkStep::Request(assembled)
+                match (within, segments.pop()) {
+                    (Some(_), Some((_, rebased))) => BulkStep::Request(rebased),
+                    _ => BulkStep::Request(assembled),
+                }
             });
             current.clear();
         }
@@ -4984,9 +5598,28 @@ fn split_bulk_requests(
     contents: &str,
     base_dir: Option<&std::path::Path>,
 ) -> Result<BulkProgram, String> {
+    split_bulk_requests_with(contents, base_dir, &mut ImportAliases::new())
+}
+
+/// `split_bulk_requests` starting from `aliases`, which also receives the
+/// ones the text declares.
+fn split_bulk_requests_with(
+    contents: &str,
+    base_dir: Option<&std::path::Path>,
+    aliases: &mut ImportAliases,
+) -> Result<BulkProgram, String> {
     let mut program = BulkProgram::default();
     let mut chain = std::collections::HashSet::new();
-    split_bulk_requests_inner(contents, base_dir, &mut chain, &mut program)?;
+    split_bulk_requests_inner(contents, base_dir, None, aliases, &mut chain, &mut program)?;
+    Ok(program)
+}
+
+/// `split_bulk_requests` for a line typed at the prompt: an alias imported
+/// there stays for the session, so a later line can include from it.
+fn split_bulk_requests_in_session(contents: &str) -> Result<BulkProgram, String> {
+    let mut aliases = session_imports().lock().unwrap().clone();
+    let program = split_bulk_requests_with(contents, None, &mut aliases)?;
+    *session_imports().lock().unwrap() = aliases;
     Ok(program)
 }
 
@@ -5314,7 +5947,7 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
 
     // URL gate: validate the configured base URI against all collected conditions
     // before any output or requests, so test data can't reach the wrong environment.
-    if let Err(e) = evaluate_url_gate(&program.url_conditions, &config.base_uri) {
+    if let Err(e) = evaluate_program_gates(&program, &config.base_uri) {
         eprintln!("error: {}", e);
         std::process::exit(1);
     }
@@ -5323,9 +5956,10 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
     // sending. Done before any stdout output so a declined run leaves stdout clean.
     if config.preview {
         let preview_lines: Vec<String> = program
-            .steps
+            .import_notes
             .iter()
-            .flat_map(|step| match step {
+            .map(|note| note.text.clone())
+            .chain(program.steps.iter().flat_map(|step| match step {
                 BulkStep::Request(r) => parse_request_line(r)
                     .map(|(method, uri, body)| format_request_preview(&method, &uri, &body))
                     .into_iter()
@@ -5348,7 +5982,7 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
                 }
                 BulkStep::Assert { negate, request } => vec![format_assert(*negate, request)],
                 BulkStep::Confirm(message) => vec![format_confirm(message)],
-            })
+            }))
             .collect();
         if !confirm_preview(&preview_lines, &config.base_uri) {
             return;
@@ -5363,6 +5997,16 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
             colored::control::set_override(true);
         }
         println!("{}", format!("[{}]", config.base_uri).dimmed());
+    }
+
+    // The log says which commit each import was, since a branch moves. Outside
+    // the log only a cached copy standing in for the remote is worth a line.
+    for note in &program.import_notes {
+        if config.bulk_silent {
+            println!("{}", note.text.dimmed());
+        } else if note.stale {
+            eprintln!("warning: {}", note.text);
+        }
     }
 
     for step in &program.steps {
@@ -8230,6 +8874,14 @@ enum PromptLine {
 }
 
 fn classify_prompt_line(input: &str) -> PromptLine {
+    // An import fetches, and its alias belongs to the session: both are
+    // `run_program_line`'s to do.
+    let imports = input
+        .lines()
+        .any(|l| l.split_whitespace().next().is_some_and(|w| w.eq_ignore_ascii_case("import")));
+    if imports {
+        return PromptLine::Program;
+    }
     match split_bulk_requests(input, None) {
         Ok(mut program) if program.url_conditions.is_empty() && program.steps.len() == 1 => {
             match program.steps.pop() {
@@ -8283,12 +8935,19 @@ fn looks_like_a_path(word: &str) -> bool {
 /// throughout and is restored afterwards, like a `&&` chain. A failed assert,
 /// a declined confirm, an errored request, or esc stops the remaining steps.
 fn run_program_line(state: &mut AppState, stdout: &mut io::Stdout, line: &str) -> io::Result<()> {
-    let program = match split_bulk_requests(line, None) {
+    // A fetch can take a moment; say what the prompt is busy with.
+    if matches!(classify_prompt_line(line), PromptLine::Program) && line.to_ascii_lowercase().contains("import") {
+        show_program_status(state, stdout, "importing…".to_string())?;
+    }
+    let program = match split_bulk_requests_in_session(line) {
         Ok(p) => p,
         Err(e) => return show_program_status(state, stdout, describe_program_error(&e)),
     };
-    if let Err(e) = evaluate_url_gate(&program.url_conditions, &state.config.base_uri) {
+    if let Err(e) = evaluate_program_gates(&program, &state.config.base_uri) {
         return show_program_status(state, stdout, e);
+    }
+    for note in &program.import_notes {
+        log_directive_line(state, stdout, note.text.dimmed().to_string())?;
     }
 
     // Published so every per-request input restore shows the typed line.
@@ -11698,7 +12357,7 @@ struct FilePathContext {
     is_include: bool,
 }
 
-const DIRECTIVES: [&str; 4] = ["sleep", "assert", "confirm", "url"];
+const DIRECTIVES: [&str; 5] = ["sleep", "assert", "confirm", "url", "import"];
 
 /// The include path being typed, when the line can only be one: a single line
 /// that is no chain and whose first word is no method, directive or `/path`.
@@ -11874,10 +12533,28 @@ fn get_include_completions(partial: &str) -> Vec<String> {
     if partial == "~" {
         return vec!["~/".to_string()];
     }
-    get_file_completions(partial)
-        .into_iter()
-        .filter(|c| c.ends_with('/') || names_api_file(c))
-        .collect()
+    let runnable = |c: &String| c.ends_with('/') || names_api_file(c);
+    let imports = session_imports().lock().unwrap();
+    // `cl/…` completes inside the repository imported as `cl`.
+    if let Some((repo, rest)) = alias_include(partial, &imports) {
+        let root = format!("{}/", repo.root.display());
+        return get_file_completions(&format!("{}{}", root, rest))
+            .into_iter()
+            .filter(runnable)
+            .filter_map(|c| c.strip_prefix(&root).map(|inside| format!("{}/{}", repo.alias, inside)))
+            .collect();
+    }
+    let mut results: Vec<String> = get_file_completions(partial).into_iter().filter(runnable).collect();
+    if !partial.is_empty() && !partial.contains('/') {
+        let mut aliases: Vec<String> = imports
+            .keys()
+            .filter(|alias| alias.starts_with(partial))
+            .map(|alias| format!("{}/", alias))
+            .collect();
+        aliases.sort();
+        results.splice(0..0, aliases);
+    }
+    results
 }
 
 fn file_completions_for(ctx: &FilePathContext) -> Vec<String> {
@@ -16797,5 +17474,370 @@ mod tests {
         // outer object whose other values aren't all strings, so nothing returned.
         let s = r#"{ "identifiers": {}, "name": "Bob" }"#;
         assert_eq!(extract_identifier_pairs(s), Vec::<(String, String)>::new());
+    }
+
+    // ----- import git -----
+
+    /// Point the import cache at a scratch directory, once for the whole test
+    /// binary: the variable is process-wide.
+    fn use_test_import_cache() {
+        static CACHE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        let dir = CACHE.get_or_init(|| tempfile::tempdir().unwrap());
+        std::env::set_var("API_IMPORT_CACHE", dir.path());
+    }
+
+    fn test_git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A repository holding `files`, committed and tagged `1.0`. Returns the
+    /// directory guard, its `file://` URL and the commit.
+    fn test_repo(files: &[(&str, &str)]) -> (tempfile::TempDir, String, String) {
+        use_test_import_cache();
+        let dir = tempfile::tempdir().unwrap();
+        test_git(dir.path(), &["init", "-q", "-b", "main"]);
+        for (name, contents) in files {
+            let path = dir.path().join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        }
+        test_git(dir.path(), &["add", "-A"]);
+        test_git(dir.path(), &["commit", "-q", "-m", "seed"]);
+        test_git(dir.path(), &["tag", "-a", "1.0", "-m", "one"]);
+        let sha = test_git(dir.path(), &["rev-parse", "HEAD"]);
+        let url = format!("file://{}", dir.path().canonicalize().unwrap().display());
+        (dir, url, sha)
+    }
+
+    fn requests_of(program: &BulkProgram) -> Vec<String> {
+        program
+            .steps
+            .iter()
+            .flat_map(|step| match step {
+                BulkStep::Request(r) => vec![r.clone()],
+                BulkStep::Chain(segments) => segments.iter().map(|(_, s)| s.clone()).collect(),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn import_directive_parses_its_json() {
+        let spec = parse_import_directive(
+            r#"import git cl { "url": "https://github.com/Polyjuice/cloddy", "ref": "2.1.0", "path": "seeds" }"#,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            spec,
+            ImportSpec {
+                alias: "cl".to_string(),
+                url: "https://github.com/Polyjuice/cloddy".to_string(),
+                git_ref: "2.1.0".to_string(),
+                path: Some("seeds".to_string()),
+            }
+        );
+        // The scp-like spelling of ssh is a URL too.
+        assert!(parse_import_directive(
+            r#"import git cl { "url": "git@github.com:Polyjuice/cloddy.git", "ref": "main" }"#,
+            None,
+            None
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn import_directive_rejects_what_it_cannot_mean() {
+        let ok_body = r#"{ "url": "https://example.com/r", "ref": "1.0" }"#;
+        for (line, expected) in [
+            ("import".to_string(), "incomplete import"),
+            ("import git cl".to_string(), "incomplete import"),
+            (format!("import svn cl {ok_body}"), "unknown import kind `svn`"),
+            (format!("import git get {ok_body}"), "invalid import alias `get`"),
+            (format!("import git sleep {ok_body}"), "invalid import alias `sleep`"),
+            (format!("import git a/b {ok_body}"), "invalid import alias `a/b`"),
+            ("import git cl https://example.com/r".to_string(), "invalid import"),
+            ("import git cl [1]".to_string(), "invalid import"),
+            (r#"import git cl { "url": "https://example.com/r" }"#.to_string(), "`ref` is required"),
+            (r#"import git cl { "ref": "1.0" }"#.to_string(), "`url` is required"),
+            (r#"import git cl { "url": "https://example.com/r", "ref": 2.1 }"#.to_string(), "`ref` must be a non-empty string"),
+            (r#"import git cl { "url": "https://example.com/r", "ref": "1.0", "tag": "x" }"#.to_string(), "unknown key `tag`"),
+            (r#"import git cl { "url": "http://example.com/r", "ref": "1.0" }"#.to_string(), "unsupported url"),
+            (r#"import git cl { "url": "--upload-pack=touch /tmp/x", "ref": "1.0" }"#.to_string(), "unsupported url"),
+            (r#"import git cl { "url": "ext::sh -c id", "ref": "1.0" }"#.to_string(), "unsupported url"),
+            (r#"import git cl { "url": "/some/local/dir", "ref": "1.0" }"#.to_string(), "unsupported url"),
+            (r#"import git cl { "url": "https://example.com/r", "ref": "--orphan" }"#.to_string(), "invalid ref"),
+            (r#"import git cl { "url": "https://example.com/r", "ref": "1.0", "path": "../x" }"#.to_string(), "`path` must be a relative path"),
+            (r#"import git cl { "url": "https://example.com/r", "ref": "1.0", "path": "/etc" }"#.to_string(), "`path` must be a relative path"),
+            ("import git cl @imports/*.json".to_string(), "reads one JSON file"),
+            ("import git cl @cloddy.json~map(x)".to_string(), "takes no `~map(…)` suffix"),
+        ] {
+            let err = parse_import_directive(&line, None, None).unwrap_err();
+            assert!(err.contains(expected), "{line:?} gave {err:?}");
+        }
+    }
+
+    #[test]
+    fn pick_remote_ref_prefers_a_tags_commit_then_the_tag_then_the_branch() {
+        let listing = "aaa\trefs/heads/1.0\nbbb\trefs/tags/1.0\nccc\trefs/tags/1.0^{}\nddd\trefs/tags/other/1.0\n";
+        assert_eq!(pick_remote_ref(listing, "1.0"), Some(("ccc".to_string(), "refs/tags/1.0".to_string())));
+        let lightweight = "aaa\trefs/heads/1.0\nbbb\trefs/tags/1.0\n";
+        assert_eq!(pick_remote_ref(lightweight, "1.0"), Some(("bbb".to_string(), "refs/tags/1.0".to_string())));
+        assert_eq!(
+            pick_remote_ref("aaa\trefs/heads/main\n", "main"),
+            Some(("aaa".to_string(), "refs/heads/main".to_string()))
+        );
+        assert_eq!(
+            pick_remote_ref("aaa\trefs/heads/main\n", "refs/heads/main"),
+            Some(("aaa".to_string(), "refs/heads/main".to_string()))
+        );
+        // A tail match on another name is not the ref that was asked for.
+        assert_eq!(pick_remote_ref("ddd\trefs/tags/other/1.0\n", "1.0"), None);
+        assert_eq!(pick_remote_ref("", "1.0"), None);
+    }
+
+    #[test]
+    fn import_cache_key_is_readable_and_tells_similar_urls_apart() {
+        let key = import_cache_key("https://github.com/Polyjuice/cloddy");
+        assert!(key.starts_with("https_github.com_Polyjuice_cloddy-"), "{key}");
+        assert_eq!(key, import_cache_key("https://github.com/Polyjuice/cloddy"));
+        assert_ne!(key, import_cache_key("https://github.com/Polyjuice_cloddy"));
+    }
+
+    #[test]
+    fn import_makes_a_repository_includable_under_its_alias() {
+        let (_repo, url, sha) = test_repo(&[
+            ("sv.api", "url has localhost\nGET /sv\nPUT /sv @data/sv.json~map(x) > out.json\nsub/inner.api\n"),
+            ("sub/inner.api", "GET /inner && PUT /inner @../data/sv.json\n"),
+            ("data/sv.json", "{\"a\":1}"),
+            ("other.api", "GET /other\n"),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        // A body spanning lines, with a comment, as a request's may.
+        let src = format!(
+            "import git cl {{\n  \"url\": \"{url}\", // the seeds\n  \"ref\": \"1.0\"\n}}\n\nGET /before\ncl/sv.api\nGET /after\n"
+        );
+        let program = split_bulk_requests(&src, Some(dir.path())).unwrap();
+
+        let checkout = import_cache_dir().unwrap().join(import_cache_key(&url)).join(&sha);
+        let checkout = checkout.canonicalize().unwrap();
+        let data = checkout.join("data/sv.json");
+        assert_eq!(
+            requests_of(&program),
+            vec![
+                "GET /before".to_string(),
+                "GET /sv".to_string(),
+                // A file body is a file in the repository, wherever the batch runs.
+                format!("PUT /sv @{}~map(x) > out.json", data.display()),
+                "GET /inner".to_string(),
+                format!("PUT /inner @{}", data.display()),
+                "GET /after".to_string(),
+            ]
+        );
+        // The history is not kept, only the files.
+        assert!(!checkout.join(".git").exists());
+        assert_eq!(
+            program.import_notes,
+            vec![ImportNote { text: format!("import cl {url} 1.0 ({})", &sha[..7]), stale: false }]
+        );
+
+        // The repository's `url` line is a gate of its own, not the batch's.
+        assert!(program.url_conditions.is_empty());
+        assert_eq!(program.import_gates.len(), 1);
+        assert_eq!(program.import_gates[0].conditions, vec![UrlCondition::Has("localhost".to_string())]);
+        assert!(evaluate_program_gates(&program, "http://localhost:5000").is_ok());
+        let err = evaluate_program_gates(&program, "https://api.heads.com").unwrap_err();
+        assert!(err.starts_with("import cl: URL gate failed"), "{err}");
+    }
+
+    #[test]
+    fn an_imported_url_line_narrows_the_gate_and_never_widens_it() {
+        let (_repo, url, _) = test_repo(&[("prod.api", "url has heads.com\nGET /x\n")]);
+        let dir = tempfile::tempdir().unwrap();
+        let src = format!(
+            "url has localhost\nimport git lib {{ \"url\": \"{url}\", \"ref\": \"1.0\" }}\nlib/prod.api\n"
+        );
+        let program = split_bulk_requests(&src, Some(dir.path())).unwrap();
+        // The batch allows localhost only; the import's `heads.com` adds nothing to that.
+        assert!(evaluate_program_gates(&program, "https://api.heads.com").is_err());
+        // And where the batch would run, the import still has its say.
+        assert!(evaluate_program_gates(&program, "http://localhost:5000").is_err());
+        assert!(evaluate_program_gates(&program, "http://localhost.heads.com").is_ok());
+    }
+
+    #[test]
+    fn import_reads_its_json_from_an_at_file_and_honours_path() {
+        let (_repo, url, _) = test_repo(&[("seeds/a.api", "GET /a\n"), ("top.api", "GET /top\n")]);
+        let dir = tempfile::tempdir().unwrap();
+        let json = dir.path().join("cloddy.json");
+        fs::write(&json, format!("{{\n  // pinned\n  \"url\": \"{url}\",\n  \"ref\": \"1.0\",\n  \"path\": \"seeds\"\n}}\n")).unwrap();
+        let src = format!("import git cl @{}\ncl/*.api\n", json.display());
+        let program = split_bulk_requests(&src, Some(dir.path())).unwrap();
+        assert_eq!(requests_of(&program), vec!["GET /a".to_string()]);
+
+        let err = split_bulk_requests(&format!("import git cl @{}.missing\n", json.display()), Some(dir.path()))
+            .unwrap_err();
+        assert!(err.contains("cloddy.json.missing"), "{err}");
+
+        let src = format!("import git cl {{ \"url\": \"{url}\", \"ref\": \"1.0\", \"path\": \"nope\" }}\n");
+        let err = split_bulk_requests(&src, Some(dir.path())).unwrap_err();
+        assert!(err.contains("no directory `nope`"), "{err}");
+    }
+
+    #[test]
+    fn import_resolves_a_branch_and_a_commit_and_reports_a_missing_ref() {
+        let (_repo, url, sha) = test_repo(&[("a.api", "GET /a\n")]);
+        let dir = tempfile::tempdir().unwrap();
+        for git_ref in ["main", sha.as_str()] {
+            let src = format!("import git r {{ \"url\": \"{url}\", \"ref\": \"{git_ref}\" }}\nr/a.api\n");
+            let program = split_bulk_requests(&src, Some(dir.path())).unwrap();
+            assert_eq!(requests_of(&program), vec!["GET /a".to_string()], "{git_ref}");
+            assert!(program.import_notes[0].text.ends_with(&format!("({})", &sha[..7])), "{git_ref}");
+        }
+        let src = format!("import git r {{ \"url\": \"{url}\", \"ref\": \"9.9\" }}\n");
+        let err = split_bulk_requests(&src, Some(dir.path())).unwrap_err();
+        assert_eq!(err, format!("import ref not found: 9.9 in {url}"));
+
+        let src = "import git r { \"url\": \"file:///no/such/repo\", \"ref\": \"1.0\" }\n";
+        let err = split_bulk_requests(src, Some(dir.path())).unwrap_err();
+        assert!(err.starts_with("could not reach import file:///no/such/repo:"), "{err}");
+    }
+
+    #[test]
+    fn an_alias_belongs_to_the_file_that_declares_it() {
+        let (_repo, url, _) = test_repo(&[("a.api", "GET /a\n")]);
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("child.api"), "cl/a.api\n").unwrap();
+        let import = format!("import git cl {{ \"url\": \"{url}\", \"ref\": \"1.0\" }}\n");
+
+        // An included file does not see its parent's alias.
+        let err = split_bulk_requests(&format!("{import}child.api\n"), Some(dir.path())).unwrap_err();
+        assert_eq!(err, "include not found: cl/a.api");
+
+        // Declared twice in one file.
+        let err = split_bulk_requests(&format!("{import}{import}"), Some(dir.path())).unwrap_err();
+        assert_eq!(err, "import alias `cl` is declared twice");
+
+        // Used before it is declared.
+        let err = split_bulk_requests(&format!("cl/a.api\n{import}"), Some(dir.path())).unwrap_err();
+        assert_eq!(err, "include not found: cl/a.api");
+
+        // A directory of the same name next to the file makes `cl/…` ambiguous.
+        fs::create_dir(dir.path().join("cl")).unwrap();
+        let err = split_bulk_requests(&import, Some(dir.path())).unwrap_err();
+        assert!(err.starts_with("import alias `cl` clashes with "), "{err}");
+    }
+
+    #[test]
+    fn an_imported_file_cannot_reach_outside_its_repository() {
+        let (_repo, url, _) = test_repo(&[
+            ("abs.api", "PUT /x @/etc/hosts\n"),
+            ("home.api", "PUT /x @~/.ssh/id_rsa\n"),
+            ("up.api", "PUT /x @../../../../etc/hosts\n"),
+            ("glob.api", "PUT /x @../*.json\n"),
+            ("include.api", "../../../outside.api\n"),
+            ("ok.api", "GET /ok\n"),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let import = format!("import git cl {{ \"url\": \"{url}\", \"ref\": \"1.0\" }}\n");
+        for file in ["abs.api", "home.api", "up.api", "glob.api"] {
+            let err = split_bulk_requests(&format!("{import}cl/{file}\n"), Some(dir.path())).unwrap_err();
+            assert!(err.contains("must be a relative path inside the repository"), "{file}: {err}");
+        }
+        let err = split_bulk_requests(&format!("{import}cl/include.api\n"), Some(dir.path())).unwrap_err();
+        assert!(err.contains("include not found") || err.contains("leaves the repository"), "{err}");
+
+        // Nor can the alias be used to climb out of it.
+        fs::write(dir.path().join("outside.api"), "GET /outside\n").unwrap();
+        let checkout = match split_bulk_requests(&format!("{import}cl/ok.api\n"), Some(dir.path())) {
+            Ok(_) => session_free_checkout(&url),
+            Err(e) => panic!("{e}"),
+        };
+        let climb = pathdiff_up(&checkout, &dir.path().canonicalize().unwrap().join("outside.api"));
+        let err = split_bulk_requests(&format!("{import}cl/{climb}\n"), Some(dir.path())).unwrap_err();
+        assert!(err.contains("leaves the repository"), "{err}");
+    }
+
+    /// The single checkout of `url` in the test cache.
+    fn session_free_checkout(url: &str) -> PathBuf {
+        let repo_cache = import_cache_dir().unwrap().join(import_cache_key(url));
+        fs::read_dir(repo_cache)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.is_dir() && p.file_name().is_some_and(|n| n != "refs"))
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+    }
+
+    /// `target` written as a path relative to the directory `from`, climbing
+    /// all the way to the root first.
+    fn pathdiff_up(from: &std::path::Path, target: &std::path::Path) -> String {
+        let ups = from.components().count() - 1;
+        format!("{}{}", "../".repeat(ups), target.display().to_string().trim_start_matches('/'))
+    }
+
+    #[test]
+    fn an_imported_repository_can_import_another() {
+        let (_inner, inner_url, _) = test_repo(&[("leaf.api", "url has localhost\nGET /leaf\n")]);
+        let (_outer, outer_url, _) = test_repo(&[(
+            "top.api",
+            &format!("import git dep {{ \"url\": \"{inner_url}\", \"ref\": \"1.0\" }}\nGET /top\ndep/leaf.api\n"),
+        )]);
+        let dir = tempfile::tempdir().unwrap();
+        let src = format!("import git lib {{ \"url\": \"{outer_url}\", \"ref\": \"1.0\" }}\nlib/top.api\n");
+        let program = split_bulk_requests(&src, Some(dir.path())).unwrap();
+        assert_eq!(requests_of(&program), vec!["GET /top".to_string(), "GET /leaf".to_string()]);
+        assert_eq!(program.import_notes.len(), 2);
+        // The inner repository's gate is its own.
+        assert_eq!(program.import_gates.len(), 1);
+        assert_eq!(program.import_gates[0].alias, "dep");
+    }
+
+    #[test]
+    fn a_session_alias_outlives_the_line_and_completes() {
+        let (_repo, url, _) = test_repo(&[("sv.api", "GET /sv\n"), ("seeds/a.api", "GET /a\n"), ("notes.txt", "x")]);
+        let line = format!("import git zzsession {{ \"url\": \"{url}\", \"ref\": \"1.0\" }}");
+        assert!(matches!(classify_prompt_line(&line), PromptLine::Program));
+        let program = split_bulk_requests_in_session(&line).unwrap();
+        assert!(program.steps.is_empty());
+        assert_eq!(program.import_notes.len(), 1);
+
+        // A later line includes from it…
+        let program = split_bulk_requests_in_session("zzsession/sv.api").unwrap();
+        assert_eq!(requests_of(&program), vec!["GET /sv".to_string()]);
+        // …and a line that never declared it elsewhere still can't.
+        assert!(split_bulk_requests("zzsession/sv.api", None).is_err());
+
+        assert_eq!(get_include_completions("zzsess"), vec!["zzsession/".to_string()]);
+        assert_eq!(
+            get_include_completions("zzsession/"),
+            vec!["zzsession/seeds/".to_string(), "zzsession/sv.api".to_string()]
+        );
+        assert_eq!(get_include_completions("zzsession/seeds/"), vec!["zzsession/seeds/a.api".to_string()]);
+
+        // Declaring it again at the prompt replaces it.
+        assert!(split_bulk_requests_in_session(&line).is_ok());
+    }
+
+    #[test]
+    fn import_is_a_directive_not_an_include_path() {
+        assert!(is_program_line("import git cl {}"));
+        assert!(could_become_a_keyword("imp"));
+        let ctx = extract_file_path_context("import git cl", 13);
+        assert!(ctx.is_none_or(|c| !c.is_include));
+        // Unclosed JSON is reported like an unclosed body.
+        let err = split_bulk_requests("import git cl {\n  \"url\": \"x\"\n", None).unwrap_err();
+        assert!(err.starts_with("unclosed body"), "{err}");
     }
 }

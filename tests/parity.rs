@@ -205,6 +205,37 @@ fn prepare(dir: &Path) {
     std::fs::create_dir_all(dir.join("inc")).unwrap();
     std::fs::write(dir.join("inc/a.api"), "GET /g1\n").unwrap();
     std::fs::write(dir.join("inc/b.api"), "GET /g2\n").unwrap();
+
+    // A git repository to import, tagged `1.0`, with a body file of its own
+    // that shares a name with the one above.
+    let repo = dir.join("gitrepo");
+    std::fs::create_dir_all(repo.join("data")).unwrap();
+    std::fs::write(repo.join("sv.api"), "GET /imp1\nPUT /imp2 @data/body.json\n").unwrap();
+    std::fs::write(repo.join("data/body.json"), r#"{"from":"repo"}"#).unwrap();
+    for args in [
+        &["init", "-q", "-b", "main"][..],
+        &["add", "-A"],
+        &["commit", "-q", "-m", "seed"],
+        &["tag", "1.0"],
+    ] {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["-c", "user.name=test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    std::fs::write(
+        dir.join("cloddy.json"),
+        format!(r#"{{ "url": "{}", "ref": "1.0" }}"#, repo_url(dir)),
+    )
+    .unwrap();
+}
+
+fn repo_url(dir: &Path) -> String {
+    format!("file://{}", dir.canonicalize().unwrap().join("gitrepo").display())
 }
 
 fn cases(dir: &Path) -> Vec<Case> {
@@ -219,6 +250,10 @@ fn cases(dir: &Path) -> Vec<Case> {
     let append4 = format!(">> {out4}");
     let uri_with_redirect1 = format!("/a > {out1}");
     let uri_with_append2 = format!("/a >> {out2}");
+    let import_json = format!(r#"{{"url":"{}","ref":"1.0"}}"#, repo_url(dir));
+    let import_inline = format!("import git cl {import_json}");
+    let import_and_include = format!("import git cl {{\n  \"url\": \"{}\", // pinned\n  \"ref\": \"1.0\"\n}}\ncl/sv.api", repo_url(dir));
+    let import_missing_ref = format!(r#"import git cl {{"url":"{}","ref":"9.9"}}"#, repo_url(dir));
     vec![
         // Requests
         case("plain GET", "GET /a", Some(&["GET", "/a"]), &["GET /a"]),
@@ -350,6 +385,23 @@ fn cases(dir: &Path) -> Vec<Case> {
         case("include", "seed.api", Some(&["seed.api"]), &["GET /inc1", "GET /inc2"]),
         case("absolute include", &abs_seed, Some(&[&abs_seed]), &["GET /inc1", "GET /inc2"]),
         case("glob include", "inc/*.api", Some(&["inc/*.api"]), &["GET /g1", "GET /g2"]),
+        // Imports
+        case("import alone sends nothing", &import_inline, Some(&["import", "git", "cl", &import_json]), &[]),
+        case(
+            "import then include",
+            &import_and_include,
+            None,
+            &["GET /imp1", r#"PUT /imp2 {"from":"repo"}"#],
+        ),
+        case(
+            "import from an @file",
+            "import git cl @cloddy.json\ncl/*.api",
+            None,
+            &["GET /imp1", r#"PUT /imp2 {"from":"repo"}"#],
+        ),
+        case("import of a missing ref", &import_missing_ref, None, &[]).fails("import ref not found: 9.9"),
+        case("import without a ref", r#"import git cl {"url":"https://example.com/r"}"#, None, &[])
+            .fails("`ref` is required"),
         case("include then request", "seed.api\nGET /after", None, &["GET /inc1", "GET /inc2", "GET /after"]),
         case("missing include", "nope.api", Some(&["nope.api"]), &[]).fails("include not found: nope.api"),
         // Several lines and noise
@@ -376,6 +428,7 @@ fn api(port: u16, dir: &Path) -> std::process::Command {
     cmd.args(["--no-keychain", "-b", &format!("http://127.0.0.1:{port}"), "-k", "k"])
         .current_dir(dir)
         .env("NO_COLOR", "1")
+        .env("API_IMPORT_CACHE", dir.join(".import-cache"))
         .env_remove("API_STREAMING")
         .env_remove("API_CREDENTIALS_FILE")
         .stdin(std::process::Stdio::null());
