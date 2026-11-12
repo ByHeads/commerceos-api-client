@@ -5233,6 +5233,78 @@ fn fetch_into_cache(url: &str, fetch_name: &str, repo_cache: &std::path::Path) -
     Ok(sha)
 }
 
+/// What a git ref or an archive URL resolved to earlier in this process, by
+/// cache directory, kind, URL and ref (or pinned hash). A one-shot line is
+/// parsed twice on its way to being run, and should ask the remote once.
+type ResolvedImports = std::sync::Mutex<HashMap<(PathBuf, &'static str, String, String), FetchedImport>>;
+
+fn resolved_imports() -> &'static ResolvedImports {
+    static RESOLVED: std::sync::OnceLock<ResolvedImports> = std::sync::OnceLock::new();
+    RESOLVED.get_or_init(Default::default)
+}
+
+/// Forget what refs and URLs resolved to, so the next import asks again. The
+/// prompt does this for every line it runs: a session can outlast a push, and
+/// typing an `import` again is how its user asks for the new commit.
+fn forget_resolved_imports() {
+    resolved_imports().lock().unwrap().clear();
+}
+
+/// How long a checkout or an unpacked archive may go unused before a later
+/// fetch clears it out of the cache.
+const IMPORT_CACHE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// The file whose modification time says when `checkout` was last used. It
+/// sits beside the checkout, not in it, so the import's own files are left
+/// exactly as they were fetched.
+fn import_used_marker(checkout: &std::path::Path) -> PathBuf {
+    let mut name = checkout.file_name().unwrap_or_default().to_os_string();
+    name.push(".used");
+    checkout.with_file_name(name)
+}
+
+/// Record that `checkout` was used just now.
+fn mark_import_used(checkout: &std::path::Path) {
+    let _ = fs::write(import_used_marker(checkout), b"");
+}
+
+/// Remove what the import cache no longer needs: checkouts and unpacked
+/// archives last used more than `max_age` ago, and the scratch directories of
+/// fetches that never finished. `keep` is the one this run just fetched.
+/// Called only when a fetch has brought something new in, so a run that finds
+/// everything cached never pays for the walk.
+fn prune_import_cache(cache_dir: &std::path::Path, keep: &std::path::Path, max_age: Duration) {
+    let now = std::time::SystemTime::now();
+    let unused_for = |path: &std::path::Path| -> Option<Duration> {
+        let modified = fs::metadata(path).and_then(|m| m.modified()).ok()?;
+        now.duration_since(modified).ok()
+    };
+    let is_hash = |name: &str| (name.len() == 40 || name.len() == 64) && name.chars().all(|c| c.is_ascii_hexdigit());
+    // One directory per repository, and `archives` beside them.
+    for group in fs::read_dir(cache_dir).into_iter().flatten().flatten() {
+        for entry in fs::read_dir(group.path()).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if path == keep || !path.is_dir() {
+                continue;
+            }
+            let marker = import_used_marker(&path);
+            // A checkout made before there were markers is as old as it is.
+            let idle = if name.starts_with(".tmp-") {
+                unused_for(&path)
+            } else if is_hash(&name) {
+                unused_for(&marker).or_else(|| unused_for(&path))
+            } else {
+                None
+            };
+            if idle.is_some_and(|idle| idle > max_age) {
+                let _ = fs::remove_dir_all(&path);
+                let _ = fs::remove_file(&marker);
+            }
+        }
+    }
+}
+
 /// A path for work in progress under `parent` (created if need be), named so
 /// two runs never share one. The directory itself is not created.
 fn cache_scratch_dir(parent: &std::path::Path) -> Result<PathBuf, String> {
@@ -5417,14 +5489,13 @@ fn fetch_archive_import(
     sha256: Option<&str>,
     token_env: Option<&str>,
 ) -> Result<FetchedImport, String> {
-    type Memo = std::sync::Mutex<HashMap<(PathBuf, String, Option<String>), FetchedImport>>;
-    static MEMO: std::sync::OnceLock<Memo> = std::sync::OnceLock::new();
-    let archives = import_cache_dir()?.join("archives");
-    let memo_key = (archives.clone(), url.to_string(), sha256.map(str::to_string));
-    let memo = MEMO.get_or_init(Default::default);
-    if let Some(known) = memo.lock().unwrap().get(&memo_key) {
+    let cache_dir = import_cache_dir()?;
+    let archives = cache_dir.join("archives");
+    let memo_key = (cache_dir.clone(), "archive", url.to_string(), sha256.unwrap_or_default().to_string());
+    if let Some(known) = resolved_imports().lock().unwrap().get(&memo_key) {
         return Ok(known.clone());
     }
+    let mut unpacked_now = false;
     let found = |sha: String, stale: bool| {
         let checkout = archives.join(&sha);
         FetchedImport { checkout: checkout.canonicalize().unwrap_or(checkout), sha, stale }
@@ -5457,6 +5528,7 @@ fn fetch_archive_import(
                         return Err(format!("import archive {}: {}", url, e));
                     }
                     move_into_cache(&scratch, &archives.join(&sha))?;
+                    unpacked_now = true;
                 }
                 if sha256.is_none() {
                     // Remembered for the day the url can't be reached.
@@ -5477,7 +5549,12 @@ fn fetch_archive_import(
             }
         }
     };
-    memo.lock().unwrap().insert(memo_key, fetched.clone());
+    let unpacked = archives.join(&fetched.sha);
+    mark_import_used(&unpacked);
+    if unpacked_now {
+        prune_import_cache(&cache_dir, &unpacked, IMPORT_CACHE_MAX_AGE);
+    }
+    resolved_imports().lock().unwrap().insert(memo_key, fetched.clone());
     Ok(fetched)
 }
 
@@ -5533,14 +5610,9 @@ fn resolve_import_dir(
 /// commit the cache doesn't hold. If the remote can't be reached, the commit
 /// the ref last resolved to is used, marked stale.
 fn fetch_git_import(url: &str, git_ref: &str) -> Result<FetchedImport, String> {
-    /// Cache directory, URL and ref, to the checkout they gave.
-    type Memo = std::sync::Mutex<HashMap<(PathBuf, String, String), FetchedImport>>;
-    static MEMO: std::sync::OnceLock<Memo> = std::sync::OnceLock::new();
     let cache_dir = import_cache_dir()?;
-    let memo_key = (cache_dir.clone(), url.to_string(), git_ref.to_string());
-    let memo = MEMO.get_or_init(Default::default);
-    // One process asks once: a line is parsed more than once on some paths.
-    if let Some(known) = memo.lock().unwrap().get(&memo_key) {
+    let memo_key = (cache_dir.clone(), "git", url.to_string(), git_ref.to_string());
+    if let Some(known) = resolved_imports().lock().unwrap().get(&memo_key) {
         return Ok(known.clone());
     }
 
@@ -5571,7 +5643,8 @@ fn fetch_git_import(url: &str, git_ref: &str) -> Result<FetchedImport, String> {
         }
     };
 
-    if !repo_cache.join(&sha).is_dir() {
+    let fetched_now = !repo_cache.join(&sha).is_dir();
+    if fetched_now {
         sha = fetch_into_cache(url, &fetch_name, &repo_cache)
             .map_err(|e| format!("could not fetch import {} {}: {}", url, git_ref, e))?;
     }
@@ -5581,12 +5654,16 @@ fn fetch_git_import(url: &str, git_ref: &str) -> Result<FetchedImport, String> {
         let _ = fs::write(&last_resolved, &sha);
     }
     let checkout = repo_cache.join(&sha);
+    mark_import_used(&checkout);
+    if fetched_now {
+        prune_import_cache(&cache_dir, &checkout, IMPORT_CACHE_MAX_AGE);
+    }
     let fetched = FetchedImport {
         checkout: checkout.canonicalize().unwrap_or(checkout),
         sha,
         stale,
     };
-    memo.lock().unwrap().insert(memo_key, fetched.clone());
+    resolved_imports().lock().unwrap().insert(memo_key, fetched.clone());
     Ok(fetched)
 }
 
@@ -5990,6 +6067,9 @@ fn split_bulk_requests_with(
 /// `split_bulk_requests` for a line typed at the prompt: an alias imported
 /// there stays for the session, so a later line can include from it.
 fn split_bulk_requests_in_session(contents: &str) -> Result<BulkProgram, String> {
+    // Each line asks the remote afresh: an `import` typed again after a push
+    // gets the new commit, where a batch resolves a ref once per run.
+    forget_resolved_imports();
     let mut aliases = session_imports().lock().unwrap().clone();
     let program = split_bulk_requests_with(contents, None, &mut aliases)?;
     *session_imports().lock().unwrap() = aliases;
@@ -18247,6 +18327,120 @@ mod tests {
 
         // Declaring it again at the prompt replaces it.
         assert!(split_bulk_requests_in_session(&line).is_ok());
+    }
+
+    #[test]
+    fn the_prompt_looks_a_branch_up_again_for_every_import_line() {
+        let (repo, url, first) = test_repo(&[("a.api", "GET /first\n")]);
+        let import = format!("import git moving {{ \"url\": \"{url}\", \"ref\": \"main\" }}\nmoving/a.api\n");
+        let dir = tempfile::tempdir().unwrap();
+        let ran = |program: BulkProgram| (requests_of(&program), program.import_notes[0].text.clone());
+
+        let (requests, note) = ran(split_bulk_requests(&import, Some(dir.path())).unwrap());
+        assert_eq!(requests, vec!["GET /first".to_string()]);
+        assert!(note.ends_with(&format!("({})", &first[..7])), "{note}");
+
+        // The branch moves.
+        fs::write(repo.path().join("a.api"), "GET /second\n").unwrap();
+        test_git(repo.path(), &["commit", "-q", "-am", "second"]);
+        let second = test_git(repo.path(), &["rev-parse", "HEAD"]);
+
+        // A line run at the prompt asks the remote again. (That a batch asks
+        // only once is tested in tests/imports.rs, by counting what git was
+        // asked: here another test may clear what this process remembers.)
+        let at_prompt = import.replace(" moving ", " zzmoving ").replace("moving/a.api", "zzmoving/a.api");
+        let (requests, note) = ran(split_bulk_requests_in_session(&at_prompt).unwrap());
+        assert_eq!(requests, vec!["GET /second".to_string()]);
+        assert!(note.ends_with(&format!("({})", &second[..7])), "{note}");
+
+        // An include on a later line uses what the alias was bound to; only
+        // an `import` typed again looks the branch up.
+        fs::write(repo.path().join("a.api"), "GET /third\n").unwrap();
+        test_git(repo.path(), &["commit", "-q", "-am", "third"]);
+        let program = split_bulk_requests_in_session("zzmoving/a.api").unwrap();
+        assert_eq!(requests_of(&program), vec!["GET /second".to_string()]);
+        let (requests, _) = ran(split_bulk_requests_in_session(&at_prompt).unwrap());
+        assert_eq!(requests, vec!["GET /third".to_string()]);
+    }
+
+    /// Set a file's or a directory's modification time to `days` ago.
+    #[cfg(unix)]
+    fn age(path: &std::path::Path, days: u64) {
+        let then = std::time::SystemTime::now() - Duration::from_secs(days * 24 * 60 * 60);
+        fs::File::open(path).unwrap().set_modified(then).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_import_cache_removes_what_went_unused_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path();
+        let repo = cache.join("https_example.com_r-0123456789abcdef");
+        let archives = cache.join("archives");
+        let sha = |c: char, n: usize| c.to_string().repeat(n);
+        // (directory, days since its marker was touched; None for no marker)
+        let stale = repo.join(sha('a', 40));
+        let recent = repo.join(sha('b', 40));
+        let unmarked_old = repo.join(sha('c', 40));
+        let unmarked_new = repo.join(sha('d', 40));
+        let kept = repo.join(sha('e', 40));
+        let stale_archive = archives.join(sha('f', 64));
+        let recent_archive = archives.join(sha('0', 64));
+        let dead_fetch = repo.join(".tmp-1-2-3");
+        let live_fetch = repo.join(".tmp-4-5-6");
+        let refs = repo.join("refs");
+        for path in [
+            &stale, &recent, &unmarked_old, &unmarked_new, &kept, &stale_archive, &recent_archive, &dead_fetch,
+            &live_fetch, &refs,
+        ] {
+            fs::create_dir_all(path).unwrap();
+            fs::write(path.join("file"), "x").unwrap();
+        }
+        for (path, days) in [(&stale, 31), (&recent, 29), (&kept, 400), (&stale_archive, 90), (&recent_archive, 1)] {
+            mark_import_used(path);
+            age(&import_used_marker(path), days);
+        }
+        // Without a marker the directory's own age stands in.
+        for path in [&unmarked_old, &dead_fetch, &refs] {
+            age(path, 60);
+        }
+        // An old directory that was used yesterday is not old.
+        age(&recent, 400);
+
+        prune_import_cache(cache, &kept, IMPORT_CACHE_MAX_AGE);
+
+        for gone in [&stale, &unmarked_old, &stale_archive, &dead_fetch] {
+            assert!(!gone.exists(), "{} should have been pruned", gone.display());
+        }
+        assert!(!import_used_marker(&stale).exists());
+        assert!(!import_used_marker(&stale_archive).exists());
+        // The one this run fetched stays whatever its marker says; `refs` is
+        // not a checkout, however old.
+        for stays in [&recent, &unmarked_new, &kept, &recent_archive, &live_fetch, &refs] {
+            assert!(stays.join("file").is_file(), "{} should have been kept", stays.display());
+        }
+        assert!(import_used_marker(&recent).is_file());
+
+        // A cache that doesn't exist is nothing to prune.
+        prune_import_cache(&cache.join("nope"), &kept, IMPORT_CACHE_MAX_AGE);
+        assert_eq!(IMPORT_CACHE_MAX_AGE, Duration::from_secs(30 * 24 * 60 * 60));
+    }
+
+    #[test]
+    fn using_an_import_marks_it_used_beside_the_checkout_not_in_it() {
+        let (_repo, url, sha) = test_repo(&[("a.api", "GET /a\n")]);
+        let dir = tempfile::tempdir().unwrap();
+        let src = format!("import git r {{ \"url\": \"{url}\", \"ref\": \"1.0\" }}\nr/a.api\n");
+        split_bulk_requests(&src, Some(dir.path())).unwrap();
+        let checkout = import_cache_dir().unwrap().join(import_cache_key(&url)).join(&sha);
+        assert!(import_used_marker(&checkout).is_file());
+        assert_eq!(import_used_marker(&checkout).file_name().unwrap().to_string_lossy(), format!("{sha}.used"));
+        let inside: Vec<String> = fs::read_dir(&checkout)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(inside, vec!["a.api".to_string()]);
     }
 
     #[test]

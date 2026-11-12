@@ -219,7 +219,8 @@ one-shot mode, with tab completion for endpoints, operators, properties, and fil
   `assert /companies/x` checks (logged as `assert GET /companies/x`, with
   `↳ assertion failed (404 Not Found)` under the status line when it fails), and `seed.api`
   runs the file, includes and all. `import git cl {…}` keeps its alias for the session, so
-  `cl/sv.api` runs on a later line and `tab` completes inside the repository. A pasted block
+  `cl/sv.api` runs on a later line and `tab` completes inside the repository; run the `import`
+  line again to pick up a branch that has moved. A pasted block
   of several lines runs line by line. Pasting a request line, a directive or a block replaces
   whatever is on the line, so a paste over the starting `GET /` is just the paste. `esc` stops a wait; a failed assert or a declined confirm
   stops the rest of the line. A mistyped request says `not a request or .api file` instead of

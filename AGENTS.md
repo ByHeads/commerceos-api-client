@@ -342,6 +342,18 @@ import archive cl {
   or by SHA-256. If a remote can't be reached, the copy that a tag, a branch
   or an unpinned archive URL last resolved to is used, and the log line says
   `cached copy: remote unreachable`.
+- **The cache cleans up after itself.** Every run that uses a checkout or an
+  unpacked archive marks it used. A run that fetches something new then
+  removes the ones last used more than 30 days ago, so a branch that moves
+  every day doesn't leave a copy per commit behind. Nothing is lost: a pruned
+  commit or archive is simply fetched again the next time it is asked for.
+  The whole directory is safe to delete at any time.
+- **A ref is looked up once per run, and once per line at the prompt.** A
+  batch that imports the same branch in several files asks the remote once
+  and runs them all against the same commit. An interactive session can
+  outlast a push, so there every line asks again: type the `import` line
+  again to get the new commit. An alias keeps the commit it was bound to
+  until then.
 - **An alias belongs to the file that declares it**, from that line down. An
   included file doesn't see it and declares its own; an imported file may
   import too. Declaring an alias twice in one file is an error, and so is an

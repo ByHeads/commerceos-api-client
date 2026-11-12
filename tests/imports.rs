@@ -860,6 +860,135 @@ fn a_repository_may_import_another_commit_of_itself() {
     assert_eq!(server.sent(), Vec::<String>::new());
 }
 
+// ----- the cache -----
+
+/// Set a file's modification time to `days` ago.
+fn age(path: &Path, days: u64) {
+    let then = std::time::SystemTime::now() - Duration::from_secs(days * 24 * 60 * 60);
+    std::fs::File::open(path).unwrap().set_modified(then).unwrap();
+}
+
+#[test]
+fn a_fetch_clears_out_checkouts_that_went_unused_for_a_month() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", Vec::new());
+    let repo = dir.join("repos/moving");
+    let first = commit(&repo, &[("step.api", b"GET /first\n")], Some("1.0"));
+    let on_main = format!("{}lib/step.api\n", import_git("lib", &repo_url(&repo), "main"));
+    let on_tag = format!("{}lib/step.api\n", import_git("lib", &repo_url(&repo), "1.0"));
+
+    let ran = run_batch(&dir, server.port, "-sa", &on_main);
+    assert!(ran.ok, "{}", ran.stderr);
+    let repo_cache = std::fs::read_dir(dir.join(".import-cache")).unwrap().flatten().next().unwrap().path();
+    let (checkout, used) = (repo_cache.join(&first), repo_cache.join(format!("{first}.used")));
+    assert!(checkout.is_dir() && used.is_file());
+
+    // Unused for longer than a month. Running it again is a use, and nothing
+    // new is fetched, so nothing is pruned and it counts as fresh again.
+    age(&used, 45);
+    let ran = run_batch(&dir, server.port, "-sa", &on_tag);
+    assert!(ran.ok, "{}", ran.stderr);
+    assert!(checkout.is_dir());
+    let idle = std::fs::metadata(&used).unwrap().modified().unwrap().elapsed().unwrap();
+    assert!(idle < Duration::from_secs(3600), "using a checkout should mark it used: {idle:?}");
+    assert_eq!(server.sent(), vec!["GET /first", "GET /first"]);
+
+    // The branch moves on while the old commit sits unused: the run that
+    // fetches the new one clears the old one out.
+    age(&used, 45);
+    let second = commit(&repo, &[("step.api", b"GET /second\n")], None);
+    let ran = run_batch(&dir, server.port, "-sa", &on_main);
+    assert!(ran.ok, "{}", ran.stderr);
+    assert_eq!(server.sent(), vec!["GET /second"]);
+    assert!(repo_cache.join(&second).is_dir());
+    assert!(!checkout.exists() && !used.exists(), "the unused checkout should have been pruned");
+
+    // It was only a copy: the tag fetches it again.
+    let ran = run_batch(&dir, server.port, "-sa", &on_tag);
+    assert!(ran.ok, "{}", ran.stderr);
+    assert_eq!(server.sent(), vec!["GET /first"]);
+    // And the commit from a moment ago, used today, is still there.
+    assert!(checkout.is_dir() && repo_cache.join(&second).is_dir());
+}
+
+#[test]
+fn an_unused_unpacked_archive_is_cleared_out_too() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", fixture_archive());
+    let batch = format!("import archive lib {{ \"url\": \"{}\" }}\nlib/parts/a.api\n", server.url("/lib.tar.gz"));
+    let ran = run_batch(&dir, server.port, "-sa", &batch);
+    assert!(ran.ok, "{}", ran.stderr);
+    let archives = dir.join(".import-cache/archives");
+    let unpacked = std::fs::read_dir(&archives)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.is_dir() && p.file_name().is_some_and(|n| n.len() == 64))
+        .expect("an unpacked archive");
+    let used = archives.join(format!("{}.used", unpacked.file_name().unwrap().to_string_lossy()));
+    assert!(used.is_file());
+
+    // A git fetch, a month and a half later, prunes across the whole cache.
+    age(&used, 45);
+    let repo = dir.join("repos/other");
+    commit(&repo, &[("step.api", b"GET /other\n")], None);
+    let ran = run_batch(&dir, server.port, "-sa", &format!("{}lib/step.api\n", import_git("lib", &repo_url(&repo), "main")));
+    assert!(ran.ok, "{}", ran.stderr);
+    assert!(!unpacked.exists() && !used.exists(), "the unused archive should have been pruned");
+}
+
+/// A `git` that writes each invocation's arguments to `log` and then runs
+/// the real one. Returns the directory to put first on the `PATH`.
+fn logging_git(dir: &Path, log: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let real = Command::new("sh").args(["-c", "command -v git"]).output().expect("sh runs");
+    let real = String::from_utf8_lossy(&real.stdout).trim().to_string();
+    assert!(!real.is_empty(), "git is not on the PATH");
+    let bin = dir.join("logging-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let shim = bin.join("git");
+    std::fs::write(&shim, format!("#!/bin/sh\necho \"$*\" >> '{}'\nexec '{real}' \"$@\"\n", log.display())).unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+#[test]
+fn a_run_asks_the_remote_about_a_branch_once_however_often_it_is_imported() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", Vec::new());
+    let repo = dir.join("repos/asked");
+    commit(&repo, &[("step.api", b"GET /step\n")], None);
+    let import = import_git("lib", &repo_url(&repo), "main");
+    let log = dir.join("git.log");
+    let path = format!("{}:{}", logging_git(&dir, &log).display(), std::env::var("PATH").unwrap());
+    let asked = |what: &str| {
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        let _ = std::fs::remove_file(&log);
+        text.lines().filter(|line| line.contains(what)).count()
+    };
+
+    // A batch whose included file imports the same branch under another name.
+    std::fs::write(dir.join("inner.api"), format!("{}again/step.api\n", import.replace(" lib ", " again "))).unwrap();
+    std::fs::write(dir.join("batch.api"), format!("{import}lib/step.api\ninner.api\n")).unwrap();
+    let mut cmd = api(&dir, server.port);
+    cmd.env("PATH", &path).args(["-sa", "batch.api"]);
+    let ran = finish(cmd, "");
+    assert!(ran.ok, "{}", ran.stderr);
+    assert_eq!(server.sent(), vec!["GET /step", "GET /step"]);
+    assert_eq!(asked("ls-remote"), 1, "one lookup for the whole run");
+
+    // A one-shot line is parsed twice on its way to being run. Everything is
+    // cached by now, so the lookup is all git is asked for.
+    let mut cmd = api(&dir, server.port);
+    cmd.env("PATH", &path).arg(format!("{import}lib/step.api"));
+    let ran = finish(cmd, "");
+    assert!(ran.ok, "{}", ran.stderr);
+    assert_eq!(server.sent(), vec!["GET /step"]);
+    let text = std::fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(text.lines().count(), 1, "{text}");
+    assert!(text.contains("ls-remote"), "{text}");
+}
+
 // ----- this client's own repository, over the network -----
 
 const REPO_HTTPS: &str = "https://github.com/byheads/commerceos-api-client";
