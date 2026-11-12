@@ -1963,7 +1963,7 @@ fn answering_server(answers: Vec<(&'static str, &'static str)>) -> (u16, std::th
 /// path. The client passes the body on untouched.
 const ASSERT_FAILED: (&str, &str) = (
     "409 Conflict",
-    r#"{"@type":"failed assertion","error":"One or more assertions failed.","details":"1 of 1 assertions failed.","failures":{"api/v1/people~count":{"was":2,"expected":{"is":3}}}}"#,
+    r#"{"@type":"failed assertion","error":"One or more assertions failed.","details":"1 of 1 assertion failed.","failures":{"api/v1/people~count":{"was":2,"expected":{"is":3}}}}"#,
 );
 /// What it answers when every assertion holds.
 const ASSERT_HELD: (&str, &str) = ("200 OK", "null");
@@ -2211,6 +2211,66 @@ fn fail_fast_stops_a_one_shot_program_line_and_a_batch_on_stdin() {
     assert_eq!(server.join().unwrap(), vec!["PUT /assert"]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).ends_with(&format!("{}\n", ASSERT_FAILED.1)));
+}
+
+/// The server pretty-prints its JSON: a failing body of several lines is
+/// passed on whole, after the last status line.
+#[test]
+fn fail_fast_passes_on_a_body_of_several_lines_whole() {
+    const PRETTY: &str = "{\n  \"@type\": \"failed assertion\",\n  \"failures\": {\n    \"api/v1/x\": {\n      \"was\": 1\n    }\n  }\n}\n";
+    let run = run_fail_fast("-sfa", "GET /before\nPUT /assert {\"api/v1/x\":{\"is\":2}}\n", vec![OK, ("409 Conflict", PRETTY)]);
+    assert!(!run.ok);
+    let (log, body) = run.stdout.rsplit_once("HTTP/1.1 409 Conflict").expect("a 409 status line");
+    assert!(log.ends_with("└─"), "{log:?}");
+    let body = body.split_once('\n').expect("the rest of the status line").1;
+    assert_eq!(body, PRETTY);
+    assert!(serde_json::from_str::<serde_json::Value>(body).is_ok());
+}
+
+/// The real endpoint, on a local CommerceOS that has it. Asserting changes
+/// nothing on the server.
+#[test]
+fn fail_fast_against_the_assert_endpoint_of_a_local_cos() {
+    require_local_cos();
+    // `GET /assert` answers `200` with `{}` where the endpoint exists and a
+    // 404 on a server from before it.
+    let probe = api().args(["-sr", "GET", "/assert"]).output().unwrap();
+    if String::from_utf8_lossy(&probe.stdout).trim() != "{}" {
+        eprintln!("fail_fast_against_the_assert_endpoint_of_a_local_cos: skipped, this server has no /assert");
+        return;
+    }
+    let dir = tempdir().unwrap();
+    let run = |name: &str, batch: &str| {
+        let file = dir.path().join(name);
+        std::fs::write(&file, batch).unwrap();
+        let out = api().env("NO_COLOR", "1").args(["-sfa"]).arg(&file).output().unwrap();
+        (out.status.code(), String::from_utf8_lossy(&out.stdout).to_string())
+    };
+
+    // Every assertion holds: `200`, and the batch goes on.
+    let (code, stdout) = run(
+        "holds.api",
+        "PUT /assert {\n  \"api/v1/echo-all~count\": { \"is not\": 5 },\n  \"api/v1/about/cos-tag\": { \"is not\": null }\n}\nGET /echo-all\n",
+    );
+    assert_eq!(code, Some(0), "{stdout}");
+    assert_eq!(stdout.matches("HTTP/1.1 200 OK").count(), 2, "{stdout}");
+
+    // One does not: `409`, the batch stops and the failure document ends stdout.
+    let (code, stdout) = run(
+        "fails.api",
+        "GET /echo-all\nPUT /assert {\n  \"api/v1/about/cos-tag\": { \"is\": \"not-the-tag-of-any-build\" }\n}\nGET /echo-all\n",
+    );
+    assert_eq!(code, Some(1), "{stdout}");
+    assert_eq!(stdout.matches("GET /echo-all").count(), 1, "the request after the assert was sent: {stdout}");
+    let body = stdout.rsplit_once("HTTP/1.1 409 Conflict").expect("a 409").1.split_once('\n').unwrap().1;
+    let failure: serde_json::Value = serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {body}"));
+    assert_eq!(failure["@type"], "failed assertion");
+    assert_eq!(failure["failures"]["api/v1/about/cos-tag"]["expected"]["is"], "not-the-tag-of-any-build");
+
+    // A body that is no assert request: `400`, which stops the batch too.
+    let (code, stdout) = run("invalid.api", "PUT /assert [1, 2]\nGET /echo-all\n");
+    assert_eq!(code, Some(1), "{stdout}");
+    assert!(stdout.contains("HTTP/1.1 400 Bad Request") && !stdout.contains("GET /echo-all"), "{stdout}");
 }
 
 // ----- import git -----

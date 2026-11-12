@@ -543,7 +543,19 @@ PUT /people/com.mi6.id=007 {"name":"James Bond"}
 └─HTTP/1.1 200 OK 0.02s
 PUT /assert {"api/v1/people~count":{"is":3}}
 └─HTTP/1.1 409 Conflict 0.01s
-{"@type":"failed assertion","error":"One or more assertions failed.","details":"1 of 1 assertions failed.","failures":{"api/v1/people~count":{"was":2,"expected":{"is":3}}}}
+{
+  "@type": "failed assertion",
+  "error": "One or more assertions failed.",
+  "details": "1 of 1 assertion failed.",
+  "failures": {
+    "api/v1/people~count": {
+      "was": 2,
+      "expected": {
+        "is": 3
+      }
+    }
+  }
+}
 ```
 
 - Nothing after the failing request is sent, and the exit code is 1.
@@ -551,6 +563,10 @@ PUT /assert {"api/v1/people~count":{"is":3}}
   server sent it, with `-sa` too (where bodies are otherwise not printed). A
   tool driving the client reads the reason from there; the status line stays
   where it always is (stdout in `-sa`, stderr otherwise).
+- The server pretty-prints its JSON, so the body is usually several lines. In
+  `-sfa` output it is everything after the last `└─HTTP/1.1 …` line. For a
+  single request (`api -f PUT /assert @asserts.json`) the status line goes to
+  stderr and stdout is the body alone, which is the easiest thing to parse.
 - This is how to check conditions with the `/assert` endpoint. `PUT /assert`
   takes a body that maps API paths, written from the base (`api/v1/…`), to
   what they should hold (`is`, `is not`), any number of them in one request:
@@ -753,5 +769,5 @@ Run it: `api -sa workshop.api`.
 - For repeated boilerplate, factor it into a `shared/` directory and use includes.
 - When generating files programmatically, prefer compact single-line JSON bodies — they're easier to grep and diff.
 - Use silent batch mode (`-sa`) when you want to verify that a long seeding script worked without drowning in response bodies.
-- Add `-f` (`-sfa`) so a failed request stops the batch: check the exit code, and on failure read the last line of stdout for the error body. Without it a batch exits 0 however many plain requests failed.
+- Add `-f` (`-sfa`) so a failed request stops the batch: check the exit code, and on failure read the error body from the end of stdout (everything after the last `└─HTTP/1.1 …` line; it is usually several lines of JSON). Without it a batch exits 0 however many plain requests failed.
 - Run with `--no-keychain` and an absolute `API_CREDENTIALS_FILE` so nothing depends on an unlocked keychain or on the working directory.
