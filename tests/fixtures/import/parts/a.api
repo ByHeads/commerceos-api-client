@@ -1,0 +1,2 @@
+# Included by seed.api through a glob, and by with-json.api through an alias.
+GET /parts/a

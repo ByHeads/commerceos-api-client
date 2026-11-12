@@ -1,0 +1,3 @@
+# A file body that leaves the import is an error before anything is sent.
+GET /escape/first
+PUT /escape @../../../Cargo.toml

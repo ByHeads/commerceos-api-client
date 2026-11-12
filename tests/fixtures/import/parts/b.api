@@ -1,0 +1,2 @@
+# A file body may climb, as long as it stays inside the import.
+PUT /parts/b @../data/body.json

@@ -5304,7 +5304,12 @@ fn write_archive_file(
 /// into `dest`. Only files and directories are written: links and device
 /// entries are skipped, and an entry named outside the archive is an error.
 fn unpack_archive(bytes: &[u8], dest: &std::path::Path) -> Result<(), String> {
-    let mut remaining = ARCHIVE_UNPACKED_LIMIT;
+    unpack_archive_within(bytes, dest, ARCHIVE_UNPACKED_LIMIT)
+}
+
+/// `unpack_archive` with the size it may unpack to given.
+fn unpack_archive_within(bytes: &[u8], dest: &std::path::Path, limit: u64) -> Result<(), String> {
+    let mut remaining = limit;
     fs::create_dir_all(dest).map_err(|e| format!("could not create {}: {}", dest.display(), e))?;
 
     if bytes.starts_with(b"PK\x03\x04") {
@@ -18497,6 +18502,24 @@ mod tests {
 
         let err = unpack_archive(b"GET /not-an-archive\n", &dir.path().join("text")).unwrap_err();
         assert_eq!(err, "not a .tar.gz, .tar or .zip archive");
+    }
+
+    #[test]
+    fn an_archive_may_only_unpack_to_so_much() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = [("a.api", "GET /aaaaaaaa\n"), ("b.api", "GET /bbbbbbbb\n")];
+        let total: u64 = files.iter().map(|(_, c)| c.len() as u64).sum();
+        for (name, bytes) in [("tar", tar_gz(&files, |_| {})), ("zip", zip_of(&files))] {
+            // Exactly what it holds is fine; the limit is on the sum of the
+            // files, so the second one is what goes over.
+            unpack_archive_within(&bytes, &dir.path().join(format!("{name}-fits")), total).unwrap();
+            let dest = dir.path().join(format!("{name}-over"));
+            let err = unpack_archive_within(&bytes, &dest, total - 1).unwrap_err();
+            assert_eq!(err, "archive unpacks to more than 1 GB", "{name}");
+            assert!(dest.join("a.api").is_file(), "{name}");
+        }
+        // The limit in force is the one the message names.
+        assert_eq!(ARCHIVE_UNPACKED_LIMIT, 1024 * 1024 * 1024);
     }
 
     #[test]

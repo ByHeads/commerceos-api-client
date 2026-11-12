@@ -1,0 +1,5 @@
+# An import that leads back to the file being read is an include loop.
+import dir me { "path": "." }
+
+GET /loop
+me/loop.api

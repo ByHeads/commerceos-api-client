@@ -320,6 +320,7 @@ Usage: api [OPTIONS] [METHOD] [URI] [BODY]
 ```sh
 cargo test --bin api                                     # unit tests
 cargo test --test parity                                 # one table of lines through file, arguments and prompt
+cargo test --test imports                                # import git/dir/archive; fetches this repo from GitHub (API_TEST_OFFLINE=1 skips that)
 API_TEST_BASE_URI=http://localhost:5000 API_TEST_KEY=… cargo test --test cli   # end-to-end, needs a local COS
 ```
 

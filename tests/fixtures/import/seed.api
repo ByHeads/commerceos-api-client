@@ -1,0 +1,13 @@
+# Entry point of the import fixture. tests/imports.rs imports this directory
+# three ways (as a directory, as a git repository and as an archive) and
+# expects the same requests each time.
+url has 127.0.0.1
+url has localhost
+
+GET /seed
+
+# A file body is a file of the import, wherever the batch is run from.
+PUT /seed/body @data/body.json
+
+# Includes resolve next to this file, globs in sorted order.
+parts/*.api

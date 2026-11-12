@@ -1,0 +1,2 @@
+# A chain in an imported file, with a file body and a body function.
+GET /chain/first && PUT /chain/second @data/body.json~map(com.heads.test)

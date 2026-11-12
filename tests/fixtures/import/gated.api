@@ -1,0 +1,4 @@
+# An import may refuse an environment; it can never allow one.
+url has production.example.com
+
+GET /gated

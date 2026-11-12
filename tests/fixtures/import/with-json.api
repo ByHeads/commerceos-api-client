@@ -1,0 +1,5 @@
+# An imported file may import too. Its `@file` is read from this import, and
+# its `import dir` may only name a directory inside it.
+import dir p @parts.json
+
+p/a.api
