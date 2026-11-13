@@ -131,6 +131,9 @@ fn answer(mut stream: std::net::TcpStream, log: &Mutex<Vec<String>>) {
         ("200 OK", "0".to_string())
     } else if path.contains("/boom") {
         ("500 Internal Server Error", "{}".to_string())
+    } else if path.contains("/keyed") {
+        // A record with only a database key and a masked value, for `--export`.
+        ("200 OK", r#"{"name":"Ann","identifiers":{"key":"k1"},"secret":"********"}"#.to_string())
     } else if path.contains("/about") {
         ("200 OK", r#"{"feature-flags":[]}"#.to_string())
     } else {
@@ -699,6 +702,115 @@ fn the_prompt_reads_the_same_lines() {
         let expected = case.prompt_sent.clone().unwrap_or_else(|| case.sent.clone());
         check(&case, "prompt", &got, &shown, &expected);
     }
+}
+
+/// `--export` rewrites a response the same way whichever door the request
+/// came in through.
+#[test]
+fn export_rewrites_the_same_way_in_a_file_from_stdin_and_as_arguments() {
+    const EXPORTED: &str = "{\n  \"identifiers\": {\n    \"com.heads.seedID\": \"k1\"\n  },\n  \"name\": \"Ann\",\n  \"secret\": null\n}\n";
+    const WARNING: &str = "WARNING: Response had masked data, replaced with null for keys: secret";
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    prepare(dir.path());
+    let run = |args: &[&str], stdin: Option<&str>| {
+        server.take();
+        let mut cmd = api(server.port, dir.path());
+        // In front of the request, unless the case puts the flag elsewhere.
+        if !args.contains(&"--export") {
+            cmd.args(["--export", "com.heads.seedID"]);
+        }
+        cmd.args(args);
+        if stdin.is_some() {
+            cmd.stdin(std::process::Stdio::piped());
+        }
+        cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn api");
+        if let Some(text) = stdin {
+            child.stdin.take().unwrap().write_all(text.as_bytes()).unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        server.settle(Duration::from_millis(150), Duration::from_secs(3));
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(server.take(), ["GET /keyed"], "{args:?}");
+        (String::from_utf8_lossy(&out.stdout).to_string(), String::from_utf8_lossy(&out.stderr).to_string())
+    };
+
+    std::fs::write(dir.path().join("case.api"), "GET /keyed\n").unwrap();
+    let doors: [(&str, (String, String)); 5] = [
+        ("file", run(&["-a", "case.api"], None)),
+        ("stdin", run(&["-a"], Some("GET /keyed\n"))),
+        ("split arguments", run(&["GET", "/keyed"], None)),
+        ("one quoted argument", run(&["GET /keyed"], None)),
+        ("the flag last", run(&["GET", "/keyed", "--export", "com.heads.seedID"], None)),
+    ];
+    for (door, (stdout, stderr)) in &doors {
+        assert_eq!(stdout, EXPORTED, "{door}");
+        assert_eq!(stderr.matches(WARNING).count(), 1, "{door}: {stderr}");
+    }
+
+    // To a file, the same bytes without the final newline, from each door.
+    for args in [&["-a", "case.api"][..], &["GET", "/keyed", ">", "out.json"], &["GET /keyed > out.json"]] {
+        if args[0] == "-a" {
+            std::fs::write(dir.path().join("case.api"), "GET /keyed > out.json\n").unwrap();
+        }
+        let (stdout, _) = run(args, None);
+        assert_eq!(stdout, "", "{args:?}");
+        assert_eq!(std::fs::read_to_string(dir.path().join("out.json")).unwrap(), EXPORTED.trim_end(), "{args:?}");
+        std::fs::remove_file(dir.path().join("out.json")).unwrap();
+    }
+}
+
+/// At the prompt the response shown is the seed data, and the hint line says
+/// what was masked.
+#[cfg(unix)]
+#[test]
+fn export_at_the_prompt_shows_the_seed_data() {
+    use pty::{plain, Prompt};
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    prepare(dir.path());
+    let mut cmd = api(server.port, dir.path());
+    cmd.args(["--export", "com.heads.seedID"]);
+    let mut prompt = Prompt::open(cmd);
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+
+    let mut run = |paste: &str| {
+        prompt.send(b"\x15");
+        prompt.pump(Duration::from_millis(60));
+        server.take();
+        prompt.paste(paste);
+        prompt.pump(Duration::from_millis(80));
+        let mark = prompt.screen.len();
+        prompt.send(b"\r");
+        let start = Instant::now();
+        let mut quiet = 0;
+        while quiet < 2 && start.elapsed() < Duration::from_secs(4) {
+            let before = server.seen();
+            prompt.pump(Duration::from_millis(120));
+            quiet = if server.seen() == before { quiet + 1 } else { 0 };
+        }
+        (server.take(), plain(&prompt.screen[mark..]))
+    };
+
+    let (sent, shown) = run("GET /keyed");
+    assert_eq!(sent, ["GET /keyed"]);
+    assert!(shown.contains("\"com.heads.seedID\": \"k1\""), "{shown}");
+    assert!(shown.contains("\"secret\": null"), "{shown}");
+    assert!(!shown.contains("\"key\"") && !shown.contains("********"), "{shown}");
+    assert!(shown.contains("replaced with null for keys: secret"), "{shown}");
+
+    // Written to a file from the prompt, it is the seed data too.
+    let (sent, _) = run("GET /keyed > prompt-out.json");
+    assert_eq!(sent, ["GET /keyed"]);
+    let written = std::fs::read_to_string(dir.path().join("prompt-out.json")).unwrap();
+    let written: serde_json::Value = serde_json::from_str(&written).unwrap();
+    assert_eq!(written, serde_json::json!({ "identifiers": { "com.heads.seedID": "k1" }, "name": "Ann", "secret": null }));
+
+    // A response without a key is shown as it came.
+    let (_, shown) = run("GET /a");
+    assert!(shown.contains("\"ok\""), "{shown}");
 }
 
 /// `-f` means the same from a file, from stdin and as arguments: the run

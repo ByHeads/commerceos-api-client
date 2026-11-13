@@ -525,6 +525,7 @@ api -a -                              # explicit stdin
 api -sa parent.api                    # silent batch mode (see below)
 api -spa parent.api                   # preview the requests, confirm before sending
 api -sfa parent.api                   # stop at the first failed request (see below)
+api --export com.heads.seedID GET /users > users.json   # a response as seed data (see below)
 ```
 
 ### Stopping at the first failure (`-f`, `--fail-fast`)
@@ -601,6 +602,70 @@ PUT /assert {"api/v1/people~count":{"is":3}}
   or 5xx where it otherwise exits 0. At the interactive prompt, `api -f` makes a
   pasted block or a `seed.api` run stop at the failing request and says
   `stopped at 409 (--fail-fast)`; the session stays open.
+
+### Exporting seed data (`--export <external-id>`)
+
+A response read from one environment can't be written to another as it is: every
+record carries its database key (`identifiers.key`), which means nothing anywhere
+else. `--export` rewrites each response so that it can be sent back with `PUT`, to
+the same environment or a different one, any number of times, and find or create
+the same records:
+
+```sh
+api --export com.heads.seedID GET /users > users.json
+api -c staging PUT /users @users.json
+```
+
+```
+# what the server answers                          # what --export prints
+{                                                  {
+  "name": "Ann",                                     "@type": "person",
+  "@type": "person",                                 "identifiers": {
+  "identifiers": {                                     "com.heads.seedID": "98850c77"
+    "key": "98850c77"                                },
+  },                                                 "name": "Ann",
+  "employer": {                                      "employer": {
+    "identifiers": {                                   "identifiers": {
+      "key": "27b65eb8",                                 "com.heads.seedID": "ourcompany"
+      "com.heads.seedID": "ourcompany"                 }
+    }                                                },
+  },                                                 "password": null
+  "password": "********"                           }
+}
+```
+
+What it does to every object in the response, however deep:
+
+- **`identifiers.key` is removed.** A record that has another identifier
+  (`com.heads.seedID`, a `userId`, anything besides `@type`) is found by that
+  one. A record with **no** other identifier keeps the key's value under the
+  name you gave, so the next `PUT` finds the record it made instead of making
+  another.
+- **A masked value (`********`) becomes `null`**, and a warning on stderr names
+  the properties: `WARNING: Response had masked data, replaced with null for
+  keys: password, secret`. The secret is not in the export; set it some other
+  way.
+- **`identifiers` moves to the front of its object**, behind `@type`. Other
+  members keep the order the server gave them.
+
+Rules:
+
+- The name is three dot-separated segments of letters, digits and `-`
+  (`com.heads.seedID`). Anything else is an error before a request is sent,
+  which is also what catches a forgotten name (`api --export GET /users`).
+- It applies to **2xx JSON responses**, wherever they go: stdout, a `> file`,
+  `>> file`, the clipboard. An error body is left as the server sent it, so
+  `-f` output is unaffected, and request bodies are never touched.
+- It works for one request, in a batch (`api --export com.heads.seedID -sa
+  export.api`, with a `> file` per request), and at the interactive prompt
+  (the warning shows in the hint line).
+- Output is indented; `-r` prints it on one line. NDJSON (`--ndjson`, or a
+  `> file.ndjson`) is rewritten line by line.
+- A response that is not JSON (a `> file.csv`, a `.sql`) is written unchanged,
+  with `WARNING: --export left a response that is not JSON unchanged`.
+- `&&`/`||`, `assert` and `sleep while` judge what the server answered, not
+  the rewritten body.
+- The whole body is needed, so `--stream` is ignored while `--export` is on.
 
 ### Credentials from disk (`--no-keychain`)
 
@@ -754,6 +819,8 @@ Run it: `api -sa workshop.api`.
 - **An archive URL without `sha256`** → downloaded again on every run, and whatever it serves that day is what runs. Add the `sha256` from the `import …` log line to pin it.
 - **`"token_env": "<the token>"`** → rejected or reported as an unset variable. It takes the *name* of an environment variable, so the secret stays out of the file.
 - **`import dir cl { "path": "cl" }`** → `import alias … clashes`. An alias can't share its name with a file or directory next to the `.api` file; name the alias something else.
+- **Seeding from a plain `GET`** → the response carries `identifiers.key`, a database key of the environment it was read from. Written elsewhere it is refused or creates duplicates. Read it with `--export <external-id>`.
+- **Expecting secrets in an export** → the API masks them (`********`) and `--export` turns that into `null`, with a warning. A password, an API key or a client secret has to be set separately.
 - **Expecting a failed request to stop a batch** → it doesn't, unless the line is an `assert`, a chain or a poll, or the run has `-f`. A plain `PUT /assert {…}` that answers 409 is logged and the next line runs. Run with `-f`.
 - **Chaining on `PUT /assert`** → a passing `/assert` answers `200` with `null`, which is falsy, so `PUT /assert {…} && …` skips what follows and `assert PUT /assert {…}` fails on a pass. Write it on its own line and run with `-f`.
 - **`assert` on a list endpoint** → `[]` is truthy, so `assert GET /people~where(x)` passes even when nothing matches. Assert a `~count` or a single item by identifier instead.
@@ -769,5 +836,6 @@ Run it: `api -sa workshop.api`.
 - For repeated boilerplate, factor it into a `shared/` directory and use includes.
 - When generating files programmatically, prefer compact single-line JSON bodies — they're easier to grep and diff.
 - Use silent batch mode (`-sa`) when you want to verify that a long seeding script worked without drowning in response bodies.
+- To move data between environments, read it with `--export com.heads.seedID` into a file and `PUT` the file. Use the same identifier name every time, so a record exported twice is one record.
 - Add `-f` (`-sfa`) so a failed request stops the batch: check the exit code, and on failure read the error body from the end of stdout (everything after the last `└─HTTP/1.1 …` line; it is usually several lines of JSON). Without it a batch exits 0 however many plain requests failed.
 - Run with `--no-keychain` and an absolute `API_CREDENTIALS_FILE` so nothing depends on an unlocked keychain or on the working directory.

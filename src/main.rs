@@ -208,6 +208,11 @@ struct Args {
     #[arg(short = 'f', long = "fail-fast")]
     fail_fast: bool,
 
+    /// Export mode: turn responses into seed data. Database keys are dropped,
+    /// and a record with no other identifier keeps its key under this name
+    #[arg(long = "export", value_name = "EXTERNAL_ID")]
+    export: Option<String>,
+
     /// Stream the response body instead of buffering it (also: API_STREAMING=1)
     #[arg(short = 't', long = "stream")]
     stream: bool,
@@ -272,6 +277,10 @@ struct Config {
     expect_falsy: bool,
     /// `-f`: a response of 400 or above ends the run. See `fail_fast_trips`.
     fail_fast: bool,
+    /// `--export <name>`: responses are rewritten as seed data, with `name`
+    /// as the external identifier a database key is kept under. See
+    /// `export_value`.
+    export_id: Option<String>,
     /// The status of the last response the prompt received, for `-f` there.
     last_status: Option<u16>,
 }
@@ -302,6 +311,7 @@ impl Default for Config {
             last_response: None,
             expect_falsy: false,
             fail_fast: false,
+            export_id: None,
             last_status: None,
         }
     }
@@ -2771,6 +2781,16 @@ fn main() {
     }
     config.preview = args.preview;
     config.fail_fast = args.fail_fast;
+    if let Some(name) = &args.export {
+        if !is_external_id_name(name) {
+            eprintln!(
+                "error: invalid export identifier: {} (expected three dot-separated segments of letters, digits and `-`, such as com.heads.seedID)",
+                name
+            );
+            std::process::exit(1);
+        }
+        config.export_id = Some(name.clone());
+    }
 
     if args.me {
         config.api_path = "/api/me/v1".to_string();
@@ -4373,6 +4393,175 @@ enum RequestOutcome {
 /// when the real problem is expired credentials or a broken server.
 fn status_is_error(status: u16) -> bool {
     matches!(status, 401 | 403 | 408 | 429) || status >= 500
+}
+
+// ---------------------------------------------------------------------------
+// `--export <external-id>`: responses as seed data
+// ---------------------------------------------------------------------------
+
+/// What the API prints in place of a value the caller may not read.
+const MASKED_VALUES: [&str; 2] = ["********", "*******"];
+
+/// Whether `name` can name an external identifier: three dot-separated
+/// segments of letters, digits and `-` (`com.heads.seedID`).
+fn is_external_id_name(name: &str) -> bool {
+    let segments: Vec<&str> = name.split('.').collect();
+    segments.len() == 3
+        && segments
+            .iter()
+            .all(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+}
+
+/// Rewrite a response value in place so that it can be sent to another
+/// environment as seed data.
+///
+/// A database key (`identifiers.key`) means something in the environment it
+/// was read from and nowhere else, so every one is dropped. A record that has
+/// another identifier is found by that one. A record that has none would be
+/// created anew by every run of the seed, so its key is kept as the value of
+/// the external identifier `id_key`, which finds it again the next time.
+///
+/// Beyond that: a masked value becomes `null` (its property's name is added
+/// to `masked`, so the caller can say what was lost), and `identifiers` is
+/// moved to the front of its object, behind `@type`, where a reader looks for
+/// it. Members otherwise keep the order the server gave them.
+///
+/// Children are rewritten before the object that holds them, so a masked
+/// `key` is `null` by the time its record is looked at and is left alone.
+fn export_value(
+    value: &mut Value,
+    id_key: &str,
+    property: Option<&str>,
+    masked: &mut std::collections::BTreeSet<String>,
+) {
+    match value {
+        Value::String(text) if MASKED_VALUES.contains(&text.as_str()) => {
+            masked.insert(property.unwrap_or("(value)").to_string());
+            *value = Value::Null;
+        }
+        Value::Array(items) => {
+            for item in items {
+                export_value(item, id_key, property, masked);
+            }
+        }
+        Value::Object(object) => {
+            for (name, member) in object.iter_mut() {
+                export_value(member, id_key, Some(name), masked);
+            }
+            export_identifiers(object, id_key);
+            put_identifiers_first(object);
+        }
+        _ => {}
+    }
+}
+
+/// Drop `identifiers.key` from `object`, keeping its value as `id_key` when
+/// the record has no other identifier. The new identifier takes the key's
+/// place among the members.
+fn export_identifiers(object: &mut Map<String, Value>, id_key: &str) {
+    let Some(Value::Object(identifiers)) = object.get_mut("identifiers") else {
+        return;
+    };
+    let has_key = identifiers.get("key").is_some_and(|key| !key.is_null() && *key != Value::Bool(false));
+    if !has_key {
+        return;
+    }
+    let only_key = identifiers.keys().all(|name| name == "@type" || name == "key");
+    for (name, value) in std::mem::take(identifiers) {
+        if name != "key" {
+            identifiers.insert(name, value);
+        } else if only_key {
+            identifiers.insert(id_key.to_string(), value);
+        }
+    }
+}
+
+/// Move `identifiers` to the front of `object`, right behind `@type` when
+/// there is one. An object without `identifiers` is left as it is.
+fn put_identifiers_first(object: &mut Map<String, Value>) {
+    if !object.contains_key("identifiers") {
+        return;
+    }
+    let (mut leading, mut rest) = (Vec::new(), Vec::new());
+    for (name, value) in std::mem::take(object) {
+        match name.as_str() {
+            "@type" => leading.insert(0, (name, value)),
+            "identifiers" => leading.push((name, value)),
+            _ => rest.push((name, value)),
+        }
+    }
+    object.extend(leading.into_iter().chain(rest));
+}
+
+/// A response body after `--export`.
+#[derive(Debug, PartialEq)]
+struct ExportedBody {
+    text: String,
+    /// The names of the properties whose masked values became `null`, sorted.
+    masked: Vec<String>,
+    /// Whether the body was JSON (or NDJSON). One that is not is unchanged.
+    is_json: bool,
+}
+
+/// Apply `--export` to a response body.
+///
+/// A JSON body is rewritten whole and printed indented, or on one line when
+/// `compact`. An NDJSON body is rewritten line by line, one compact value per
+/// line. `ndjson` says which of the two to try first, for the body of one
+/// line that is both. Anything else (CSV, SQL, text) is returned unchanged
+/// and reported through `is_json`.
+fn export_body(text: &str, id_key: &str, ndjson: bool, compact: bool) -> ExportedBody {
+    let mut masked = std::collections::BTreeSet::new();
+    let whole = |masked: &mut std::collections::BTreeSet<String>| -> Option<String> {
+        let mut value: Value = serde_json::from_str(text).ok()?;
+        export_value(&mut value, id_key, None, masked);
+        if compact { serde_json::to_string(&value).ok() } else { serde_json::to_string_pretty(&value).ok() }
+    };
+    let by_line = |masked: &mut std::collections::BTreeSet<String>| -> Option<String> {
+        let mut found = std::collections::BTreeSet::new();
+        let mut out = String::with_capacity(text.len());
+        for line in text.lines() {
+            if !line.trim().is_empty() {
+                let mut value: Value = serde_json::from_str(line).ok()?;
+                export_value(&mut value, id_key, None, &mut found);
+                out.push_str(&serde_json::to_string(&value).ok()?);
+            }
+            out.push('\n');
+        }
+        if !text.ends_with('\n') {
+            out.pop();
+        }
+        masked.extend(found);
+        Some(out)
+    };
+    if text.trim().is_empty() {
+        return ExportedBody { text: text.to_string(), masked: Vec::new(), is_json: true };
+    }
+    let exported = if ndjson {
+        by_line(&mut masked).or_else(|| whole(&mut masked))
+    } else {
+        whole(&mut masked).or_else(|| by_line(&mut masked))
+    };
+    match exported {
+        Some(text) => ExportedBody { text, masked: masked.into_iter().collect(), is_json: true },
+        None => ExportedBody { text: text.to_string(), masked: Vec::new(), is_json: false },
+    }
+}
+
+/// What the user has to be told about an exported body, if anything: values
+/// that were masked are gone from the seed data, and a body that is not JSON
+/// was not exported at all.
+fn export_warning(exported: &ExportedBody) -> Option<String> {
+    if !exported.is_json {
+        Some("WARNING: --export left a response that is not JSON unchanged".to_string())
+    } else if exported.masked.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "WARNING: Response had masked data, replaced with null for keys: {}",
+            exported.masked.join(", ")
+        ))
+    }
 }
 
 /// Whether a response with `status` ends the run under `-f`.
@@ -6797,7 +6986,9 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
     // Streaming is opt-in and already resolved from --stream/API_STREAMING, so
     // there is no per-request feature-flag round trip here. A server that
     // doesn't stream ignores the unknown `;stream=true` media-type parameter.
-    config.streaming = config.stream_requested;
+    // `--export` rewrites the whole body, so it is read whole: streaming is
+    // not asked for, and an error then arrives as a status, not mid-payload.
+    config.streaming = config.stream_requested && config.export_id.is_none();
 
     let client = build_request_client(config.timeout_secs);
 
@@ -7026,6 +7217,25 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
             if fail_fast_trips(config, status.as_u16()) {
                 fail_fast_exit(&body_text);
             }
+
+            // `--export`: what is printed, written or copied from here on is
+            // the seed data. The chain's verdict above was taken from what the
+            // server said, and an error body is left as it came.
+            let body_text = match &config.export_id {
+                Some(id_key) if status.is_success() => {
+                    let exported = export_body(
+                        &body_text,
+                        id_key,
+                        accept.starts_with("application/x-ndjson"),
+                        config.raw,
+                    );
+                    if let Some(warning) = export_warning(&exported) {
+                        eprintln!("{}", warning);
+                    }
+                    exported.text
+                }
+                _ => body_text,
+            };
 
             // Get response body — in bulk_silent mode, only write to outfile (no stdout)
             if config.bulk_silent {
@@ -8916,7 +9126,9 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
         }
     }
 
-    if state.config.streaming {
+    // `--export` rewrites the whole body, so it is read whole.
+    let streaming = state.config.streaming && state.config.export_id.is_none();
+    if streaming {
         content_type.push_str(";stream=true");
         accept.push_str(";stream=true");
     }
@@ -8947,7 +9159,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     // With no outfile the renderer owns the screen, so there's nothing to stream
     // into and the body stays buffered. `>>` and clipboard both need the whole
     // body, and a non-2xx buffers so an error payload never lands in the file.
-    let stream_outfile: Option<String> = if state.config.streaming
+    let stream_outfile: Option<String> = if streaming
         && !state.config.outfile.is_empty()
         && !state.config.outfile_append
         && !is_clipboard_target(&state.display_outfile)
@@ -9155,11 +9367,30 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
         };
     }
 
+    // What `--export` has to say about this response, for the hint line.
+    let mut export_note: Option<String> = None;
+
     match response_opt {
         Some(Ok((status, body_text, delivery))) => {
             let elapsed = start.elapsed();
 
             let status_str = format_status(status, state.config.expect_falsy);
+
+            // `--export`: the body shown, written or copied is the seed data.
+            // The verdict above was taken from what the server said.
+            let body_text = match &state.config.export_id {
+                Some(id_key) if status.is_success() && matches!(delivery, BodyDelivery::Buffered) => {
+                    let exported = export_body(
+                        &body_text,
+                        id_key,
+                        accept.starts_with("application/x-ndjson"),
+                        state.config.raw,
+                    );
+                    export_note = export_warning(&exported);
+                    exported.text
+                }
+                _ => body_text,
+            };
 
             // Handle outfile — including the `> clipboard` special target.
             if is_clipboard_target(&state.display_outfile) && state.config.outfile_append {
@@ -9272,6 +9503,12 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
             // Request was aborted or something went wrong
             block.head = "\nRequest failed\n".to_string();
         }
+    }
+
+    // Said last, so it is what the hint line shows under the response.
+    if let Some(note) = export_note.filter(|_| !state.config.quiet && !state.config.check_only) {
+        state.status_msg = note;
+        state.status_msg_at = Some(Instant::now());
     }
 
     // Refresh mapped type names after mutating /mapped-types
@@ -18524,6 +18761,222 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
         assert_eq!(inside, vec!["a.api".to_string()]);
+    }
+
+    // ----- --export -----
+
+    const SEED: &str = "com.heads.seedID";
+
+    /// `json` after `--export`, compact, and the masked property names.
+    fn exported(json: &str) -> (String, Vec<String>) {
+        let mut value: Value = serde_json::from_str(json).unwrap();
+        let mut masked = std::collections::BTreeSet::new();
+        export_value(&mut value, SEED, None, &mut masked);
+        (serde_json::to_string(&value).unwrap(), masked.into_iter().collect())
+    }
+
+    #[test]
+    fn an_external_id_name_is_three_dotted_segments() {
+        for name in ["com.heads.seedID", "com.example.id", "a.b.c", "com.my-org.seed-id", "1.2.3"] {
+            assert!(is_external_id_name(name), "{name}");
+        }
+        for name in [
+            "", "GET", "seedID", "com.heads", "com.heads.seed.ID", "com..seedID", ".heads.seedID", "com.heads.",
+            "com.heads.seed_ID", "com.heads.seed ID", "com/heads/seedID", "com.heads.seedID\n",
+        ] {
+            assert!(!is_external_id_name(name), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn export_keeps_a_lone_key_under_the_external_identifier() {
+        // No other identifier: the key is what finds the record again.
+        assert_eq!(
+            exported(r#"{"identifiers":{"key":"abc"},"name":"Ann"}"#).0,
+            r#"{"identifiers":{"com.heads.seedID":"abc"},"name":"Ann"}"#
+        );
+        // `@type` is not an identifier, and the new one takes the key's place.
+        assert_eq!(
+            exported(r#"{"@type":"person","identifiers":{"@type":"common identifiers","key":"abc"}}"#).0,
+            r#"{"@type":"person","identifiers":{"@type":"common identifiers","com.heads.seedID":"abc"}}"#
+        );
+        assert_eq!(
+            exported(r#"{"identifiers":{"key":"abc","@type":"common identifiers"}}"#).0,
+            r#"{"identifiers":{"com.heads.seedID":"abc","@type":"common identifiers"}}"#
+        );
+        // A key that is a number is kept as it is.
+        assert_eq!(exported(r#"{"identifiers":{"key":7}}"#).0, r#"{"identifiers":{"com.heads.seedID":7}}"#);
+    }
+
+    #[test]
+    fn export_drops_the_key_of_a_record_that_has_another_identifier() {
+        assert_eq!(
+            exported(r#"{"identifiers":{"key":"abc","com.mi6.id":"007"},"name":"James"}"#).0,
+            r#"{"identifiers":{"com.mi6.id":"007"},"name":"James"}"#
+        );
+        // Any other member of `identifiers` counts, namespaced or not.
+        assert_eq!(
+            exported(r#"{"identifiers":{"@type":"user identifiers","key":"abc","userId":"U1"}}"#).0,
+            r#"{"identifiers":{"@type":"user identifiers","userId":"U1"}}"#
+        );
+        // The external identifier itself, already there, is left alone.
+        assert_eq!(
+            exported(r#"{"identifiers":{"key":"abc","com.heads.seedID":"ours"}}"#).0,
+            r#"{"identifiers":{"com.heads.seedID":"ours"}}"#
+        );
+    }
+
+    #[test]
+    fn export_reaches_every_record_however_deep() {
+        let (out, _) = exported(
+            r#"[{"identifiers":{"key":"u1"},"agent":{"identifiers":{"key":"a1","com.heads.seedID":"root"},"name":"System"},
+                "clients":[{"identifiers":{"key":"c1"},"node":{"identifiers":{"key":"n1"}}},{"identifiers":{"key":"c2","clientID":"x"}}]}]"#,
+        );
+        assert_eq!(
+            out,
+            concat!(
+                r#"[{"identifiers":{"com.heads.seedID":"u1"},"#,
+                r#""agent":{"identifiers":{"com.heads.seedID":"root"},"name":"System"},"#,
+                r#""clients":[{"identifiers":{"com.heads.seedID":"c1"},"node":{"identifiers":{"com.heads.seedID":"n1"}}},"#,
+                r#"{"identifiers":{"clientID":"x"}}]}]"#
+            )
+        );
+        assert!(!out.contains("\"key\""));
+    }
+
+    #[test]
+    fn export_leaves_what_is_no_record_key_alone() {
+        for unchanged in [
+            // No `identifiers`, or one that holds no key.
+            r#"{"key":"abc","name":"x"}"#,
+            r#"{"identifiers":{"com.mi6.id":"007"}}"#,
+            r#"{"identifiers":{}}"#,
+            // An `identifiers` that is no object.
+            r#"{"identifiers":"abc"}"#,
+            r#"{"identifiers":null}"#,
+            r#"{"identifiers":["key"]}"#,
+            // A key that holds nothing is not a key to keep or to drop.
+            r#"{"identifiers":{"key":null}}"#,
+            r#"{"identifiers":{"key":false}}"#,
+            // A member called `key` anywhere else.
+            r#"{"settings":{"key":"abc"},"kv":[{"key":"a","value":1}]}"#,
+            // Scalars and empties.
+            "null", "true", "213", r#""text""#, "[]", "{}", r#"[1,"two",null]"#,
+        ] {
+            let (out, masked) = exported(unchanged);
+            assert_eq!(out, unchanged);
+            assert!(masked.is_empty(), "{unchanged}");
+        }
+    }
+
+    #[test]
+    fn export_puts_identifiers_first_and_keeps_the_servers_order_otherwise() {
+        // Behind `@type` when there is one, wherever the two were.
+        assert_eq!(
+            exported(r#"{"zeta":1,"name":"x","identifiers":{"com.a.b":"1"},"alpha":2,"@type":"person"}"#).0,
+            r#"{"@type":"person","identifiers":{"com.a.b":"1"},"zeta":1,"name":"x","alpha":2}"#
+        );
+        // First when there is none.
+        assert_eq!(
+            exported(r#"{"zeta":1,"identifiers":{"com.a.b":"1"},"alpha":2}"#).0,
+            r#"{"identifiers":{"com.a.b":"1"},"zeta":1,"alpha":2}"#
+        );
+        // Whatever `identifiers` holds.
+        assert_eq!(exported(r#"{"name":"x","identifiers":null}"#).0, r#"{"identifiers":null,"name":"x"}"#);
+        // An object without `identifiers` is not reordered, `@type` included.
+        let untouched = r#"{"zeta":1,"@type":"thing","alpha":{"b":1,"a":2}}"#;
+        assert_eq!(exported(untouched).0, untouched);
+        // Nor are the members of `identifiers` itself.
+        assert_eq!(
+            exported(r#"{"identifiers":{"zeta.a.b":"1","key":"k","alpha.a.b":"2","@type":"t"}}"#).0,
+            r#"{"identifiers":{"zeta.a.b":"1","alpha.a.b":"2","@type":"t"}}"#
+        );
+    }
+
+    #[test]
+    fn export_nulls_masked_values_and_names_their_properties() {
+        let (out, masked) = exported(
+            r#"{"secret":"********","nested":{"password":"*******","apiKey":"********","fine":"*****"},
+                "list":["********","kept"],"secret2":"********x","name":"********"}"#,
+        );
+        assert_eq!(
+            out,
+            r#"{"secret":null,"nested":{"password":null,"apiKey":null,"fine":"*****"},"list":[null,"kept"],"secret2":"********x","name":null}"#
+        );
+        // Sorted, each once; a value in a list goes by the list's name.
+        assert_eq!(masked, ["apiKey", "list", "name", "password", "secret"]);
+
+        // The same name twice is one name.
+        let (_, masked) = exported(r#"[{"secret":"********"},{"secret":"********"}]"#);
+        assert_eq!(masked, ["secret"]);
+        // A body that is one masked value has no property to name.
+        let (out, masked) = exported(r#""********""#);
+        assert_eq!((out.as_str(), masked), ("null", vec!["(value)".to_string()]));
+
+        // A masked key is nothing to keep: it becomes null and stays, and no
+        // external identifier is made from it.
+        let (out, masked) = exported(r#"{"identifiers":{"key":"********"},"name":"x"}"#);
+        assert_eq!(out, r#"{"identifiers":{"key":null},"name":"x"}"#);
+        assert_eq!(masked, ["key"]);
+    }
+
+    #[test]
+    fn export_body_prints_json_indented_or_compact_and_ndjson_by_line() {
+        let json = r#"[{"identifiers":{"key":"a"},"n":1}]"#;
+        let pretty = export_body(json, SEED, false, false);
+        assert_eq!(
+            pretty.text,
+            "[\n  {\n    \"identifiers\": {\n      \"com.heads.seedID\": \"a\"\n    },\n    \"n\": 1\n  }\n]"
+        );
+        assert!(pretty.is_json && pretty.masked.is_empty());
+        assert_eq!(export_body(json, SEED, false, true).text, r#"[{"identifiers":{"com.heads.seedID":"a"},"n":1}]"#);
+        // The server's own indentation is read like any other.
+        assert_eq!(export_body(&pretty.text, SEED, false, true).text, r#"[{"identifiers":{"com.heads.seedID":"a"},"n":1}]"#);
+
+        // NDJSON: one compact value per line, blank lines and the final
+        // newline as they were, whatever `compact` says.
+        let ndjson = "{\"identifiers\":{\"key\":\"a\"}}\n\n{\"identifiers\":{\"key\":\"b\",\"com.x.y\":\"1\"},\"secret\":\"********\"}\n";
+        let by_line = export_body(ndjson, SEED, true, false);
+        assert_eq!(by_line.text, "{\"identifiers\":{\"com.heads.seedID\":\"a\"}}\n\n{\"identifiers\":{\"com.x.y\":\"1\"},\"secret\":null}\n");
+        assert_eq!(by_line.masked, ["secret"]);
+        assert_eq!(export_body(ndjson.trim_end(), SEED, true, false).text, by_line.text.trim_end());
+        // Lines of JSON are read as NDJSON also when nothing said they were.
+        assert_eq!(export_body(ndjson, SEED, false, false).text, by_line.text);
+        // One line is both: what was asked for decides how it is printed.
+        let one = r#"{"identifiers":{"key":"a"}}"#;
+        assert_eq!(export_body(one, SEED, true, false).text, r#"{"identifiers":{"com.heads.seedID":"a"}}"#);
+        assert!(export_body(one, SEED, false, false).text.contains("\n  \"identifiers\": {"));
+        // An indented JSON body asked for as NDJSON is still JSON.
+        assert_eq!(export_body(&pretty.text, SEED, true, true).text, r#"[{"identifiers":{"com.heads.seedID":"a"},"n":1}]"#);
+    }
+
+    #[test]
+    fn export_body_leaves_what_is_not_json_unchanged_and_says_so() {
+        for text in ["@type,givenName\nperson,Ann\n", "INSERT INTO people VALUES (1);\n", "<html></html>", "{\"cut\": "] {
+            let body = export_body(text, SEED, false, false);
+            assert_eq!((body.text.as_str(), body.is_json), (text, false));
+            assert_eq!(
+                export_warning(&body).as_deref(),
+                Some("WARNING: --export left a response that is not JSON unchanged")
+            );
+        }
+        // One bad line makes the whole body not NDJSON; no line is rewritten.
+        let mixed = "{\"identifiers\":{\"key\":\"a\"},\"secret\":\"********\"}\nnot json\n";
+        let body = export_body(mixed, SEED, true, false);
+        assert_eq!((body.text.as_str(), body.is_json), (mixed, false));
+        assert!(body.masked.is_empty());
+
+        // An empty body (a 204) is nothing to export and nothing to warn about.
+        for empty in ["", "\n", "  "] {
+            let body = export_body(empty, SEED, false, false);
+            assert_eq!((body.text.as_str(), body.is_json), (empty, true));
+            assert_eq!(export_warning(&body), None);
+        }
+        assert_eq!(export_warning(&export_body("[1]", SEED, false, false)), None);
+        assert_eq!(
+            export_warning(&export_body(r#"{"b":"********","a":"*******"}"#, SEED, false, false)).as_deref(),
+            Some("WARNING: Response had masked data, replaced with null for keys: a, b")
+        );
     }
 
     #[test]

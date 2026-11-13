@@ -2273,6 +2273,227 @@ fn fail_fast_against_the_assert_endpoint_of_a_local_cos() {
     assert!(stdout.contains("HTTP/1.1 400 Bad Request") && !stdout.contains("GET /echo-all"), "{stdout}");
 }
 
+// ----- --export -----
+
+const SEED: &str = "com.heads.seedID";
+
+/// A user as the API prints one: its own record has only a database key, the
+/// agent below it has an external identifier as well, and a secret is masked.
+const USERS: &str = r#"[{"name":"Integration","@type":"user","identifiers":{"@type":"user identifiers","key":"2a196c5b"},"agent":{"@type":"agent","identifiers":{"key":"c59cf786","com.heads.seedID":"root-organization"},"name":"System"},"oauth2Clients":[{"identifiers":{"key":"6ac6a3b8","clientID":"mock"},"secret":"********"}]}]"#;
+/// The same as seed data, on one line.
+const USERS_EXPORTED: &str = r#"[{"@type":"user","identifiers":{"@type":"user identifiers","com.heads.seedID":"2a196c5b"},"name":"Integration","agent":{"@type":"agent","identifiers":{"com.heads.seedID":"root-organization"},"name":"System"},"oauth2Clients":[{"identifiers":{"clientID":"mock"},"secret":null}]}]"#;
+const MASKED_WARNING: &str = "WARNING: Response had masked data, replaced with null for keys: secret";
+
+struct ExportRun {
+    ok: bool,
+    stdout: String,
+    stderr: String,
+    seen: Vec<String>,
+    dir: tempfile::TempDir,
+}
+
+/// Run the client with `args` in a fresh directory against a server giving
+/// `answers`.
+fn run_export(args: &[&str], answers: Vec<(&'static str, &'static str)>) -> ExportRun {
+    let (port, server) = answering_server(answers);
+    let dir = tempdir().unwrap();
+    let out = api_against_port(port)
+        .env("NO_COLOR", "1")
+        .current_dir(dir.path())
+        .args(args)
+        .output()
+        .expect("api runs");
+    ExportRun {
+        ok: out.status.success(),
+        stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+        seen: server.join().expect("server thread"),
+        dir,
+    }
+}
+
+fn compact(json: &str) -> String {
+    serde_json::to_string(&serde_json::from_str::<serde_json::Value>(json).unwrap_or_else(|e| panic!("{e}: {json}"))).unwrap()
+}
+
+#[test]
+fn export_rewrites_a_response_as_seed_data() {
+    let run = run_export(&["--export", SEED, "GET", "/users"], vec![("200 OK", USERS)]);
+    assert!(run.ok, "{}", run.stderr);
+    assert_eq!(run.seen, vec!["GET /users"]);
+    // Indented, the members in the server's order behind `@type` and `identifiers`.
+    assert!(run.stdout.starts_with("[\n  {\n    \"@type\": \"user\",\n    \"identifiers\": {\n"), "{}", run.stdout);
+    assert_eq!(compact(&run.stdout), USERS_EXPORTED);
+    assert!(!run.stdout.contains("\"key\""), "{}", run.stdout);
+    // The status line and the warning go to stderr; stdout is the data alone.
+    assert!(run.stderr.contains("HTTP/1.1 200 OK"), "{}", run.stderr);
+    assert!(run.stderr.contains(MASKED_WARNING), "{}", run.stderr);
+
+    // `-r` prints it on one line; `-s` drops the status line, not the warning.
+    let run = run_export(&["--export", SEED, "-sr", "GET", "/users"], vec![("200 OK", USERS)]);
+    assert_eq!(run.stdout, format!("{USERS_EXPORTED}\n"));
+    assert_eq!(run.stderr.trim(), MASKED_WARNING);
+
+    // Without the flag the response is what the server sent.
+    let run = run_export(&["-sr", "GET", "/users"], vec![("200 OK", USERS)]);
+    assert_eq!(run.stdout, format!("{USERS}\n"));
+    assert_eq!(run.stderr, "");
+}
+
+#[test]
+fn export_wants_a_name_of_three_dotted_segments_before_it_sends_anything() {
+    for name in ["GET", "seedID", "com.heads", "com.heads.seed.ID", "com.heads.seed_ID"] {
+        let run = run_export(&["--export", name, "GET", "/users"], vec![("200 OK", USERS)]);
+        assert!(!run.ok, "{name}");
+        assert!(run.stderr.contains(&format!("invalid export identifier: {name}")), "{name}: {}", run.stderr);
+        assert_eq!(run.seen, Vec::<String>::new(), "{name}");
+        assert_eq!(run.stdout, "");
+    }
+}
+
+#[test]
+fn export_writes_seed_data_to_an_outfile_and_appends_it() {
+    let batch = "GET /users > users.json\nGET /users >> users.json\nGET /users\n";
+    let (port, server) = answering_server(vec![("200 OK", USERS)]);
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("batch.api"), batch).unwrap();
+    let out = api_against_port(port)
+        .env("NO_COLOR", "1")
+        .current_dir(dir.path())
+        .args(["--export", SEED, "-sa", "batch.api"])
+        .output()
+        .unwrap();
+    assert_eq!(server.join().unwrap().len(), 3);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    // The file holds the seed data of both requests, spliced into one list.
+    let written: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.path().join("users.json")).unwrap()).unwrap();
+    let one: serde_json::Value = serde_json::from_str(USERS_EXPORTED).unwrap();
+    assert_eq!(written, serde_json::json!([one[0], one[0]]));
+    // `-sa` still prints no body, exported or not; the warning is once per response.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("seedID") && !stdout.contains("2a196c5b"), "{stdout}");
+    assert_eq!(String::from_utf8_lossy(&out.stderr).matches(MASKED_WARNING).count(), 3);
+
+    // One request, redirected.
+    let run = run_export(&["--export", SEED, "GET", "/users", ">", "one.json"], vec![("200 OK", USERS)]);
+    assert!(run.ok, "{}", run.stderr);
+    assert_eq!(run.stdout, "");
+    assert_eq!(compact(&std::fs::read_to_string(run.dir.path().join("one.json")).unwrap()), USERS_EXPORTED);
+}
+
+#[test]
+fn export_leaves_an_error_body_as_the_server_sent_it() {
+    const REFUSED: &str = r#"{"@type":"conflict","identifiers":{"key":"abc"},"secret":"********"}"#;
+    for flags in [&["--export", SEED, "-sr"][..], &["--export", SEED, "-sfr"]] {
+        let run = run_export(&[flags, &["GET", "/users"]].concat(), vec![("409 Conflict", REFUSED)]);
+        assert_eq!(run.stdout, format!("{REFUSED}\n"), "{flags:?}");
+        assert!(!run.stderr.contains("WARNING"), "{flags:?}: {}", run.stderr);
+        assert_eq!(run.ok, !flags.contains(&"-sfr"), "{flags:?}");
+    }
+}
+
+#[test]
+fn a_chain_is_judged_on_what_the_server_said_not_on_the_seed_data() {
+    // A masked value is a "yes" from the server, and `null` once exported.
+    let run = run_export(
+        &["--export", SEED, "-sr", "GET /secret && GET /users"],
+        vec![("200 OK", r#""********""#), ("200 OK", USERS)],
+    );
+    assert!(run.ok, "{}", run.stderr);
+    assert_eq!(run.seen, vec!["GET /secret", "GET /users"]);
+}
+
+#[test]
+fn export_rewrites_ndjson_by_line_and_leaves_csv_alone() {
+    const LINES: &str = "{\"identifiers\":{\"key\":\"a\"},\"n\":1}\n{\"identifiers\":{\"key\":\"b\",\"com.x.y\":\"1\"},\"secret\":\"********\"}\n";
+    let run = run_export(&["--export", SEED, "-s", "--ndjson", "GET", "/people"], vec![("200 OK", LINES)]);
+    assert!(run.ok, "{}", run.stderr);
+    assert_eq!(
+        run.stdout,
+        "{\"identifiers\":{\"com.heads.seedID\":\"a\"},\"n\":1}\n{\"identifiers\":{\"com.x.y\":\"1\"},\"secret\":null}\n"
+    );
+    assert_eq!(run.stderr.trim(), MASKED_WARNING);
+
+    // One line asked for as NDJSON stays one line.
+    let run = run_export(&["--export", SEED, "-s", "--ndjson", "GET", "/people"], vec![("200 OK", "{\"identifiers\":{\"key\":\"a\"}}\n")]);
+    assert_eq!(run.stdout, "{\"identifiers\":{\"com.heads.seedID\":\"a\"}}\n");
+
+    // Not JSON: passed on unchanged, with a warning that it was.
+    const CSV: &str = "key,name\nabc,Ann\n";
+    let run = run_export(&["--export", SEED, "-s", "GET", "/people", ">", "people.csv"], vec![("200 OK", CSV)]);
+    assert!(run.ok, "{}", run.stderr);
+    assert_eq!(std::fs::read_to_string(run.dir.path().join("people.csv")).unwrap(), CSV);
+    assert!(run.stderr.contains("WARNING: --export left a response that is not JSON unchanged"), "{}", run.stderr);
+
+    // An empty answer is nothing to export and nothing to warn about: the
+    // output is what it is without the flag.
+    let plain = run_export(&["-s", "DELETE", "/people/1"], vec![("204 No Content", "")]);
+    let run = run_export(&["--export", SEED, "-s", "DELETE", "/people/1"], vec![("204 No Content", "")]);
+    assert!(run.ok);
+    assert_eq!((run.stdout.as_str(), run.stderr.as_str()), (plain.stdout.as_str(), ""));
+}
+
+#[test]
+fn export_does_not_ask_for_a_streamed_response() {
+    let headers = captured_request_headers(&["--stream", "--export", SEED], &[]);
+    assert!(!headers.contains("stream=true"), "--export reads the whole body: {headers}");
+    let headers = captured_request_headers(&["--export", SEED], &[("API_STREAMING", "1")]);
+    assert!(!headers.contains("stream=true"), "{headers}");
+    // And with `--stream` the seed data is what is written, whole.
+    let run = run_export(&["--export", SEED, "--stream", "-sr", "GET", "/users", ">", "users.json"], vec![("200 OK", USERS)]);
+    assert!(run.ok, "{}", run.stderr);
+    assert_eq!(std::fs::read_to_string(run.dir.path().join("users.json")).unwrap(), USERS_EXPORTED);
+}
+
+/// Against a local CommerceOS: what is echoed, and what is really there.
+/// Nothing is stored by either.
+#[test]
+fn export_against_a_local_cos() {
+    require_local_cos();
+    // An echo answers the body it was sent. The body names no `@type`: one
+    // that does is read as that type, and a made-up key is then refused.
+    let echoed = api()
+        .env("NO_COLOR", "1")
+        .args([
+            "--export", SEED, "-sr", "PUT", "/echo-all",
+            r#"[{"name":"Ann","identifiers":{"key":"k1"},"secret":"********","boss":{"identifiers":{"key":"k2","com.mi6.id":"M"}}}]"#,
+        ])
+        .output()
+        .unwrap();
+    assert!(echoed.status.success(), "{}", String::from_utf8_lossy(&echoed.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&echoed.stdout).trim(),
+        r#"[{"identifiers":{"com.heads.seedID":"k1"},"name":"Ann","secret":null,"boss":{"identifiers":{"com.mi6.id":"M"}}}]"#
+    );
+    assert!(String::from_utf8_lossy(&echoed.stderr).contains(MASKED_WARNING));
+
+    // Real records: no database key is left, and none has lost every identifier.
+    fn check(value: &serde_json::Value, records: &mut usize) {
+        match value {
+            serde_json::Value::Object(object) => {
+                if let Some(serde_json::Value::Object(identifiers)) = object.get("identifiers") {
+                    *records += 1;
+                    assert!(!identifiers.contains_key("key"), "a key was left: {identifiers:?}");
+                    assert!(identifiers.keys().any(|name| name != "@type"), "no identifier left: {object:?}");
+                    let leading: Vec<&String> = object.keys().take(2).collect();
+                    assert!(leading.contains(&&"identifiers".to_string()), "identifiers not in front: {leading:?}");
+                }
+                object.values().for_each(|member| check(member, records));
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(|item| check(item, records)),
+            _ => {}
+        }
+    }
+    for uri in ["/users~take(5)", "/people~take(5)", "/companies~take(5)"] {
+        let out = api().args(["--export", SEED, "-s", "GET", uri]).output().unwrap();
+        assert!(out.status.success(), "{uri}: {}", String::from_utf8_lossy(&out.stderr));
+        let seed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{uri}: {e}"));
+        let mut records = 0;
+        check(&seed, &mut records);
+        assert!(records > 0, "{uri} answered no records to check");
+    }
+}
+
 // ----- import git -----
 
 fn git_in(dir: &std::path::Path, args: &[&str]) -> String {

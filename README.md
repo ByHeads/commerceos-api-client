@@ -72,6 +72,14 @@ api sleep 5 while not /imports~count                         # poll until it fli
 api seed.api                                                 # run a file, same as -a seed.api
 ```
 
+`--export <external-id>` turns a response into seed data that can be `PUT` to another environment:
+database keys are dropped, a record with no other identifier keeps its key under the name you give,
+and masked values become `null` (with a warning).
+
+```sh
+api --export com.heads.seedID GET /users > users.json
+```
+
 A first word that is neither a method nor a path is an error (`not a request or .api file`),
 not a request to a nonsense path. Bodies are read as in a batch file, comments stripped and
 raw newlines inside strings escaped, and a `> file` may sit in any argument.
@@ -301,6 +309,7 @@ Usage: api [OPTIONS] [METHOD] [URI] [BODY]
   -s, --silent                    No status output; with -a, one status line per request
   -p, --preview                   Show the request(s) and confirm before sending
   -f, --fail-fast                 Stop at the first response of 400 or above: print its body, exit 1
+      --export <EXTERNAL_ID>      Rewrite responses as seed data: drop database keys, keeping a lone one as EXTERNAL_ID
   -r, --raw                       No pretty-printing
   -i, --include-nulls             Include null values in the response
       --ndjson                    NDJSON request and response
