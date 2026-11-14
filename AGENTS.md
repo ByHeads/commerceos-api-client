@@ -643,9 +643,11 @@ What it does to every object in the response, however deep:
   another.
 - **A masked value (`********`) becomes `null`**, and a line on stderr says
   where: `Response had masked data, now null at oauth2Clients/secret,
-  localCredentials/password`. A path is written from the top of the response
-  and leaves out positions in lists, so it is named once however many records
-  had it. The secret is not in the export; set it some other way.
+  localCredentials/password and 1 other place`. A path is written from the
+  top of the response and leaves out positions in lists, so it is one place
+  however many records had it. Two places are named and the rest are
+  counted; search the export for `null` to find them all. The secret is not
+  in the export; set it some other way.
 - **`identifiers` moves to the front of its object**, behind `@type`. Other
   members keep the order the server gave them.
 

@@ -4561,7 +4561,15 @@ fn export_warning(exported: &ExportedBody) -> Option<String> {
     } else if exported.masked.is_empty() {
         None
     } else {
-        Some(format!("Response had masked data, now null at {}", exported.masked.join(", ")))
+        // Two places are named; the rest are counted, so the line stays one
+        // line however much of a response was masked.
+        let named = exported.masked.iter().take(2).map(String::as_str).collect::<Vec<_>>().join(", ");
+        let more = match exported.masked.len().saturating_sub(2) {
+            0 => String::new(),
+            1 => " and 1 other place".to_string(),
+            n => format!(" and {} other places", n),
+        };
+        Some(format!("Response had masked data, now null at {}{}", named, more))
     }
 }
 
@@ -18990,6 +18998,22 @@ mod tests {
         assert_eq!(
             export_warning(&export_body(r#"{"b":"********","a":{"c":"*******"}}"#, SEED, false, false)).as_deref(),
             Some("Response had masked data, now null at b, a/c")
+        );
+        // Two places are named and the rest counted.
+        let warned = |json: &str| export_warning(&export_body(json, SEED, false, false));
+        assert_eq!(warned(r#"{"a":"********"}"#).as_deref(), Some("Response had masked data, now null at a"));
+        assert_eq!(
+            warned(r#"{"a":"********","b":"********","c":"********"}"#).as_deref(),
+            Some("Response had masked data, now null at a, b and 1 other place")
+        );
+        assert_eq!(
+            warned(r#"{"a":"********","b":{"x":"********","y":"********"},"c":["********"],"d":"********"}"#).as_deref(),
+            Some("Response had masked data, now null at a, b/x and 3 other places")
+        );
+        // Places are counted, not values: one path in many records is one.
+        assert_eq!(
+            warned(r#"[{"a":"********","b":"********"},{"a":"********","b":"********"}]"#).as_deref(),
+            Some("Response had masked data, now null at a, b")
         );
         // NDJSON lines share one list: a path is named once across them.
         assert_eq!(

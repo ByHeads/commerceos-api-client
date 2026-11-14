@@ -2343,6 +2343,15 @@ fn export_rewrites_a_response_as_seed_data() {
 }
 
 #[test]
+fn export_names_two_masked_places_and_counts_the_rest() {
+    const MASKED: &str = r#"[{"password":"********","clients":[{"secret":"********","pin":"*******"}],"apiKey":"********"},{"password":"********"}]"#;
+    let run = run_export(&["--export", SEED, "-sr", "GET", "/users"], vec![("200 OK", MASKED)]);
+    assert!(run.ok, "{}", run.stderr);
+    assert_eq!(run.stderr.trim(), "Response had masked data, now null at password, clients/secret and 2 other places");
+    assert_eq!(run.stdout.trim(), r#"[{"password":null,"clients":[{"secret":null,"pin":null}],"apiKey":null},{"password":null}]"#);
+}
+
+#[test]
 fn export_wants_a_name_of_three_dotted_segments_before_it_sends_anything() {
     for name in ["GET", "seedID", "com.heads", "com.heads.seed.ID", "com.heads.seed_ID"] {
         let run = run_export(&["--export", name, "GET", "/users"], vec![("200 OK", USERS)]);
