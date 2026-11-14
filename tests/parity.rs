@@ -709,7 +709,7 @@ fn the_prompt_reads_the_same_lines() {
 #[test]
 fn export_rewrites_the_same_way_in_a_file_from_stdin_and_as_arguments() {
     const EXPORTED: &str = "{\n  \"identifiers\": {\n    \"com.heads.seedID\": \"k1\"\n  },\n  \"name\": \"Ann\",\n  \"secret\": null\n}\n";
-    const WARNING: &str = "WARNING: Response had masked data, replaced with null for keys: secret";
+    const WARNING: &str = "Response had masked data, now null at secret";
     let server = RecordingServer::start();
     let dir = tempfile::tempdir().unwrap();
     prepare(dir.path());
@@ -799,7 +799,8 @@ fn export_at_the_prompt_shows_the_seed_data() {
     assert!(shown.contains("\"com.heads.seedID\": \"k1\""), "{shown}");
     assert!(shown.contains("\"secret\": null"), "{shown}");
     assert!(!shown.contains("\"key\"") && !shown.contains("********"), "{shown}");
-    assert!(shown.contains("replaced with null for keys: secret"), "{shown}");
+    assert!(shown.contains("Response had masked data, now null at secret"), "{shown}");
+    assert!(!shown.contains("WARNING"), "{shown}");
 
     // Written to a file from the prompt, it is the seed data too.
     let (sent, _) = run("GET /keyed > prompt-out.json");

@@ -641,10 +641,11 @@ What it does to every object in the response, however deep:
   one. A record with **no** other identifier keeps the key's value under the
   name you gave, so the next `PUT` finds the record it made instead of making
   another.
-- **A masked value (`********`) becomes `null`**, and a warning on stderr names
-  the properties: `WARNING: Response had masked data, replaced with null for
-  keys: password, secret`. The secret is not in the export; set it some other
-  way.
+- **A masked value (`********`) becomes `null`**, and a line on stderr says
+  where: `Response had masked data, now null at oauth2Clients/secret,
+  localCredentials/password`. A path is written from the top of the response
+  and leaves out positions in lists, so it is named once however many records
+  had it. The secret is not in the export; set it some other way.
 - **`identifiers` moves to the front of its object**, behind `@type`. Other
   members keep the order the server gave them.
 
@@ -658,7 +659,7 @@ Rules:
   `-f` output is unaffected, and request bodies are never touched.
 - It works for one request, in a batch (`api --export com.heads.seedID -sa
   export.api`, with a `> file` per request), and at the interactive prompt
-  (the warning shows in the hint line).
+  (the masked-data line shows in the hint line).
 - Output is indented; `-r` prints it on one line. NDJSON (`--ndjson`, or a
   `> file.ndjson`) is rewritten line by line.
 - A response that is not JSON (a `> file.csv`, a `.sql`) is written unchanged,
@@ -820,7 +821,7 @@ Run it: `api -sa workshop.api`.
 - **`"token_env": "<the token>"`** → rejected or reported as an unset variable. It takes the *name* of an environment variable, so the secret stays out of the file.
 - **`import dir cl { "path": "cl" }`** → `import alias … clashes`. An alias can't share its name with a file or directory next to the `.api` file; name the alias something else.
 - **Seeding from a plain `GET`** → the response carries `identifiers.key`, a database key of the environment it was read from. Written elsewhere it is refused or creates duplicates. Read it with `--export <external-id>`.
-- **Expecting secrets in an export** → the API masks them (`********`) and `--export` turns that into `null`, with a warning. A password, an API key or a client secret has to be set separately.
+- **Expecting secrets in an export** → the API masks them (`********`) and `--export` turns that into `null`, and says where (`Response had masked data, now null at …`). A password, an API key or a client secret has to be set separately.
 - **Expecting a failed request to stop a batch** → it doesn't, unless the line is an `assert`, a chain or a poll, or the run has `-f`. A plain `PUT /assert {…}` that answers 409 is logged and the next line runs. Run with `-f`.
 - **Chaining on `PUT /assert`** → a passing `/assert` answers `200` with `null`, which is falsy, so `PUT /assert {…} && …` skips what follows and `assert PUT /assert {…}` fails on a pass. Write it on its own line and run with `-f`.
 - **`assert` on a list endpoint** → `[]` is truthy, so `assert GET /people~where(x)` passes even when nothing matches. Assert a `~count` or a single item by identifier instead.

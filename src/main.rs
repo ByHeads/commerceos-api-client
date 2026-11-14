@@ -4421,32 +4421,38 @@ fn is_external_id_name(name: &str) -> bool {
 /// created anew by every run of the seed, so its key is kept as the value of
 /// the external identifier `id_key`, which finds it again the next time.
 ///
-/// Beyond that: a masked value becomes `null` (its property's name is added
-/// to `masked`, so the caller can say what was lost), and `identifiers` is
+/// Beyond that: a masked value becomes `null` (where it was is added to
+/// `masked`, so the caller can say what was lost), and `identifiers` is
 /// moved to the front of its object, behind `@type`, where a reader looks for
 /// it. Members otherwise keep the order the server gave them.
 ///
 /// Children are rewritten before the object that holds them, so a masked
 /// `key` is `null` by the time its record is looked at and is left alone.
-fn export_value(
-    value: &mut Value,
-    id_key: &str,
-    property: Option<&str>,
-    masked: &mut std::collections::BTreeSet<String>,
-) {
+fn export_value(value: &mut Value, id_key: &str, path: &mut String, masked: &mut Vec<String>) {
     match value {
         Value::String(text) if MASKED_VALUES.contains(&text.as_str()) => {
-            masked.insert(property.unwrap_or("(value)").to_string());
+            let at = if path.is_empty() { "(root)" } else { path.as_str() };
+            if !masked.iter().any(|seen| seen == at) {
+                masked.push(at.to_string());
+            }
             *value = Value::Null;
         }
+        // An item is at its list's path: `clients/secret` names the secret of
+        // every client, once, however many there are.
         Value::Array(items) => {
             for item in items {
-                export_value(item, id_key, property, masked);
+                export_value(item, id_key, path, masked);
             }
         }
         Value::Object(object) => {
+            let parent = path.len();
             for (name, member) in object.iter_mut() {
-                export_value(member, id_key, Some(name), masked);
+                if parent > 0 {
+                    path.push('/');
+                }
+                path.push_str(name);
+                export_value(member, id_key, path, masked);
+                path.truncate(parent);
             }
             export_identifiers(object, id_key);
             put_identifiers_first(object);
@@ -4497,7 +4503,9 @@ fn put_identifiers_first(object: &mut Map<String, Value>) {
 #[derive(Debug, PartialEq)]
 struct ExportedBody {
     text: String,
-    /// The names of the properties whose masked values became `null`, sorted.
+    /// Where the masked values that became `null` were: paths from the top
+    /// of the response, without positions in lists, each once, in the order
+    /// they were first met.
     masked: Vec<String>,
     /// Whether the body was JSON (or NDJSON). One that is not is unchanged.
     is_json: bool,
@@ -4511,19 +4519,20 @@ struct ExportedBody {
 /// line that is both. Anything else (CSV, SQL, text) is returned unchanged
 /// and reported through `is_json`.
 fn export_body(text: &str, id_key: &str, ndjson: bool, compact: bool) -> ExportedBody {
-    let mut masked = std::collections::BTreeSet::new();
-    let whole = |masked: &mut std::collections::BTreeSet<String>| -> Option<String> {
+    let whole = || -> Option<(String, Vec<String>)> {
         let mut value: Value = serde_json::from_str(text).ok()?;
-        export_value(&mut value, id_key, None, masked);
-        if compact { serde_json::to_string(&value).ok() } else { serde_json::to_string_pretty(&value).ok() }
+        let mut masked = Vec::new();
+        export_value(&mut value, id_key, &mut String::new(), &mut masked);
+        let out = if compact { serde_json::to_string(&value) } else { serde_json::to_string_pretty(&value) };
+        Some((out.ok()?, masked))
     };
-    let by_line = |masked: &mut std::collections::BTreeSet<String>| -> Option<String> {
-        let mut found = std::collections::BTreeSet::new();
+    let by_line = || -> Option<(String, Vec<String>)> {
+        let mut masked = Vec::new();
         let mut out = String::with_capacity(text.len());
         for line in text.lines() {
             if !line.trim().is_empty() {
                 let mut value: Value = serde_json::from_str(line).ok()?;
-                export_value(&mut value, id_key, None, &mut found);
+                export_value(&mut value, id_key, &mut String::new(), &mut masked);
                 out.push_str(&serde_json::to_string(&value).ok()?);
             }
             out.push('\n');
@@ -4531,19 +4540,14 @@ fn export_body(text: &str, id_key: &str, ndjson: bool, compact: bool) -> Exporte
         if !text.ends_with('\n') {
             out.pop();
         }
-        masked.extend(found);
-        Some(out)
+        Some((out, masked))
     };
     if text.trim().is_empty() {
         return ExportedBody { text: text.to_string(), masked: Vec::new(), is_json: true };
     }
-    let exported = if ndjson {
-        by_line(&mut masked).or_else(|| whole(&mut masked))
-    } else {
-        whole(&mut masked).or_else(|| by_line(&mut masked))
-    };
+    let exported = if ndjson { by_line().or_else(whole) } else { whole().or_else(by_line) };
     match exported {
-        Some(text) => ExportedBody { text, masked: masked.into_iter().collect(), is_json: true },
+        Some((text, masked)) => ExportedBody { text, masked, is_json: true },
         None => ExportedBody { text: text.to_string(), masked: Vec::new(), is_json: false },
     }
 }
@@ -4557,10 +4561,7 @@ fn export_warning(exported: &ExportedBody) -> Option<String> {
     } else if exported.masked.is_empty() {
         None
     } else {
-        Some(format!(
-            "WARNING: Response had masked data, replaced with null for keys: {}",
-            exported.masked.join(", ")
-        ))
+        Some(format!("Response had masked data, now null at {}", exported.masked.join(", ")))
     }
 }
 
@@ -18767,12 +18768,12 @@ mod tests {
 
     const SEED: &str = "com.heads.seedID";
 
-    /// `json` after `--export`, compact, and the masked property names.
+    /// `json` after `--export`, compact, and where its masked values were.
     fn exported(json: &str) -> (String, Vec<String>) {
         let mut value: Value = serde_json::from_str(json).unwrap();
-        let mut masked = std::collections::BTreeSet::new();
-        export_value(&mut value, SEED, None, &mut masked);
-        (serde_json::to_string(&value).unwrap(), masked.into_iter().collect())
+        let mut masked = Vec::new();
+        export_value(&mut value, SEED, &mut String::new(), &mut masked);
+        (serde_json::to_string(&value).unwrap(), masked)
     }
 
     #[test]
@@ -18894,7 +18895,7 @@ mod tests {
     }
 
     #[test]
-    fn export_nulls_masked_values_and_names_their_properties() {
+    fn export_nulls_masked_values_and_says_where_they_were() {
         let (out, masked) = exported(
             r#"{"secret":"********","nested":{"password":"*******","apiKey":"********","fine":"*****"},
                 "list":["********","kept"],"secret2":"********x","name":"********"}"#,
@@ -18903,21 +18904,34 @@ mod tests {
             out,
             r#"{"secret":null,"nested":{"password":null,"apiKey":null,"fine":"*****"},"list":[null,"kept"],"secret2":"********x","name":null}"#
         );
-        // Sorted, each once; a value in a list goes by the list's name.
-        assert_eq!(masked, ["apiKey", "list", "name", "password", "secret"]);
+        // Paths from the top, in the order they were met; a value in a list
+        // is at the list's path.
+        assert_eq!(masked, ["secret", "nested/password", "nested/apiKey", "list", "name"]);
 
-        // The same name twice is one name.
+        // A list adds no position, so what every record has is named once,
+        // at any depth, and the response being a list itself adds nothing.
+        let (out, masked) = exported(
+            r#"[{"clients":[{"secret":"********"},{"secret":"********","node":{"pin":"*******"}}],"creds":[{"apiKey":"********"}]},
+                {"clients":[{"secret":"********"}],"creds":[]}]"#,
+        );
+        assert_eq!(masked, ["clients/secret", "clients/node/pin", "creds/apiKey"]);
+        assert!(!out.contains('*'), "{out}");
         let (_, masked) = exported(r#"[{"secret":"********"},{"secret":"********"}]"#);
         assert_eq!(masked, ["secret"]);
-        // A body that is one masked value has no property to name.
-        let (out, masked) = exported(r#""********""#);
-        assert_eq!((out.as_str(), masked), ("null", vec!["(value)".to_string()]));
+        // The same name in two places is two paths.
+        let (_, masked) = exported(r#"{"a":{"secret":"********"},"b":{"secret":"********"}}"#);
+        assert_eq!(masked, ["a/secret", "b/secret"]);
+        // A body that is one masked value has no path below the top.
+        for body in [r#""********""#, r#"["********"]"#] {
+            assert_eq!(exported(body).1, ["(root)"], "{body}");
+        }
+        assert_eq!(exported(r#""********""#).0, "null");
 
         // A masked key is nothing to keep: it becomes null and stays, and no
         // external identifier is made from it.
         let (out, masked) = exported(r#"{"identifiers":{"key":"********"},"name":"x"}"#);
         assert_eq!(out, r#"{"identifiers":{"key":null},"name":"x"}"#);
-        assert_eq!(masked, ["key"]);
+        assert_eq!(masked, ["identifiers/key"]);
     }
 
     #[test]
@@ -18974,8 +18988,14 @@ mod tests {
         }
         assert_eq!(export_warning(&export_body("[1]", SEED, false, false)), None);
         assert_eq!(
-            export_warning(&export_body(r#"{"b":"********","a":"*******"}"#, SEED, false, false)).as_deref(),
-            Some("WARNING: Response had masked data, replaced with null for keys: a, b")
+            export_warning(&export_body(r#"{"b":"********","a":{"c":"*******"}}"#, SEED, false, false)).as_deref(),
+            Some("Response had masked data, now null at b, a/c")
+        );
+        // NDJSON lines share one list: a path is named once across them.
+        assert_eq!(
+            export_warning(&export_body("{\"s\":\"********\"}\n{\"s\":\"********\",\"t\":\"********\"}\n", SEED, true, false))
+                .as_deref(),
+            Some("Response had masked data, now null at s, t")
         );
     }
 

@@ -2282,7 +2282,9 @@ const SEED: &str = "com.heads.seedID";
 const USERS: &str = r#"[{"name":"Integration","@type":"user","identifiers":{"@type":"user identifiers","key":"2a196c5b"},"agent":{"@type":"agent","identifiers":{"key":"c59cf786","com.heads.seedID":"root-organization"},"name":"System"},"oauth2Clients":[{"identifiers":{"key":"6ac6a3b8","clientID":"mock"},"secret":"********"}]}]"#;
 /// The same as seed data, on one line.
 const USERS_EXPORTED: &str = r#"[{"@type":"user","identifiers":{"@type":"user identifiers","com.heads.seedID":"2a196c5b"},"name":"Integration","agent":{"@type":"agent","identifiers":{"com.heads.seedID":"root-organization"},"name":"System"},"oauth2Clients":[{"identifiers":{"clientID":"mock"},"secret":null}]}]"#;
-const MASKED_WARNING: &str = "WARNING: Response had masked data, replaced with null for keys: secret";
+/// What is said about `USERS`: where the masked value was, from the top of
+/// the response, without positions in lists.
+const MASKED_WARNING: &str = "Response had masked data, now null at oauth2Clients/secret";
 
 struct ExportRun {
     ok: bool,
@@ -2387,7 +2389,7 @@ fn export_leaves_an_error_body_as_the_server_sent_it() {
     for flags in [&["--export", SEED, "-sr"][..], &["--export", SEED, "-sfr"]] {
         let run = run_export(&[flags, &["GET", "/users"]].concat(), vec![("409 Conflict", REFUSED)]);
         assert_eq!(run.stdout, format!("{REFUSED}\n"), "{flags:?}");
-        assert!(!run.stderr.contains("WARNING"), "{flags:?}: {}", run.stderr);
+        assert!(!run.stderr.contains("masked data") && !run.stderr.contains("WARNING"), "{flags:?}: {}", run.stderr);
         assert_eq!(run.ok, !flags.contains(&"-sfr"), "{flags:?}");
     }
 }
@@ -2412,7 +2414,7 @@ fn export_rewrites_ndjson_by_line_and_leaves_csv_alone() {
         run.stdout,
         "{\"identifiers\":{\"com.heads.seedID\":\"a\"},\"n\":1}\n{\"identifiers\":{\"com.x.y\":\"1\"},\"secret\":null}\n"
     );
-    assert_eq!(run.stderr.trim(), MASKED_WARNING);
+    assert_eq!(run.stderr.trim(), "Response had masked data, now null at secret");
 
     // One line asked for as NDJSON stays one line.
     let run = run_export(&["--export", SEED, "-s", "--ndjson", "GET", "/people"], vec![("200 OK", "{\"identifiers\":{\"key\":\"a\"}}\n")]);
@@ -2465,7 +2467,7 @@ fn export_against_a_local_cos() {
         String::from_utf8_lossy(&echoed.stdout).trim(),
         r#"[{"identifiers":{"com.heads.seedID":"k1"},"name":"Ann","secret":null,"boss":{"identifiers":{"com.mi6.id":"M"}}}]"#
     );
-    assert!(String::from_utf8_lossy(&echoed.stderr).contains(MASKED_WARNING));
+    assert!(String::from_utf8_lossy(&echoed.stderr).contains("Response had masked data, now null at secret"));
 
     // Real records: no database key is left, and none has lost every identifier.
     fn check(value: &serde_json::Value, records: &mut usize) {

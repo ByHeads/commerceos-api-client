@@ -74,7 +74,7 @@ api seed.api                                                 # run a file, same 
 
 `--export <external-id>` turns a response into seed data that can be `PUT` to another environment:
 database keys are dropped, a record with no other identifier keeps its key under the name you give,
-and masked values become `null` (with a warning).
+and masked values become `null` (it says where).
 
 ```sh
 api --export com.heads.seedID GET /users > users.json
