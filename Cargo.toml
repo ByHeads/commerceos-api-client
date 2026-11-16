@@ -15,7 +15,15 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive"] }
 
 # HTTP client (using rustls for cross-compilation without system OpenSSL)
-reqwest = { version = "0.11", features = ["blocking", "json", "rustls-tls"], default-features = false }
+reqwest = { version = "0.13", features = ["blocking", "json", "charset", "http2", "rustls-no-provider"], default-features = false }
+
+# TLS, set up by hand in `tls_config`: reqwest's own `rustls` feature brings
+# aws-lc-rs, which needs cmake and a C compiler per cross-compiled target, and
+# verifies against the OS trust store. ring cross-compiles with the linkers in
+# .cargo/config.toml, and the bundled Mozilla roots keep a binary working where
+# no certificates are installed (a bare container).
+rustls = { version = "0.23", features = ["ring", "std", "tls12"], default-features = false }
+webpki-roots = "1"
 
 # Body decoding, the way reqwest's own `text()` does it (already in its tree)
 encoding_rs = "0.8"

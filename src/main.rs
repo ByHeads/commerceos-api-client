@@ -325,6 +325,27 @@ impl Default for Config {
 /// otherwise applies its own 30s default — far too short for large exports.
 const DEFAULT_TIMEOUT_SECS: u64 = 600; // 10 minutes
 
+/// The TLS setup every HTTP client here uses: rustls on ring, TLS 1.2 and 1.3,
+/// verifying against the Mozilla root certificates compiled into the binary.
+/// Nothing is read from the machine, so a server is trusted the same way on
+/// every platform and in a container that has no certificates installed.
+fn tls_config() -> rustls::ClientConfig {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .expect("ring supports the default TLS versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    config
+}
+
+/// Where every HTTP client starts, so none is built without `tls_config`.
+fn client_builder() -> reqwest::blocking::ClientBuilder {
+    Client::builder().tls_backend_preconfigured(tls_config())
+}
+
 /// Build the HTTP client. The timeout is always passed explicitly, so reqwest's
 /// hidden default can never apply; `0` disables it (`--timeout 0`).
 fn build_request_client(timeout_secs: u64) -> Client {
@@ -333,10 +354,10 @@ fn build_request_client(timeout_secs: u64) -> Client {
     } else {
         Some(Duration::from_secs(timeout_secs))
     };
-    Client::builder()
+    client_builder()
         .timeout(timeout)
         .build()
-        .unwrap_or_else(|_| Client::new())
+        .expect("could not set up the HTTP client")
 }
 
 /// How a request timeout should be described in errors and help text.
@@ -469,7 +490,7 @@ fn set_default_connection(name: &str) -> Result<(), String> {
 // OAuth2 client credentials token exchange
 fn oauth2_token_exchange(base_uri: &str, client_id: &str, client_secret: &str) -> Result<(String, u64), String> {
     let token_url = format!("{}/oauth2/v1/token", base_uri.trim_end_matches('/'));
-    let client = Client::builder()
+    let client = client_builder()
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| e.to_string())?;
@@ -2252,7 +2273,7 @@ impl ConnectionFlow {
             }
         } else {
             // API key or Bearer token
-            let client = Client::builder().timeout(Duration::from_secs(10)).build().ok();
+            let client = client_builder().timeout(Duration::from_secs(10)).build().ok();
             if let Some(client) = client {
                 let test_url = format!("{}/api/v1", url.trim_end_matches('/'));
                 let mut req = client.get(&test_url);
@@ -3568,10 +3589,10 @@ fn get_1password_credentials(selector: &str) -> Result<(String, String), String>
 /// - streaming: true if response:streaming feature flag is present
 /// Err(status) for auth errors (401/403)
 fn check_connection(config: &Config) -> Result<(bool, bool, bool), u16> {
-    let client = Client::builder()
+    let client = client_builder()
         .timeout(Duration::from_secs(5))
         .build()
-        .unwrap_or_else(|_| Client::new());
+        .expect("could not set up the HTTP client");
 
     let url = format!("{}{}/about", config.base_uri, config.api_path);
 
@@ -5739,7 +5760,7 @@ fn download_archive(url: &str, token: Option<&str>) -> Result<Vec<u8>, String> {
     if let Some(path) = url.strip_prefix("file://") {
         return fs::read(path).map_err(|e| e.to_string());
     }
-    let client = Client::builder()
+    let client = client_builder()
         .timeout(Duration::from_secs(300))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             let secure = attempt.url().scheme() == "https" || is_loopback_url(attempt.url());
@@ -11953,10 +11974,10 @@ fn background_load(config: &Config, op_selector: Option<String>) -> BackgroundLo
 }
 
 fn fetch_mapped_type_names(config: &Config) -> Vec<String> {
-    let client = Client::builder()
+    let client = client_builder()
         .timeout(Duration::from_secs(10))
         .build()
-        .unwrap_or_else(|_| Client::new());
+        .expect("could not set up the HTTP client");
 
     let url = format!("{}{}/mapped-types", config.base_uri, config.api_path);
     let mut request = client.get(&url);
@@ -12026,10 +12047,10 @@ fn apply_background_result(state: &mut AppState, result: BackgroundLoadResult) {
 }
 
 fn load_openapi_spec_into(config: &Config, result: &mut BackgroundLoadResult) {
-    let client = Client::builder()
+    let client = client_builder()
         .timeout(Duration::from_secs(30))
         .build()
-        .unwrap_or_else(|_| Client::new());
+        .expect("could not set up the HTTP client");
 
     let url = format!("{}/openapi/spec.json", config.base_uri);
 
