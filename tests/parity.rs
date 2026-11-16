@@ -843,6 +843,52 @@ fn at_a_terminal_ctrl_d_is_no_answer_and_enter_still_accepts() {
     assert_eq!(ended, Some(true), "{shown}");
 }
 
+/// Colour is for a terminal. Whether there is one is asked of the standard
+/// library (`IsTerminal`) since `atty` went: a run at a terminal is coloured
+/// and does not wait on the terminal for a body, a captured one is plain.
+#[cfg(unix)]
+#[test]
+fn output_is_coloured_at_a_terminal_and_plain_when_captured() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("p.api"), "GET /a\nPUT /b {\"x\":1}\n").unwrap();
+
+    for args in [&["GET", "/a"][..], &["-a", "p.api"], &["-sa", "p.api"]] {
+        // Captured, and nothing in the environment asking for colour or against it.
+        server.take();
+        let out = api(server.port, dir.path())
+            .env_remove("NO_COLOR")
+            .env_remove("CLICOLOR_FORCE")
+            .args(args)
+            .output()
+            .expect("spawn api");
+        server.settle(Duration::from_millis(150), Duration::from_secs(3));
+        assert!(out.status.success(), "{args:?}");
+        assert!(!server.take().is_empty(), "{args:?}");
+        let captured = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(captured.contains("200 OK"), "{args:?}: {captured}");
+        assert!(!captured.contains('\x1b'), "{args:?}: escape sequences in captured output:\n{captured:?}");
+
+        // At a terminal: the same lines, coloured. It ends by itself, so it
+        // did not sit reading the terminal for a request body.
+        server.take();
+        let mut cmd = api(server.port, dir.path());
+        cmd.args(args);
+        let mut term = pty::Prompt::open(cmd);
+        let start = Instant::now();
+        let mut ended = None;
+        while ended.is_none() && start.elapsed() < Duration::from_secs(15) {
+            term.pump(Duration::from_millis(50));
+            ended = term.exited();
+        }
+        term.pump(Duration::from_millis(100));
+        assert_eq!(ended, Some(true), "{args:?}:\n{}", term.screen);
+        assert!(!server.take().is_empty(), "{args:?}");
+        assert!(pty::plain(&term.screen).contains("200 OK"), "{args:?}:\n{}", term.screen);
+        assert!(term.screen.contains("\x1b["), "{args:?}: no colour at a terminal:\n{:?}", term.screen);
+    }
+}
+
 /// The terminal is asked even when stdin is the program: with a terminal a
 /// `confirm` in a program read from stdin can be answered.
 #[cfg(unix)]

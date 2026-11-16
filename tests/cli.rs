@@ -1912,6 +1912,254 @@ fn timeout_expiry_reports_the_timeout_not_a_dead_server() {
     );
 }
 
+// ----- the HTTP client itself: methods, credentials, TLS -----
+
+/// A server that answers each request with the next `(status, body)` of
+/// `answers` (repeating the last) and returns every request whole, head and
+/// body, as it arrived.
+fn whole_request_server(answers: Vec<(&'static str, &'static str)>) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let handle = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        for i in 0.. {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let accepted = loop {
+                match listener.accept() {
+                    Ok(pair) => break Some(pair),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() > deadline {
+                            break None;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("accept: {e}"),
+                }
+            };
+            let Some((mut stream, _)) = accepted else { break };
+            stream.set_nonblocking(false).unwrap();
+            stream.set_read_timeout(Some(std::time::Duration::from_millis(300))).unwrap();
+            // Head and body may come in separate writes: read until quiet.
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => request.extend_from_slice(&buf[..n]),
+                }
+                let text = String::from_utf8_lossy(&request);
+                if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                    let length = head
+                        .lines()
+                        .filter_map(|l| l.split_once(':'))
+                        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                        .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if body.len() >= length {
+                        break;
+                    }
+                }
+            }
+            let request = String::from_utf8_lossy(&request).to_string();
+            let (status, body) = answers[i.min(answers.len() - 1)];
+            // A HEAD is answered without a body, as HTTP has it.
+            let body = if request.starts_with("HEAD ") { "" } else { body };
+            seen.push(request);
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            let _ = stream.flush();
+        }
+        seen
+    });
+    (port, handle)
+}
+
+/// The value of `name` among a request's headers, whatever its case.
+fn header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+    request
+        .split("\r\n\r\n")
+        .next()?
+        .lines()
+        .skip(1)
+        .filter_map(|l| l.split_once(':'))
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.trim())
+}
+
+#[test]
+fn every_method_reaches_the_server_with_its_body() {
+    for (method, body) in [
+        ("GET", None),
+        ("POST", Some(r#"[{"a":1}]"#)),
+        ("PUT", Some(r#"{"a":1}"#)),
+        ("PATCH", Some(r#"{"a":1}"#)),
+        ("DELETE", None),
+        ("HEAD", None),
+        ("OPTIONS", None),
+    ] {
+        let (port, server) = whole_request_server(vec![("200 OK", "{}")]);
+        let mut cmd = api_against_port(port);
+        cmd.args(["-s", method, "/things/1"]);
+        if let Some(body) = body {
+            cmd.arg(body);
+        }
+        let out = cmd.output().expect("api runs");
+        let seen = server.join().expect("server thread");
+        assert!(out.status.success(), "{method}: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(seen.len(), 1, "{method}: {seen:?}");
+        assert!(seen[0].starts_with(&format!("{method} /api/v1/things/1 HTTP/1.1\r\n")), "{method}: {}", seen[0]);
+        let sent_body = seen[0].split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+        assert_eq!(sent_body, body.unwrap_or(""), "{method}");
+        if body.is_some() {
+            assert_eq!(header(&seen[0], "content-type"), Some("application/json"), "{method}: {}", seen[0]);
+        }
+    }
+}
+
+#[test]
+fn a_key_is_sent_as_basic_and_a_token_as_bearer() {
+    let run = |args: &[&str]| {
+        let (port, server) = whole_request_server(vec![("200 OK", "{}")]);
+        let mut cmd = Command::cargo_bin("api").expect("api binary built");
+        cmd.arg("--no-keychain")
+            .env("API_CREDENTIALS_FILE", "/nonexistent/credentials.json")
+            .args(["-b", &format!("http://127.0.0.1:{port}"), "-s"])
+            .args(args)
+            .args(["GET", "/things"]);
+        let out = cmd.output().expect("api runs");
+        let seen = server.join().expect("server thread");
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(seen.len(), 1, "{args:?}: {seen:?}");
+        header(&seen[0], "authorization").unwrap_or("").to_string()
+    };
+
+    // An API key is the password of a Basic login with no user name.
+    use base64::Engine;
+    let basic = base64::engine::general_purpose::STANDARD.encode(":my-key");
+    assert_eq!(run(&["-k", "my-key"]), format!("Basic {basic}"));
+    assert_eq!(run(&["--token", "tok-123"]), "Bearer tok-123");
+    // A token wins over a key given with it.
+    assert_eq!(run(&["-k", "my-key", "--token", "tok-123"]), "Bearer tok-123");
+    // A key that is a JWT is a token and goes as one.
+    let jwt = format!("eyJhbGciOiJIUzI1NiJ9.{}.sig", "a".repeat(200));
+    assert_eq!(run(&["-k", &jwt]), format!("Bearer {jwt}"));
+}
+
+#[test]
+fn an_oauth2_connection_exchanges_its_secret_for_a_token_first() {
+    let dir = tempdir().unwrap();
+    let credentials = dir.path().join("credentials.json");
+    let write = |port: u16| {
+        std::fs::write(
+            &credentials,
+            format!(
+                r#"{{"connections":[{{"name":"local","url":"http://127.0.0.1:{port}","auth_type":"oauth2","credential":"s3cret","client_id":"my-client"}}],"default":"local"}}"#
+            ),
+        )
+        .unwrap();
+    };
+    let run = || {
+        let mut cmd = Command::cargo_bin("api").expect("api binary built");
+        cmd.arg("--no-keychain").env("API_CREDENTIALS_FILE", &credentials).args(["-s", "GET", "/things"]);
+        cmd.output().expect("api runs")
+    };
+
+    let (port, server) = whole_request_server(vec![("200 OK", r#"{"access_token":"tok-from-exchange","expires_in":60}"#), ("200 OK", "{}")]);
+    write(port);
+    let out = run();
+    let seen = server.join().expect("server thread");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    assert!(seen[0].starts_with("POST /oauth2/v1/token HTTP/1.1\r\n"), "{}", seen[0]);
+    assert_eq!(header(&seen[0], "content-type"), Some("application/x-www-form-urlencoded"));
+    assert!(seen[0].ends_with("grant_type=client_credentials&client_id=my-client&client_secret=s3cret"), "{}", seen[0]);
+    assert!(seen[1].starts_with("GET /api/v1/things HTTP/1.1\r\n"), "{}", seen[1]);
+    assert_eq!(header(&seen[1], "authorization"), Some("Bearer tok-from-exchange"));
+    // The secret goes to the token endpoint only.
+    assert!(!seen[1].contains("s3cret"), "{}", seen[1]);
+
+    // A refused exchange is an error, and the request is not sent without a token.
+    let (port, server) = whole_request_server(vec![("401 Unauthorized", r#"{"error":"invalid_client"}"#), ("200 OK", "{}")]);
+    write(port);
+    let out = run();
+    let seen = server.join().expect("server thread");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("401"), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(seen.len(), 1, "{seen:?}");
+}
+
+/// An https server on this machine with a certificate nobody signed.
+/// Returns what the handshake came to and every byte of HTTP that got
+/// through it.
+fn self_signed_https_server() -> (u16, std::thread::JoinHandle<(bool, String)>) {
+    use std::io::{Read, Write};
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()]).expect("certificate");
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(signing_key.serialize_der().into());
+    let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.der().clone()], key)
+        .expect("server config");
+    let config = std::sync::Arc::new(config);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut shook, mut heard) = (false, String::new());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while std::time::Instant::now() < deadline {
+            let Ok((mut stream, _)) = listener.accept() else {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+            let mut tls = rustls::ServerConnection::new(config.clone()).unwrap();
+            let mut channel = rustls::Stream::new(&mut tls, &mut stream);
+            let mut buf = [0u8; 4096];
+            if let Ok(n) = channel.read(&mut buf) {
+                heard.push_str(&String::from_utf8_lossy(&buf[..n]));
+                let _ = channel.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+            }
+            shook |= !tls.is_handshaking();
+        }
+        (shook, heard)
+    });
+    (port, handle)
+}
+
+#[test]
+fn a_certificate_nobody_signed_is_refused_and_nothing_is_sent_over_it() {
+    for host in ["localhost", "127.0.0.1"] {
+        let (port, server) = self_signed_https_server();
+        let out = Command::cargo_bin("api")
+            .unwrap()
+            .arg("--no-keychain")
+            .env("API_CREDENTIALS_FILE", "/nonexistent/credentials.json")
+            .env("NO_COLOR", "1")
+            .args(["-b", &format!("https://{host}:{port}"), "-k", "my-secret-key", "--timeout", "5", "PUT", "/things/1", r#"{"a":1}"#])
+            .output()
+            .expect("api runs");
+        let (shook, heard) = server.join().expect("server thread");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{host}: {stderr}");
+        // The handshake is where it ends: no request, and so no key, got through.
+        assert!(!shook, "{host}: the client accepted the certificate");
+        assert_eq!(heard, "", "{host}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "", "{host}");
+        assert!(!stderr.is_empty(), "{host}: a refused certificate has to be said");
+    }
+}
+
 // ----- -f / --fail-fast -----
 
 /// A server that answers each request with the next `(status, body)` of
@@ -2106,6 +2354,39 @@ fn fail_fast_leaves_questions_alone() {
         run.seen,
         vec!["GET /people/1", "PUT /people/1", "GET /people/2", "GET /imports/running", "GET /after"]
     );
+}
+
+#[test]
+fn a_request_timeout_and_a_rate_limit_are_never_an_answer() {
+    // 408 and 429 say "not now", not "no": a question that gets one ends
+    // the run wherever it was asked, and `-f` puts the body on stdout.
+    for status in ["408 Request Timeout", "429 Too Many Requests"] {
+        // A chain condition: the run ends and the body says why.
+        for batch in ["GET /q || PUT /x {\"a\":1}\nGET /never\n", "GET /q && PUT /x {\"a\":1}\nGET /never\n"] {
+            let run = run_fail_fast("-sfa", batch, vec![(status, "slow down"), OK]);
+            assert_eq!(run.code, Some(1), "{status}: {batch}\n{}", run.stderr);
+            assert_eq!(run.seen, vec!["GET /q"], "{status}: {batch}");
+            assert!(run.stdout.ends_with("slow down\n"), "{status}: {batch}\n{:?}", run.stdout);
+        }
+        // An assert and a poll report it themselves, with `-f` too.
+        for (batch, says) in [
+            ("assert not GET /q\nGET /never\n", "assert not GET /q — could not be evaluated"),
+            ("sleep 10ms while GET /q\nGET /never\n", "condition could not be evaluated (check 1)"),
+        ] {
+            let run = run_fail_fast("-sfa", batch, vec![(status, "slow down"), OK]);
+            assert_eq!(run.code, Some(1), "{status}: {batch}\n{}", run.stderr);
+            assert_eq!(run.seen, vec!["GET /q"], "{status}: {batch}");
+            assert!(run.stderr.contains(says), "{status}: {batch}\n{}", run.stderr);
+        }
+        // Without `-f` it ends the run from a question all the same…
+        let run = run_fail_fast("-sa", "GET /q || PUT /x {\"a\":1}\nGET /never\n", vec![(status, "slow down"), OK]);
+        assert_eq!(run.code, Some(1), "{status}: {}", run.stderr);
+        assert_eq!(run.seen, vec!["GET /q"], "{status}");
+        // …and a plain request that gets one is logged and passed, as any failure is.
+        let run = run_fail_fast("-sa", "GET /q\nGET /after\n", vec![(status, "slow down"), OK]);
+        assert!(run.ok, "{status}: {}", run.stderr);
+        assert_eq!(run.seen, vec!["GET /q", "GET /after"], "{status}");
+    }
 }
 
 #[test]
@@ -2424,6 +2705,62 @@ fn a_chain_is_judged_on_what_the_server_said_not_on_the_seed_data() {
     );
     assert!(run.ok, "{}", run.stderr);
     assert_eq!(run.seen, vec!["GET /secret", "GET /users"]);
+}
+
+#[test]
+fn an_assert_and_a_poll_are_judged_on_what_the_server_said_not_on_the_seed_data() {
+    // The masked value is a "yes" to each of them, though it exports as `null`.
+    let (port, server) = answering_server(vec![("200 OK", r#""********""#), ("200 OK", r#""********""#), ("200 OK", USERS)]);
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("batch.api"),
+        "assert GET /secret\nsleep 10ms while not GET /secret\nGET /users > users.json\n",
+    )
+    .unwrap();
+    let out = api_against_port(port)
+        .env("NO_COLOR", "1")
+        .current_dir(dir.path())
+        .args(["--export", SEED, "-sa", "batch.api"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(server.join().unwrap(), vec!["GET /secret", "GET /secret", "GET /users"]);
+    assert!(out.status.success(), "{stderr}");
+    assert_eq!(compact(&std::fs::read_to_string(dir.path().join("users.json")).unwrap()), USERS_EXPORTED);
+    // A question's answer is not data: only the response that was written warns.
+    assert_eq!(stderr.matches("masked data").count(), 1, "{stderr}");
+
+    // And the other way round: `assert not` on a masked value fails.
+    let run = run_export(&["--export", SEED, "-s", "assert not GET /secret"], vec![("200 OK", r#""********""#)]);
+    assert!(!run.ok);
+    assert!(run.stderr.contains("assertion failed"), "{}", run.stderr);
+}
+
+#[test]
+fn export_to_the_clipboard_and_appended_to_ndjson_is_seed_data_too() {
+    // The clipboard is not read back (a headless runner has none to read);
+    // the response is kept off stdout and the masked place is still named.
+    let run = run_export(&["--export", SEED, "GET", "/users", ">", "clipboard"], vec![("200 OK", USERS)]);
+    assert_eq!(run.stdout, "");
+    assert!(run.stderr.contains(MASKED_WARNING), "{}", run.stderr);
+    assert!(!run.dir.path().join("clipboard").exists());
+
+    // Appended to an NDJSON file: the lines of each response, exported.
+    const LINES: &str = "{\"identifiers\":{\"key\":\"a\"},\"n\":1}\n{\"identifiers\":{\"key\":\"b\",\"com.x.y\":\"1\"}}\n";
+    let (port, server) = answering_server(vec![("200 OK", LINES)]);
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("batch.api"), "GET /people >> people.ndjson\nGET /people >> people.ndjson\n").unwrap();
+    let out = api_against_port(port)
+        .env("NO_COLOR", "1")
+        .current_dir(dir.path())
+        .args(["--export", SEED, "-sa", "batch.api"])
+        .output()
+        .unwrap();
+    assert_eq!(server.join().unwrap().len(), 2);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let written = std::fs::read_to_string(dir.path().join("people.ndjson")).unwrap();
+    let exported = "{\"identifiers\":{\"key?\":\"a\",\"com.heads.seedID\":\"a\"},\"n\":1}\n{\"identifiers\":{\"com.x.y\":\"1\"}}\n";
+    assert_eq!(written, exported.repeat(2));
 }
 
 #[test]
