@@ -669,6 +669,9 @@ struct AppState {
     /// export on. Kept while export is off, so turning it on again does not
     /// ask twice.
     export_name: Option<String>,
+    /// A name typed for export mode that was refused, kept so the next
+    /// ctrl+r opens with it there to correct. Esc discards it.
+    export_name_draft: String,
     ctrl_c_pending: bool,
     ctrl_c_at: Option<std::time::Instant>,
     width: u16,
@@ -755,6 +758,7 @@ impl AppState {
             status_msg_at: None,
             streaming_flash_at: None,
             export_name,
+            export_name_draft: String::new(),
             ctrl_c_pending: false,
             ctrl_c_at: None,
             width: 80,
@@ -10652,99 +10656,95 @@ fn confirm_inline(stdout: &mut io::Stdout, prompt: &str) -> io::Result<bool> {
     }
 }
 
+/// What the hint line says when the name typed for export mode is refused.
+const EXPORT_NAME_REFUSED: &str = "export needs a namespaced key, like com.heads.seedID";
+
 /// ctrl+r: turn export mode on or off for the session, as `--export` does for
 /// a run. Turning it on needs the external identifier's name. There is no
 /// default: it is asked for the first time, and remembered until the session
 /// ends (a session started with `--export <name>` knows it already).
+///
+/// Everything it has to say goes where the prompt says everything else: the
+/// status message in the hint line. A name that is not a namespaced key
+/// closes the dialog with such a message and leaves export off; ctrl+r again
+/// opens the dialog with the name there to correct.
 fn handle_export_toggle(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<()> {
-    if state.config.export_id.take().is_some() {
-        state.status_msg = "export off".to_string();
+    let notice = |state: &mut AppState, stdout: &mut io::Stdout, text: String| -> io::Result<()> {
+        state.status_msg = text;
         state.status_msg_at = Some(Instant::now());
-        return render(stdout, state);
+        render(stdout, state)
+    };
+    if state.config.export_id.take().is_some() {
+        return notice(state, stdout, "export off".to_string());
     }
     let name = match state.export_name.clone() {
         Some(name) => name,
-        None => match ask_export_name(state, stdout)? {
-            Some(name) => name,
-            None => {
-                state.status_msg = "cancelled".to_string();
-                state.status_msg_at = Some(Instant::now());
-                return render(stdout, state);
+        None => {
+            let draft = std::mem::take(&mut state.export_name_draft);
+            match ask_export_name(state, stdout, &draft)? {
+                None => return notice(state, stdout, "cancelled".to_string()),
+                Some(name) if !is_namespaced_key(&name) => {
+                    state.export_name_draft = name;
+                    return notice(state, stdout, EXPORT_NAME_REFUSED.to_string());
+                }
+                Some(name) => name,
             }
-        },
+        }
     };
-    state.status_msg = format!("export on: {}", name);
-    state.status_msg_at = Some(Instant::now());
     state.streaming_flash_at = Some(Instant::now());
     state.export_name = Some(name.clone());
-    state.config.export_id = Some(name);
-    render(stdout, state)
+    state.config.export_id = Some(name.clone());
+    notice(state, stdout, format!("export on: {}", name))
 }
 
 /// Ask, in the command area, for the name export mode keeps a lone key
-/// under. Enter on a name that is not a namespaced key asks again, with what
-/// was typed left to correct; esc or an empty answer gives `None`.
+/// under, the way ctrl+s asks for a connection's name: a prompt on the input
+/// line, and `enter to …, esc to cancel` under the ruler. Gives what was
+/// typed, trimmed; `None` for esc or an empty answer. Whether it is a name
+/// that can be used is the caller's to say.
 ///
 /// The dialog takes the command area's place, row for row: the top ruler
 /// stays, the prompt stands on the first input line, and the bottom ruler
-/// and a hint follow. Nothing in it may wrap. A hint or a typed name wider
-/// than the terminal would take a row more than was counted: the prompt is
-/// then drawn a row too low, over the bottom ruler, and every redraw after
-/// the dialog starts a row too low as well and leaves a ruler behind. So the
-/// hint is cut to the width, the input line keeps to it, and the two rows
-/// below the prompt are drawn with auto-wrap off, as `render` draws its own.
-fn ask_export_name(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<Option<String>> {
+/// and the hint follow. Nothing in it may wrap. A row more than was counted
+/// would put the prompt a row too low, over the bottom ruler, and every
+/// redraw after the dialog would start a row too low as well and leave a
+/// ruler behind. So the hint is cut to the width, the input line keeps to
+/// it, and the two rows below the prompt are drawn with auto-wrap off, as
+/// `render` draws its own.
+fn ask_export_name(state: &mut AppState, stdout: &mut io::Stdout, prefill: &str) -> io::Result<Option<String>> {
     let width = state.width as usize;
     let ruler_line = format!("\x1b[38;5;239m{}\x1b[0m", "─".repeat(width));
     let input_lines = state.prev_input_lines;
     let prompt = "› Export with external identifier: ";
+    let hint = fit_to_width("enter to turn export on, esc to cancel", width.saturating_sub(3));
 
     // From the hint line, where `render` leaves the cursor, up to the first
     // input line. Clear the command area from there; the top ruler is kept.
-    execute!(stdout, cursor::MoveUp(1 + input_lines), cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
+    // Leave the prompt's row empty for now, draw the bottom ruler and the
+    // hint under it, and come back up for the input.
+    execute!(
+        stdout,
+        cursor::MoveUp(1 + input_lines),
+        cursor::MoveToColumn(0),
+        Clear(ClearType::FromCursorDown),
+        Print("\x1b[?7l"),
+        Print("\r\n"),
+        Print(format!("{}\r\n", ruler_line)),
+        Print(format!("  {}", hint.dimmed())),
+        Print("\x1b[?7h"),
+        cursor::MoveUp(2),
+        cursor::MoveToColumn(0)
+    )?;
+    let typed = read_inline_input_within(stdout, prompt, false, prefill, Some(width))?;
 
-    let mut typed = String::new();
-    let mut hint = "e.g. com.heads.seedID · enter to turn export on, esc to cancel";
-    let answer = loop {
-        // The cursor is on the prompt's row. Leave it empty for now, draw the
-        // bottom ruler and the hint under it, and come back up for the input.
-        let hint_line = fit_to_width(hint, width.saturating_sub(3));
-        execute!(
-            stdout,
-            Print("\x1b[?7l"),
-            Print("\r\n"),
-            Print(format!("{}\r\n", ruler_line)),
-            Print(format!("  {}", hint_line.dimmed())),
-            Print("\x1b[?7h"),
-            cursor::MoveUp(2),
-            cursor::MoveToColumn(0)
-        )?;
-        match read_inline_input_within(stdout, prompt, false, &typed, Some(width))? {
-            None => break None,
-            Some(name) => {
-                let name = name.trim().to_string();
-                if name.is_empty() {
-                    break None;
-                }
-                if is_namespaced_key(&name) {
-                    break Some(name);
-                }
-                hint = "not a namespaced key: needs three dot-separated segments, like com.heads.seedID";
-                typed = name;
-                // Enter left the cursor a row down, on the ruler. Back onto
-                // the prompt's row, to draw the three rows again.
-                execute!(stdout, cursor::MoveUp(1), cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
-            }
-        }
-    };
-
-    // The cursor is on the row under the prompt. Clear from there, and go
-    // down to where the hint line of the command area is, for `render`.
+    // Enter and esc both leave the cursor on the row under the prompt. Clear
+    // from there, and go down to where the hint line of the command area is,
+    // for `render`.
     execute!(stdout, cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
     for _ in 0..input_lines {
         execute!(stdout, Print("\r\n"))?;
     }
-    Ok(answer)
+    Ok(typed.map(|name| name.trim().to_string()).filter(|name| !name.is_empty()))
 }
 
 fn handle_save_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<()> {
