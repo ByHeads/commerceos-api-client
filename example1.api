@@ -1,12 +1,34 @@
 # This is a comment
 
-PUT /people/com.mi6.id=007 { "name": "James Bond" }
+export com.heads.seedID
+
+import git mingrej {
+  "url": "https://github.com/byheads/cos-integration-mingrej",
+  "ref": "master"
+}
+
+mingrej/apply.api
+
+PUT /assert {
+  "api/v1/config-panels/com.voyado.config/syncInterval": {
+    "is not": null,
+    "suggest": "00:01:00",
+    "resolveSuggest": "api/v1/now/+=0:0:10"
+  },
+  "api/v1/config-panels/com.voyado.config/syncInterval2": {
+    "is not": null,
+    "suggest": "00:01:00",
+    "resolveIs": "api/v1/now/+=0:0:10"
+  }
+}
+
+PUT /people/com.mi6.id=007 {"name": "James Bond"}
 
 PUT /people [{
-	"identifiers": {
-		"com.mi6.id": "006"
-	},
-	"name": "Alec Trevelyan"
+  "identifiers": {
+    "com.mi6.id": "006"
+  },
+  "name": "Alec Trevelyan"
 }]
 
 GET /people~with(com.heads.*) > ~/my-file.json
@@ -14,13 +36,13 @@ GET /people~with(com.heads.*) > ~/my-file.json
 #PUT /people @people.json
 
 PUT /people/com.mi6.id=006/addresses/main {
-	"line1": "Janus Syndicate HQ",
-	"line2": "
+  "line1": "Janus Syndicate HQ",
+  "line2": "
 		Entrance through black door between the two demonic face symbols
 ",
-	"postalCode": "40502",
-	"cityName": "St. Petersburg",
-	"countryCode": "RU"
+  "postalCode": "40502",
+  "cityName": "St. Petersburg",
+  "countryCode": "RU"
 }
 
 example2.api

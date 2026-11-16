@@ -4633,6 +4633,11 @@ fn export_value(value: &mut Value, id_key: &str, path: &mut String, masked: &mut
 /// Take `identifiers.key` out of `object`. A record that has no other
 /// identifier gets the key back as `key?` and as `id_key`, in the key's
 /// place, `key?` first. One that has another identifier gets neither.
+///
+/// An identifier that is `null` is not one the record has: with `-i` the
+/// server lists every identifier a record could have (`"clientID": null`),
+/// and a masked one has just been nulled. Neither can find the record, so
+/// neither stands in for the key. The member itself is left where it is.
 fn export_identifiers(object: &mut Map<String, Value>, id_key: &str) {
     let Some(Value::Object(identifiers)) = object.get_mut("identifiers") else {
         return;
@@ -4641,7 +4646,9 @@ fn export_identifiers(object: &mut Map<String, Value>, id_key: &str) {
     if !has_key {
         return;
     }
-    let only_key = identifiers.keys().all(|name| matches!(name.as_str(), "@type" | "key" | "key?"));
+    let only_key = identifiers
+        .iter()
+        .all(|(name, value)| matches!(name.as_str(), "@type" | "key" | "key?") || value.is_null());
     for (name, value) in std::mem::take(identifiers) {
         match name.as_str() {
             "key" => {
@@ -19550,6 +19557,34 @@ mod tests {
                 None => assert!(!identifiers.values().any(|v| v == "k2" || v == "k3")),
             }
         }
+    }
+
+    #[test]
+    fn export_does_not_take_a_null_identifier_for_one_the_record_has() {
+        let exported = |body: &str| export_body(body, SEED, false, true).text;
+        // What `-i` answers for a record with only a key: the unset
+        // identifier is listed, as null. The record still has only its key.
+        assert_eq!(
+            exported(r#"{"identifiers":{"key":"k1","clientID":null},"name":"a"}"#),
+            r#"{"identifiers":{"key?":"k1","com.heads.seedID":"k1","clientID":null},"name":"a"}"#
+        );
+        // Several nulls, and `@type` among them, change nothing.
+        assert_eq!(
+            exported(r#"{"identifiers":{"@type":"t","clientID":null,"key":"k1","userId":null}}"#),
+            r#"{"identifiers":{"@type":"t","clientID":null,"key?":"k1","com.heads.seedID":"k1","userId":null}}"#
+        );
+        // One real identifier beside a null one is still the one to go by.
+        assert_eq!(
+            exported(r#"{"identifiers":{"key":"k2","clientID":"mock","userId":null}}"#),
+            r#"{"identifiers":{"clientID":"mock","userId":null}}"#
+        );
+        // An identifier that was masked is null by now and finds nothing either.
+        assert_eq!(
+            exported(r#"{"identifiers":{"key":"k3","token":"********"}}"#),
+            r#"{"identifiers":{"key?":"k3","com.heads.seedID":"k3","token":null}}"#
+        );
+        // `false` and an empty string are values the server gave, and count.
+        assert_eq!(exported(r#"{"identifiers":{"key":"k4","flag":false}}"#), r#"{"identifiers":{"flag":false}}"#);
     }
 
     #[test]

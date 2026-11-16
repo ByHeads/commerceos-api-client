@@ -2684,6 +2684,26 @@ fn export_rewrites_a_response_as_seed_data() {
 }
 
 #[test]
+fn export_with_include_nulls_keeps_the_identity_of_a_record_that_has_only_a_key() {
+    // With `-i` an identifier the record does not have arrives as null. It
+    // was counted as one the record has, the key was dropped for it, and the
+    // record came out with nothing to find it by.
+    const CLIENTS: &str = r#"[{"identifiers":{"key":"k1","clientID":null},"name":"a"},{"identifiers":{"key":"k2","clientID":"mock"},"name":"b"},{"identifiers":{"key":"k3"},"name":"c"}]"#;
+    let run = run_export(&["--export", SEED, "-i", "-sr", "GET", "/oauth2-clients"], vec![("200 OK", CLIENTS)]);
+    assert!(run.ok, "{}", run.stderr);
+    assert_eq!(
+        run.stdout.trim(),
+        r#"[{"identifiers":{"key?":"k1","com.heads.seedID":"k1","clientID":null},"name":"a"},{"identifiers":{"clientID":"mock"},"name":"b"},{"identifiers":{"key?":"k3","com.heads.seedID":"k3"},"name":"c"}]"#
+    );
+    // Every record can be found by something that is not null.
+    let records: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
+    for record in records.as_array().unwrap() {
+        let found_by = record["identifiers"].as_object().unwrap().iter().any(|(name, v)| name != "key?" && !v.is_null());
+        assert!(found_by, "{record}");
+    }
+}
+
+#[test]
 fn export_names_two_masked_places_and_counts_the_rest() {
     const MASKED: &str = r#"[{"password":"********","clients":[{"secret":"********","pin":"*******"}],"apiKey":"********"},{"password":"********"}]"#;
     let run = run_export(&["--export", SEED, "-sr", "GET", "/users"], vec![("200 OK", MASKED)]);

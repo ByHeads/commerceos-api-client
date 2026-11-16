@@ -728,6 +728,10 @@ What it does to every object in the response, however deep:
   there: the first write creates the record with the name, and the next one
   finds it by the name. `key?` is written only here, beside the name made
   from the key.
+- **An identifier that is `null` is not one the record has.** With `-i` the
+  server lists identifiers a record doesn't have (`"clientID": null`); such a
+  record still has only its key and keeps it as `key?` and under the name.
+  The `null` member stays in the output, since `-i` asked for it.
 - **A masked value (`********`) becomes `null`**, and a line on stderr says
   where: `Response had masked data, now null at oauth2Clients/secret,
   localCredentials/password and 1 other place`. A path is written from the
