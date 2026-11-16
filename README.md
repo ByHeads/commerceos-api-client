@@ -72,9 +72,11 @@ api sleep 5 while not /imports~count                         # poll until it fli
 api seed.api                                                 # run a file, same as -a seed.api
 ```
 
-`--export <external-id>` turns a response into seed data that can be `PUT` to another environment:
-database keys are dropped, a record with no other identifier keeps its key under the name you give,
-and masked values become `null` (it says where).
+`--export <external-id>` turns a response into seed data that can be `PUT` back where it was read or
+to another environment: every database key is written as `key?` (a key that may name nothing), a
+record with no other identifier also gets its key under the name you give, and masked values become
+`null` (it says where). The name is a namespaced key such as `com.heads.seedID`. At the prompt,
+`ctrl+r` turns it on and off and asks for the name the first time.
 
 ```sh
 api --export com.heads.seedID GET /users > users.json
@@ -281,6 +283,7 @@ the URI inserts it verbatim and promotes the method. `ctrl+y` copies the last re
 | `ctrl+o` | Open the last saved file |
 | `ctrl+b` | Open API docs in the browser |
 | `ctrl+t` | Toggle streaming |
+| `ctrl+r` | Toggle export mode; asks for the external identifier name the first time |
 | `ctrl+s` | Save connection |
 | `ctrl+q` | Switch connection |
 | `ctrl+c` | Quit (press twice) |
@@ -309,7 +312,7 @@ Usage: api [OPTIONS] [METHOD] [URI] [BODY]
   -s, --silent                    No status output; with -a, one status line per request
   -p, --preview                   Show the request(s) and confirm before sending
   -f, --fail-fast                 Stop at the first response of 400 or above: print its body, exit 1
-      --export <EXTERNAL_ID>      Rewrite responses as seed data: drop database keys, keeping a lone one as EXTERNAL_ID
+      --export <EXTERNAL_ID>      Rewrite responses as seed data: keys as `key?`, a lone one also as EXTERNAL_ID
   -r, --raw                       No pretty-printing
   -i, --include-nulls             Include null values in the response
       --ndjson                    NDJSON request and response

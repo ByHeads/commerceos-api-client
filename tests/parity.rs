@@ -708,7 +708,7 @@ fn the_prompt_reads_the_same_lines() {
 /// came in through.
 #[test]
 fn export_rewrites_the_same_way_in_a_file_from_stdin_and_as_arguments() {
-    const EXPORTED: &str = "{\n  \"identifiers\": {\n    \"com.heads.seedID\": \"k1\"\n  },\n  \"name\": \"Ann\",\n  \"secret\": null\n}\n";
+    const EXPORTED: &str = "{\n  \"identifiers\": {\n    \"key?\": \"k1\",\n    \"com.heads.seedID\": \"k1\"\n  },\n  \"name\": \"Ann\",\n  \"secret\": null\n}\n";
     const WARNING: &str = "Response had masked data, now null at secret";
     let server = RecordingServer::start();
     let dir = tempfile::tempdir().unwrap();
@@ -796,6 +796,7 @@ fn export_at_the_prompt_shows_the_seed_data() {
 
     let (sent, shown) = run("GET /keyed");
     assert_eq!(sent, ["GET /keyed"]);
+    assert!(shown.contains("\"key?\": \"k1\""), "{shown}");
     assert!(shown.contains("\"com.heads.seedID\": \"k1\""), "{shown}");
     assert!(shown.contains("\"secret\": null"), "{shown}");
     assert!(!shown.contains("\"key\"") && !shown.contains("********"), "{shown}");
@@ -807,11 +808,140 @@ fn export_at_the_prompt_shows_the_seed_data() {
     assert_eq!(sent, ["GET /keyed"]);
     let written = std::fs::read_to_string(dir.path().join("prompt-out.json")).unwrap();
     let written: serde_json::Value = serde_json::from_str(&written).unwrap();
-    assert_eq!(written, serde_json::json!({ "identifiers": { "com.heads.seedID": "k1" }, "name": "Ann", "secret": null }));
+    assert_eq!(
+        written,
+        serde_json::json!({ "identifiers": { "key?": "k1", "com.heads.seedID": "k1" }, "name": "Ann", "secret": null })
+    );
 
     // A response without a key is shown as it came.
     let (_, shown) = run("GET /a");
     assert!(shown.contains("\"ok\""), "{shown}");
+}
+
+/// ctrl+r turns export mode on and off in a running session. The name is
+/// asked for the first time, has to be a namespaced key, and is remembered.
+#[cfg(unix)]
+#[test]
+fn ctrl_r_toggles_export_at_the_prompt_and_asks_for_the_name_once() {
+    use pty::Prompt;
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    prepare(dir.path());
+    // Started without `--export`.
+    let mut prompt = Prompt::open(api(server.port, dir.path()));
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+
+    // Type `keys` (ctrl+r is \x12), and give the screen what it showed.
+    fn keys(prompt: &mut pty::Prompt, keys: &[u8]) -> String {
+        let mark = prompt.screen.len();
+        prompt.send(keys);
+        prompt.pump(Duration::from_millis(500));
+        pty::plain(&prompt.screen[mark..])
+    }
+    // Send `GET /keyed` and give what was shown for it.
+    fn get_keyed(prompt: &mut pty::Prompt, server: &RecordingServer) -> String {
+        prompt.send(b"\x15");
+        prompt.pump(Duration::from_millis(60));
+        server.take();
+        prompt.paste("GET /keyed");
+        prompt.pump(Duration::from_millis(80));
+        let mark = prompt.screen.len();
+        prompt.send(b"\r");
+        let start = Instant::now();
+        let mut quiet = 0;
+        while quiet < 2 && start.elapsed() < Duration::from_secs(4) {
+            let before = server.seen();
+            prompt.pump(Duration::from_millis(120));
+            quiet = if server.seen() == before { quiet + 1 } else { 0 };
+        }
+        assert_eq!(server.take(), ["GET /keyed"]);
+        pty::plain(&prompt.screen[mark..])
+    }
+
+    // Off: the response is what the server sent.
+    let shown = get_keyed(&mut prompt, &server);
+    assert!(shown.contains("\"key\": \"k1\"") && shown.contains("********"), "{shown}");
+
+    // ctrl+r asks for the name. There is no default to accept.
+    let shown = keys(&mut prompt, b"\x12");
+    assert!(shown.contains("Export with external identifier:"), "{shown}");
+    assert!(shown.contains("a namespaced key, such as com.heads.seedID"), "{shown}");
+    // Esc leaves export off, and so does an empty answer.
+    let shown = keys(&mut prompt, b"\x1b");
+    assert!(shown.contains("cancelled"), "{shown}");
+    keys(&mut prompt, b"\x12");
+    let shown = keys(&mut prompt, b"\r");
+    assert!(shown.contains("cancelled"), "{shown}");
+    let shown = get_keyed(&mut prompt, &server);
+    assert!(shown.contains("\"key\": \"k1\""), "{shown}");
+
+    // A name that is no namespaced key is refused, and asked for again with
+    // what was typed left to correct.
+    keys(&mut prompt, b"\x12");
+    let shown = keys(&mut prompt, b"seedID\r");
+    assert!(shown.contains("not a namespaced key: seedID"), "{shown}");
+    assert!(shown.contains("three dot-separated segments"), "{shown}");
+    assert!(shown.contains("Export with external identifier: seedID"), "{shown}");
+    // Six backspaces, then a good one.
+    let shown = keys(&mut prompt, b"\x7f\x7f\x7f\x7f\x7f\x7fcom.example.exportID\r");
+    assert!(shown.contains("export on: com.example.exportID"), "{shown}");
+
+    // On: the response is the seed data, under that name.
+    let shown = get_keyed(&mut prompt, &server);
+    assert!(shown.contains("\"key?\": \"k1\"") && shown.contains("\"com.example.exportID\": \"k1\""), "{shown}");
+    assert!(shown.contains("\"secret\": null") && !shown.contains("\"key\""), "{shown}");
+    // The marker sits at the right of the hint line while it is on.
+    let shown = keys(&mut prompt, b"\x15");
+    assert!(shown.trim_end().ends_with("export"), "{shown:?}");
+
+    // ctrl+r again turns it off, and the next response is plain again.
+    let shown = keys(&mut prompt, b"\x12");
+    assert!(shown.contains("export off"), "{shown}");
+    let shown = get_keyed(&mut prompt, &server);
+    assert!(shown.contains("\"key\": \"k1\"") && !shown.contains("key?"), "{shown}");
+
+    // And on once more: the name is remembered, nothing is asked.
+    let shown = keys(&mut prompt, b"\x12");
+    assert!(shown.contains("export on: com.example.exportID"), "{shown}");
+    assert!(!shown.contains("Export with external identifier"), "{shown}");
+    let shown = get_keyed(&mut prompt, &server);
+    assert!(shown.contains("\"com.example.exportID\": \"k1\""), "{shown}");
+}
+
+/// A session started with `--export <name>` has its name: ctrl+r turns
+/// export off and on again without asking.
+#[cfg(unix)]
+#[test]
+fn ctrl_r_in_a_session_started_with_export_does_not_ask() {
+    use pty::{plain, Prompt};
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    prepare(dir.path());
+    let mut cmd = api(server.port, dir.path());
+    cmd.args(["--export", "com.heads.seedID"]);
+    let mut prompt = Prompt::open(cmd);
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+
+    let press = |prompt: &mut Prompt| {
+        let mark = prompt.screen.len();
+        prompt.send(b"\x12");
+        prompt.pump(Duration::from_millis(500));
+        plain(&prompt.screen[mark..])
+    };
+    let shown = press(&mut prompt);
+    assert!(shown.contains("export off"), "{shown}");
+    let shown = press(&mut prompt);
+    assert!(shown.contains("export on: com.heads.seedID"), "{shown}");
+    assert!(!shown.contains("Export with external identifier"), "{shown}");
+
+    // The help lists the key.
+    let mark = prompt.screen.len();
+    prompt.send(b"\x08");
+    prompt.pump(Duration::from_millis(400));
+    let shown = plain(&prompt.screen[mark..]);
+    assert!(shown.contains("ctrl+r     Toggle export mode"), "{shown}");
 }
 
 /// `-f` means the same from a file, from stdin and as arguments: the run

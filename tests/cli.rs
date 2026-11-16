@@ -2278,10 +2278,11 @@ fn fail_fast_against_the_assert_endpoint_of_a_local_cos() {
 const SEED: &str = "com.heads.seedID";
 
 /// A user as the API prints one: its own record has only a database key, the
-/// agent below it has an external identifier as well, and a secret is masked.
+/// agent below it and the client have another identifier as well, and a
+/// secret is masked.
 const USERS: &str = r#"[{"name":"Integration","@type":"user","identifiers":{"@type":"user identifiers","key":"2a196c5b"},"agent":{"@type":"agent","identifiers":{"key":"c59cf786","com.heads.seedID":"root-organization"},"name":"System"},"oauth2Clients":[{"identifiers":{"key":"6ac6a3b8","clientID":"mock"},"secret":"********"}]}]"#;
 /// The same as seed data, on one line.
-const USERS_EXPORTED: &str = r#"[{"@type":"user","identifiers":{"@type":"user identifiers","com.heads.seedID":"2a196c5b"},"name":"Integration","agent":{"@type":"agent","identifiers":{"com.heads.seedID":"root-organization"},"name":"System"},"oauth2Clients":[{"identifiers":{"clientID":"mock"},"secret":null}]}]"#;
+const USERS_EXPORTED: &str = r#"[{"@type":"user","identifiers":{"@type":"user identifiers","key?":"2a196c5b","com.heads.seedID":"2a196c5b"},"name":"Integration","agent":{"@type":"agent","identifiers":{"key?":"c59cf786","com.heads.seedID":"root-organization"},"name":"System"},"oauth2Clients":[{"identifiers":{"key?":"6ac6a3b8","clientID":"mock"},"secret":null}]}]"#;
 /// What is said about `USERS`: where the masked value was, from the top of
 /// the response, without positions in lists.
 const MASKED_WARNING: &str = "Response had masked data, now null at oauth2Clients/secret";
@@ -2326,7 +2327,9 @@ fn export_rewrites_a_response_as_seed_data() {
     // Indented, the members in the server's order behind `@type` and `identifiers`.
     assert!(run.stdout.starts_with("[\n  {\n    \"@type\": \"user\",\n    \"identifiers\": {\n"), "{}", run.stdout);
     assert_eq!(compact(&run.stdout), USERS_EXPORTED);
+    // Every key is there as `key?`, and none as `key`.
     assert!(!run.stdout.contains("\"key\""), "{}", run.stdout);
+    assert_eq!(run.stdout.matches("\"key?\"").count(), 3, "{}", run.stdout);
     // The status line and the warning go to stderr; stdout is the data alone.
     assert!(run.stderr.contains("HTTP/1.1 200 OK"), "{}", run.stderr);
     assert!(run.stderr.contains(MASKED_WARNING), "{}", run.stderr);
@@ -2352,13 +2355,21 @@ fn export_names_two_masked_places_and_counts_the_rest() {
 }
 
 #[test]
-fn export_wants_a_name_of_three_dotted_segments_before_it_sends_anything() {
-    for name in ["GET", "seedID", "com.heads", "com.heads.seed.ID", "com.heads.seed_ID"] {
+fn export_wants_a_namespaced_key_before_it_sends_anything() {
+    for name in ["GET", "seedID", "com.heads", "com.heads.seed.ID", "my-co.heads.seedID", "com.heads.seed ID"] {
         let run = run_export(&["--export", name, "GET", "/users"], vec![("200 OK", USERS)]);
         assert!(!run.ok, "{name}");
         assert!(run.stderr.contains(&format!("invalid export identifier: {name}")), "{name}: {}", run.stderr);
+        assert!(run.stderr.contains("three dot-separated segments"), "{name}: {}", run.stderr);
         assert_eq!(run.seen, Vec::<String>::new(), "{name}");
         assert_eq!(run.stdout, "");
+    }
+    // What the server takes as a namespaced key is taken here: `_` anywhere,
+    // `-` in the second and third segment, `$` in the third.
+    for name in ["com.heads.seed_ID", "my_co.my-org.seed-id$"] {
+        let run = run_export(&["--export", name, "-sr", "GET", "/users"], vec![("200 OK", r#"{"identifiers":{"key":"k"}}"#)]);
+        assert!(run.ok, "{name}: {}", run.stderr);
+        assert_eq!(run.stdout.trim(), format!(r#"{{"identifiers":{{"key?":"k","{name}":"k"}}}}"#), "{name}");
     }
 }
 
@@ -2421,13 +2432,13 @@ fn export_rewrites_ndjson_by_line_and_leaves_csv_alone() {
     assert!(run.ok, "{}", run.stderr);
     assert_eq!(
         run.stdout,
-        "{\"identifiers\":{\"com.heads.seedID\":\"a\"},\"n\":1}\n{\"identifiers\":{\"com.x.y\":\"1\"},\"secret\":null}\n"
+        "{\"identifiers\":{\"key?\":\"a\",\"com.heads.seedID\":\"a\"},\"n\":1}\n{\"identifiers\":{\"key?\":\"b\",\"com.x.y\":\"1\"},\"secret\":null}\n"
     );
     assert_eq!(run.stderr.trim(), "Response had masked data, now null at secret");
 
     // One line asked for as NDJSON stays one line.
     let run = run_export(&["--export", SEED, "-s", "--ndjson", "GET", "/people"], vec![("200 OK", "{\"identifiers\":{\"key\":\"a\"}}\n")]);
-    assert_eq!(run.stdout, "{\"identifiers\":{\"com.heads.seedID\":\"a\"}}\n");
+    assert_eq!(run.stdout, "{\"identifiers\":{\"key?\":\"a\",\"com.heads.seedID\":\"a\"}}\n");
 
     // Not JSON: passed on unchanged, with a warning that it was.
     const CSV: &str = "key,name\nabc,Ann\n";
@@ -2474,18 +2485,24 @@ fn export_against_a_local_cos() {
     assert!(echoed.status.success(), "{}", String::from_utf8_lossy(&echoed.stderr));
     assert_eq!(
         String::from_utf8_lossy(&echoed.stdout).trim(),
-        r#"[{"identifiers":{"com.heads.seedID":"k1"},"name":"Ann","secret":null,"boss":{"identifiers":{"com.mi6.id":"M"}}}]"#
+        r#"[{"identifiers":{"key?":"k1","com.heads.seedID":"k1"},"name":"Ann","secret":null,"boss":{"identifiers":{"key?":"k2","com.mi6.id":"M"}}}]"#
     );
     assert!(String::from_utf8_lossy(&echoed.stderr).contains("Response had masked data, now null at secret"));
 
-    // Real records: no database key is left, and none has lost every identifier.
+    // Real records: every database key is written as `key?`, none is left
+    // as `key`, and each record has an identifier besides it.
     fn check(value: &serde_json::Value, records: &mut usize) {
         match value {
             serde_json::Value::Object(object) => {
                 if let Some(serde_json::Value::Object(identifiers)) = object.get("identifiers") {
                     *records += 1;
                     assert!(!identifiers.contains_key("key"), "a key was left: {identifiers:?}");
-                    assert!(identifiers.keys().any(|name| name != "@type"), "no identifier left: {object:?}");
+                    let optional = identifiers.get("key?").and_then(|key| key.as_str()).unwrap_or_default();
+                    assert_eq!(optional.len(), 32, "no `key?` with the database key: {identifiers:?}");
+                    assert!(
+                        identifiers.keys().any(|name| name != "@type" && name != "key?"),
+                        "nothing but the key to find it by: {object:?}"
+                    );
                     let leading: Vec<&String> = object.keys().take(2).collect();
                     assert!(leading.contains(&&"identifiers".to_string()), "identifiers not in front: {leading:?}");
                 }

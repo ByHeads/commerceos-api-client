@@ -605,10 +605,11 @@ PUT /assert {"api/v1/people~count":{"is":3}}
 
 ### Exporting seed data (`--export <external-id>`)
 
-A response read from one environment can't be written to another as it is: every
-record carries its database key (`identifiers.key`), which means nothing anywhere
-else. `--export` rewrites each response so that it can be sent back with `PUT`, to
-the same environment or a different one, any number of times, and find or create
+A response read from one environment can't be written to another as it is. Every
+record carries its database key (`identifiers.key`), and a write that names a
+record by a key no record has is refused (`400 failed indexing`). `--export`
+rewrites each response so that it can be sent back with `PUT`, to the environment
+it was read from or to a different one, any number of times, and find or create
 the same records:
 
 ```sh
@@ -621,26 +622,34 @@ api -c staging PUT /users @users.json
 {                                                  {
   "name": "Ann",                                     "@type": "person",
   "@type": "person",                                 "identifiers": {
-  "identifiers": {                                     "com.heads.seedID": "98850c77"
-    "key": "98850c77"                                },
-  },                                                 "name": "Ann",
-  "employer": {                                      "employer": {
-    "identifiers": {                                   "identifiers": {
-      "key": "27b65eb8",                                 "com.heads.seedID": "ourcompany"
-      "com.heads.seedID": "ourcompany"                 }
-    }                                                },
-  },                                                 "password": null
-  "password": "********"                           }
-}
+  "identifiers": {                                     "key?": "98850c77…",
+    "key": "98850c77…"                                 "com.heads.seedID": "98850c77…"
+  },                                                 },
+  "employer": {                                      "name": "Ann",
+    "identifiers": {                                 "employer": {
+      "key": "27b65eb8…",                              "identifiers": {
+      "com.heads.seedID": "ourcompany"                   "key?": "27b65eb8…",
+    }                                                    "com.heads.seedID": "ourcompany"
+  },                                                   }
+  "password": "********"                             },
+}                                                    "password": null
+                                                   }
 ```
 
 What it does to every object in the response, however deep:
 
-- **`identifiers.key` is removed.** A record that has another identifier
-  (`com.heads.seedID`, a `userId`, anything besides `@type`) is found by that
-  one. A record with **no** other identifier keeps the key's value under the
-  name you gave, so the next `PUT` finds the record it made instead of making
-  another.
+- **`identifiers.key` is written as `key?`**, the key that may name nothing.
+  Where a record has that key, `key?` names it, so a write to the environment
+  the data was read from finds every record. Where none has, the API reads
+  the identifiers as if `key?` were not there, and the record's other
+  identifiers find or create it. `key` is never left beside `key?` (the API
+  refuses the pair).
+- **A record with no other identifier also gets its key under the name you
+  gave** (`com.heads.seedID` above). Without it, every write to another
+  environment would create the record again; with it, the second write finds
+  the record the first one made. A record that already has another
+  identifier (`com.heads.seedID`, a `userId`, anything besides `@type`) gets
+  `key?` and nothing more.
 - **A masked value (`********`) becomes `null`**, and a line on stderr says
   where: `Response had masked data, now null at oauth2Clients/secret,
   localCredentials/password and 1 other place`. A path is written from the
@@ -653,22 +662,35 @@ What it does to every object in the response, however deep:
 
 Rules:
 
-- The name is three dot-separated segments of letters, digits and `-`
-  (`com.heads.seedID`). Anything else is an error before a request is sent,
-  which is also what catches a forgotten name (`api --export GET /users`).
+- The name is a **namespaced key**, the form the API wants an external
+  identifier's name in: exactly three dot-separated segments of letters,
+  digits and `_`, at most 128 characters (`com.heads.seedID`). The second
+  segment may also hold `-`, the third `-` and `$`. Anything else is an error
+  before a request is sent, which is also what catches a forgotten name
+  (`api --export GET /users`).
+- **The server has to know `key?`.** One that doesn't refuses the export on
+  a write with `400 failed coercion` (`The key 'key?' is not a valid
+  namespaced key`).
 - It applies to **2xx JSON responses**, wherever they go: stdout, a `> file`,
   `>> file`, the clipboard. An error body is left as the server sent it, so
   `-f` output is unaffected, and request bodies are never touched.
-- It works for one request, in a batch (`api --export com.heads.seedID -sa
-  export.api`, with a `> file` per request), and at the interactive prompt
-  (the masked-data line shows in the hint line).
+- It works for one request and in a batch (`api --export com.heads.seedID
+  -sa export.api`, with a `> file` per request).
+- **At the interactive prompt, `ctrl+r` turns export mode on and off**, the
+  way `ctrl+t` does streaming, and `export` shows at the right of the hint
+  line while it is on. The first time, it asks for the name: there is no
+  default, and a name that is not a namespaced key is asked for again. The
+  name is remembered until the session ends, so turning export on again
+  doesn't ask. A session started with `--export <name>` starts with export
+  on and has its name. The masked-data line shows in the hint line.
 - Output is indented; `-r` prints it on one line. NDJSON (`--ndjson`, or a
   `> file.ndjson`) is rewritten line by line.
 - A response that is not JSON (a `> file.csv`, a `.sql`) is written unchanged,
   with `WARNING: --export left a response that is not JSON unchanged`.
 - `&&`/`||`, `assert` and `sleep while` judge what the server answered, not
   the rewritten body.
-- The whole body is needed, so `--stream` is ignored while `--export` is on.
+- The whole body is needed, so `--stream` is ignored while export is on (at
+  the prompt, `export` takes the place of the `streaming` marker).
 
 ### Credentials from disk (`--no-keychain`)
 
@@ -822,7 +844,8 @@ Run it: `api -sa workshop.api`.
 - **An archive URL without `sha256`** → downloaded again on every run, and whatever it serves that day is what runs. Add the `sha256` from the `import …` log line to pin it.
 - **`"token_env": "<the token>"`** → rejected or reported as an unset variable. It takes the *name* of an environment variable, so the secret stays out of the file.
 - **`import dir cl { "path": "cl" }`** → `import alias … clashes`. An alias can't share its name with a file or directory next to the `.api` file; name the alias something else.
-- **Seeding from a plain `GET`** → the response carries `identifiers.key`, a database key of the environment it was read from. Written elsewhere it is refused or creates duplicates. Read it with `--export <external-id>`.
+- **Seeding from a plain `GET`** → the response carries `identifiers.key`, a database key of the environment it was read from. Written elsewhere it is refused (`400 failed indexing`: a `key` that names nothing). Read it with `--export <external-id>`, which writes it as `key?`.
+- **Writing an export to a server without `key?`** → `400 failed coercion`, `The key 'key?' is not a valid namespaced key`. The export needs a server that knows the optional key.
 - **Expecting secrets in an export** → the API masks them (`********`) and `--export` turns that into `null`, and says where (`Response had masked data, now null at …`). A password, an API key or a client secret has to be set separately.
 - **Expecting a failed request to stop a batch** → it doesn't, unless the line is an `assert`, a chain or a poll, or the run has `-f`. A plain `PUT /assert {…}` that answers 409 is logged and the next line runs. Run with `-f`.
 - **Chaining on `PUT /assert`** → a passing `/assert` answers `200` with `null`, which is falsy, so `PUT /assert {…} && …` skips what follows and `assert PUT /assert {…}` fails on a pass. Write it on its own line and run with `-f`.
@@ -839,6 +862,6 @@ Run it: `api -sa workshop.api`.
 - For repeated boilerplate, factor it into a `shared/` directory and use includes.
 - When generating files programmatically, prefer compact single-line JSON bodies — they're easier to grep and diff.
 - Use silent batch mode (`-sa`) when you want to verify that a long seeding script worked without drowning in response bodies.
-- To move data between environments, read it with `--export com.heads.seedID` into a file and `PUT` the file. Use the same identifier name every time, so a record exported twice is one record.
+- To move data between environments, read it with `--export com.heads.seedID` into a file and `PUT` the file. Use the same identifier name every time, so a record exported twice is one record. The same file can be written back where it was read: `key?` finds each record there.
 - Add `-f` (`-sfa`) so a failed request stops the batch: check the exit code, and on failure read the error body from the end of stdout (everything after the last `└─HTTP/1.1 …` line; it is usually several lines of JSON). Without it a batch exits 0 however many plain requests failed.
 - Run with `--no-keychain` and an absolute `API_CREDENTIALS_FILE` so nothing depends on an unlocked keychain or on the working directory.

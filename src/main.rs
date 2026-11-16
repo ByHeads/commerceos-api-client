@@ -39,6 +39,9 @@ const STREAMING_INFO_MSG: &str = "streamed bodies may encode errors, ctrl+h for 
 
 /// The persistent footer marker shown while streaming is active.
 const STREAMING_INDICATOR: &str = "streaming";
+/// Shown in the same place while export mode is on. Streaming is not asked
+/// for then, so the two never have to share the line.
+const EXPORT_INDICATOR: &str = "export";
 
 /// Prose of the long-form streaming caveat, shown in the ctrl+h panel while
 /// streaming is active — the footer notice only has room to point here. The
@@ -104,7 +107,7 @@ fn streaming_help_lines(base_uri: &str) -> Vec<String> {
 /// counted: the docs link carries the connection's host, and a long one would
 /// wrap into rows the clear span didn't know about.
 fn help_line_count(state: &AppState) -> u16 {
-    let base = 26;
+    let base = 27;
     if !state.config.streaming {
         return base;
     }
@@ -208,8 +211,9 @@ struct Args {
     #[arg(short = 'f', long = "fail-fast")]
     fail_fast: bool,
 
-    /// Export mode: turn responses into seed data. Database keys are dropped,
-    /// and a record with no other identifier keeps its key under this name
+    /// Export mode: turn responses into seed data. Every database key is
+    /// written as `key?`, and a record with no other identifier also gets its
+    /// key under this name, a namespaced key such as com.heads.seedID
     #[arg(long = "export", value_name = "EXTERNAL_ID")]
     export: Option<String>,
 
@@ -277,8 +281,9 @@ struct Config {
     expect_falsy: bool,
     /// `-f`: a response of 400 or above ends the run. See `fail_fast_trips`.
     fail_fast: bool,
-    /// `--export <name>`: responses are rewritten as seed data, with `name`
-    /// as the external identifier a database key is kept under. See
+    /// Export mode, from `--export <name>` or ctrl+r at the prompt: responses
+    /// are rewritten as seed data, with `name` as the external identifier a
+    /// lone database key is also kept under. `None` is off. See
     /// `export_value`.
     export_id: Option<String>,
     /// The status of the last response the prompt received, for `-f` there.
@@ -659,6 +664,11 @@ struct AppState {
     status_msg_at: Option<std::time::Instant>,
     /// Set when streaming turns on, to pulse the footer indicator white.
     streaming_flash_at: Option<std::time::Instant>,
+    /// The external identifier name export mode uses in this session: the
+    /// one from `--export`, or the one typed the first time ctrl+r turned
+    /// export on. Kept while export is off, so turning it on again does not
+    /// ask twice.
+    export_name: Option<String>,
     ctrl_c_pending: bool,
     ctrl_c_at: Option<std::time::Instant>,
     width: u16,
@@ -717,6 +727,7 @@ struct AppState {
 
 impl AppState {
     fn new(config: Config) -> Self {
+        let export_name = config.export_id.clone();
         AppState {
             config,
             input: "GET /".to_string(),
@@ -743,6 +754,7 @@ impl AppState {
             status_msg: String::new(),
             status_msg_at: None,
             streaming_flash_at: None,
+            export_name,
             ctrl_c_pending: false,
             ctrl_c_at: None,
             width: 80,
@@ -2782,11 +2794,8 @@ fn main() {
     config.preview = args.preview;
     config.fail_fast = args.fail_fast;
     if let Some(name) = &args.export {
-        if !is_external_id_name(name) {
-            eprintln!(
-                "error: invalid export identifier: {} (expected three dot-separated segments of letters, digits and `-`, such as com.heads.seedID)",
-                name
-            );
+        if !is_namespaced_key(name) {
+            eprintln!("error: invalid export identifier: {} ({})", name, NAMESPACED_KEY_HELP);
             std::process::exit(1);
         }
         config.export_id = Some(name.clone());
@@ -4402,24 +4411,39 @@ fn status_is_error(status: u16) -> bool {
 /// What the API prints in place of a value the caller may not read.
 const MASKED_VALUES: [&str; 2] = ["********", "*******"];
 
-/// Whether `name` can name an external identifier: three dot-separated
-/// segments of letters, digits and `-` (`com.heads.seedID`).
-fn is_external_id_name(name: &str) -> bool {
+/// Whether `name` is a namespaced key, the form the API wants an external
+/// identifier's name in: exactly three dot-separated segments and at most 128
+/// characters (`com.heads.seedID`). The segments are word characters; the
+/// second may also hold `-`, and the third `-` and `$`. The same rule as the
+/// server's `isNamespacedKey` (`^\w+\.[\w-]+\.[\w$-]+$`), so a name accepted
+/// here is one a write accepts.
+fn is_namespaced_key(name: &str) -> bool {
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
     let segments: Vec<&str> = name.split('.').collect();
-    segments.len() == 3
-        && segments
-            .iter()
-            .all(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+    name.len() <= 128
+        && segments.len() == 3
+        && segments.iter().all(|segment| !segment.is_empty())
+        && segments[0].chars().all(word)
+        && segments[1].chars().all(|c| word(c) || c == '-')
+        && segments[2].chars().all(|c| word(c) || c == '-' || c == '$')
 }
+
+/// What to say about a name that is not a namespaced key.
+const NAMESPACED_KEY_HELP: &str = "a namespaced key has three dot-separated segments, such as com.heads.seedID";
 
 /// Rewrite a response value in place so that it can be sent to another
 /// environment as seed data.
 ///
-/// A database key (`identifiers.key`) means something in the environment it
-/// was read from and nowhere else, so every one is dropped. A record that has
-/// another identifier is found by that one. A record that has none would be
-/// created anew by every run of the seed, so its key is kept as the value of
-/// the external identifier `id_key`, which finds it again the next time.
+/// A database key (`identifiers.key`) names an object in the environment it
+/// was read from and nowhere else, and a write that names an object by a key
+/// no object has is refused. So every `key` is written as `key?`, the
+/// optional key: the API takes it to name the object where one has that key,
+/// and reads the identifiers as if it were not written where none has. The
+/// export can then be written back where it was read, where every object is
+/// found by its key, and anywhere else, where it is found by its other
+/// identifiers. A record that has no other identifier would be created anew
+/// by every write elsewhere, so it also gets its key as the value of the
+/// external identifier `id_key`, which finds it again the next time.
 ///
 /// Beyond that: a masked value becomes `null` (where it was is added to
 /// `masked`, so the caller can say what was lost), and `identifiers` is
@@ -4428,6 +4452,7 @@ fn is_external_id_name(name: &str) -> bool {
 ///
 /// Children are rewritten before the object that holds them, so a masked
 /// `key` is `null` by the time its record is looked at and is left alone.
+/// `key` and `key?` are never both left in one object: the API refuses that.
 fn export_value(value: &mut Value, id_key: &str, path: &mut String, masked: &mut Vec<String>) {
     match value {
         Value::String(text) if MASKED_VALUES.contains(&text.as_str()) => {
@@ -4461,9 +4486,9 @@ fn export_value(value: &mut Value, id_key: &str, path: &mut String, masked: &mut
     }
 }
 
-/// Drop `identifiers.key` from `object`, keeping its value as `id_key` when
-/// the record has no other identifier. The new identifier takes the key's
-/// place among the members.
+/// Rename `identifiers.key` to `key?` in `object`, and give a record that has
+/// no other identifier its key as `id_key` too. Both take the key's place
+/// among the members, `key?` first.
 fn export_identifiers(object: &mut Map<String, Value>, id_key: &str) {
     let Some(Value::Object(identifiers)) = object.get_mut("identifiers") else {
         return;
@@ -4472,12 +4497,23 @@ fn export_identifiers(object: &mut Map<String, Value>, id_key: &str) {
     if !has_key {
         return;
     }
-    let only_key = identifiers.keys().all(|name| name == "@type" || name == "key");
+    let only_key = identifiers.keys().all(|name| matches!(name.as_str(), "@type" | "key" | "key?"));
     for (name, value) in std::mem::take(identifiers) {
-        if name != "key" {
-            identifiers.insert(name, value);
-        } else if only_key {
-            identifiers.insert(id_key.to_string(), value);
+        match name.as_str() {
+            "key" => {
+                if only_key {
+                    identifiers.insert("key?".to_string(), value.clone());
+                    identifiers.insert(id_key.to_string(), value);
+                } else {
+                    identifiers.insert("key?".to_string(), value);
+                }
+            }
+            // An answer never carries one. If it did, the key read beside it
+            // is the one to go by, and the two may not stand together.
+            "key?" => {}
+            _ => {
+                identifiers.insert(name, value);
+            }
         }
     }
 }
@@ -8152,6 +8188,11 @@ fn handle_key_event(
             render(stdout, state)?;
         }
 
+        // Toggle export mode (ctrl+r)
+        (KeyModifiers::CONTROL, KeyCode::Char('r')) => {
+            handle_export_toggle(state, stdout)?;
+        }
+
         // Save connection (ctrl+s)
         (KeyModifiers::CONTROL, KeyCode::Char('s')) => {
             handle_save_connection(state, stdout)?;
@@ -10555,6 +10596,78 @@ fn confirm_inline(stdout: &mut io::Stdout, prompt: &str) -> io::Result<bool> {
     }
 }
 
+/// ctrl+r: turn export mode on or off for the session, as `--export` does for
+/// a run. Turning it on needs the external identifier's name. There is no
+/// default: it is asked for the first time, and remembered until the session
+/// ends (a session started with `--export <name>` knows it already).
+fn handle_export_toggle(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<()> {
+    if state.config.export_id.take().is_some() {
+        state.status_msg = "export off".to_string();
+        state.status_msg_at = Some(Instant::now());
+        return render(stdout, state);
+    }
+    let name = match state.export_name.clone() {
+        Some(name) => name,
+        None => match ask_export_name(state, stdout)? {
+            Some(name) => name,
+            None => {
+                state.status_msg = "cancelled".to_string();
+                state.status_msg_at = Some(Instant::now());
+                return render(stdout, state);
+            }
+        },
+    };
+    state.status_msg = format!("export on: {}", name);
+    state.status_msg_at = Some(Instant::now());
+    state.streaming_flash_at = Some(Instant::now());
+    state.export_name = Some(name.clone());
+    state.config.export_id = Some(name);
+    render(stdout, state)
+}
+
+/// Ask, in the command area, for the name export mode keeps a lone key
+/// under. Enter on a name that is not a namespaced key asks again, with what
+/// was typed left to correct; esc or an empty answer gives `None`.
+fn ask_export_name(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<Option<String>> {
+    let ruler_line = format!("\x1b[38;5;239m{}\x1b[0m", "─".repeat(state.width as usize));
+    let input_lines = state.prev_input_lines;
+    let prompt = "› Export with external identifier: ";
+
+    // Clear the command area (input lines, bottom ruler, hint), keep the top ruler.
+    execute!(stdout, cursor::MoveUp(1 + input_lines), cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
+
+    let mut typed = String::new();
+    let mut hint = "a namespaced key, such as com.heads.seedID · enter to turn export on, esc to cancel".to_string();
+    let answer = loop {
+        // The prompt line, the bottom ruler and the hint; then back up to the prompt.
+        execute!(stdout, Print("\r\n"), Print(format!("{}\r\n", ruler_line)), Print(format!("  {}", hint.dimmed())))?;
+        execute!(stdout, cursor::MoveUp(2), cursor::MoveToColumn(0))?;
+        match read_inline_input(stdout, prompt, false, &typed)? {
+            None => break None,
+            Some(name) => {
+                let name = name.trim().to_string();
+                if name.is_empty() {
+                    break None;
+                }
+                if is_namespaced_key(&name) {
+                    break Some(name);
+                }
+                hint = format!("not a namespaced key: {} · {}", name, NAMESPACED_KEY_HELP);
+                typed = name;
+                // Back onto the prompt line, to draw the three lines again.
+                execute!(stdout, cursor::MoveUp(1), cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
+            }
+        }
+    };
+
+    // Restore the normal command area for `render`.
+    execute!(stdout, cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
+    for _ in 0..input_lines {
+        execute!(stdout, Print("\r\n"))?;
+    }
+    Ok(answer)
+}
+
 fn handle_save_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<()> {
     let width = state.width as usize;
     let ruler = "─".repeat(width);
@@ -11016,7 +11129,7 @@ const STREAMING_INDICATOR_MARGIN: usize = 2;
 /// Auto-wrap is disabled around this block, so even writing to the final column
 /// is safe — no phantom line appears.
 fn streaming_indicator(state: &AppState, left_width: usize) -> String {
-    let Some(pad) = streaming_indicator_pad(state, left_width) else {
+    let (Some(pad), Some(label)) = (streaming_indicator_pad(state, left_width), footer_indicator(state)) else {
         return String::new();
     };
 
@@ -11038,11 +11151,11 @@ fn streaming_indicator(state: &AppState, left_width: usize) -> String {
                 None
             };
             match shade {
-                Some(s) => format!("\x1b[38;5;{}m{}\x1b[0m", s, STREAMING_INDICATOR),
-                None => STREAMING_INDICATOR.dimmed().to_string(),
+                Some(s) => format!("\x1b[38;5;{}m{}\x1b[0m", s, label),
+                None => label.dimmed().to_string(),
             }
         }
-        None => STREAMING_INDICATOR.dimmed().to_string(),
+        None => label.dimmed().to_string(),
     };
 
     // No trailing spaces needed — render clears the area first, so the margin is
@@ -11050,14 +11163,25 @@ fn streaming_indicator(state: &AppState, left_width: usize) -> String {
     format!("{}{}", " ".repeat(pad), styled)
 }
 
-/// Spaces between the left-hand text and the `streaming` marker, or `None`
-/// when streaming is off or the line can't hold both.
-fn streaming_indicator_pad(state: &AppState, left_width: usize) -> Option<usize> {
-    if !state.config.streaming {
-        return None;
+/// The marker at the right of the hint line: `export` while export mode is
+/// on, `streaming` while streaming is, nothing otherwise. Export wins, since
+/// a response is read whole while it is on.
+fn footer_indicator(state: &AppState) -> Option<&'static str> {
+    if state.config.export_id.is_some() {
+        Some(EXPORT_INDICATOR)
+    } else if state.config.streaming {
+        Some(STREAMING_INDICATOR)
+    } else {
+        None
     }
+}
+
+/// Spaces between the left-hand text and the marker, or `None` when there is
+/// no marker to show or the line can't hold both.
+fn streaming_indicator_pad(state: &AppState, left_width: usize) -> Option<usize> {
+    let label = footer_indicator(state)?;
     let width = state.width as usize;
-    let used = 2 + left_width + STREAMING_INDICATOR.len() + STREAMING_INDICATOR_MARGIN;
+    let used = 2 + left_width + label.len() + STREAMING_INDICATOR_MARGIN;
     // Not enough room — the left-hand text is the more useful of the two.
     (width >= used + 1).then(|| width - used)
 }
@@ -11115,15 +11239,15 @@ impl StreamPulse {
 /// pulse the marker is; `None` leaves it steady.
 fn transient_hint_line(state: &AppState, text: &str, pulse: Option<Duration>) -> String {
     let mut line = format!("  {}", text.dimmed());
-    if let Some(pad) = streaming_indicator_pad(state, text.chars().count()) {
+    if let (Some(pad), Some(label)) = (streaming_indicator_pad(state, text.chars().count()), footer_indicator(state)) {
         line.push_str(&" ".repeat(pad));
         match pulse {
             Some(since) => line.push_str(&format!(
                 "\x1b[38;5;{}m{}\x1b[0m",
                 stream_pulse_shade(since),
-                STREAMING_INDICATOR
+                label
             )),
-            None => line.push_str(&STREAMING_INDICATOR.dimmed().to_string()),
+            None => line.push_str(&label.dimmed().to_string()),
         }
     }
     line
@@ -11336,6 +11460,7 @@ fn render<W: Write>(stdout: &mut W, state: &mut AppState) -> io::Result<()> {
             Print(format!("{}\r\n", "  ctrl+b     Open API docs in browser".dimmed())),
             Print(format!("{}\r\n", "  ctrl+o     Open last saved file".dimmed())),
             Print(format!("{}\r\n", "  ctrl+t     Toggle response streaming".dimmed())),
+            Print(format!("{}\r\n", "  ctrl+r     Toggle export mode (responses as seed data)".dimmed())),
             Print(format!("{}\r\n", "  ctrl+c     Quit".dimmed())),
             Print("\r\n"),
             Print(format!("{}\r\n", "  ctrl+h or esc to close".dimmed()))
@@ -18785,54 +18910,98 @@ mod tests {
     }
 
     #[test]
-    fn an_external_id_name_is_three_dotted_segments() {
-        for name in ["com.heads.seedID", "com.example.id", "a.b.c", "com.my-org.seed-id", "1.2.3"] {
-            assert!(is_external_id_name(name), "{name}");
+    fn a_namespaced_key_is_what_the_server_takes_for_one() {
+        // The server's rule: ^\w+\.[\w-]+\.[\w$-]+$, at most 128 characters.
+        for name in [
+            "com.heads.seedID", "com.example.id", "a.b.c", "com.my-org.seed-id", "1.2.3", "com.heads.seed_ID",
+            "my_co.heads.id", "com.heads.id$", "com.heads.$",
+        ] {
+            assert!(is_namespaced_key(name), "{name}");
         }
         for name in [
             "", "GET", "seedID", "com.heads", "com.heads.seed.ID", "com..seedID", ".heads.seedID", "com.heads.",
-            "com.heads.seed_ID", "com.heads.seed ID", "com/heads/seedID", "com.heads.seedID\n",
+            "com.heads.seed ID", "com/heads/seedID", "com.heads.seedID\n", " com.heads.seedID",
+            // `-` is for the second and third segment, `$` for the third.
+            "my-co.heads.id", "com.he$ds.id", "c$m.heads.id",
+            // Letters of the ASCII alphabet only, as `\w` has it.
+            "com.heads.nyckelö", "key?", "com.heads.key?",
         ] {
-            assert!(!is_external_id_name(name), "{name:?}");
+            assert!(!is_namespaced_key(name), "{name:?}");
         }
+        let long = |n: usize| format!("com.heads.{}", "x".repeat(n - "com.heads.".len()));
+        assert!(is_namespaced_key(&long(128)));
+        assert!(!is_namespaced_key(&long(129)));
     }
 
     #[test]
-    fn export_keeps_a_lone_key_under_the_external_identifier() {
-        // No other identifier: the key is what finds the record again.
+    fn export_writes_a_lone_key_as_key_and_as_the_external_identifier() {
+        // No other identifier: `key?` finds the record where it was read, and
+        // the name finds it everywhere else from the second write on.
         assert_eq!(
             exported(r#"{"identifiers":{"key":"abc"},"name":"Ann"}"#).0,
-            r#"{"identifiers":{"com.heads.seedID":"abc"},"name":"Ann"}"#
+            r#"{"identifiers":{"key?":"abc","com.heads.seedID":"abc"},"name":"Ann"}"#
         );
-        // `@type` is not an identifier, and the new one takes the key's place.
+        // `@type` is not an identifier, and the two take the key's place.
         assert_eq!(
             exported(r#"{"@type":"person","identifiers":{"@type":"common identifiers","key":"abc"}}"#).0,
-            r#"{"@type":"person","identifiers":{"@type":"common identifiers","com.heads.seedID":"abc"}}"#
+            r#"{"@type":"person","identifiers":{"@type":"common identifiers","key?":"abc","com.heads.seedID":"abc"}}"#
         );
         assert_eq!(
             exported(r#"{"identifiers":{"key":"abc","@type":"common identifiers"}}"#).0,
-            r#"{"identifiers":{"com.heads.seedID":"abc","@type":"common identifiers"}}"#
+            r#"{"identifiers":{"key?":"abc","com.heads.seedID":"abc","@type":"common identifiers"}}"#
         );
         // A key that is a number is kept as it is.
-        assert_eq!(exported(r#"{"identifiers":{"key":7}}"#).0, r#"{"identifiers":{"com.heads.seedID":7}}"#);
+        assert_eq!(
+            exported(r#"{"identifiers":{"key":7}}"#).0,
+            r#"{"identifiers":{"key?":7,"com.heads.seedID":7}}"#
+        );
     }
 
     #[test]
-    fn export_drops_the_key_of_a_record_that_has_another_identifier() {
+    fn export_writes_every_key_as_key_also_beside_another_identifier() {
+        // The record is found by its other identifier anywhere, and by `key?`
+        // where it was read. It gets no name made from the key.
         assert_eq!(
             exported(r#"{"identifiers":{"key":"abc","com.mi6.id":"007"},"name":"James"}"#).0,
-            r#"{"identifiers":{"com.mi6.id":"007"},"name":"James"}"#
+            r#"{"identifiers":{"key?":"abc","com.mi6.id":"007"},"name":"James"}"#
         );
         // Any other member of `identifiers` counts, namespaced or not.
         assert_eq!(
             exported(r#"{"identifiers":{"@type":"user identifiers","key":"abc","userId":"U1"}}"#).0,
-            r#"{"identifiers":{"@type":"user identifiers","userId":"U1"}}"#
+            r#"{"identifiers":{"@type":"user identifiers","key?":"abc","userId":"U1"}}"#
         );
         // The external identifier itself, already there, is left alone.
         assert_eq!(
             exported(r#"{"identifiers":{"key":"abc","com.heads.seedID":"ours"}}"#).0,
-            r#"{"identifiers":{"com.heads.seedID":"ours"}}"#
+            r#"{"identifiers":{"key?":"abc","com.heads.seedID":"ours"}}"#
         );
+        // `key?` stands where `key` stood.
+        assert_eq!(
+            exported(r#"{"identifiers":{"com.a.b":"1","key":"abc","com.c.d":"2"}}"#).0,
+            r#"{"identifiers":{"com.a.b":"1","key?":"abc","com.c.d":"2"}}"#
+        );
+    }
+
+    #[test]
+    fn export_never_leaves_key_and_key_side_by_side() {
+        // The API refuses `key` beside `key?`. No answer carries `key?`, but
+        // if one did, the key read beside it is the one that is written.
+        for (body, expected) in [
+            (r#"{"identifiers":{"key?":"old","key":"abc"}}"#, r#"{"identifiers":{"key?":"abc","com.heads.seedID":"abc"}}"#),
+            (r#"{"identifiers":{"key":"abc","key?":"old","com.x.y":"1"}}"#, r#"{"identifiers":{"key?":"abc","com.x.y":"1"}}"#),
+        ] {
+            let (out, _) = exported(body);
+            assert_eq!(out, expected);
+            assert!(!out.contains("\"key\""), "{out}");
+        }
+        // What was exported once is not changed by exporting it again.
+        for body in [
+            r#"[{"identifiers":{"key":"u1"},"agent":{"identifiers":{"key":"a1","com.x.y":"root"}},"secret":"********"}]"#,
+            r#"{"identifiers":{"key":"abc","userId":"U1"}}"#,
+        ] {
+            let once = exported(body).0;
+            assert_eq!(exported(&once).0, once);
+        }
     }
 
     #[test]
@@ -18844,10 +19013,10 @@ mod tests {
         assert_eq!(
             out,
             concat!(
-                r#"[{"identifiers":{"com.heads.seedID":"u1"},"#,
-                r#""agent":{"identifiers":{"com.heads.seedID":"root"},"name":"System"},"#,
-                r#""clients":[{"identifiers":{"com.heads.seedID":"c1"},"node":{"identifiers":{"com.heads.seedID":"n1"}}},"#,
-                r#"{"identifiers":{"clientID":"x"}}]}]"#
+                r#"[{"identifiers":{"key?":"u1","com.heads.seedID":"u1"},"#,
+                r#""agent":{"identifiers":{"key?":"a1","com.heads.seedID":"root"},"name":"System"},"#,
+                r#""clients":[{"identifiers":{"key?":"c1","com.heads.seedID":"c1"},"node":{"identifiers":{"key?":"n1","com.heads.seedID":"n1"}}},"#,
+                r#"{"identifiers":{"key?":"c2","clientID":"x"}}]}]"#
             )
         );
         assert!(!out.contains("\"key\""));
@@ -18864,11 +19033,13 @@ mod tests {
             r#"{"identifiers":"abc"}"#,
             r#"{"identifiers":null}"#,
             r#"{"identifiers":["key"]}"#,
-            // A key that holds nothing is not a key to keep or to drop.
+            // A key that holds nothing is not a key to write.
             r#"{"identifiers":{"key":null}}"#,
             r#"{"identifiers":{"key":false}}"#,
             // A member called `key` anywhere else.
             r#"{"settings":{"key":"abc"},"kv":[{"key":"a","value":1}]}"#,
+            // Seed data as it is: nothing more to do to it.
+            r#"{"identifiers":{"key?":"abc","com.heads.seedID":"abc"}}"#,
             // Scalars and empties.
             "null", "true", "213", r#""text""#, "[]", "{}", r#"[1,"two",null]"#,
         ] {
@@ -18876,6 +19047,53 @@ mod tests {
             assert_eq!(out, unchanged);
             assert!(masked.is_empty(), "{unchanged}");
         }
+    }
+
+    #[test]
+    fn the_footer_marker_is_export_while_export_is_on_and_streaming_otherwise() {
+        let mut state = AppState::new(Config::default());
+        state.width = 80;
+        let shown = |state: &AppState| -> String {
+            let line = streaming_indicator(state, 20);
+            let mut plain = String::new();
+            let mut chars = line.chars();
+            while let Some(c) = chars.next() {
+                if c == '\x1b' {
+                    for skipped in chars.by_ref() {
+                        if skipped == 'm' {
+                            break;
+                        }
+                    }
+                } else {
+                    plain.push(c);
+                }
+            }
+            plain.trim_start().to_string()
+        };
+        assert_eq!((footer_indicator(&state), shown(&state).as_str()), (None, ""));
+        state.config.streaming = true;
+        assert_eq!((footer_indicator(&state), shown(&state).as_str()), (Some("streaming"), "streaming"));
+        // Export reads a response whole, so it takes the marker's place.
+        state.config.export_id = Some(SEED.to_string());
+        assert_eq!((footer_indicator(&state), shown(&state).as_str()), (Some("export"), "export"));
+        state.config.streaming = false;
+        assert_eq!((footer_indicator(&state), shown(&state).as_str()), (Some("export"), "export"));
+        // It ends where the streaming marker does, the margin in from the edge.
+        assert_eq!(visible_len(&streaming_indicator(&state, 20)), 80 - 2 - 20 - STREAMING_INDICATOR_MARGIN);
+        assert!(transient_hint_line(&state, "waiting", None).ends_with(&EXPORT_INDICATOR.dimmed().to_string()));
+        // Too narrow for both: the text on the left is kept.
+        state.width = 30;
+        assert_eq!(shown(&state), "");
+        state.config.export_id = None;
+        assert_eq!(footer_indicator(&state), None);
+    }
+
+    #[test]
+    fn a_session_started_with_export_knows_the_name_and_one_without_has_none() {
+        assert_eq!(AppState::new(Config::default()).export_name, None);
+        let started = AppState::new(Config { export_id: Some(SEED.to_string()), ..Config::default() });
+        assert_eq!(started.export_name.as_deref(), Some(SEED));
+        assert_eq!(started.config.export_id.as_deref(), Some(SEED));
     }
 
     #[test]
@@ -18898,7 +19116,7 @@ mod tests {
         // Nor are the members of `identifiers` itself.
         assert_eq!(
             exported(r#"{"identifiers":{"zeta.a.b":"1","key":"k","alpha.a.b":"2","@type":"t"}}"#).0,
-            r#"{"identifiers":{"zeta.a.b":"1","alpha.a.b":"2","@type":"t"}}"#
+            r#"{"identifiers":{"zeta.a.b":"1","key?":"k","alpha.a.b":"2","@type":"t"}}"#
         );
     }
 
@@ -18935,8 +19153,8 @@ mod tests {
         }
         assert_eq!(exported(r#""********""#).0, "null");
 
-        // A masked key is nothing to keep: it becomes null and stays, and no
-        // external identifier is made from it.
+        // A masked key is nothing to write: it becomes null and stays, and
+        // neither `key?` nor an external identifier is made from it.
         let (out, masked) = exported(r#"{"identifiers":{"key":"********"},"name":"x"}"#);
         assert_eq!(out, r#"{"identifiers":{"key":null},"name":"x"}"#);
         assert_eq!(masked, ["identifiers/key"]);
@@ -18948,28 +19166,28 @@ mod tests {
         let pretty = export_body(json, SEED, false, false);
         assert_eq!(
             pretty.text,
-            "[\n  {\n    \"identifiers\": {\n      \"com.heads.seedID\": \"a\"\n    },\n    \"n\": 1\n  }\n]"
+            "[\n  {\n    \"identifiers\": {\n      \"key?\": \"a\",\n      \"com.heads.seedID\": \"a\"\n    },\n    \"n\": 1\n  }\n]"
         );
         assert!(pretty.is_json && pretty.masked.is_empty());
-        assert_eq!(export_body(json, SEED, false, true).text, r#"[{"identifiers":{"com.heads.seedID":"a"},"n":1}]"#);
+        assert_eq!(export_body(json, SEED, false, true).text, r#"[{"identifiers":{"key?":"a","com.heads.seedID":"a"},"n":1}]"#);
         // The server's own indentation is read like any other.
-        assert_eq!(export_body(&pretty.text, SEED, false, true).text, r#"[{"identifiers":{"com.heads.seedID":"a"},"n":1}]"#);
+        assert_eq!(export_body(&pretty.text, SEED, false, true).text, r#"[{"identifiers":{"key?":"a","com.heads.seedID":"a"},"n":1}]"#);
 
         // NDJSON: one compact value per line, blank lines and the final
         // newline as they were, whatever `compact` says.
         let ndjson = "{\"identifiers\":{\"key\":\"a\"}}\n\n{\"identifiers\":{\"key\":\"b\",\"com.x.y\":\"1\"},\"secret\":\"********\"}\n";
         let by_line = export_body(ndjson, SEED, true, false);
-        assert_eq!(by_line.text, "{\"identifiers\":{\"com.heads.seedID\":\"a\"}}\n\n{\"identifiers\":{\"com.x.y\":\"1\"},\"secret\":null}\n");
+        assert_eq!(by_line.text, "{\"identifiers\":{\"key?\":\"a\",\"com.heads.seedID\":\"a\"}}\n\n{\"identifiers\":{\"key?\":\"b\",\"com.x.y\":\"1\"},\"secret\":null}\n");
         assert_eq!(by_line.masked, ["secret"]);
         assert_eq!(export_body(ndjson.trim_end(), SEED, true, false).text, by_line.text.trim_end());
         // Lines of JSON are read as NDJSON also when nothing said they were.
         assert_eq!(export_body(ndjson, SEED, false, false).text, by_line.text);
         // One line is both: what was asked for decides how it is printed.
         let one = r#"{"identifiers":{"key":"a"}}"#;
-        assert_eq!(export_body(one, SEED, true, false).text, r#"{"identifiers":{"com.heads.seedID":"a"}}"#);
+        assert_eq!(export_body(one, SEED, true, false).text, r#"{"identifiers":{"key?":"a","com.heads.seedID":"a"}}"#);
         assert!(export_body(one, SEED, false, false).text.contains("\n  \"identifiers\": {"));
         // An indented JSON body asked for as NDJSON is still JSON.
-        assert_eq!(export_body(&pretty.text, SEED, true, true).text, r#"[{"identifiers":{"com.heads.seedID":"a"},"n":1}]"#);
+        assert_eq!(export_body(&pretty.text, SEED, true, true).text, r#"[{"identifiers":{"key?":"a","com.heads.seedID":"a"},"n":1}]"#);
     }
 
     #[test]
