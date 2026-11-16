@@ -5712,7 +5712,7 @@ fn unpack_archive_within(bytes: &[u8], dest: &std::path::Path, limit: u64) -> Re
         for i in 0..zip.len() {
             let entry = zip.by_index(i).map_err(|e| format!("could not read the zip archive: {}", e))?;
             let Some(name) = entry.enclosed_name() else {
-                return Err(format!("archive entry leaves the archive: {}", entry.name()));
+                return Err(format!("archive entry leaves the archive: {}", String::from_utf8_lossy(entry.name_raw())));
             };
             let path = archive_entry_dest(&name, dest)?;
             if entry.is_dir() {
