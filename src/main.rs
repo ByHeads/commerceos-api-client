@@ -211,9 +211,9 @@ struct Args {
     #[arg(short = 'f', long = "fail-fast")]
     fail_fast: bool,
 
-    /// Export mode: turn responses into seed data. Every database key is
-    /// written as `key?`, and a record with no other identifier also gets its
-    /// key under this name, a namespaced key such as com.heads.seedID
+    /// Export mode: turn responses into seed data. Database keys are dropped,
+    /// and a record with no other identifier keeps its key as `key?` and under
+    /// this name, a namespaced key such as com.heads.seedID
     #[arg(long = "export", value_name = "EXTERNAL_ID")]
     export: Option<String>,
 
@@ -283,7 +283,7 @@ struct Config {
     fail_fast: bool,
     /// Export mode, from `--export <name>` or ctrl+r at the prompt: responses
     /// are rewritten as seed data, with `name` as the external identifier a
-    /// lone database key is also kept under. `None` is off. See
+    /// lone database key is kept under, beside `key?`. `None` is off. See
     /// `export_value`.
     export_id: Option<String>,
     /// The status of the last response the prompt received, for `-f` there.
@@ -4436,14 +4436,19 @@ const NAMESPACED_KEY_HELP: &str = "a namespaced key has three dot-separated segm
 ///
 /// A database key (`identifiers.key`) names an object in the environment it
 /// was read from and nowhere else, and a write that names an object by a key
-/// no object has is refused. So every `key` is written as `key?`, the
-/// optional key: the API takes it to name the object where one has that key,
-/// and reads the identifiers as if it were not written where none has. The
-/// export can then be written back where it was read, where every object is
-/// found by its key, and anywhere else, where it is found by its other
-/// identifiers. A record that has no other identifier would be created anew
-/// by every write elsewhere, so it also gets its key as the value of the
-/// external identifier `id_key`, which finds it again the next time.
+/// no object has is refused. So no `key` is left in the export.
+///
+/// - A record that has another identifier is found by that one, where it was
+///   read and anywhere else. Its key is dropped.
+/// - A record that has none would be created anew by every write. It gets
+///   its key as the value of the external identifier `id_key`, which finds
+///   it from the second write on, and as `key?`, the optional key. The API
+///   takes `key?` to name the object where one has that key, and reads the
+///   identifiers as if it were not written where none has. So the first
+///   write back where the record was read finds it too, and gives it the name.
+///
+/// `key?` is written where the name is made from the key and nowhere else,
+/// which is the rule of the platform's own export mode.
 ///
 /// Beyond that: a masked value becomes `null` (where it was is added to
 /// `masked`, so the caller can say what was lost), and `identifiers` is
@@ -4486,9 +4491,9 @@ fn export_value(value: &mut Value, id_key: &str, path: &mut String, masked: &mut
     }
 }
 
-/// Rename `identifiers.key` to `key?` in `object`, and give a record that has
-/// no other identifier its key as `id_key` too. Both take the key's place
-/// among the members, `key?` first.
+/// Take `identifiers.key` out of `object`. A record that has no other
+/// identifier gets the key back as `key?` and as `id_key`, in the key's
+/// place, `key?` first. One that has another identifier gets neither.
 fn export_identifiers(object: &mut Map<String, Value>, id_key: &str) {
     let Some(Value::Object(identifiers)) = object.get_mut("identifiers") else {
         return;
@@ -4504,8 +4509,6 @@ fn export_identifiers(object: &mut Map<String, Value>, id_key: &str) {
                 if only_key {
                     identifiers.insert("key?".to_string(), value.clone());
                     identifiers.insert(id_key.to_string(), value);
-                } else {
-                    identifiers.insert("key?".to_string(), value);
                 }
             }
             // An answer never carries one. If it did, the key read beside it
@@ -18958,28 +18961,48 @@ mod tests {
     }
 
     #[test]
-    fn export_writes_every_key_as_key_also_beside_another_identifier() {
-        // The record is found by its other identifier anywhere, and by `key?`
-        // where it was read. It gets no name made from the key.
+    fn export_drops_the_key_of_a_record_that_has_another_identifier() {
+        // The record is found by its other identifier, where it was read and
+        // anywhere else. No name is made from its key, so it gets no `key?`.
         assert_eq!(
             exported(r#"{"identifiers":{"key":"abc","com.mi6.id":"007"},"name":"James"}"#).0,
-            r#"{"identifiers":{"key?":"abc","com.mi6.id":"007"},"name":"James"}"#
+            r#"{"identifiers":{"com.mi6.id":"007"},"name":"James"}"#
         );
         // Any other member of `identifiers` counts, namespaced or not.
         assert_eq!(
             exported(r#"{"identifiers":{"@type":"user identifiers","key":"abc","userId":"U1"}}"#).0,
-            r#"{"identifiers":{"@type":"user identifiers","key?":"abc","userId":"U1"}}"#
+            r#"{"identifiers":{"@type":"user identifiers","userId":"U1"}}"#
         );
         // The external identifier itself, already there, is left alone.
         assert_eq!(
             exported(r#"{"identifiers":{"key":"abc","com.heads.seedID":"ours"}}"#).0,
-            r#"{"identifiers":{"key?":"abc","com.heads.seedID":"ours"}}"#
+            r#"{"identifiers":{"com.heads.seedID":"ours"}}"#
         );
-        // `key?` stands where `key` stood.
         assert_eq!(
             exported(r#"{"identifiers":{"com.a.b":"1","key":"abc","com.c.d":"2"}}"#).0,
-            r#"{"identifiers":{"com.a.b":"1","key?":"abc","com.c.d":"2"}}"#
+            r#"{"identifiers":{"com.a.b":"1","com.c.d":"2"}}"#
         );
+    }
+
+    #[test]
+    fn key_is_written_only_where_the_name_is_made_from_the_key() {
+        // One response, both kinds of record: `key?` stands beside the name
+        // it was made with, and nowhere else.
+        let (out, _) = exported(
+            r#"[{"identifiers":{"key":"k1"}},{"identifiers":{"key":"k2","com.x.y":"1"}},{"identifiers":{"key":"k3","com.heads.seedID":"s"}}]"#,
+        );
+        assert_eq!(
+            out,
+            r#"[{"identifiers":{"key?":"k1","com.heads.seedID":"k1"}},{"identifiers":{"com.x.y":"1"}},{"identifiers":{"com.heads.seedID":"s"}}]"#
+        );
+        let value: Value = serde_json::from_str(&out).unwrap();
+        for record in value.as_array().unwrap() {
+            let identifiers = record["identifiers"].as_object().unwrap();
+            match identifiers.get("key?") {
+                Some(key) => assert_eq!(identifiers.get(SEED), Some(key)),
+                None => assert!(!identifiers.values().any(|v| v == "k2" || v == "k3")),
+            }
+        }
     }
 
     #[test]
@@ -18988,7 +19011,7 @@ mod tests {
         // if one did, the key read beside it is the one that is written.
         for (body, expected) in [
             (r#"{"identifiers":{"key?":"old","key":"abc"}}"#, r#"{"identifiers":{"key?":"abc","com.heads.seedID":"abc"}}"#),
-            (r#"{"identifiers":{"key":"abc","key?":"old","com.x.y":"1"}}"#, r#"{"identifiers":{"key?":"abc","com.x.y":"1"}}"#),
+            (r#"{"identifiers":{"key":"abc","key?":"old","com.x.y":"1"}}"#, r#"{"identifiers":{"com.x.y":"1"}}"#),
         ] {
             let (out, _) = exported(body);
             assert_eq!(out, expected);
@@ -19014,9 +19037,9 @@ mod tests {
             out,
             concat!(
                 r#"[{"identifiers":{"key?":"u1","com.heads.seedID":"u1"},"#,
-                r#""agent":{"identifiers":{"key?":"a1","com.heads.seedID":"root"},"name":"System"},"#,
+                r#""agent":{"identifiers":{"com.heads.seedID":"root"},"name":"System"},"#,
                 r#""clients":[{"identifiers":{"key?":"c1","com.heads.seedID":"c1"},"node":{"identifiers":{"key?":"n1","com.heads.seedID":"n1"}}},"#,
-                r#"{"identifiers":{"key?":"c2","clientID":"x"}}]}]"#
+                r#"{"identifiers":{"clientID":"x"}}]}]"#
             )
         );
         assert!(!out.contains("\"key\""));
@@ -19116,7 +19139,7 @@ mod tests {
         // Nor are the members of `identifiers` itself.
         assert_eq!(
             exported(r#"{"identifiers":{"zeta.a.b":"1","key":"k","alpha.a.b":"2","@type":"t"}}"#).0,
-            r#"{"identifiers":{"zeta.a.b":"1","key?":"k","alpha.a.b":"2","@type":"t"}}"#
+            r#"{"identifiers":{"zeta.a.b":"1","alpha.a.b":"2","@type":"t"}}"#
         );
     }
 
@@ -19177,7 +19200,7 @@ mod tests {
         // newline as they were, whatever `compact` says.
         let ndjson = "{\"identifiers\":{\"key\":\"a\"}}\n\n{\"identifiers\":{\"key\":\"b\",\"com.x.y\":\"1\"},\"secret\":\"********\"}\n";
         let by_line = export_body(ndjson, SEED, true, false);
-        assert_eq!(by_line.text, "{\"identifiers\":{\"key?\":\"a\",\"com.heads.seedID\":\"a\"}}\n\n{\"identifiers\":{\"key?\":\"b\",\"com.x.y\":\"1\"},\"secret\":null}\n");
+        assert_eq!(by_line.text, "{\"identifiers\":{\"key?\":\"a\",\"com.heads.seedID\":\"a\"}}\n\n{\"identifiers\":{\"com.x.y\":\"1\"},\"secret\":null}\n");
         assert_eq!(by_line.masked, ["secret"]);
         assert_eq!(export_body(ndjson.trim_end(), SEED, true, false).text, by_line.text.trim_end());
         // Lines of JSON are read as NDJSON also when nothing said they were.
