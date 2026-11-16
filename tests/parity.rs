@@ -641,6 +641,264 @@ fn a_confirm_nobody_answered_stops_the_batch() {
     assert_eq!(ran.code, Some(1), "{}", ran.stderr);
 }
 
+/// A run asks as often as it has questions, and each answer is one line of
+/// stdin: `yes |` answers them all, and a run that is given fewer answers
+/// than it has questions stops at the first one left open.
+#[cfg(unix)]
+#[test]
+fn every_question_of_a_run_takes_its_own_answer() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("q.api"), "GET /a\nconfirm One\nGET /b\nconfirm Two\nGET /c\n").unwrap();
+
+    // The preview and both confirms, answered.
+    let ran = ask(&server, dir.path(), &["-spa", "q.api"], Some("y\n\nyes\n"));
+    assert_eq!(ran.sent, ["GET /a", "GET /b", "GET /c"], "{}", ran.stderr);
+    assert_eq!(ran.code, Some(0), "{}", ran.stderr);
+
+    // What `yes |` writes: more answers than questions.
+    let ran = ask(&server, dir.path(), &["-spa", "q.api"], Some(&"y\n".repeat(50)));
+    assert_eq!(ran.sent, ["GET /a", "GET /b", "GET /c"], "{}", ran.stderr);
+    assert_eq!(ran.code, Some(0), "{}", ran.stderr);
+
+    // One answer short: the second confirm finds end of input.
+    let ran = ask(&server, dir.path(), &["-spa", "q.api"], Some("y\ny\n"));
+    assert_eq!(ran.sent, ["GET /a", "GET /b"], "{}", ran.stderr);
+    assert!(ran.stderr.contains(UNANSWERED), "{}", ran.stderr);
+    assert_eq!(ran.code, Some(1), "{}", ran.stderr);
+
+    // A "no" at the second question: what ran before it stays run, exit 0.
+    let ran = ask(&server, dir.path(), &["-spa", "q.api"], Some("y\nn\n"));
+    assert_eq!(ran.sent, ["GET /a"], "{}", ran.stderr);
+    assert!(!ran.stderr.contains(UNANSWERED), "{}", ran.stderr);
+    assert_eq!(ran.code, Some(0), "{}", ran.stderr);
+
+    // Anything that is not Enter, `y` or `yes` declines, in any case.
+    for answer in ["no\n", "x\n", "yess\n", "  N  \n"] {
+        let ran = ask(&server, dir.path(), &["-spa", "q.api"], Some(answer));
+        assert_eq!(ran.sent, Vec::<String>::new(), "{answer:?}");
+        assert_eq!(ran.code, Some(0), "{answer:?}: {}", ran.stderr);
+    }
+    for answer in ["Y\n", "YES\n", " y \n", "y"] {
+        let ran = ask(&server, dir.path(), &["-sa", "q.api"], Some(&format!("{answer}\ny\n")));
+        assert_eq!(ran.sent, ["GET /a", "GET /b", "GET /c"], "{answer:?}: {}", ran.stderr);
+    }
+}
+
+/// The question is the same without `-s`, and with stdin closed outright.
+#[cfg(unix)]
+#[test]
+fn an_unanswered_question_stops_a_plain_batch_and_one_with_stdin_closed() {
+    use std::os::unix::process::CommandExt;
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("p.api"), "GET /a\n").unwrap();
+    std::fs::write(dir.path().join("c.api"), "GET /before\nconfirm\nGET /after\n").unwrap();
+
+    for (args, sent) in [(&["-pa", "p.api"][..], &[][..]), (&["-a", "c.api"], &["GET /before"]), (&["-p", "GET", "/a"], &[])] {
+        let ran = ask(&server, dir.path(), args, None);
+        assert_eq!(ran.sent, sent, "{args:?}");
+        assert!(ran.stderr.contains(UNANSWERED), "{args:?}: {}", ran.stderr);
+        assert_eq!(ran.code, Some(1), "{args:?}: {}", ran.stderr);
+    }
+    // The default prompt of a bare `confirm`.
+    let ran = ask(&server, dir.path(), &["-sa", "c.api"], Some("n\n"));
+    assert!(ran.stderr.contains("Continue? [Y/n]"), "{}", ran.stderr);
+
+    // `<&-`: no descriptor 0 at all.
+    for (args, sent) in [(&["-spa", "p.api"][..], &[][..]), (&["-sa", "c.api"], &["GET /before"])] {
+        server.take();
+        let mut cmd = api(server.port, dir.path());
+        cmd.args(args).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                libc::close(0);
+                Ok(())
+            });
+        }
+        let out = cmd.output().expect("spawn api");
+        server.settle(Duration::from_millis(150), Duration::from_secs(3));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(server.take(), sent, "{args:?}: {stderr}");
+        assert!(stderr.contains(UNANSWERED), "{args:?}: {stderr}");
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {stderr}");
+    }
+}
+
+/// The preview lists every step of the program as it will run, counts only
+/// the requests among them, and sends none of it when declined.
+#[cfg(unix)]
+#[test]
+fn the_preview_lists_directives_and_chains_and_counts_only_requests() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("d.api"),
+        "GET /a && PUT /b {\"x\":1} || GET /c\nsleep 1.5s\nsleep 2 while not GET /d~count\nassert not GET /e\nconfirm Go on\nconfirm\nDELETE /f\n",
+    )
+    .unwrap();
+    let ran = ask(&server, dir.path(), &["-spa", "d.api"], Some("n\n"));
+    assert_eq!(ran.sent, Vec::<String>::new());
+    assert_eq!(ran.code, Some(0), "{}", ran.stderr);
+    let lines: Vec<&str> = ran.stderr.lines().map(str::trim_end).collect();
+    assert_eq!(
+        &lines[..9],
+        [
+            &format!("Preview — 4 requests | GET PUT DELETE [http://127.0.0.1:{}]", server.port)[..],
+            "  GET /a",
+            "  && PUT /b {\"x\":1}",
+            "  || GET /c",
+            "  sleep 1.5s",
+            "  sleep 2s while not GET /d~count",
+            "  assert not GET /e",
+            "  confirm Go on",
+            "  confirm",
+        ],
+        "{}",
+        ran.stderr
+    );
+    assert!(lines[9..].iter().any(|l| l.trim() == "DELETE /f"), "{}", ran.stderr);
+
+    // A program with no request in it says so and still asks.
+    std::fs::write(dir.path().join("s.api"), "sleep 10ms\n").unwrap();
+    let ran = ask(&server, dir.path(), &["-spa", "s.api"], Some("n\n"));
+    assert!(ran.stderr.starts_with("Preview — 0 requests ["), "{}", ran.stderr);
+    assert!(ran.stderr.contains("  sleep 10ms") && ran.stderr.contains("Run? [Y/n]"), "{}", ran.stderr);
+
+    // One request, singular.
+    let ran = ask(&server, dir.path(), &["-sp", "PUT", "/x", "{\"a\":1}"], Some("n\n"));
+    assert!(ran.stderr.starts_with("Preview — 1 request | PUT ["), "{}", ran.stderr);
+    assert_eq!(ran.sent, Vec::<String>::new());
+
+    // Accepted once, the preview is not asked again per request.
+    std::fs::write(dir.path().join("two.api"), "GET /a\nGET /b\n").unwrap();
+    let ran = ask(&server, dir.path(), &["-spa", "two.api"], Some("y\n"));
+    assert_eq!(ran.sent, ["GET /a", "GET /b"], "{}", ran.stderr);
+    assert_eq!(ran.stderr.matches("Run? [Y/n]").count(), 1, "{}", ran.stderr);
+}
+
+/// A batch run in a terminal, to its end. Returns what the terminal showed
+/// and whether the client ended well.
+#[cfg(unix)]
+fn batch_in_a_terminal(cmd: std::process::Command, wait_for: &str, keys: &[u8]) -> (String, Option<bool>) {
+    let mut term = pty::Prompt::open(cmd);
+    if !wait_for.is_empty() {
+        term.wait_for(wait_for, Duration::from_secs(15));
+        term.send(keys);
+    }
+    let start = Instant::now();
+    let mut ended = None;
+    while ended.is_none() && start.elapsed() < Duration::from_secs(15) {
+        term.pump(Duration::from_millis(50));
+        ended = term.exited();
+    }
+    term.pump(Duration::from_millis(100));
+    (pty::plain(&term.screen), ended)
+}
+
+/// At a terminal the answer comes from the terminal: Enter accepts, `n`
+/// declines, and ctrl+D, which ends the input without a line, is nobody
+/// answering.
+#[cfg(unix)]
+#[test]
+fn at_a_terminal_ctrl_d_is_no_answer_and_enter_still_accepts() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("p.api"), "GET /a\n").unwrap();
+    std::fs::write(dir.path().join("c.api"), "GET /before\nconfirm Really?\nGET /after\n").unwrap();
+
+    let run = |args: &[&str], question: &str, keys: &[u8]| {
+        server.take();
+        let mut cmd = api(server.port, dir.path());
+        cmd.args(args);
+        let (shown, ended) = batch_in_a_terminal(cmd, question, keys);
+        server.settle(Duration::from_millis(150), Duration::from_secs(3));
+        (server.take(), ended, shown)
+    };
+    let none: [&str; 0] = [];
+
+    let (sent, ended, shown) = run(&["-spa", "p.api"], "Run? [Y/n]", b"\x04");
+    assert_eq!(sent, none, "{shown}");
+    assert!(shown.contains(UNANSWERED), "{shown}");
+    assert_eq!(ended, Some(false), "{shown}");
+
+    let (sent, ended, shown) = run(&["-spa", "p.api"], "Run? [Y/n]", b"\r");
+    assert_eq!(sent, ["GET /a"], "{shown}");
+    assert_eq!(ended, Some(true), "{shown}");
+
+    let (sent, ended, shown) = run(&["-spa", "p.api"], "Run? [Y/n]", b"n\r");
+    assert_eq!(sent, none, "{shown}");
+    assert!(shown.contains("aborted") && !shown.contains(UNANSWERED), "{shown}");
+    assert_eq!(ended, Some(true), "{shown}");
+
+    let (sent, ended, shown) = run(&["-sa", "c.api"], "Really? [Y/n]", b"\x04");
+    assert_eq!(sent, ["GET /before"], "{shown}");
+    assert!(shown.contains(UNANSWERED), "{shown}");
+    assert_eq!(ended, Some(false), "{shown}");
+
+    let (sent, ended, shown) = run(&["-sa", "c.api"], "Really? [Y/n]", b"y\r");
+    assert_eq!(sent, ["GET /before", "GET /after"], "{shown}");
+    assert_eq!(ended, Some(true), "{shown}");
+}
+
+/// The terminal is asked even when stdin is the program: with a terminal a
+/// `confirm` in a program read from stdin can be answered.
+#[cfg(unix)]
+#[test]
+fn a_program_on_stdin_asks_the_terminal() {
+    use std::os::unix::process::CommandExt;
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let program = dir.path().join("c.api");
+    std::fs::write(&program, "GET /before\nconfirm Really?\nGET /after\n").unwrap();
+
+    // A terminal of its own to be the controlling one, and the file on stdin.
+    let (mut master, mut slave) = (0, 0);
+    assert_eq!(unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) }, 0);
+    let mut cmd = api(server.port, dir.path());
+    cmd.args(["-sa", "-"])
+        .stdin(std::fs::File::open(&program).unwrap())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::setsid();
+            libc::ioctl(slave, libc::TIOCSCTTY as _, 0);
+            libc::close(slave);
+            libc::close(master);
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().expect("spawn api");
+    // Answer once the question is on stderr: what is typed into a terminal
+    // before the client has opened it is dropped.
+    let mut errors = child.stderr.take().unwrap();
+    let mut stderr = String::new();
+    let mut buf = [0u8; 1024];
+    while !stderr.contains("Really? [Y/n]") {
+        let n = errors.read(&mut buf).expect("read stderr");
+        assert!(n > 0, "the client ended without asking: {stderr}");
+        stderr.push_str(&String::from_utf8_lossy(&buf[..n]));
+    }
+    assert_eq!(unsafe { libc::write(master, b"y\n".as_ptr() as *const _, 2) }, 2);
+    // And read the echo back: on macOS the line is not handed to the reader
+    // while its echo sits unread in the terminal.
+    let mut echo = [0u8; 16];
+    assert!(unsafe { libc::read(master, echo.as_mut_ptr() as *mut _, echo.len()) } > 0, "no echo");
+    errors.read_to_string(&mut stderr).expect("read stderr");
+    let status = child.wait().expect("api runs");
+    unsafe {
+        libc::close(slave);
+        libc::close(master);
+    }
+    server.settle(Duration::from_millis(150), Duration::from_secs(3));
+    assert_eq!(server.take(), ["GET /before", "GET /after"], "{stderr}");
+    assert!(status.success(), "{stderr}");
+}
+
 #[cfg(unix)]
 mod pty {
     use super::*;
