@@ -530,6 +530,117 @@ fn a_file_read_from_stdin_is_the_same_file() {
     }
 }
 
+/// What a confirmation run did: what the server received, the exit code, stderr.
+#[cfg(unix)]
+struct Asked {
+    sent: Vec<String>,
+    code: Option<i32>,
+    stderr: String,
+}
+
+/// Run the client where a question can only be answered from stdin: in a
+/// session of its own (`setsid`), so `/dev/tty` does not open even when
+/// `cargo test` was started in a terminal. `stdin` is what the question finds
+/// there; `None` is nothing at all (`/dev/null`).
+#[cfg(unix)]
+fn ask(server: &RecordingServer, dir: &Path, args: &[&str], stdin: Option<&str>) -> Asked {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    server.take();
+    let mut cmd = api(server.port, dir);
+    cmd.args(args)
+        .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().expect("spawn api");
+    if let Some(text) = stdin {
+        child.stdin.take().unwrap().write_all(text.as_bytes()).unwrap();
+    }
+    let out = child.wait_with_output().expect("api runs");
+    server.settle(Duration::from_millis(150), Duration::from_secs(3));
+    Asked {
+        sent: server.take(),
+        code: out.status.code(),
+        stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+    }
+}
+
+#[cfg(unix)]
+const UNANSWERED: &str = "aborted (could not read confirmation)";
+
+/// `-p` asks before sending. End of input is nobody answering, not Enter:
+/// nothing is sent and the run fails. An empty line still accepts.
+#[cfg(unix)]
+#[test]
+fn a_preview_nobody_answered_sends_nothing() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("p.api"), "GET /a\n").unwrap();
+    let none: [&str; 0] = [];
+
+    // A file and a single request, with nothing on stdin and with an empty pipe.
+    for args in [&["-spa", "p.api"][..], &["-sp", "GET", "/a"]] {
+        for stdin in [None, Some("")] {
+            let ran = ask(&server, dir.path(), args, stdin);
+            assert_eq!(ran.sent, none, "{args:?} {stdin:?}");
+            assert!(ran.stderr.contains(UNANSWERED), "{args:?} {stdin:?}: {}", ran.stderr);
+            assert_eq!(ran.code, Some(1), "{args:?} {stdin:?}: {}", ran.stderr);
+        }
+    }
+
+    // A person declining is not a failure.
+    let ran = ask(&server, dir.path(), &["-spa", "p.api"], Some("n\n"));
+    assert_eq!(ran.sent, none);
+    assert!(ran.stderr.contains("aborted") && !ran.stderr.contains(UNANSWERED), "{}", ran.stderr);
+    assert_eq!(ran.code, Some(0), "{}", ran.stderr);
+
+    // Enter, `y` and `yes` accept.
+    for answer in ["\n", "y\n", "yes\n"] {
+        let ran = ask(&server, dir.path(), &["-spa", "p.api"], Some(answer));
+        assert_eq!(ran.sent, ["GET /a"], "{answer:?}: {}", ran.stderr);
+        assert_eq!(ran.code, Some(0), "{answer:?}: {}", ran.stderr);
+    }
+}
+
+/// The `confirm` directive is the same question in the middle of a file.
+#[cfg(unix)]
+#[test]
+fn a_confirm_nobody_answered_stops_the_batch() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    const PROGRAM: &str = "GET /before\nconfirm Really?\nGET /after\n";
+    std::fs::write(dir.path().join("c.api"), PROGRAM).unwrap();
+
+    for stdin in [None, Some("")] {
+        let ran = ask(&server, dir.path(), &["-sa", "c.api"], stdin);
+        assert_eq!(ran.sent, ["GET /before"], "{stdin:?}");
+        assert!(ran.stderr.contains(UNANSWERED), "{stdin:?}: {}", ran.stderr);
+        assert_eq!(ran.code, Some(1), "{stdin:?}: {}", ran.stderr);
+    }
+
+    let ran = ask(&server, dir.path(), &["-sa", "c.api"], Some("n\n"));
+    assert_eq!(ran.sent, ["GET /before"]);
+    assert_eq!(ran.code, Some(0), "{}", ran.stderr);
+
+    let ran = ask(&server, dir.path(), &["-sa", "c.api"], Some("\n"));
+    assert_eq!(ran.sent, ["GET /before", "GET /after"], "{}", ran.stderr);
+    assert_eq!(ran.code, Some(0), "{}", ran.stderr);
+
+    // The program itself on stdin: it was read to its end, so its `confirm`
+    // finds end of input and can't be answered.
+    let ran = ask(&server, dir.path(), &["-sa", "-"], Some(PROGRAM));
+    assert_eq!(ran.sent, ["GET /before"]);
+    assert!(ran.stderr.contains(UNANSWERED), "{}", ran.stderr);
+    assert_eq!(ran.code, Some(1), "{}", ran.stderr);
+}
+
 #[cfg(unix)]
 mod pty {
     use super::*;

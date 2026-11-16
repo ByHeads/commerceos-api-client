@@ -461,8 +461,17 @@ POST /deploy { "go": true }
 - Enter, `y`, or `yes` continues; anything else prints `aborted` and stops the
   batch with exit 0 (the user declined, so it's not a failure).
 - In `-sa` mode the confirm line is echoed, then the prompt appears on stderr.
-- If no terminal is available and stdin can't be read, the batch aborts with
-  `aborted (could not read confirmation)` and exit 0, matching declined previews.
+- The answer is read from the terminal. With no terminal (CI, cron, an agent's
+  shell) it is read from stdin, so it can be piped: `yes | api -sa file.api`
+  answers every `confirm` with yes, `echo n | api -sa file.api` declines the
+  first.
+- **A question nobody answered is not a yes.** End of input (no terminal and
+  stdin empty or closed, or ctrl+D at a terminal) stops the batch with
+  `aborted (could not read confirmation)` and **exit 1**: nothing after the
+  `confirm` is sent. An empty line is Enter and still accepts.
+- When the program itself is on stdin (`api -a -`, `cat file.api | api -a`)
+  there is nothing left there to answer with, so without a terminal a `confirm`
+  in it always stops the run.
 
 ### The same syntax at the prompt and on the command line
 
@@ -527,6 +536,20 @@ api -spa parent.api                   # preview the requests, confirm before sen
 api -sfa parent.api                   # stop at the first failed request (see below)
 api --export com.heads.seedID GET /users > users.json   # a response as seed data (see below)
 ```
+
+### Previewing (`-p`, `--preview`)
+
+`-p` lists what would be sent (imports and includes followed) and asks
+`Run? [Y/n]` once, before the first request. It asks before sending; it is
+**not a dry run**: Enter, `y` or `yes` sends everything.
+
+- `n` prints `aborted`, sends nothing and exits 0.
+- The answer is read like a `confirm`'s: from the terminal, or from stdin when
+  there is none. A question nobody answered (end of input) sends nothing,
+  prints `aborted (could not read confirmation)` and exits 1.
+- To print the resolved program without sending anything from a shell with no
+  terminal: `echo n | api -spa file.api`. To run it unattended:
+  `yes | api -spa file.api`, or leave `-p` off.
 
 ### Stopping at the first failure (`-f`, `--fail-fast`)
 
@@ -848,6 +871,7 @@ Run it: `api -sa workshop.api`.
 - **Seeding from a plain `GET`** → the response carries `identifiers.key`, a database key of the environment it was read from. Written elsewhere it is refused (`400 failed indexing`: a `key` that names nothing). Read it with `--export <external-id>`, which takes the key out and keeps a lone one as `key?` and under the name.
 - **Writing an export to a server without `key?`** → `400 failed coercion`, `The key 'key?' is not a valid namespaced key`, as soon as the export holds a record that had only a key. Such an export needs a server that knows the optional key.
 - **Expecting secrets in an export** → the API masks them (`********`) and `--export` turns that into `null`, and says where (`Response had masked data, now null at …`). A password, an API key or a client secret has to be set separately.
+- **`-p` or `confirm` without a terminal** → up to 3.3.1, end of input was read as Enter, so an unattended `api -spa file.api` or a `confirm` gate sent everything. From 3.3.2 it sends nothing and exits 1 with `aborted (could not read confirmation)`. Pipe the answer (`yes | …`, `echo n | …`); a program read from stdin (`api -a -`) has no stdin left to answer with.
 - **Expecting a failed request to stop a batch** → it doesn't, unless the line is an `assert`, a chain or a poll, or the run has `-f`. A plain `PUT /assert {…}` that answers 409 is logged and the next line runs. Run with `-f`.
 - **Chaining on `PUT /assert`** → a passing `/assert` answers `200` with `null`, which is falsy, so `PUT /assert {…} && …` skips what follows and `assert PUT /assert {…}` fails on a pass. Write it on its own line and run with `-f`.
 - **`assert` on a list endpoint** → `[]` is truthy, so `assert GET /people~where(x)` passes even when nothing matches. Assert a `~count` or a single item by identifier instead.

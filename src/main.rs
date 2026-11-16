@@ -6619,8 +6619,12 @@ fn note_last_block(state: &mut AppState, stdout: &mut io::Stdout, note: &str) ->
 
 /// Ask the user a yes/no question and return true if they confirm (Y/yes/empty).
 /// Prompt is printed to stderr; answer read from /dev/tty (falling back to stdin)
-/// so it works when stdin is piped. On error (can't read), prints an abort message
-/// and returns false.
+/// so it works when stdin is piped.
+///
+/// An empty *line* is Enter and accepts. End of input is not an answer: with no
+/// terminal and nothing on stdin (CI, cron, a closed or empty pipe), or ctrl+D
+/// at a terminal, nobody agreed. That, like a read error, prints an abort
+/// message and exits 1 with nothing sent. A decline returns false (exit 0).
 fn ask_yes_no(prompt: &str) -> bool {
     eprint!("{} ", prompt.bold());
     let _ = io::stderr().flush();
@@ -6628,17 +6632,16 @@ fn ask_yes_no(prompt: &str) -> bool {
     // Read a single line of input, preferring /dev/tty so a piped stdin
     // (e.g. `-a -`) does not consume the request data as the answer.
     let mut answer = String::new();
-    let read_ok = match fs::File::open("/dev/tty") {
-        Ok(tty) => {
-            let mut reader = io::BufReader::new(tty);
-            reader.read_line(&mut answer).is_ok()
-        }
-        Err(_) => io::stdin().read_line(&mut answer).is_ok(),
+    let read = match fs::File::open("/dev/tty") {
+        Ok(tty) => io::BufReader::new(tty).read_line(&mut answer),
+        Err(_) => io::stdin().read_line(&mut answer),
     };
-    if !read_ok {
-        // No way to ask — treat as decline to be safe.
+    // `Ok(0)` is end of input: no line was read, not even an empty one.
+    if !matches!(read, Ok(n) if n > 0) {
+        // The prompt is still open on its line; end it before the message.
+        eprintln!();
         eprintln!("aborted (could not read confirmation)");
-        return false;
+        std::process::exit(1);
     }
     let a = answer.trim().to_lowercase();
     let proceed = a.is_empty() || a == "y" || a == "yes";
@@ -6895,8 +6898,8 @@ fn run_assert(config: &mut Config, negate: bool, request: &str) -> bool {
 
 /// Execute a `confirm [message]` step. Displays the confirm line in `-sa` mode
 /// and asks the user for confirmation. Returns true if they confirm (Y/yes/empty),
-/// false (exit 0 with `aborted` message) if they decline. On error (can't read),
-/// also returns false after printing an abort message.
+/// false (exit 0 with `aborted` message) if they decline. When the question
+/// can't be answered (end of input, read error) the process exits 1.
 fn run_confirm(config: &Config, message: &Option<String>) -> bool {
     let line = format_confirm(message);
     if config.bulk_silent {

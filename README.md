@@ -175,7 +175,9 @@ printed to the terminal.
 
 `api -a file.api` runs the requests in a file top to bottom; `-a -` or a pipe reads stdin.
 `-s` makes it a compact log of one status line per request; `-p` previews the requests and
-asks before sending.
+asks before sending. It is not a dry run: Enter sends them. With no terminal the answer is
+read from stdin (`echo n | api -spa seed.api` prints the program and sends nothing), and a
+question nobody answered sends nothing and exits 1.
 
 ```sh
 api -sa seed.api
