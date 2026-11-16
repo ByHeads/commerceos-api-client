@@ -28,7 +28,8 @@ use std::time::Duration;
 /// `METHOD /path body`, the `/api/v1` prefix dropped.
 ///
 /// - `/lib.tar.gz` answers with the archive it was started with.
-/// - `/moved` redirects there; `/moved-off` redirects to a plain-http host.
+/// - `/moved` redirects there; `/moved-off` redirects to a plain-http host;
+///   `/loop` redirects to itself.
 /// - A path with `missing` in it is a 404.
 /// - Anything else is the API, and answers `answer` as JSON.
 struct Server {
@@ -148,6 +149,7 @@ fn respond(
     let (status, extra, payload): (&str, String, &[u8]) = match path.as_str() {
         "/lib.tar.gz" => ("200 OK", "Content-Type: application/gzip\r\n".to_string(), archive),
         "/moved" => ("302 Found", format!("Location: http://127.0.0.1:{port}/lib.tar.gz\r\n"), b""),
+        "/loop" => ("302 Found", format!("Location: http://127.0.0.1:{port}/loop\r\n"), b""),
         "/moved-off" => ("302 Found", "Location: http://plain-http.example.invalid/lib.tar.gz\r\n".to_string(), b""),
         missing if missing.contains("missing") => {
             ("404 Not Found", "Content-Type: application/json\r\n".to_string(), b"null")
@@ -625,6 +627,209 @@ fn an_archive_download_follows_a_redirect_but_not_onto_plain_http() {
     assert!(ran.stderr.contains("redirected to a url that is not https"), "{}", ran.stderr);
     // The redirect was refused, not followed and failed: nothing was sent on.
     assert_eq!(server.sent(), vec!["GET /moved-off"]);
+
+    // A redirect that never arrives is given up on, not followed for ever.
+    let batch = format!("import archive lib {{ \"url\": \"{}\" }}\nGET /never\n", server.url("/loop"));
+    let ran = run_batch(&dir, server.port, "-sa", &batch);
+    assert!(!ran.ok);
+    assert!(ran.stderr.contains("too many redirects"), "{}", ran.stderr);
+    let sent = server.sent();
+    assert!(sent.len() > 5 && sent.iter().all(|r| r == "GET /loop"), "{sent:?}");
+}
+
+// ----- archive formats -----
+
+/// The fixture as a `.zip` under one top directory, with the directory
+/// entries a zip tool writes, and as a `.tar` that is not compressed.
+fn fixture_zip() -> Vec<u8> {
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default();
+    let mut dirs = std::collections::BTreeSet::new();
+    zip.add_directory("fixture-1.0/", options).unwrap();
+    for (name, contents) in fixture_files() {
+        if let Some((parent, _)) = name.rsplit_once('/') {
+            if dirs.insert(parent.to_string()) {
+                zip.add_directory(format!("fixture-1.0/{parent}/"), options).unwrap();
+            }
+        }
+        zip.start_file(format!("fixture-1.0/{name}"), options).unwrap();
+        zip.write_all(&contents).unwrap();
+    }
+    zip.finish().unwrap().into_inner()
+}
+
+fn fixture_tar() -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    for (name, contents) in fixture_files() {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, format!("fixture-1.0/{name}"), &contents[..]).unwrap();
+    }
+    builder.into_inner().unwrap()
+}
+
+#[test]
+fn a_zip_and_a_plain_tar_send_what_the_tar_gz_sends() {
+    for (format, archive) in [("zip", fixture_zip()), ("tar", fixture_tar())] {
+        let (_guard, dir) = temp();
+        // Downloaded: the name says `.tar.gz`, the content says otherwise.
+        let server = Server::start("1", archive.clone());
+        let import = format!("import archive lib {{ \"url\": \"{}\" }}", server.url("/lib.tar.gz"));
+        let ran = run_batch(&dir, server.port, "-sa", &format!("{import}\n{RUN_THE_FIXTURE}"));
+        assert!(ran.ok, "{format}: {}", ran.stderr);
+        assert_eq!(server.api_requests(), fixture_requests(), "{format}");
+
+        // From a file on this machine, every kind of body included.
+        let file = dir.join(format!("fixture.{format}"));
+        std::fs::write(&file, &archive).unwrap();
+        let import = format!("import archive lib {{ \"url\": \"file://{}\" }}", file.display());
+        let ran = run_batch(&dir, server.port, "-sa", &format!("{import}\n{RUN_THE_FIXTURE}lib/nested/index.api\n"));
+        assert!(ran.ok, "{format}: {}", ran.stderr);
+        let sent = server.sent();
+        assert_eq!(&sent[..fixture_requests().len()], &fixture_requests()[..], "{format}");
+        assert!(sent.len() > fixture_requests().len(), "{format}: the nested include sent nothing");
+    }
+}
+
+#[test]
+fn a_truncated_archive_fails_before_any_request_and_leaves_nothing_in_the_cache() {
+    for (format, archive) in [("zip", fixture_zip()), ("tar.gz", fixture_archive())] {
+        let (_guard, dir) = temp();
+        let server = Server::start("1", archive[..archive.len() / 2].to_vec());
+        let batch = format!("import archive lib {{ \"url\": \"{}\" }}\nGET /never\n", server.url("/lib.tar.gz"));
+        let ran = run_batch(&dir, server.port, "-sa", &batch);
+        assert!(!ran.ok, "{format}");
+        assert!(ran.stderr.contains("archive"), "{format}: {}", ran.stderr);
+        assert_eq!(server.api_requests(), Vec::<String>::new(), "{format}");
+        let left: Vec<String> = std::fs::read_dir(dir.join(".import-cache/archives"))
+            .map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect())
+            .unwrap_or_default();
+        assert!(left.iter().all(|name| name == "refs"), "{format}: {left:?}");
+    }
+}
+
+// ----- what an import line may say -----
+
+#[test]
+fn a_pinned_archive_with_another_hash_is_refused_before_any_request() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", fixture_archive());
+    let url = server.url("/lib.tar.gz");
+    let wrong = "0".repeat(64);
+    let batch = format!("import archive lib {{ \"url\": \"{url}\", \"sha256\": \"{wrong}\" }}\nGET /own\nlib/seed.api\n");
+    let ran = run_batch(&dir, server.port, "-sa", &batch);
+    assert!(!ran.ok);
+    assert!(ran.stderr.contains(&format!("import archive {url}: sha256 mismatch (expected {wrong}, got ")), "{}", ran.stderr);
+    assert_eq!(server.api_requests(), Vec::<String>::new());
+
+    // The hash it said it got is the one that pins it.
+    let got = ran.stderr.split("got ").nth(1).unwrap().chars().take(64).collect::<String>();
+    let batch = format!("import archive lib {{ \"url\": \"{url}\", \"sha256\": \"{got}\" }}\nlib/parts/a.api\n");
+    let ran = run_batch(&dir, server.port, "-sa", &batch);
+    assert!(ran.ok, "{}", ran.stderr);
+    assert_eq!(server.api_requests(), vec!["GET /parts/a"]);
+    // Upper case is the same hash, and the cache now answers without a download.
+    let batch = batch.replace(&got, &got.to_uppercase());
+    let ran = run_batch(&dir, server.port, "-sa", &batch);
+    assert!(ran.ok, "{}", ran.stderr);
+    assert_eq!(server.sent(), vec!["GET /parts/a"]);
+}
+
+#[test]
+fn an_import_line_that_cannot_be_meant_stops_the_batch_before_any_request() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", fixture_archive());
+    std::fs::create_dir_all(dir.join("taken")).unwrap();
+    std::fs::write(dir.join("not-json.json"), "{ \"path\": ").unwrap();
+    std::fs::write(dir.join("a-list.json"), "[\"x\"]").unwrap();
+    std::fs::write(dir.join("not-json-either.json"), "{ \"path\": nowhere }").unwrap();
+    let here = fixture().display().to_string();
+    for (import, says) in [
+        // An archive over plain http from anywhere but this machine.
+        (r#"import archive lib { "url": "http://example.com/lib.tar.gz" }"#.to_string(), "unsupported url"),
+        (r#"import archive lib { "url": "ftp://example.com/lib.tar.gz" }"#.to_string(), "unsupported url"),
+        (r#"import archive lib { "url": "file://relative/lib.tar.gz" }"#.to_string(), "unsupported url"),
+        // A hash that is not one.
+        (format!(r#"import archive lib {{ "url": "{}", "sha256": "abc" }}"#, server.url("/lib.tar.gz")), "sha256"),
+        // An alias that already names something next to the batch.
+        (format!(r#"import dir taken {{ "path": "{here}" }}"#), "import alias `taken` clashes with"),
+        // The same alias twice.
+        (format!("import dir lib {{ \"path\": \"{here}\" }}\nimport dir lib {{ \"path\": \"{here}\" }}"), "import alias `lib` is declared twice"),
+        // JSON that is not JSON, not an object, or has a key the kind doesn't take.
+        (r#"import dir lib { "path": }"#.to_string(), "import lib: invalid JSON"),
+        (r#"import dir lib ["x"]"#.to_string(), "invalid import: expected `import <git|dir|archive> <alias>"),
+        ("import dir lib @a-list.json".to_string(), "import lib: expected a JSON object"),
+        ("import dir lib @not-json.json".to_string(), "import file not-json.json: unclosed body"),
+        ("import dir lib @not-json-either.json".to_string(), "import lib: invalid JSON"),
+        ("import dir lib @no-such-file.json".to_string(), "no-such-file.json"),
+        (r#"import dir lib { "path": "no-such-directory" }"#.to_string(), "no-such-directory"),
+        (r#"import svn lib { "url": "x" }"#.to_string(), "svn"),
+        (format!(r#"import git lib {{ "url": "file://{here}", "ref": "1.0", "path": "/etc" }}"#), "`path` must be a relative path inside the import"),
+    ] {
+        let ran = run_batch(&dir, server.port, "-sa", &format!("{import}\nGET /never\n"));
+        assert!(!ran.ok, "{import}");
+        assert!(ran.stderr.contains(says), "{import}: expected {says:?} in\n{}", ran.stderr);
+        assert_eq!(server.sent(), Vec::<String>::new(), "{import}");
+    }
+}
+
+#[test]
+fn path_starts_the_alias_in_a_subdirectory_of_a_repository_and_of_an_archive() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", fixture_archive());
+    let (repo, _) = fixture_repository(&dir.join("fixture-repo"));
+    for (kind, import) in [
+        ("git", format!("import git lib {{ \"url\": \"{repo}\", \"ref\": \"1.0\", \"path\": \"parts\" }}")),
+        // Below the one top directory the archive is packed under.
+        ("archive", format!("import archive lib {{ \"url\": \"{}\", \"path\": \"parts\" }}", server.url("/lib.tar.gz"))),
+    ] {
+        let ran = run_batch(&dir, server.port, "-sa", &format!("{import}\nlib/*.api\n"));
+        assert!(ran.ok, "{kind}: {}", ran.stderr);
+        // `b.api` sends a body from above `path`: still inside the import.
+        assert_eq!(server.api_requests(), vec!["GET /parts/a".to_string(), format!("PUT /parts/b {BODY}")], "{kind}");
+
+        // What is above `path` is not under the alias.
+        let ran = run_batch(&dir, server.port, "-sa", &format!("{import}\nlib/seed.api\n"));
+        assert!(!ran.ok, "{kind}");
+        assert_eq!(server.api_requests(), Vec::<String>::new(), "{kind}");
+
+        // A `path` that is not in the import.
+        let ran = run_batch(&dir, server.port, "-sa", &format!("{}\nGET /never\n", import.replace("\"parts\"", "\"no-such\"")));
+        assert!(!ran.ok, "{kind}");
+        assert!(ran.stderr.contains("no-such"), "{kind}: {}", ran.stderr);
+        assert_eq!(server.api_requests(), Vec::<String>::new(), "{kind}");
+    }
+}
+
+// ----- -f in an imported file -----
+
+#[test]
+fn fail_fast_stops_inside_an_imported_file_with_the_body_last_on_stdout() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", fixture_archive());
+    std::fs::create_dir_all(dir.join("mine")).unwrap();
+    std::fs::write(dir.join("mine/steps.api"), "GET /lib/first\nPUT /lib/missing {\"a\":1}\nGET /lib/never\n").unwrap();
+    let batch = "import dir lib { \"path\": \"mine\" }\nGET /own\nlib/steps.api\nGET /after\n";
+
+    let ran = run_batch(&dir, server.port, "-sfa", batch);
+    assert!(!ran.ok);
+    assert_eq!(server.sent(), vec!["GET /own", "GET /lib/first", "PUT /lib/missing {\"a\":1}"]);
+    assert!(ran.stdout.trim_end().ends_with("null"), "the 404's body is last: {:?}", ran.stdout);
+
+    // Without `-f` the import runs to its end and so does the batch.
+    let ran = run_batch(&dir, server.port, "-sa", batch);
+    assert!(ran.ok, "{}", ran.stderr);
+    assert_eq!(server.sent().len(), 5);
+
+    // The same through a repository and an archive, with the fixture's own
+    // failing step: a question (`assert`) that is answered "no".
+    for (kind, import) in each_kind(&dir, &server) {
+        let ran = run_batch(&dir, server.port, "-sfa", &format!("{import}\nlib/assert-fails.api\nGET /after\n"));
+        assert!(!ran.ok, "{kind}");
+        assert_eq!(server.api_requests(), vec!["GET /assert/before", "GET /assert/missing"], "{kind}");
+    }
 }
 
 // ----- git itself -----
