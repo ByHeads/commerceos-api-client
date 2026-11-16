@@ -540,12 +540,19 @@ mod pty {
         master: i32,
         child: std::process::Child,
         pub screen: String,
+        /// The bytes of a character that a read ended in the middle of.
+        partial: Vec<u8>,
     }
 
     impl Prompt {
-        pub fn open(mut cmd: std::process::Command) -> Self {
+        pub fn open(cmd: std::process::Command) -> Self {
+            Self::open_sized(cmd, 200)
+        }
+
+        /// The prompt in a terminal `cols` wide.
+        pub fn open_sized(mut cmd: std::process::Command, cols: u16) -> Self {
             let (mut master, mut slave) = (0, 0);
-            let mut size = libc::winsize { ws_row: 50, ws_col: 200, ws_xpixel: 0, ws_ypixel: 0 };
+            let mut size = libc::winsize { ws_row: 50, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
             let rc = unsafe {
                 libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), &mut size)
             };
@@ -565,7 +572,7 @@ mod pty {
             cmd.env("TERM", "xterm-256color").env_remove("NO_COLOR");
             let child = cmd.spawn().expect("spawn api in a pty");
             unsafe { libc::close(slave) };
-            Prompt { master, child, screen: String::new() }
+            Prompt { master, child, screen: String::new(), partial: Vec::new() }
         }
 
         pub fn send(&mut self, bytes: &[u8]) {
@@ -611,7 +618,18 @@ mod pty {
                 if chunk.windows(4).any(|w| w == b"\x1b[6n") {
                     self.send(b"\x1b[50;1R");
                 }
-                self.screen.push_str(&String::from_utf8_lossy(chunk));
+                // A read can end inside a character (`─` is three bytes).
+                // Keep such a tail for the next read: decoded on its own it
+                // would be three replacement characters where one `─` stood.
+                self.partial.extend_from_slice(chunk);
+                let whole = match std::str::from_utf8(&self.partial) {
+                    Ok(_) => self.partial.len(),
+                    Err(e) if e.error_len().is_none() => e.valid_up_to(),
+                    Err(_) => self.partial.len(),
+                };
+                let rest = self.partial.split_off(whole);
+                self.screen.push_str(&String::from_utf8_lossy(&self.partial));
+                self.partial = rest;
             }
         }
 
@@ -630,6 +648,99 @@ mod pty {
             let _ = self.child.wait();
             unsafe { libc::close(self.master) };
         }
+    }
+
+    /// What a terminal `cols` wide shows after `output`: one string per row,
+    /// without trailing blanks. `plain` gives the text that was written;
+    /// this gives where it ended up, which is what a layout has to be judged
+    /// on. It is as much of a terminal as the client uses: text, CR and LF,
+    /// relative cursor moves, erase in line and in display, saved cursor
+    /// positions, and auto-wrap switched on and off. Colours are dropped.
+    pub fn rows(output: &str, cols: usize) -> Vec<String> {
+        let mut grid: Vec<Vec<char>> = vec![Vec::new()];
+        let (mut row, mut col) = (0usize, 0usize);
+        let mut saved = (0usize, 0usize);
+        let mut wrap = true;
+        let mut chars = output.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\x1b' => match chars.next() {
+                    Some('[') => {
+                        let mut params = String::new();
+                        let mut last = ' ';
+                        for d in chars.by_ref() {
+                            if ('\x40'..='\x7e').contains(&d) {
+                                last = d;
+                                break;
+                            }
+                            params.push(d);
+                        }
+                        let given: Option<usize> = params.split(';').next().and_then(|p| p.parse().ok());
+                        let count = given.unwrap_or(1).max(1);
+                        match last {
+                            'A' => row = row.saturating_sub(count),
+                            'B' => row += count,
+                            'C' => col = (col + count).min(cols.saturating_sub(1)),
+                            'D' => col = col.saturating_sub(count),
+                            'G' => col = count - 1,
+                            'J' if given.unwrap_or(0) == 0 => {
+                                grid[row].truncate(col);
+                                grid.truncate(row + 1);
+                            }
+                            'K' if given.unwrap_or(0) == 2 => grid[row].clear(),
+                            'K' => grid[row].truncate(col),
+                            'h' | 'l' if params == "?7" => wrap = last == 'h',
+                            _ => {}
+                        }
+                    }
+                    // An operating system command runs to a BEL or to ESC \.
+                    Some(']') => {
+                        while let Some(d) = chars.next() {
+                            if d == '\x07' || (d == '\x1b' && chars.next_if_eq(&'\\').is_some()) {
+                                break;
+                            }
+                        }
+                    }
+                    Some('7') => saved = (row, col),
+                    Some('8') => (row, col) = saved,
+                    _ => {}
+                },
+                '\r' => col = 0,
+                '\n' => row += 1,
+                c if c.is_control() => {}
+                c => {
+                    if col >= cols {
+                        if wrap {
+                            row += 1;
+                            col = 0;
+                        } else {
+                            col = cols.saturating_sub(1);
+                        }
+                    }
+                    while grid.len() <= row {
+                        grid.push(Vec::new());
+                    }
+                    while grid[row].len() < col {
+                        grid[row].push(' ');
+                    }
+                    if col < grid[row].len() {
+                        grid[row][col] = c;
+                    } else {
+                        grid[row].push(c);
+                    }
+                    col += 1;
+                }
+            }
+            while grid.len() <= row {
+                grid.push(Vec::new());
+            }
+        }
+        let mut rows: Vec<String> =
+            grid.iter().map(|cells| cells.iter().collect::<String>().trim_end().to_string()).collect();
+        while rows.last().is_some_and(|last| last.is_empty()) {
+            rows.pop();
+        }
+        rows
     }
 
     /// The screen without its escape sequences.
@@ -866,7 +977,7 @@ fn ctrl_r_toggles_export_at_the_prompt_and_asks_for_the_name_once() {
     // ctrl+r asks for the name. There is no default to accept.
     let shown = keys(&mut prompt, b"\x12");
     assert!(shown.contains("Export with external identifier:"), "{shown}");
-    assert!(shown.contains("a namespaced key, such as com.heads.seedID"), "{shown}");
+    assert!(shown.contains("e.g. com.heads.seedID · enter to turn export on, esc to cancel"), "{shown}");
     // Esc leaves export off, and so does an empty answer.
     let shown = keys(&mut prompt, b"\x1b");
     assert!(shown.contains("cancelled"), "{shown}");
@@ -880,8 +991,7 @@ fn ctrl_r_toggles_export_at_the_prompt_and_asks_for_the_name_once() {
     // what was typed left to correct.
     keys(&mut prompt, b"\x12");
     let shown = keys(&mut prompt, b"seedID\r");
-    assert!(shown.contains("not a namespaced key: seedID"), "{shown}");
-    assert!(shown.contains("three dot-separated segments"), "{shown}");
+    assert!(shown.contains("not a namespaced key: needs three dot-separated segments"), "{shown}");
     assert!(shown.contains("Export with external identifier: seedID"), "{shown}");
     // Six backspaces, then a good one.
     let shown = keys(&mut prompt, b"\x7f\x7f\x7f\x7f\x7f\x7fcom.example.exportID\r");
@@ -907,6 +1017,104 @@ fn ctrl_r_toggles_export_at_the_prompt_and_asks_for_the_name_once() {
     assert!(!shown.contains("Export with external identifier"), "{shown}");
     let shown = get_keyed(&mut prompt, &server);
     assert!(shown.contains("\"com.example.exportID\": \"k1\""), "{shown}");
+}
+
+/// The dialog ctrl+r opens is drawn in the command area and nowhere else:
+/// the top ruler stays, the prompt takes the input line's place, the bottom
+/// ruler and a hint follow, and closing it gives the command area back as it
+/// was. In a terminal narrower than its texts, nothing may wrap: a wrapped
+/// line pushes the dialog down a row, and every close then leaves a ruler
+/// behind.
+#[cfg(unix)]
+#[test]
+fn the_export_name_dialog_stays_in_the_command_area_at_any_width() {
+    use pty::Prompt;
+
+    for cols in [200u16, 84, 60, 44] {
+        let server = RecordingServer::start();
+        let dir = tempfile::tempdir().unwrap();
+        prepare(dir.path());
+        let mut prompt = Prompt::open_sized(api(server.port, dir.path()), cols);
+        prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+        prompt.pump(Duration::from_millis(600));
+
+        let width = cols as usize;
+        let ruler = "─".repeat(width);
+        let keys = |prompt: &mut Prompt, keys: &[u8]| {
+            prompt.send(keys);
+            prompt.pump(Duration::from_millis(450));
+            pty::rows(&prompt.screen, width)
+        };
+
+        // The command area is the last four rows: the top ruler with the
+        // host in it, the input line, the bottom ruler and the hint.
+        let before = pty::rows(&prompt.screen, width);
+        let top = before.len() - 4;
+        let shown = before.join("\n");
+        assert!(before[top].starts_with('─') && before[top].contains("127.0.0.1"), "{cols}:\n{shown}");
+        assert!(before[top + 1].starts_with("GET /"), "{cols}:\n{shown}");
+        assert_eq!(before[top + 2], ruler, "{cols}:\n{shown}");
+        assert!(before[top + 3].starts_with("  ctrl+h for shortcuts"), "{cols}:\n{shown}");
+
+        // What every state of the dialog has to look like.
+        let dialog = |now: &[String], what: &str| {
+            let shown = now.join("\n");
+            assert_eq!(now.len(), before.len(), "{cols}, {what}: the command area moved\n{shown}");
+            assert_eq!(now[..=top], before[..=top], "{cols}, {what}: the rows above changed\n{shown}");
+            assert!(now[top + 1].starts_with("› Export with external identifier:"), "{cols}, {what}:\n{shown}");
+            assert_eq!(now[top + 2], ruler, "{cols}, {what}: no bottom ruler under the prompt\n{shown}");
+            assert!(now[top + 3].starts_with("  ") && now[top + 3].len() > 2, "{cols}, {what}: no hint\n{shown}");
+            for row in [&now[top + 1], &now[top + 3]] {
+                assert!(row.chars().count() < width, "{cols}, {what}: a row reaches the margin\n{shown}");
+            }
+        };
+        // And the command area once it is closed again.
+        let closed = |now: &[String], hint: &str, what: &str| {
+            let shown = now.join("\n");
+            assert_eq!(now.len(), before.len(), "{cols}, {what}: the command area moved\n{shown}");
+            assert_eq!(now[..top + 3], before[..top + 3], "{cols}, {what}: not what it was\n{shown}");
+            assert!(now[top + 3].starts_with(hint), "{cols}, {what}: {:?}\n{shown}", now[top + 3]);
+        };
+
+        let now = keys(&mut prompt, b"\x12");
+        dialog(&now, "opened");
+        assert!(now[top + 3].contains("com.heads.seedID"), "{cols}:\n{}", now.join("\n"));
+        if cols >= 84 {
+            assert!(now[top + 3].ends_with("esc to cancel"), "{cols}: {:?}", now[top + 3]);
+        }
+
+        // A name that is refused: the dialog is drawn again, in place.
+        let now = keys(&mut prompt, b"seedID\r");
+        dialog(&now, "refused");
+        assert!(now[top + 1].ends_with("seedID"), "{cols}: {:?}", now[top + 1]);
+        assert!(now[top + 3].starts_with("  not a namespaced key"), "{cols}: {:?}", now[top + 3]);
+
+        // More than the line holds: the end of what is typed stays in view.
+        let long = "x".repeat(150);
+        let now = keys(&mut prompt, format!("{long}Z").as_bytes());
+        dialog(&now, "a long name");
+        assert!(now[top + 1].ends_with("xZ"), "{cols}: {:?}", now[top + 1]);
+        // 35 columns of prompt, `seedID`, and the 151 typed now.
+        assert_eq!(now[top + 1].contains('…'), width < 35 + 6 + 151 + 2, "{cols}: {:?}", now[top + 1]);
+        let now = keys(&mut prompt, b"\r");
+        dialog(&now, "a long name refused");
+
+        // Closed, and opened and closed again: nothing is left behind.
+        let now = keys(&mut prompt, b"\x1b");
+        closed(&now, "  cancelled", "cancelled");
+        for round in 0..3 {
+            let now = keys(&mut prompt, b"\x12");
+            dialog(&now, &format!("opened again, {round}"));
+            let now = keys(&mut prompt, b"\x1b");
+            closed(&now, "  cancelled", &format!("cancelled again, {round}"));
+        }
+
+        // Answered: the command area is back, with export on.
+        keys(&mut prompt, b"\x12");
+        let now = keys(&mut prompt, b"com.example.exportID\r");
+        closed(&now, "  export on: com.example.exportID", "answered");
+        assert!(now[top + 3].ends_with("export"), "{cols}: {:?}", now[top + 3]);
+    }
 }
 
 /// A session started with `--export <name>` has its name: ctrl+r turns

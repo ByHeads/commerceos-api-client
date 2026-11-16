@@ -1272,13 +1272,35 @@ fn collapse_newlines_for_log(body: &str) -> String {
 /// wrapping. Counts chars rather than bytes, so multibyte input (`Möör`) is
 /// neither over-counted nor split mid-codepoint.
 fn fit_body_to_width(body: &str, budget: usize) -> String {
-    let collapsed = collapse_newlines_for_log(body);
-    if char_len(&collapsed) <= budget {
-        return collapsed;
+    fit_to_width(&collapse_newlines_for_log(body), budget)
+}
+
+/// Cut `text` to `budget` visible columns, keeping its start: the end gives
+/// way to an ellipsis, which is counted inside the budget.
+fn fit_to_width(text: &str, budget: usize) -> String {
+    if char_len(text) <= budget {
+        return text.to_string();
+    }
+    if budget == 0 {
+        return String::new();
     }
     // Reserve one column for the ellipsis itself.
-    let head: String = collapsed.chars().take(budget.saturating_sub(1)).collect();
+    let head: String = text.chars().take(budget - 1).collect();
     format!("{}…", head)
+}
+
+/// Cut `text` to `budget` visible columns, keeping its end: for a value
+/// being typed, where the end is what the next key adds to.
+fn fit_tail_to_width(text: &str, budget: usize) -> String {
+    let len = char_len(text);
+    if len <= budget {
+        return text.to_string();
+    }
+    if budget == 0 {
+        return String::new();
+    }
+    let tail: String = text.chars().skip(len - (budget - 1)).collect();
+    format!("…{}", tail)
 }
 
 // Strip ANSI escape codes and return visible character count
@@ -10532,17 +10554,48 @@ fn cycle_method(state: &mut AppState) {
 
 // Read a line of input in raw mode (already in raw mode when called from interactive)
 fn read_inline_input(stdout: &mut io::Stdout, prompt: &str, mask: bool, prefill: &str) -> io::Result<Option<String>> {
+    read_inline_input_within(stdout, prompt, mask, prefill, None)
+}
+
+/// The prompt and the value of an inline input as one line of at most `cols`
+/// columns holds them, with a column kept for the cursor block and one free
+/// at the margin. A value too long for the line shows its end. `None` for
+/// `cols` leaves both as they are.
+fn inline_input_line(prompt: &str, value: &str, cols: Option<usize>) -> (String, String) {
+    let Some(cols) = cols else {
+        return (prompt.to_string(), value.to_string());
+    };
+    let budget = cols.saturating_sub(2);
+    let prompt = fit_to_width(prompt, budget);
+    let value = fit_tail_to_width(value, budget - char_len(&prompt));
+    (prompt, value)
+}
+
+/// `read_inline_input` on a line that must not wrap. With `cols`, the
+/// terminal's width, what is drawn never reaches the right margin however
+/// much is typed, so the rows drawn around the line stay where they are.
+fn read_inline_input_within(
+    stdout: &mut io::Stdout,
+    prompt: &str,
+    mask: bool,
+    prefill: &str,
+    cols: Option<usize>,
+) -> io::Result<Option<String>> {
     let mut buf = prefill.to_string();
 
-    let render_line = |stdout: &mut io::Stdout, prompt: &str, buf: &str, mask: bool| -> io::Result<()> {
+    let shown = |buf: &str| -> (String, String) {
+        let value = if mask && !buf.is_empty() { "•".repeat(buf.len()) } else { buf.to_string() };
+        inline_input_line(prompt, &value, cols)
+    };
+    let render_line = |stdout: &mut io::Stdout, buf: &str| -> io::Result<()> {
         execute!(stdout, cursor::MoveToColumn(0), Clear(ClearType::CurrentLine))?;
-        let display = if mask && !buf.is_empty() { "•".repeat(buf.len()) } else { buf.to_string() };
-        execute!(stdout, Print(format!("{}{}\x1b[48;5;247m\x1b[38;5;0m \x1b[0m", prompt, display)))?;
+        let (prompt, value) = shown(buf);
+        execute!(stdout, Print(format!("{}{}\x1b[48;5;247m\x1b[38;5;0m \x1b[0m", prompt, value)))?;
         stdout.flush()?;
         Ok(())
     };
 
-    render_line(stdout, prompt, &buf, mask)?;
+    render_line(stdout, &buf)?;
 
     loop {
         if event::poll(Duration::from_millis(100))? {
@@ -10557,8 +10610,8 @@ fn read_inline_input(stdout: &mut io::Stdout, prompt: &str, mask: bool, prefill:
                 match key.code {
                     KeyCode::Enter => {
                         execute!(stdout, cursor::MoveToColumn(0), Clear(ClearType::CurrentLine))?;
-                        let display = if mask && !buf.is_empty() { "•".repeat(buf.len()) } else { buf.clone() };
-                        execute!(stdout, Print(format!("{}{}\r\n", prompt, display)))?;
+                        let (prompt, value) = shown(&buf);
+                        execute!(stdout, Print(format!("{}{}\r\n", prompt, value)))?;
                         return Ok(Some(buf));
                     }
                     KeyCode::Esc => {
@@ -10573,7 +10626,7 @@ fn read_inline_input(stdout: &mut io::Stdout, prompt: &str, mask: bool, prefill:
             }
         }
 
-        render_line(stdout, prompt, &buf, mask)?;
+        render_line(stdout, &buf)?;
     }
 }
 
@@ -10631,21 +10684,42 @@ fn handle_export_toggle(state: &mut AppState, stdout: &mut io::Stdout) -> io::Re
 /// Ask, in the command area, for the name export mode keeps a lone key
 /// under. Enter on a name that is not a namespaced key asks again, with what
 /// was typed left to correct; esc or an empty answer gives `None`.
+///
+/// The dialog takes the command area's place, row for row: the top ruler
+/// stays, the prompt stands on the first input line, and the bottom ruler
+/// and a hint follow. Nothing in it may wrap. A hint or a typed name wider
+/// than the terminal would take a row more than was counted: the prompt is
+/// then drawn a row too low, over the bottom ruler, and every redraw after
+/// the dialog starts a row too low as well and leaves a ruler behind. So the
+/// hint is cut to the width, the input line keeps to it, and the two rows
+/// below the prompt are drawn with auto-wrap off, as `render` draws its own.
 fn ask_export_name(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<Option<String>> {
-    let ruler_line = format!("\x1b[38;5;239m{}\x1b[0m", "─".repeat(state.width as usize));
+    let width = state.width as usize;
+    let ruler_line = format!("\x1b[38;5;239m{}\x1b[0m", "─".repeat(width));
     let input_lines = state.prev_input_lines;
     let prompt = "› Export with external identifier: ";
 
-    // Clear the command area (input lines, bottom ruler, hint), keep the top ruler.
+    // From the hint line, where `render` leaves the cursor, up to the first
+    // input line. Clear the command area from there; the top ruler is kept.
     execute!(stdout, cursor::MoveUp(1 + input_lines), cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
 
     let mut typed = String::new();
-    let mut hint = "a namespaced key, such as com.heads.seedID · enter to turn export on, esc to cancel".to_string();
+    let mut hint = "e.g. com.heads.seedID · enter to turn export on, esc to cancel";
     let answer = loop {
-        // The prompt line, the bottom ruler and the hint; then back up to the prompt.
-        execute!(stdout, Print("\r\n"), Print(format!("{}\r\n", ruler_line)), Print(format!("  {}", hint.dimmed())))?;
-        execute!(stdout, cursor::MoveUp(2), cursor::MoveToColumn(0))?;
-        match read_inline_input(stdout, prompt, false, &typed)? {
+        // The cursor is on the prompt's row. Leave it empty for now, draw the
+        // bottom ruler and the hint under it, and come back up for the input.
+        let hint_line = fit_to_width(hint, width.saturating_sub(3));
+        execute!(
+            stdout,
+            Print("\x1b[?7l"),
+            Print("\r\n"),
+            Print(format!("{}\r\n", ruler_line)),
+            Print(format!("  {}", hint_line.dimmed())),
+            Print("\x1b[?7h"),
+            cursor::MoveUp(2),
+            cursor::MoveToColumn(0)
+        )?;
+        match read_inline_input_within(stdout, prompt, false, &typed, Some(width))? {
             None => break None,
             Some(name) => {
                 let name = name.trim().to_string();
@@ -10655,15 +10729,17 @@ fn ask_export_name(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
                 if is_namespaced_key(&name) {
                     break Some(name);
                 }
-                hint = format!("not a namespaced key: {} · {}", name, NAMESPACED_KEY_HELP);
+                hint = "not a namespaced key: needs three dot-separated segments, like com.heads.seedID";
                 typed = name;
-                // Back onto the prompt line, to draw the three lines again.
+                // Enter left the cursor a row down, on the ruler. Back onto
+                // the prompt's row, to draw the three rows again.
                 execute!(stdout, cursor::MoveUp(1), cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
             }
         }
     };
 
-    // Restore the normal command area for `render`.
+    // The cursor is on the row under the prompt. Clear from there, and go
+    // down to where the hint line of the command area is, for `render`.
     execute!(stdout, cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
     for _ in 0..input_lines {
         execute!(stdout, Print("\r\n"))?;
@@ -19070,6 +19146,52 @@ mod tests {
             assert_eq!(out, unchanged);
             assert!(masked.is_empty(), "{unchanged}");
         }
+    }
+
+    #[test]
+    fn text_is_cut_to_a_width_from_either_end() {
+        assert_eq!(fit_to_width("abcdef", 6), "abcdef");
+        assert_eq!(fit_to_width("abcdef", 5), "abcd…");
+        assert_eq!(fit_to_width("abcdef", 1), "…");
+        assert_eq!(fit_to_width("abcdef", 0), "");
+        assert_eq!(fit_to_width("", 0), "");
+        assert_eq!(fit_tail_to_width("abcdef", 6), "abcdef");
+        assert_eq!(fit_tail_to_width("abcdef", 5), "…cdef");
+        assert_eq!(fit_tail_to_width("abcdef", 1), "…");
+        assert_eq!(fit_tail_to_width("abcdef", 0), "");
+        // Columns, not bytes.
+        assert_eq!(fit_to_width("Möööör", 4), "Möö…");
+        assert_eq!(fit_tail_to_width("Möööör", 4), "…öör");
+        // The body on a request line is cut the same way, once on one line.
+        assert_eq!(fit_body_to_width("{\n  \"a\": 1\n}", 6), fit_to_width(&collapse_newlines_for_log("{\n  \"a\": 1\n}"), 6));
+    }
+
+    #[test]
+    fn an_inline_input_line_keeps_to_the_width_it_is_given() {
+        let prompt = "› Export with external identifier: ";
+        let line = |value: &str, cols: usize| {
+            let (prompt, value) = inline_input_line(prompt, value, Some(cols));
+            format!("{}{}", prompt, value)
+        };
+        // It fits: as written, with room for the cursor block and the margin.
+        assert_eq!(line("com.heads.seedID", 80), format!("{prompt}com.heads.seedID"));
+        assert_eq!(line("", 37), prompt);
+        // Too long: the end of the value stays, the line stops two short.
+        let long = "x".repeat(200) + "Z";
+        for cols in [200, 84, 60, 44, 39] {
+            let shown = line(&long, cols);
+            assert_eq!(char_len(&shown), cols - 2, "{cols}");
+            assert!(shown.starts_with(prompt) && shown.ends_with('Z'), "{cols}: {shown}");
+            assert!(shown[prompt.len()..].starts_with('…'), "{cols}: {shown}");
+        }
+        // One column left for the value: the ellipsis alone.
+        assert_eq!(line(&long, 38), format!("{prompt}…"));
+        // Narrower than the prompt: the prompt gives way, and nothing wraps.
+        for cols in [36, 20, 3, 2, 1, 0] {
+            assert!(char_len(&line(&long, cols)) <= cols.saturating_sub(2), "{cols}");
+        }
+        // No width given: nothing is cut.
+        assert_eq!(inline_input_line(prompt, &long, None), (prompt.to_string(), long.clone()));
     }
 
     #[test]
