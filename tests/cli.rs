@@ -43,6 +43,16 @@ fn api() -> Command {
     cmd
 }
 
+/// The system clipboard is one per machine, and macOS refuses a write while
+/// another is under way (`NSPasteboard#writeObjects: returned false`). Tests
+/// that copy to it hold this for as long as they do, so they take turns.
+static CLIPBOARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn clipboard_turn() -> std::sync::MutexGuard<'static, ()> {
+    // A test that failed while holding it has not broken the clipboard.
+    CLIPBOARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Fail with an instructive message if no test credentials are available.
 fn require_credentials() {
     let has_env = std::env::var("API_TEST_BASE_URI").is_ok()
@@ -282,6 +292,7 @@ fn glob_at_file_skips_os_junk_files() {
 
 #[test]
 fn clipboard_outfile_suppresses_stdout_and_logs_target() {
+    let _turn = clipboard_turn();
     require_local_cos();
     // `> clipboard` should route the response away from stdout (same as `> file`)
     // and emit the dimmed `> clipboard` marker on stderr in non-silent mode.
@@ -312,6 +323,7 @@ fn clipboard_outfile_suppresses_stdout_and_logs_target() {
 
 #[test]
 fn clipboard_outfile_is_case_insensitive() {
+    let _turn = clipboard_turn();
     require_local_cos();
     let assert = api()
         .args(["GET", "/echo-all > CLIPBOARD"])
@@ -651,6 +663,7 @@ fn outfile_marker_reports_bytes_written() {
 
 #[test]
 fn clipboard_marker_reports_bytes_copied() {
+    let _turn = clipboard_turn();
     require_local_cos();
     let assert = api()
         .args(["GET", "/echo-all > clipboard"])
@@ -1940,8 +1953,10 @@ fn whole_request_server(answers: Vec<(&'static str, &'static str)>) -> (u16, std
             };
             let Some((mut stream, _)) = accepted else { break };
             stream.set_nonblocking(false).unwrap();
-            stream.set_read_timeout(Some(std::time::Duration::from_millis(300))).unwrap();
-            // Head and body may come in separate writes: read until quiet.
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(1))).unwrap();
+            // Head and body may come in separate writes: read until the
+            // body is as long as the head says. What is no HTTP at all (a TLS
+            // hello) ends when nothing more comes.
             let mut request = Vec::new();
             let mut buf = [0u8; 4096];
             loop {
@@ -2779,6 +2794,7 @@ fn an_assert_and_a_poll_are_judged_on_what_the_server_said_not_on_the_seed_data(
 
 #[test]
 fn export_to_the_clipboard_and_appended_to_ndjson_is_seed_data_too() {
+    let _turn = clipboard_turn();
     // The clipboard is not read back (a headless runner has none to read);
     // the response is kept off stdout and the masked place is still named.
     let run = run_export(&["--export", SEED, "GET", "/users", ">", "clipboard"], vec![("200 OK", USERS)]);
@@ -2802,6 +2818,57 @@ fn export_to_the_clipboard_and_appended_to_ndjson_is_seed_data_too() {
     let written = std::fs::read_to_string(dir.path().join("people.ndjson")).unwrap();
     let exported = "{\"identifiers\":{\"key?\":\"a\",\"com.heads.seedID\":\"a\"},\"n\":1}\n{\"identifiers\":{\"com.x.y\":\"1\"}}\n";
     assert_eq!(written, exported.repeat(2));
+}
+
+#[test]
+fn an_ndjson_outfile_holds_one_compact_value_per_line_whatever_was_answered() {
+    // One record is one line of NDJSON and one JSON value at once. Written to
+    // a file it was indented like JSON; a second `>>` then added a compact line.
+    const RECORD: &str = r#"{"@type":"api version info","schema-version":"1.1"}"#;
+    const LIST: &str = r#"[{"id":1},{"id":2}]"#;
+    let run = |answer: &'static str, batch: &str, flags: &[&str]| {
+        let (port, server) = answering_server(vec![("200 OK", answer)]);
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("batch.api"), batch).unwrap();
+        let out = api_against_port(port)
+            .env("NO_COLOR", "1")
+            .current_dir(dir.path())
+            .args(flags)
+            .arg("batch.api")
+            .output()
+            .unwrap();
+        server.join().unwrap();
+        assert!(out.status.success(), "{batch}: {}", String::from_utf8_lossy(&out.stderr));
+        let read = |name: &str| std::fs::read_to_string(dir.path().join(name)).unwrap_or_default();
+        (read("out.ndjson"), read("out.njson"), read("out.json"), String::from_utf8_lossy(&out.stderr).to_string())
+    };
+    let line = format!("{RECORD}\n");
+
+    // With and without `-s`: the two code paths that write a file.
+    for flags in [&["-sa"][..], &["-a"]] {
+        let (ndjson, ..) = run(RECORD, "GET /about > out.ndjson\n", flags);
+        assert_eq!(ndjson, line, "{flags:?}");
+        let (ndjson, ..) = run(RECORD, "GET /about >> out.ndjson\nGET /about >> out.ndjson\nGET /about >> out.ndjson\n", flags);
+        assert_eq!(ndjson, line.repeat(3), "{flags:?}");
+        // A list, from a server that answers JSON whatever it is asked for.
+        let (ndjson, njson, ..) = run(LIST, "GET /things > out.ndjson\nGET /things >> out.njson\nGET /things >> out.njson\n", flags);
+        assert_eq!(ndjson, "{\"id\":1}\n{\"id\":2}\n", "{flags:?}");
+        assert_eq!(njson, "{\"id\":1}\n{\"id\":2}\n".repeat(2), "{flags:?}");
+        // A `.json` target is indented as before.
+        let (_, _, json, _) = run(RECORD, "GET /about > out.json\n", flags);
+        assert_eq!(json, "{\n  \"@type\": \"api version info\",\n  \"schema-version\": \"1.1\"\n}", "{flags:?}");
+    }
+    // The size that is reported is the size that was written.
+    let (_, _, _, stderr) = run(RECORD, "GET /about > out.ndjson\n", &["-a"]);
+    assert!(stderr.contains(&format!("> out.ndjson ({} B)", line.len())), "{stderr}");
+
+    // And as seed data: the same shape, exported.
+    let (ndjson, ..) = run(
+        r#"{"identifiers":{"key":"a"},"n":1}"#,
+        "GET /one > out.ndjson\nGET /one >> out.ndjson\n",
+        &["--export", SEED, "-sa"],
+    );
+    assert_eq!(ndjson, "{\"identifiers\":{\"key?\":\"a\",\"com.heads.seedID\":\"a\"},\"n\":1}\n".repeat(2));
 }
 
 #[test]

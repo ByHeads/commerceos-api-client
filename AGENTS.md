@@ -149,6 +149,9 @@ GET /people > clipboard                  # system clipboard, case-insensitive
 - `>> file` appends by content: JSON is spliced into one array, `.ndjson`/`.njson`
   targets get one compact object per line, `.csv` appends drop the duplicate
   header row, anything else is text-appended. `>> clipboard` is rejected.
+- A `.ndjson`/`.njson` target always holds one compact JSON value per line,
+  after `>` and after any number of `>>`: a single record is one line, and a
+  list is one line per element. Other JSON targets are indented.
 - Under the status line the client prints the target and the size written, on
   stderr: `> people.json (47.1 KB)`, `>> people.json (+1.2 KB)`. `-s` suppresses it.
 

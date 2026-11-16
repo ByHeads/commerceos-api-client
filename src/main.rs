@@ -4320,10 +4320,40 @@ fn classify_streamed(status: u16, prefix: &str, overflowed: bool) -> RequestOutc
     }
 }
 
+/// Whether `path` names an NDJSON file (`.ndjson` or `.njson`, any case).
+fn is_ndjson_path(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    lower.ends_with(".ndjson") || lower.ends_with(".njson")
+}
+
+/// `content` as NDJSON, when it is one JSON value: a list becomes one compact
+/// line per element (none for an empty list), anything else one compact line.
+/// `None` when it is not one JSON value, which is what NDJSON of several
+/// lines is: that is left as it came.
+fn ndjson_lines(content: &str) -> Option<String> {
+    let line = |v: &Value| serde_json::to_string(v).ok();
+    let lines: Vec<String> = match serde_json::from_str::<Value>(content.trim()).ok()? {
+        Value::Array(items) => items.iter().map(line).collect::<Option<_>>()?,
+        single => vec![line(&single)?],
+    };
+    Some(lines.iter().map(|l| format!("{}\n", l)).collect())
+}
+
+/// Write `content` to the outfile at `path`, replacing what is there, and
+/// return the bytes written. An NDJSON target gets NDJSON: a response that is
+/// one JSON value (a single record, or a list from a server that was not
+/// asked for NDJSON) is never written indented or as a list there, so the
+/// file reads the same after `>` as after any number of `>>`.
+fn write_outfile(path: &str, content: &str) -> io::Result<u64> {
+    let lines = if is_ndjson_path(path) { ndjson_lines(content) } else { None };
+    let content = lines.as_deref().unwrap_or(content);
+    fs::write(path, content).map(|()| content.len() as u64)
+}
+
 /// - target missing or empty → plain write, identical to `>`
 /// - `.ndjson`/`.njson` target → a JSON-array payload is exploded to one compact
 ///   object per line, a single JSON value becomes one compact line, and
-///   anything else (already-NDJSON) is text-appended
+///   anything else (already-NDJSON) is text-appended; the first write too
 /// - `.csv` target → the payload's first line (its header row) is dropped,
 ///   since the target already carries one
 /// - both sides parse as JSON → one array, merged as a textual splice: arrays
@@ -4342,7 +4372,8 @@ fn append_to_outfile(path: &str, new_content: &str) -> io::Result<()> {
         Err(e) => return Err(e),
     };
     if existing.trim().is_empty() {
-        return fs::write(path, new_content);
+        // The first append is a plain write, in the shape the target takes.
+        return write_outfile(path, new_content).map(|_| ());
     }
 
     // Text append: keep existing bytes untouched, separate with one newline.
@@ -4357,22 +4388,14 @@ fn append_to_outfile(path: &str, new_content: &str) -> io::Result<()> {
     };
 
     let path_lower = path.to_lowercase();
-    let merged = if path_lower.ends_with(".ndjson") || path_lower.ends_with(".njson") {
+    let merged = if is_ndjson_path(path) {
         // NDJSON: keep the one-value-per-line shape whatever shape the payload
         // arrived in.
-        match serde_json::from_str::<Value>(new_content.trim()) {
-            Ok(Value::Array(items)) => {
-                let lines: Vec<String> = items
-                    .iter()
-                    .filter_map(|v| serde_json::to_string(v).ok())
-                    .collect();
-                text_append(&existing, &format!("{}\n", lines.join("\n")))
-            }
-            Ok(single) => {
-                let line = serde_json::to_string(&single).unwrap_or_else(|_| new_content.trim().to_string());
-                text_append(&existing, &format!("{}\n", line))
-            }
-            Err(_) => text_append(&existing, new_content),
+        match ndjson_lines(new_content) {
+            // An empty list has no line to add.
+            Some(lines) if lines.is_empty() => return Ok(()),
+            Some(lines) => text_append(&existing, &lines),
+            None => text_append(&existing, new_content),
         }
     } else if path_lower.ends_with(".csv") {
         // CSV: the target already has a header row — drop the payload's.
@@ -7422,7 +7445,7 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                             let res = if outfile_append {
                                 append_to_outfile(file_path, &output)
                             } else {
-                                fs::write(file_path, &output)
+                                write_outfile(file_path, &output).map(|_| ())
                             };
                             if let Err(e) = res {
                                 eprintln!("Error writing to {}: {}", file_path, e);
@@ -7467,22 +7490,19 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                 } else if let Some(ref file_path) = outfile {
                     let before = if outfile_append { file_len(file_path) } else { 0 };
                     let res = if outfile_append {
-                        append_to_outfile(file_path, &output)
+                        append_to_outfile(file_path, &output).map(|()| file_len(file_path).saturating_sub(before))
                     } else {
-                        fs::write(file_path, &output)
+                        write_outfile(file_path, &output)
                     };
-                    if let Err(e) = res {
-                        eprintln!("Error writing to {}: {}", file_path, e);
-                    } else if !config.silent {
+                    match res {
+                        Err(e) => eprintln!("Error writing to {}: {}", file_path, e),
                         // Match interactive output: status line already printed,
                         // now print ">/>> outfile (size)" (dimmed) on the next line.
-                        let display = display_outfile.as_deref().unwrap_or(file_path);
-                        let written = if outfile_append {
-                            file_len(file_path).saturating_sub(before)
-                        } else {
-                            output.len() as u64
-                        };
-                        eprintln!("{}", outfile_marker(display, written, outfile_append).dimmed());
+                        Ok(written) if !config.silent => {
+                            let display = display_outfile.as_deref().unwrap_or(file_path);
+                            eprintln!("{}", outfile_marker(display, written, outfile_append).dimmed());
+                        }
+                        Ok(_) => {}
                     }
                 } else {
                     print!("{}", output);
@@ -9610,8 +9630,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
                             append_to_outfile(&state.config.outfile, &body_text)
                                 .map(|()| file_len(&state.config.outfile).saturating_sub(before))
                         } else {
-                            fs::write(&state.config.outfile, &body_text)
-                                .map(|()| body_text.len() as u64)
+                            write_outfile(&state.config.outfile, &body_text)
                         }
                     }
                 };
@@ -16554,6 +16573,55 @@ mod tests {
         let fresh = dir.path().join("fresh.csv");
         append_to_outfile(fresh.to_str().unwrap(), "id,name\n9,Zoe\n").unwrap();
         assert_eq!(fs::read_to_string(&fresh).unwrap(), "id,name\n9,Zoe\n");
+    }
+
+    #[test]
+    fn an_ndjson_outfile_is_ndjson_from_the_first_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let read = |p: &std::path::Path| fs::read_to_string(p).unwrap();
+        let about_pretty = "{\n  \"@type\": \"api version info\",\n  \"schema-version\": \"1.1\"\n}";
+        let about_line = "{\"@type\":\"api version info\",\"schema-version\":\"1.1\"}\n";
+
+        // The reported bug: one record, indented on its way to the file. `>`
+        // wrote it indented, and so did the first `>>`, ahead of a compact line.
+        for name in ["about.ndjson", "about.njson", "ABOUT.NDJSON"] {
+            let path = dir.path().join(name);
+            let p = path.to_str().unwrap();
+            assert_eq!(write_outfile(p, about_pretty).unwrap(), about_line.len() as u64, "{name}");
+            assert_eq!(read(&path), about_line, "{name}");
+            fs::remove_file(&path).unwrap();
+            append_to_outfile(p, about_pretty).unwrap();
+            append_to_outfile(p, about_pretty).unwrap();
+            assert_eq!(read(&path), about_line.repeat(2), "{name}");
+        }
+
+        // A list is its elements, a scalar is a line, an empty list is nothing.
+        let path = dir.path().join("list.ndjson");
+        let p = path.to_str().unwrap();
+        write_outfile(p, "[\n  {\"id\": 1},\n  {\"id\": 2}\n]").unwrap();
+        assert_eq!(read(&path), "{\"id\":1}\n{\"id\":2}\n");
+        append_to_outfile(p, "[]").unwrap();
+        append_to_outfile(p, "3").unwrap();
+        assert_eq!(read(&path), "{\"id\":1}\n{\"id\":2}\n3\n");
+        write_outfile(p, "[]").unwrap();
+        assert_eq!(read(&path), "");
+
+        // NDJSON of several lines, and what is not JSON, is written as it came.
+        let lines = "{\"id\":1}\n{\"id\":2}\n";
+        assert_eq!(write_outfile(p, lines).unwrap(), lines.len() as u64);
+        assert_eq!(read(&path), lines);
+        write_outfile(p, "not json").unwrap();
+        assert_eq!(read(&path), "not json");
+
+        // Any other target is written as it is given.
+        let json = dir.path().join("about.json");
+        write_outfile(json.to_str().unwrap(), about_pretty).unwrap();
+        assert_eq!(read(&json), about_pretty);
+
+        assert_eq!(ndjson_lines("{\"a\": 1}").as_deref(), Some("{\"a\":1}\n"));
+        assert_eq!(ndjson_lines("[]").as_deref(), Some(""));
+        assert_eq!(ndjson_lines(lines), None);
+        assert!(is_ndjson_path("a/b.NJSON") && !is_ndjson_path("b.json") && !is_ndjson_path("ndjson"));
     }
 
     #[test]
