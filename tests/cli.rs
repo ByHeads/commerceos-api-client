@@ -3583,3 +3583,214 @@ fn import_dir_runs_a_local_directory_and_logs_where_it_is() {
     // Used in place: there is nothing to cache.
     assert!(!dir.join(".import-cache").exists());
 }
+
+// ----- describe blocks: --describe, -m, --assert -----
+//
+// None of these reach a server: `--describe` and `--assert` send nothing, and
+// the `-m` runs are declined at the preview.
+
+/// The api binary with nothing configured, in `dir`.
+fn bare_api(dir: &std::path::Path) -> Command {
+    let mut cmd = Command::cargo_bin("api").expect("api binary built");
+    cmd.current_dir(dir)
+        .env("NO_COLOR", "1")
+        .env("LANG", "sv_SE.UTF-8")
+        .env_remove("LC_ALL")
+        .env_remove("LC_MESSAGES")
+        .env_remove("API_CREDENTIALS_FILE");
+    cmd
+}
+
+const DESCRIBED: &str = r#"# Catalog seed
+url has localhost
+{
+  "title": { "sv-se": "Katalog", "en-US": "Catalog" },
+  // what it is for
+  "description": { "sv-SE": "Innehåller x y z." },
+  "docsLink": "https://link-to-docs.com"
+}
+
+PUT /assert { "api/v1/people~count": { "is": 3 } }
+PUT /people/x { "name": "X" }
+PUT /assert { "api/v1/people~count": { "is": 4 } }
+"#;
+
+#[test]
+fn describe_prints_the_block_and_needs_no_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("cat.api"), DESCRIBED).unwrap();
+    std::fs::write(dir.path().join("none.api"), "GET /a\n").unwrap();
+
+    bare_api(dir.path())
+        .args(["--describe", "cat.api"])
+        .assert()
+        .success()
+        .stderr("")
+        .stdout(concat!(
+            "{\n  \"title\": {\n    \"sv-SE\": \"Katalog\",\n    \"en-US\": \"Catalog\"\n  },\n",
+            "  \"description\": {\n    \"sv-SE\": \"Innehåller x y z.\"\n  },\n",
+            "  \"docsLink\": \"https://link-to-docs.com\"\n}\n"
+        ));
+    // -r on one line; a file without a block is `null`; stdin is a file too.
+    bare_api(dir.path())
+        .args(["-r", "--describe", "cat.api"])
+        .assert()
+        .success()
+        .stdout("{\"title\":{\"sv-SE\":\"Katalog\",\"en-US\":\"Catalog\"},\"description\":{\"sv-SE\":\"Innehåller x y z.\"},\"docsLink\":\"https://link-to-docs.com\"}\n");
+    bare_api(dir.path()).args(["--describe", "none.api"]).assert().success().stdout("null\n").stderr("");
+    bare_api(dir.path())
+        .args(["-r", "--describe", "-"])
+        .write_stdin("{ \"title\": { \"en\": \"Piped\" } }\nGET /a\n")
+        .assert()
+        .success()
+        .stdout("{\"title\":{\"en\":\"Piped\"}}\n");
+    bare_api(dir.path())
+        .args(["--describe", "missing.api"])
+        .assert()
+        .failure()
+        .stdout("")
+        .stderr(predicate::str::starts_with("error: could not read missing.api"));
+}
+
+#[test]
+fn describe_warns_about_a_shape_that_is_off_and_fails_on_a_block_out_of_place() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("off.api"),
+        "{ \"title\": { \"sv_SE\": \"x\" }, \"docsLink\": 5, \"owner\": \"me\" }\nGET /a\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("late.api"), "GET /a\n{ \"title\": {} }\n").unwrap();
+    std::fs::write(dir.path().join("low.api"), "PUT /a\n{ \"x\": 1 }\n").unwrap();
+    std::fs::write(dir.path().join("bad.api"), "{ \"title\": }\nGET /a\n").unwrap();
+
+    // Off shape: a warning per thing, the block printed all the same, exit 0.
+    bare_api(dir.path())
+        .args(["-r", "--describe", "off.api"])
+        .assert()
+        .success()
+        .stdout("{\"title\":{\"sv_SE\":\"x\"},\"docsLink\":5,\"owner\":\"me\"}\n")
+        .stderr(concat!(
+            "warning: describe block: title/sv_SE is not a locale\n",
+            "warning: describe block: docsLink is not an http(s) link\n",
+            "warning: describe block: owner is not a member of a describe block (title, description, docsLink)\n"
+        ));
+    // The same warnings when the file is run, before anything is sent.
+    bare_api(dir.path())
+        .args(["--no-keychain", "-b", "http://127.0.0.1:1", "-k", "x", "-spa", "off.api"])
+        .write_stdin("n\n")
+        .assert()
+        .success()
+        .stderr(predicate::str::starts_with("warning: describe block: title/sv_SE is not a locale\n"))
+        .stderr(predicate::str::contains("aborted"));
+
+    for (file, says) in [
+        ("late.api", "error: a describe block must come before the first request\n"),
+        ("low.api", "error: a describe block must come before the first request (a body starts on the request line)\n"),
+    ] {
+        bare_api(dir.path()).args(["--describe", file]).assert().failure().stdout("").stderr(says);
+        // Running it stops at the same thing, with nothing sent.
+        bare_api(dir.path())
+            .args(["--no-keychain", "-b", "http://127.0.0.1:1", "-k", "x", "-sa", file])
+            .assert()
+            .failure()
+            .stdout("")
+            .stderr(says);
+    }
+    bare_api(dir.path())
+        .args(["--describe", "bad.api"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::starts_with("error: invalid describe block: "));
+}
+
+#[test]
+fn describe_first_prints_the_block_in_the_readers_language_above_the_preview() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("cat.api"), DESCRIBED).unwrap();
+    let run = |lang: &str, args: &[&str]| {
+        let out = bare_api(dir.path())
+            .env("LANG", lang)
+            .args(["--no-keychain", "-b", "http://localhost:1", "-k", "x"])
+            .args(args)
+            .write_stdin("n\n")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?}: nothing was sent, so nothing is logged");
+        String::from_utf8(out.stderr).unwrap()
+    };
+
+    let swedish = "Katalog\nInnehåller x y z.\nhttps://link-to-docs.com\n\nPreview — 3 requests";
+    assert!(run("sv_SE.UTF-8", &["-spma", "cat.api"]).starts_with(swedish));
+    // Long form, and the file named as a one-shot argument.
+    assert!(run("sv_SE.UTF-8", &["-sp", "--describe-first", "-a", "cat.api"]).starts_with(swedish));
+    assert!(run("sv_SE.UTF-8", &["-spm", "cat.api"]).starts_with(swedish));
+    // English where it is the reader's language or the reader's has no text;
+    // the description has only the Swedish.
+    let english = "Catalog\nInnehåller x y z.\nhttps://link-to-docs.com\n\nPreview";
+    for lang in ["en_GB.UTF-8", "de_DE.UTF-8", "C"] {
+        assert!(run(lang, &["-spma", "cat.api"]).starts_with(english), "{lang}");
+    }
+    // Without -m the preview is all there is.
+    assert!(run("sv_SE.UTF-8", &["-spa", "cat.api"]).starts_with("Preview — 3 requests"));
+    // A file with no block prints nothing for it.
+    std::fs::write(dir.path().join("none.api"), "GET /a\n").unwrap();
+    assert!(run("sv_SE.UTF-8", &["-spma", "none.api"]).starts_with("Preview — 1 request"));
+}
+
+#[test]
+fn a_describe_block_alone_as_an_argument_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    bare_api(dir.path())
+        .args(["--no-keychain", "-b", "http://127.0.0.1:1", "-k", "x", "{\"title\":{}}"])
+        .assert()
+        .failure()
+        .stdout("")
+        .stderr("error: a describe block alone sends nothing. It goes at the top of a .api file.\n");
+}
+
+#[test]
+fn assert_flag_lists_every_put_assert_body_in_one_array() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("cat.api"), format!("{DESCRIBED}shared/more.api\nPUT /assert @asserts.json\n")).unwrap();
+    std::fs::create_dir(dir.path().join("shared")).unwrap();
+    std::fs::write(
+        dir.path().join("shared/more.api"),
+        "GET /a && PUT v1/assert {\n  \"api/v1/now\": { \"is not\": null } // chained\n}\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("asserts.json"), "{ \"api/v1/file\": { \"is\": 1 } }").unwrap();
+    std::fs::write(dir.path().join("none.api"), "GET /a\nassert GET /b\n").unwrap();
+    std::fs::write(dir.path().join("broken.api"), "PUT /assert { \"a\": }\n").unwrap();
+
+    bare_api(dir.path())
+        .args(["-r", "--assert", "cat.api"])
+        .assert()
+        .success()
+        .stderr("")
+        .stdout(concat!(
+            r#"[{"api/v1/people~count":{"is":3}},"#,
+            r#"{"api/v1/people~count":{"is":4}},"#,
+            r#"{"api/v1/now":{"is not":null}},"#,
+            r#"{"api/v1/file":{"is":1}}]"#,
+            "\n"
+        ));
+    bare_api(dir.path())
+        .args(["--assert", "none.api"])
+        .assert()
+        .success()
+        .stdout("[]\n");
+    bare_api(dir.path())
+        .args(["--assert", "broken.api"])
+        .assert()
+        .failure()
+        .stdout("")
+        .stderr(predicate::str::starts_with("error: the body of `PUT /assert` is not JSON: "));
+    bare_api(dir.path())
+        .args(["--assert", "cat.api", "--describe", "cat.api"])
+        .assert()
+        .failure()
+        .stdout("")
+        .stderr("error: --describe and --assert each print a document of their own: use one\n");
+}

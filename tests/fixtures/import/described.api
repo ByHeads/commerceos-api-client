@@ -1,0 +1,9 @@
+# A file with a describe block of its own. Imported or included, the block
+# is read and left alone: it describes this file, not the batch that runs it.
+{
+  "title": { "en-US": "Described fixture" },
+  "description": { "en-US": "Asserts one path and sends one request." }
+}
+
+PUT /assert { "api/v1/described~count": { "is": 1 } }
+GET /described/after

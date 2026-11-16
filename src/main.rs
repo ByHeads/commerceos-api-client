@@ -210,6 +210,19 @@ struct Args {
     #[arg(short = 'f', long = "fail-fast")]
     fail_fast: bool,
 
+    /// Print the describe block of the .api file being run before running it
+    #[arg(short = 'm', long = "describe-first")]
+    describe_first: bool,
+
+    /// Print the describe block of a .api file as JSON and send nothing
+    #[arg(long = "describe", value_name = "FILE")]
+    describe: Option<String>,
+
+    /// Print the bodies of every `PUT /assert` a .api file makes, includes
+    /// and imports followed, as one JSON array, and send nothing
+    #[arg(long = "assert", value_name = "FILE")]
+    assert: Option<String>,
+
     /// Export mode: turn responses into seed data. Database keys are dropped,
     /// and a record with no other identifier keeps its key as `key?` and under
     /// this name, a namespaced key such as com.heads.seedID
@@ -280,6 +293,8 @@ struct Config {
     expect_falsy: bool,
     /// `-f`: a response of 400 or above ends the run. See `fail_fast_trips`.
     fail_fast: bool,
+    /// `-m`: print the describe block of the file being run before it runs.
+    describe_first: bool,
     /// Export mode, from `--export <name>` or ctrl+r at the prompt: responses
     /// are rewritten as seed data, with `name` as the external identifier a
     /// lone database key is kept under, beside `key?`. `None` is off. See
@@ -318,6 +333,7 @@ impl Default for Config {
             last_response: None,
             expect_falsy: false,
             fail_fast: false,
+            describe_first: false,
             export_id: None,
             export_pinned: false,
             last_status: None,
@@ -2812,6 +2828,20 @@ fn main() {
         std::process::exit(0);
     }
 
+    // `--describe` and `--assert` read a file and print what it says. Nothing
+    // is sent, so neither needs a connection.
+    if args.describe.is_some() && args.assert.is_some() {
+        eprintln!("error: --describe and --assert each print a document of their own: use one");
+        std::process::exit(1);
+    }
+    if let Some(file) = &args.describe {
+        std::process::exit(print_describe_block(file, args.raw));
+    }
+    if let Some(file) = &args.assert {
+        let api_path = if args.me { "/api/me/v1" } else { "/api/v1" };
+        std::process::exit(print_assertions(file, api_path, args.raw));
+    }
+
     // Route all credential I/O to a file instead of the OS keychain.
     // Must happen before any keychain access below.
     if args.no_keychain {
@@ -2839,6 +2869,7 @@ fn main() {
     }
     config.preview = args.preview;
     config.fail_fast = args.fail_fast;
+    config.describe_first = args.describe_first;
     if let Some(name) = &args.export {
         if !is_namespaced_key(name) {
             eprintln!("error: invalid export identifier: {} ({})", name, NAMESPACED_KEY_HELP);
@@ -3260,6 +3291,14 @@ fn main() {
             eprintln!("error: `export` alone sends nothing. Use --export <name> with a request, or put the line in a .api file.");
             std::process::exit(1);
         }
+        // The file named on the line is the file being run, so `-m` prints
+        // its describe block, as `-ma` on the file would.
+        if config.describe_first {
+            config.describe_first = false;
+            if let Some(block) = describe_block_of_named_file(&line) {
+                print_describe_first(&block);
+            }
+        }
         if let Some(selector) = &op_selector {
             match get_1password_credentials(selector) {
                 Ok((base_uri, api_key)) => {
@@ -3273,9 +3312,16 @@ fn main() {
             }
         }
         // A mistyped request would otherwise be reported as a missing include.
-        if let Err(e) = split_bulk_requests(&line, None) {
-            eprintln!("error: {}", describe_program_error(&e));
-            std::process::exit(1);
+        match split_bulk_requests(&line, None) {
+            Err(e) => {
+                eprintln!("error: {}", describe_program_error(&e));
+                std::process::exit(1);
+            }
+            Ok(program) if program.only_describes() => {
+                eprintln!("error: {}", DESCRIBE_ALONE);
+                std::process::exit(1);
+            }
+            Ok(_) => {}
         }
         run_bulk_from_str(&mut config, &line, None);
         return;
@@ -5015,9 +5061,21 @@ struct BulkProgram {
     import_gates: Vec<ImportGate>,
     /// The imports the program made, in the order they were declared.
     import_notes: Vec<ImportNote>,
+    /// The describe block of the file itself. One in an included or imported
+    /// file is checked and left where it is: it describes that file.
+    describe: Option<serde_json::Map<String, serde_json::Value>>,
+    /// What the describe blocks read hold that a describe block should not,
+    /// one line each. A warning: the batch runs all the same.
+    describe_warnings: Vec<String>,
 }
 
 impl BulkProgram {
+    /// The text was a describe block and nothing else, so running it would
+    /// send nothing.
+    fn only_describes(&self) -> bool {
+        self.describe.is_some() && self.steps.is_empty() && self.url_conditions.is_empty()
+    }
+
     /// The gate collecting the `url` lines of `repo`.
     fn import_gate(&mut self, repo: &ImportedRepo) -> &mut Vec<UrlCondition> {
         let at = match self.import_gates.iter().position(|g| g.checkout == repo.checkout) {
@@ -6294,6 +6352,389 @@ fn declare_import(
     Ok(())
 }
 
+/// Where a describe block may stand: before the first request, import,
+/// include or directive of its file, with only comments, blank lines and
+/// `url` lines above it. Anywhere else a `{` that starts a line is a body
+/// that lost its request, and is refused instead of being read as either.
+#[derive(Default)]
+struct DescribePlacement {
+    /// Something other than a comment or a `url` line has been read.
+    opened: bool,
+    /// The file's describe block has been read.
+    described: bool,
+    /// The line above is a `PUT`, `POST` or `PATCH` with no body, so a JSON
+    /// block here is most likely the body, written a line too low.
+    bodyless: bool,
+}
+
+impl DescribePlacement {
+    /// A blank line or a comment.
+    fn gap(&mut self) {
+        self.bodyless = false;
+    }
+
+    /// The first line of whatever comes next. `Ok(true)`: it opens the
+    /// file's describe block.
+    fn begin(&mut self, trimmed: &str) -> Result<bool, String> {
+        let hint = if self.bodyless { " (a body starts on the request line)" } else { "" };
+        if trimmed.starts_with('[') {
+            return Err(format!("a describe block is a JSON object, not an array{}", hint));
+        }
+        if trimmed.starts_with('{') {
+            if self.opened {
+                return Err(format!("a describe block must come before the first request{}", hint));
+            }
+            if self.described {
+                return Err("a file has one describe block, and this is a second".to_string());
+            }
+            return Ok(true);
+        }
+        self.bodyless = false;
+        if !matches!(parse_url_condition(trimmed), Ok(Some(_))) {
+            self.opened = true;
+        }
+        Ok(false)
+    }
+
+    /// A request has been read whole (`""` for anything else).
+    fn request(&mut self, text: &str) {
+        self.bodyless = parse_request_line(text)
+            .is_some_and(|(method, _, body)| body.is_empty() && ["PUT", "POST", "PATCH"].contains(&method.as_str()));
+    }
+}
+
+const DESCRIBE_ALONE: &str = "a describe block alone sends nothing. It goes at the top of a .api file.";
+
+type DescribeBlock = serde_json::Map<String, serde_json::Value>;
+
+/// Read the text of a describe block, comments stripped, as the object it is.
+fn parse_describe_block(text: &str) -> Result<DescribeBlock, String> {
+    match serde_json::from_str::<serde_json::Value>(text.trim()) {
+        Ok(serde_json::Value::Object(block)) => Ok(block),
+        Ok(_) => Err("a describe block is a JSON object".to_string()),
+        Err(e) => Err(format!("invalid describe block: {}", e)),
+    }
+}
+
+/// A locale key in the one spelling it is printed in (`sv-se` → `sv-SE`,
+/// `ZH-hans-cn` → `zh-Hans-CN`), or `None` when it is no locale: a language
+/// of two or three letters, then optionally a script of four letters and a
+/// region of two letters or three digits, joined by `-`.
+fn canonical_locale(key: &str) -> Option<String> {
+    let mut parts = key.split('-');
+    let language = parts.next()?;
+    if !(2..=3).contains(&language.len()) || !language.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let mut out = language.to_ascii_lowercase();
+    let mut next = parts.next();
+    if let Some(script) = next.filter(|p| p.len() == 4 && p.chars().all(|c| c.is_ascii_alphabetic())) {
+        out.push('-');
+        out.push_str(&script[..1].to_ascii_uppercase());
+        out.push_str(&script[1..].to_ascii_lowercase());
+        next = parts.next();
+    }
+    if let Some(region) = next {
+        let letters = region.len() == 2 && region.chars().all(|c| c.is_ascii_alphabetic());
+        let digits = region.len() == 3 && region.chars().all(|c| c.is_ascii_digit());
+        if !(letters || digits) {
+            return None;
+        }
+        out.push('-');
+        out.push_str(&region.to_ascii_uppercase());
+        next = parts.next();
+    }
+    next.is_none().then_some(out)
+}
+
+/// Check a describe block against what one holds, `title` and `description`
+/// as texts by locale and `docsLink` as a link, and return it with its locale
+/// keys in one spelling, beside a line for each thing that is not as it
+/// should be. Nothing is dropped but a locale given twice: a member this
+/// client does not know may be one a later client does.
+fn check_describe_block(block: DescribeBlock) -> (DescribeBlock, Vec<String>) {
+    use serde_json::Value;
+    let mut out = DescribeBlock::new();
+    let mut warnings = Vec::new();
+    for (key, value) in block {
+        match (key.as_str(), value) {
+            ("title" | "description", Value::Object(texts)) => {
+                let mut checked = DescribeBlock::new();
+                for (locale, text) in texts {
+                    let name = canonical_locale(&locale).unwrap_or_else(|| {
+                        warnings.push(format!("{}/{} is not a locale", key, locale));
+                        locale.clone()
+                    });
+                    if !text.is_string() {
+                        warnings.push(format!("{}/{} is not a text", key, locale));
+                    }
+                    if checked.contains_key(&name) {
+                        warnings.push(format!("{}/{} is given twice", key, locale));
+                        continue;
+                    }
+                    checked.insert(name, text);
+                }
+                out.insert(key, Value::Object(checked));
+            }
+            ("title" | "description", other) => {
+                warnings.push(format!("{} is not an object of texts by locale, like {{ \"sv-SE\": \"…\" }}", key));
+                out.insert(key, other);
+            }
+            ("docsLink", link) => {
+                if !link.as_str().is_some_and(|l| l.starts_with("https://") || l.starts_with("http://")) {
+                    warnings.push("docsLink is not an http(s) link".to_string());
+                }
+                out.insert(key, link);
+            }
+            (_, other) => {
+                warnings.push(format!("{} is not a member of a describe block (title, description, docsLink)", key));
+                out.insert(key, other);
+            }
+        }
+    }
+    (out, warnings)
+}
+
+/// The describe block of a `.api` text, checked, without running anything it
+/// names: includes are not opened and imports not fetched. Placement is
+/// judged as the batch parser judges it (`DescribePlacement`), so a block
+/// that would stop a run is an error here too.
+fn scan_describe_block(contents: &str) -> Result<Option<(DescribeBlock, Vec<String>)>, String> {
+    let mut place = DescribePlacement::default();
+    let mut current = String::new();
+    let mut describing = false;
+    let mut found = None;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if current.is_empty() {
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                place.gap();
+                continue;
+            }
+            describing = place.begin(trimmed)?;
+            current.push_str(line);
+        } else {
+            current.push('\n');
+            current.push_str(line);
+        }
+        let (cleaned, depth) = strip_body_comments_and_count(&current);
+        if depth <= 0 {
+            let assembled = escape_newlines_in_strings(&cleaned);
+            if describing {
+                found = Some(check_describe_block(parse_describe_block(&assembled)?));
+                place.described = true;
+            } else {
+                place.request(if split_request_chain(&assembled).len() > 1 { "" } else { &assembled });
+            }
+            current.clear();
+        }
+    }
+    if describing && !current.trim().is_empty() {
+        let (_, depth) = strip_body_comments_and_count(&current);
+        return Err(format!("unclosed describe block (depth {})", depth));
+    }
+    Ok(found)
+}
+
+/// A `.api` file named on the command line, with the directory its includes
+/// start from. `-` is stdin, `~/` the home directory.
+fn read_api_file(file: &str) -> Result<(String, Option<PathBuf>), String> {
+    if file == "-" {
+        let mut contents = String::new();
+        io::stdin().read_to_string(&mut contents).map_err(|_| "could not read stdin".to_string())?;
+        return Ok((contents, None));
+    }
+    let path = match (file.strip_prefix("~/"), dirs::home_dir()) {
+        (Some(rest), Some(home)) => format!("{}/{}", home.display(), rest),
+        _ => file.to_string(),
+    };
+    let contents = fs::read_to_string(&path).map_err(|e| format!("could not read {}: {}", path, e))?;
+    Ok((contents, std::path::Path::new(&path).parent().map(|p| p.to_path_buf())))
+}
+
+/// JSON for stdout: indented, or on one line with `-r`.
+fn print_json_document(value: &serde_json::Value, raw: bool) {
+    let text = if raw { serde_json::to_string(value) } else { serde_json::to_string_pretty(value) };
+    println!("{}", text.unwrap_or_else(|_| "null".to_string()));
+}
+
+/// `--describe <file>`: the file's describe block on stdout, `null` when it
+/// has none. Returns the exit code.
+fn print_describe_block(file: &str, raw: bool) -> i32 {
+    let found = read_api_file(file).and_then(|(contents, _)| scan_describe_block(&contents));
+    match found {
+        Ok(found) => {
+            let (block, warnings) = found.map_or((serde_json::Value::Null, Vec::new()), |(b, w)| (b.into(), w));
+            for warning in warnings {
+                eprintln!("warning: describe block: {}", warning);
+            }
+            print_json_document(&block, raw);
+            0
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            1
+        }
+    }
+}
+
+/// The describe block of the one `.api` file a one-shot line names, if that
+/// is all the line is.
+fn describe_block_of_named_file(line: &str) -> Option<DescribeBlock> {
+    let file = line.trim();
+    if !names_api_file(file) || file.contains(char::is_whitespace) || file.contains(['*', '?', '[']) {
+        return None;
+    }
+    let (contents, _) = read_api_file(file).ok()?;
+    scan_describe_block(&contents).ok()?.map(|(block, _)| block)
+}
+
+/// The locale the user reads, from the environment (`LC_ALL`, `LC_MESSAGES`,
+/// `LANG`: `sv_SE.UTF-8` is `sv-SE`). None for `C`, `POSIX` or nothing set.
+fn user_locale() -> Option<String> {
+    ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .find(|value| !value.is_empty())
+        .and_then(|value| {
+            let name = value.split(['.', '@']).next().unwrap_or("").replace('_', "-");
+            canonical_locale(&name)
+        })
+}
+
+/// The text of a `title` or `description` to show a reader of `locale`: that
+/// locale's, else one in the same language, else English, else the first.
+fn localized_text<'a>(texts: Option<&'a serde_json::Value>, locale: Option<&str>) -> Option<&'a str> {
+    let texts: Vec<(&str, &str)> = texts?
+        .as_object()?
+        .iter()
+        .filter_map(|(key, text)| Some((key.as_str(), text.as_str()?)))
+        .collect();
+    let language = |key: &str| key.split('-').next().unwrap_or("").to_ascii_lowercase();
+    let exact = locale.and_then(|l| texts.iter().find(|(key, _)| key.eq_ignore_ascii_case(l)));
+    let same_language = locale.and_then(|l| texts.iter().find(|(key, _)| language(key) == language(l)));
+    let english = texts.iter().find(|(key, _)| language(key) == "en");
+    exact.or(same_language).or(english).or(texts.first()).map(|(_, text)| *text)
+}
+
+/// Break `text` into lines of at most `width` characters at its spaces,
+/// keeping the line breaks it has.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for paragraph in text.lines() {
+        let mut line = String::new();
+        for word in paragraph.split_whitespace() {
+            if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+                lines.push(std::mem::take(&mut line));
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+        lines.push(line);
+    }
+    lines
+}
+
+/// The lines `-m` prints for a describe block: the title, the description
+/// wrapped to `width`, and the link.
+fn describe_first_lines(block: &DescribeBlock, locale: Option<&str>, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(title) = localized_text(block.get("title"), locale) {
+        lines.push(title.bold().to_string());
+    }
+    if let Some(description) = localized_text(block.get("description"), locale) {
+        lines.extend(wrap_words(description, width));
+    }
+    if let Some(link) = block.get("docsLink").and_then(|l| l.as_str()) {
+        lines.push(link.dimmed().to_string());
+    }
+    lines
+}
+
+/// `-m`: say on stderr what the file about to run is, from its describe
+/// block, with an empty line under it.
+fn print_describe_first(block: &DescribeBlock) {
+    let width = if io::stderr().is_terminal() {
+        colored::control::set_override(true);
+        terminal::size().map(|(w, _)| w as usize).unwrap_or(80)
+    } else {
+        80
+    };
+    let lines = describe_first_lines(block, user_locale().as_deref(), width.max(20));
+    if lines.is_empty() {
+        return;
+    }
+    for line in lines {
+        eprintln!("{}", line);
+    }
+    eprintln!();
+}
+
+/// Whether a request URI is the `/assert` endpoint of an API version.
+fn is_assert_uri(api_path: &str, uri: &str) -> bool {
+    let uri = uri.split(" >").next().unwrap_or("").trim();
+    let path = resolve_request_path(api_path, uri);
+    let Some(prefix) = path.trim_end_matches('/').strip_suffix("/assert") else {
+        return false;
+    };
+    let version = prefix.rsplit('/').next().unwrap_or("");
+    prefix.starts_with("/api/")
+        && version.strip_prefix('v').is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// The body of every `PUT /assert` a program sends, in the order it sends
+/// them and each as it is written: one element per request, so two requests
+/// that assert the same path stay two.
+fn collect_assertions(program: &BulkProgram, api_path: &str) -> Result<Vec<serde_json::Value>, String> {
+    let requests = program.steps.iter().flat_map(|step| match step {
+        BulkStep::Request(request) => vec![request.as_str()],
+        BulkStep::Chain(segments) => segments.iter().map(|(_, request)| request.as_str()).collect(),
+        _ => Vec::new(),
+    });
+    let mut assertions = Vec::new();
+    for request in requests {
+        let Some((method, uri, body)) = parse_request_line(request) else { continue };
+        if method != "PUT" || !is_assert_uri(api_path, &uri) {
+            continue;
+        }
+        let text = match body.strip_prefix('@') {
+            Some(_) => {
+                let (file_body, _) = parse_body_functions(&body);
+                let file = file_body.trim_start_matches('@').trim().to_string();
+                let contents = resolve_at_file_body(&file)?.contents;
+                let text = String::from_utf8(contents).map_err(|_| format!("not UTF-8 text: @{}", file))?;
+                normalize_request_text(&text).map_err(|e| format!("@{}: {}", file, e))?
+            }
+            None => body.clone(),
+        };
+        let value = serde_json::from_str(text.trim())
+            .map_err(|e| format!("the body of `PUT {}` is not JSON: {}", uri.split(" >").next().unwrap_or("").trim(), e))?;
+        assertions.push(value);
+    }
+    Ok(assertions)
+}
+
+/// `--assert <file>`: what the file asserts, as one JSON array on stdout.
+/// Returns the exit code.
+fn print_assertions(file: &str, api_path: &str, raw: bool) -> i32 {
+    let assertions = read_api_file(file).and_then(|(contents, base_dir)| {
+        let program = split_bulk_requests(&contents, base_dir.as_deref()).map_err(|e| describe_program_error(&e))?;
+        collect_assertions(&program, api_path)
+    });
+    match assertions {
+        Ok(assertions) => {
+            print_json_document(&serde_json::Value::Array(assertions), raw);
+            0
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            1
+        }
+    }
+}
+
 /// Evaluate every gate of a program: the batch's own `url` lines, then each
 /// imported repository's. All of them must pass.
 fn evaluate_program_gates(program: &BulkProgram, url: &str) -> Result<(), String> {
@@ -6374,8 +6815,14 @@ fn split_bulk_requests_inner(
     // The export mode this text starts in: none for a file, the session's
     // for a line typed at the prompt. Returns the one it ends in.
     mut export: Option<String>,
+    // The included or imported file this text is, as its include line names
+    // it; none for the file being run, whose describe block is the program's.
+    included_as: Option<&str>,
 ) -> Result<Option<String>, String> {
     let mut current = String::new();
+    let mut place = DescribePlacement::default();
+    // Whether `current` is a describe block.
+    let mut describing = false;
     // Whether `current` is an `import` directive rather than a request. Its
     // JSON may span lines, so it is assembled the way a request body is.
     let mut importing = false;
@@ -6386,12 +6833,14 @@ fn split_bulk_requests_inner(
         if current.is_empty() {
             // Between requests: skip blank lines and comments
             if trimmed.is_empty() || trimmed.starts_with('#') {
+                place.gap();
                 continue;
             }
-            // Decide: request line, directive (sleep/url), or include?
+            // Decide: describe block, request line, directive (sleep/url), or include?
+            describing = place.begin(trimmed)?;
             let first_word = trimmed.split_whitespace().next().unwrap_or("");
             importing = first_word.eq_ignore_ascii_case("import");
-            if !importing && !starts_a_request(first_word) {
+            if !describing && !importing && !starts_a_request(first_word) {
                 // `sleep N` — timing directive.
                 if first_word.eq_ignore_ascii_case("sleep") {
                     let rest = trimmed["sleep".len()..].trim();
@@ -6467,6 +6916,7 @@ fn split_bulk_requests_inner(
                         chain,
                         program,
                         None,
+                        Some(trimmed),
                     )?;
                     if export.is_some() || left_in.is_some() {
                         program.steps.push(BulkStep::Export { name: export.clone(), written: false });
@@ -6487,6 +6937,20 @@ fn split_bulk_requests_inner(
             // included) has been assembled, so a chained segment can carry a
             // multi-line body of its own.
             let assembled = escape_newlines_in_strings(&cleaned);
+            if describing {
+                describing = false;
+                current.clear();
+                let (block, warnings) = check_describe_block(parse_describe_block(&assembled)?);
+                place.described = true;
+                program.describe_warnings.extend(warnings.into_iter().map(|w| match included_as {
+                    Some(file) => format!("describe block in {}: {}", file, w),
+                    None => format!("describe block: {}", w),
+                }));
+                if included_as.is_none() {
+                    program.describe = Some(block);
+                }
+                continue;
+            }
             if importing {
                 importing = false;
                 current.clear();
@@ -6507,6 +6971,7 @@ fn split_bulk_requests_inner(
                     return Err(format!("chain segment is not a request: `{}`", bad.trim()));
                 }
             }
+            place.request(if segments.len() > 1 { "" } else { &assembled });
             program.steps.push(if segments.len() > 1 {
                 BulkStep::Chain(segments)
             } else {
@@ -6521,6 +6986,9 @@ fn split_bulk_requests_inner(
 
     if !current.trim().is_empty() {
         let (_, depth) = strip_body_comments_and_count(&current);
+        if describing {
+            return Err(format!("unclosed describe block (depth {})", depth));
+        }
         return Err(format!(
             "unclosed body at end of bulk file (depth {})",
             depth
@@ -6552,7 +7020,7 @@ fn split_bulk_requests_with(
 ) -> Result<BulkProgram, String> {
     let mut program = BulkProgram::default();
     let mut chain = std::collections::HashSet::new();
-    split_bulk_requests_inner(contents, base_dir, None, aliases, &mut chain, &mut program, export)?;
+    split_bulk_requests_inner(contents, base_dir, None, aliases, &mut chain, &mut program, export, None)?;
     Ok(program)
 }
 
@@ -6906,6 +7374,16 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
         std::process::exit(1);
     }
 
+    for warning in &program.describe_warnings {
+        eprintln!("warning: {}", warning);
+    }
+    // `-m`: say what the file is before the preview asks whether to run it.
+    if config.describe_first {
+        if let Some(block) = &program.describe {
+            print_describe_first(block);
+        }
+    }
+
     // Preview: show all resolved requests (and sleeps) and confirm once before
     // sending. Done before any stdout output so a declined run leaves stdout clean.
     if config.preview {
@@ -7191,25 +7669,13 @@ fn format_duration(d: Duration) -> String {
 }
 
 fn run_bulk(config: &mut Config, file_path: &str) {
-    let path = if file_path.starts_with("~/") {
-        if let Some(home) = dirs::home_dir() {
-            format!("{}{}", home.display(), &file_path[1..])
-        } else {
-            file_path.to_string()
-        }
-    } else {
-        file_path.to_string()
-    };
-
-    let contents = match fs::read_to_string(&path) {
-        Ok(c) => c,
+    let (contents, base_dir) = match read_api_file(file_path) {
+        Ok(read) => read,
         Err(e) => {
-            eprintln!("error: could not read {}: {}", path, e);
+            eprintln!("error: {}", e);
             std::process::exit(1);
         }
     };
-
-    let base_dir = std::path::Path::new(&path).parent().map(|p| p.to_path_buf());
     run_bulk_from_str(config, &contents, base_dir.as_deref());
 }
 
@@ -9067,6 +9533,22 @@ fn paste_is_api_text(paste: &str) -> bool {
         || DIRECTIVES.iter().any(|d| first.eq_ignore_ascii_case(d))
         || names_api_file(first)
         || (first.starts_with('/') && trimmed.trim_end().contains('\n'))
+        || (first.starts_with('{') && describe_block_leads(trimmed))
+}
+
+/// True if `text` is a JSON object with more lines under it: a `.api` file
+/// that opens with its describe block, where an object alone is a body.
+fn describe_block_leads(text: &str) -> bool {
+    let mut current = String::new();
+    let mut lines = text.lines();
+    for line in lines.by_ref() {
+        current.push_str(line);
+        current.push('\n');
+        if strip_body_comments_and_count(&current).1 <= 0 {
+            return lines.any(|rest| !rest.trim().is_empty());
+        }
+    }
+    false
 }
 
 /// Uppercase the leading method token of a request line (e.g. `get /x` →
@@ -9993,8 +10475,14 @@ fn run_program_line(state: &mut AppState, stdout: &mut io::Stdout, line: &str) -
         Ok(p) => p,
         Err(e) => return show_program_status(state, stdout, describe_program_error(&e)),
     };
+    if program.only_describes() {
+        return show_program_status(state, stdout, DESCRIBE_ALONE.to_string());
+    }
     if let Err(e) = evaluate_program_gates(&program, &state.config.base_uri) {
         return show_program_status(state, stdout, e);
+    }
+    for warning in &program.describe_warnings {
+        log_directive_line(state, stdout, format!("warning: {}", warning).dimmed().to_string())?;
     }
     for note in &program.import_notes {
         log_directive_line(state, stdout, note.text.dimmed().to_string())?;
@@ -20216,5 +20704,279 @@ mod tests {
             err,
             format!("import archive {url}: environment variable API_TEST_TOKEN_THAT_IS_NOT_SET is not set")
         );
+    }
+
+    // ----- describe blocks, -m, --describe and --assert -----
+
+    fn describe_of(src: &str) -> DescribeBlock {
+        split_bulk_requests(src, None).unwrap().describe.expect("a describe block")
+    }
+
+    #[test]
+    fn a_describe_block_is_read_before_the_first_request_and_never_sent() {
+        let src = "# seed\nurl has localhost\n{\n  \"title\": { \"sv-SE\": \"Katalog\" }, // name\n  \"description\": { \"sv-SE\": \"rad ett\nrad två\" }\n}\n\nGET /a\nPUT /b { \"x\": 1 }\n";
+        let program = split_bulk_requests(src, None).unwrap();
+        assert_eq!(
+            program.steps,
+            vec![BulkStep::Request("GET /a".to_string()), BulkStep::Request("PUT /b { \"x\": 1 }".to_string())]
+        );
+        assert_eq!(program.url_conditions, vec![UrlCondition::Has("localhost".to_string())]);
+        let block = program.describe.unwrap();
+        assert_eq!(block["title"]["sv-SE"], "Katalog");
+        // A raw newline in a string is kept, as in a body.
+        assert_eq!(block["description"]["sv-SE"], "rad ett\nrad två");
+        assert!(program.describe_warnings.is_empty());
+        // A file without one has none.
+        assert!(split_bulk_requests("GET /a\n", None).unwrap().describe.is_none());
+    }
+
+    #[test]
+    fn a_describe_block_anywhere_else_stops_the_file() {
+        let late = "a describe block must come before the first request";
+        for (src, says) in [
+            ("GET /a\n\n{ \"title\": {} }\n", late.to_string()),
+            ("sleep 1ms\n{ \"title\": {} }\n", late.to_string()),
+            ("confirm\n{ \"title\": {} }\n", late.to_string()),
+            ("export com.heads.seedID\n{ \"title\": {} }\n", late.to_string()),
+            ("import dir d { \"path\": \".\" }\n{ \"title\": {} }\n", late.to_string()),
+            // Under a request with no body it is most likely the body.
+            ("PUT /a\n{ \"x\": 1 }\n", format!("{late} (a body starts on the request line)")),
+            ("PATCH /a\n{\n  \"x\": 1\n}\n", format!("{late} (a body starts on the request line)")),
+            // A blank line or a comment between them, a body on the request,
+            // or a method that takes none: no such hint.
+            ("PUT /a\n\n{ \"x\": 1 }\n", late.to_string()),
+            ("PUT /a\n# note\n{ \"x\": 1 }\n", late.to_string()),
+            ("PUT /a {}\n{ \"x\": 1 }\n", late.to_string()),
+            ("GET /a\n{ \"x\": 1 }\n", late.to_string()),
+            ("{ \"title\": {} }\n{ \"title\": {} }\n", "a file has one describe block, and this is a second".to_string()),
+            ("[ { \"title\": {} } ]\nGET /a\n", "a describe block is a JSON object, not an array".to_string()),
+            ("PUT /a\n[1]\n", "a describe block is a JSON object, not an array (a body starts on the request line)".to_string()),
+            ("{ \"title\": {\n", "unclosed describe block (depth 2)".to_string()),
+        ] {
+            assert_eq!(split_bulk_requests(src, None).unwrap_err(), says, "{src:?}");
+            // `--describe` reads the file alone and judges it the same.
+            if !src.starts_with("import") {
+                assert_eq!(scan_describe_block(src).unwrap_err(), says, "scan {src:?}");
+            }
+        }
+        for src in ["{ \"title\": }\nGET /a\n", "{ \"title\": {} } trailing\nGET /a\n"] {
+            let err = split_bulk_requests(src, None).unwrap_err();
+            assert!(err.starts_with("invalid describe block: "), "{err}");
+            assert_eq!(scan_describe_block(src).unwrap_err(), err);
+        }
+    }
+
+    #[test]
+    fn a_describe_block_is_checked_and_what_is_off_is_a_warning() {
+        let (block, warnings) = check_describe_block(
+            parse_describe_block(
+                r#"{ "title": { "sv-se": "Katalog", "EN": "Catalog", "zh-hans-cn": "目录", "es-419": "Catálogo" },
+                     "description": { "sv-SE": "x" }, "docsLink": "https://link-to-docs.com" }"#,
+            )
+            .unwrap(),
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // Locale keys are read in any case and printed in one.
+        let keys: Vec<&String> = block["title"].as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["sv-SE", "en", "zh-Hans-CN", "es-419"]);
+        // Members keep the order they were written in.
+        assert_eq!(block.keys().collect::<Vec<_>>(), ["title", "description", "docsLink"]);
+
+        let (block, warnings) = check_describe_block(
+            parse_describe_block(
+                r#"{ "title": { "sv_SE": "a", "sv": 3, "SV": "b" }, "description": "plain",
+                     "docsLink": "ftp://x", "Title": {}, "owner": "me" }"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            warnings,
+            [
+                "title/sv_SE is not a locale",
+                "title/sv is not a text",
+                "title/SV is given twice",
+                "description is not an object of texts by locale, like { \"sv-SE\": \"…\" }",
+                "docsLink is not an http(s) link",
+                "Title is not a member of a describe block (title, description, docsLink)",
+                "owner is not a member of a describe block (title, description, docsLink)",
+            ]
+        );
+        // Nothing but the repeated locale is dropped.
+        assert_eq!(block["owner"], "me");
+        assert_eq!(block["description"], "plain");
+        assert_eq!(block["title"], serde_json::json!({ "sv_SE": "a", "sv": 3 }));
+        for link in [serde_json::json!(1), serde_json::json!(null), serde_json::json!("link-to-docs.com")] {
+            let (_, warnings) = check_describe_block(parse_describe_block(&format!("{{\"docsLink\":{link}}}")).unwrap());
+            assert_eq!(warnings, ["docsLink is not an http(s) link"]);
+        }
+    }
+
+    #[test]
+    fn canonical_locale_reads_any_case_and_refuses_what_is_no_locale() {
+        for (key, name) in [
+            ("sv-SE", "sv-SE"),
+            ("SV-se", "sv-SE"),
+            ("en", "en"),
+            ("FIL", "fil"),
+            ("zh-HANS", "zh-Hans"),
+            ("zh-hans-cn", "zh-Hans-CN"),
+            ("es-419", "es-419"),
+        ] {
+            assert_eq!(canonical_locale(key).as_deref(), Some(name), "{key}");
+        }
+        for key in ["", "s", "sv_SE", "sv-", "sv-S", "sv-SE-x", "svenska", "sv-1234", "s1", "sv-SE-SE", "sv--SE", "sv-åä"] {
+            assert_eq!(canonical_locale(key), None, "{key}");
+        }
+    }
+
+    #[test]
+    fn a_describe_block_in_an_included_file_is_checked_and_stays_that_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("inc.api"), "{ \"title\": \"Included\" }\nGET /inc\n").unwrap();
+        std::fs::write(dir.path().join("bad.api"), "GET /inc\n{ \"title\": {} }\n").unwrap();
+
+        let src = "{ \"title\": { \"en\": \"Top\" } }\ninc.api\nGET /a\n";
+        let program = split_bulk_requests(src, Some(dir.path())).unwrap();
+        assert_eq!(program.describe.unwrap()["title"]["en"], "Top");
+        assert_eq!(
+            program.describe_warnings,
+            ["describe block in inc.api: title is not an object of texts by locale, like { \"sv-SE\": \"…\" }"]
+        );
+        assert_eq!(program.steps.len(), 2);
+
+        // A file that has none does not take an included file's.
+        let program = split_bulk_requests("inc.api\n", Some(dir.path())).unwrap();
+        assert!(program.describe.is_none());
+        assert!(!program.only_describes());
+        // Each file has a top of its own: the included one may open with a
+        // block after the including file has sent requests.
+        assert!(split_bulk_requests("GET /a\ninc.api\n", Some(dir.path())).is_ok());
+        // A misplaced block in an included file stops the batch too.
+        assert_eq!(
+            split_bulk_requests("bad.api\n", Some(dir.path())).unwrap_err(),
+            "a describe block must come before the first request"
+        );
+    }
+
+    #[test]
+    fn scan_describe_block_reads_the_file_without_opening_what_it_names() {
+        // Neither the include nor the import exists; the block is read anyway.
+        let src = "# top\nurl is http://localhost:5000\n{ \"title\": { \"sv-se\": \"Katalog\" }, \"x\": 1 }\nimport git cl {\n  \"url\": \"https://example.invalid/x\",\n  \"ref\": \"1\"\n}\nnope/missing.api\nPUT /a {\n  \"b\": [1, 2]\n}\nGET /a && PUT /b { \"c\": 1 }\n";
+        let (block, warnings) = scan_describe_block(src).unwrap().unwrap();
+        assert_eq!(block["title"]["sv-SE"], "Katalog");
+        assert_eq!(warnings, ["x is not a member of a describe block (title, description, docsLink)"]);
+        assert_eq!(scan_describe_block("GET /a\nPUT /b {\n \"x\": 1\n}\n").unwrap(), None);
+        assert_eq!(scan_describe_block("").unwrap(), None);
+        // The same block the batch parser reads.
+        let src = "{ \"title\": { \"SV-se\": \"Katalog\" }, \"docsLink\": \"https://x\" }\nGET /a\n";
+        assert_eq!(scan_describe_block(src).unwrap().unwrap().0, describe_of(src));
+    }
+
+    #[test]
+    fn a_describe_block_alone_is_a_program_that_sends_nothing() {
+        assert!(split_bulk_requests("{ \"title\": {} }", None).unwrap().only_describes());
+        assert!(split_bulk_requests("# note\n{ \"title\": {} }\n", None).unwrap().only_describes());
+        assert!(!split_bulk_requests("{ \"title\": {} }\nGET /a", None).unwrap().only_describes());
+        assert!(!split_bulk_requests("{ \"title\": {} }\nurl has x", None).unwrap().only_describes());
+        assert!(!split_bulk_requests("# note", None).unwrap().only_describes());
+        // At the prompt it is a program, not a request to send.
+        assert!(matches!(classify_prompt_line("{ \"title\": {} }", None), PromptLine::Program));
+        assert!(matches!(
+            classify_prompt_line("{ \"title\": {} }\nGET /a", None),
+            PromptLine::Request(r) if r == "GET /a"
+        ));
+    }
+
+    #[test]
+    fn a_pasted_file_that_opens_with_a_describe_block_is_api_text() {
+        assert!(paste_is_api_text("{ \"title\": {} }\nGET /a"));
+        assert!(paste_is_api_text("{\n  \"title\": { \"sv-SE\": \"}\" } // }\n}\n\n# note\nGET /a\n"));
+        // An object alone is a body, whatever it holds and however long.
+        assert!(!paste_is_api_text("{ \"title\": {} }"));
+        assert!(!paste_is_api_text("{\n  \"a\": 1\n}\n\n"));
+        assert!(!paste_is_api_text("{\n  \"a\": 1"));
+        assert!(!paste_is_api_text("[1]\nGET /a"));
+    }
+
+    #[test]
+    fn localized_text_picks_the_readers_locale_then_language_then_english() {
+        let texts = serde_json::json!({ "de-DE": "Katalog", "en-US": "Catalog", "sv-SE": "Katalog sv", "sv-FI": "Katalog fi", "nb": 5 });
+        let pick = |locale: Option<&str>| localized_text(Some(&texts), locale);
+        assert_eq!(pick(Some("sv-FI")), Some("Katalog fi"));
+        assert_eq!(pick(Some("sv-fi")), Some("Katalog fi"));
+        assert_eq!(pick(Some("sv")), Some("Katalog sv"));
+        assert_eq!(pick(Some("sv-NO")), Some("Katalog sv"));
+        assert_eq!(pick(Some("fr-FR")), Some("Catalog"));
+        assert_eq!(pick(None), Some("Catalog"));
+        // A value that is no text is never shown.
+        assert_eq!(pick(Some("nb")), Some("Catalog"));
+        let no_english = serde_json::json!({ "de-DE": "Katalog", "sv-SE": "Katalog sv" });
+        assert_eq!(localized_text(Some(&no_english), Some("fr")), Some("Katalog"));
+        assert_eq!(localized_text(Some(&serde_json::json!({})), None), None);
+        assert_eq!(localized_text(Some(&serde_json::json!("plain")), None), None);
+        assert_eq!(localized_text(None, Some("sv")), None);
+    }
+
+    #[test]
+    fn describe_first_lines_are_the_title_the_wrapped_description_and_the_link() {
+        colored::control::set_override(false);
+        let block = describe_of(
+            "{ \"title\": { \"sv-SE\": \"Katalog\" }, \"description\": { \"sv-SE\": \"Innehåller x y z och andra saker.\nKör bananer också.\" }, \"docsLink\": \"https://link-to-docs.com\" }\nGET /a",
+        );
+        assert_eq!(
+            describe_first_lines(&block, Some("sv-SE"), 20),
+            ["Katalog", "Innehåller x y z och", "andra saker.", "Kör bananer också.", "https://link-to-docs.com"]
+        );
+        // Only what the block has.
+        assert_eq!(describe_first_lines(&describe_of("{ \"docsLink\": \"https://x\" }\nGET /a"), None, 80), ["https://x"]);
+        assert!(describe_first_lines(&describe_of("{ \"title\": {} }\nGET /a"), None, 80).is_empty());
+        // A word longer than the width is not cut.
+        assert_eq!(wrap_words("a bbbbbbbbbb c", 4), ["a", "bbbbbbbbbb", "c"]);
+        assert_eq!(wrap_words("åäö åäö", 7), ["åäö åäö"]);
+    }
+
+    #[test]
+    fn is_assert_uri_knows_the_endpoint_however_it_is_written() {
+        for uri in ["/assert", "assert", "/v1/assert", "v1/assert", "/api/v1/assert", "api/v2/assert", "/assert/", "/assert > /tmp/out.json"] {
+            assert!(is_assert_uri("/api/v1", uri), "{uri}");
+        }
+        assert!(is_assert_uri("/api/me/v1", "/assert"));
+        for uri in ["/asserts", "/people/assert", "/assert/x", "/assert~count", "/api/assert", "/", ""] {
+            assert!(!is_assert_uri("/api/v1", uri), "{uri}");
+        }
+    }
+
+    #[test]
+    fn collect_assertions_takes_every_put_assert_body_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("asserts.json");
+        std::fs::write(&file, "{ \"api/v1/file\": { \"is\": 1 } // from a file\n}").unwrap();
+        std::fs::write(dir.path().join("inc.api"), "PUT v1/assert {\"api/v1/now\":{\"is not\":null}}\n").unwrap();
+        let src = format!(
+            "{{ \"title\": {{}} }}\nPUT /assert {{ \"api/v1/people~count\": {{ \"is\": 3 }} }}\nGET /assert\nPUT /people/x {{ \"a\": 1 }}\ninc.api\nassert GET /people~count\nGET /a && PUT /api/v1/assert {{\n  \"z\": {{ \"is\": 1 }}, // z first\n  \"api/v1/people~count\": {{ \"is not\": 3, \"suggest\": [4] }}\n}} > /tmp/out.json\nPUT /assert @{}\n",
+            file.display()
+        );
+        let program = split_bulk_requests(&src, Some(dir.path())).unwrap();
+        let assertions = collect_assertions(&program, "/api/v1").unwrap();
+        assert_eq!(
+            serde_json::to_string(&assertions).unwrap(),
+            concat!(
+                r#"[{"api/v1/people~count":{"is":3}},"#,
+                r#"{"api/v1/now":{"is not":null}},"#,
+                // Two requests that assert the same path stay two, and the
+                // members of one keep their order.
+                r#"{"z":{"is":1},"api/v1/people~count":{"is not":3,"suggest":[4]}},"#,
+                r#"{"api/v1/file":{"is":1}}]"#
+            )
+        );
+        // A file that asserts nothing asserts an empty list.
+        let program = split_bulk_requests("GET /a\nassert /b\n", None).unwrap();
+        assert!(collect_assertions(&program, "/api/v1").unwrap().is_empty());
+        // A body that can't be read is an error, not a gap in the list.
+        let program = split_bulk_requests("PUT /assert { \"a\": }\n", None).unwrap();
+        let err = collect_assertions(&program, "/api/v1").unwrap_err();
+        assert!(err.starts_with("the body of `PUT /assert` is not JSON: "), "{err}");
+        let program = split_bulk_requests("PUT /assert @/nowhere/asserts.json\n", None).unwrap();
+        assert!(collect_assertions(&program, "/api/v1").is_err());
     }
 }

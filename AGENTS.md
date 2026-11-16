@@ -14,6 +14,7 @@ METHOD URI [BODY] [> OUTFILE]
 - If the first token starts with `/`, `GET` is implied — `/people` is the same as `GET /people`.
 - `URI` may be written **with or without its leading slash**, and with or without the `/api/v1` prefix — `GET api/v1/people`, `GET /api/v1/people`, `GET v1/people`, and `GET /people` all request the same thing. That makes a path copied out of a browser URL or a log usable as-is. In a `.api` file this needs an explicit method, because a bare line that doesn't start with `/` is an [include](#6-includes).
 - `BODY` and `OUTFILE` are optional. If both are present, `BODY` comes first; the `> path` suffix is parsed off the end.
+- A body starts on the request line. A `{` that starts a line of its own is a [describe block](#describe-block), which belongs at the top of the file.
 - A line may hold several requests joined by `&&` / `||`, see [chaining](#5-chaining).
 
 ```
@@ -377,6 +378,176 @@ import archive cl {
 - **`> outfile` in an imported file is not restricted** and writes where it
   says, relative to the working directory. Read an import with `-p` before
   running it for the first time: it sends requests with your credentials.
+
+## Describe block
+
+A file may open with one JSON object that says what the file is. It is never
+sent. It is there for people and for tools that list or run `.api` files:
+
+```
+# Catalog seed
+{
+  "title": {
+    "sv-SE": "Katalog",
+    "en-US": "Catalog"
+  },
+  "description": {
+    "sv-SE": "Innehåller x y z och andra intressanta saker, se till att köra bananer också."
+  },
+  "docsLink": "https://link-to-docs.com"
+}
+
+PUT /products @products/*.json
+```
+
+| Member | |
+|---|---|
+| `title` | an object of texts by locale: `{ "sv-SE": "…", "en-US": "…" }` |
+| `description` | the same, for a longer text |
+| `docsLink` | a string, an `http://` or `https://` link |
+
+All three are optional. A locale key is a language with an optional script
+and region (`sv`, `sv-SE`, `zh-Hans-CN`), read in any case: `sv-se` is `sv-SE`.
+
+**Where it goes.** Before the file's first request, import, include or
+directive. Only comments, blank lines and `url` lines may stand above it, and
+a file has one. It is written like a body: it may span lines, hold `//`, `#`
+and `/* */` comments, and have raw newlines in its strings.
+
+**What stops the batch** (exit 1, before anything is sent):
+
+- a `{` that starts a line after the first request, import, include or
+  directive: `a describe block must come before the first request`. Directly
+  under a `PUT`, `POST` or `PATCH` that has no body the message adds `(a body
+  starts on the request line)`, since that is what it most likely was;
+- a second describe block in the same file;
+- a line that starts with `[`: `a describe block is a JSON object, not an array`;
+- JSON that can't be read (`invalid describe block: …`), or a block that is
+  never closed.
+
+**What is only a warning** (stderr, and the batch runs): anything in the block
+that is not the shape above. One line each, naming the place:
+
+```
+warning: describe block: title/sv_SE is not a locale
+warning: describe block: description is not an object of texts by locale, like { "sv-SE": "…" }
+warning: describe block: docsLink is not an http(s) link
+warning: describe block: owner is not a member of a describe block (title, description, docsLink)
+```
+
+A member the client does not know is warned about and kept, so a file written
+for a later version still runs. A locale written twice (`sv-SE` and `sv-se`)
+keeps the first.
+
+**It is the file's own.** A describe block in an included or imported file is
+checked (its warnings say `describe block in shared/users.api: …`) and
+otherwise left alone: it describes that file, not the batch that includes it.
+
+### Reading it: `--describe <file>`
+
+```sh
+api --describe catalog.api          # indented
+api -r --describe catalog.api       # on one line
+```
+
+Prints the file's describe block on stdout as JSON, or `null` when the file
+has none, and exits 0. Nothing is sent and no connection is needed. Includes
+are not opened and imports are not fetched, so it is quick and works offline;
+`-` reads the file from stdin. Locale keys are printed in one spelling
+(`sv-SE`), whatever case the file has them in. Shape warnings go to stderr,
+still with exit 0; a block that would stop a run (out of place, invalid) is
+`error: …` on stderr with exit 1 and nothing on stdout.
+
+### Showing it before a run: `-m`
+
+`-m` (`--describe-first`) prints the block of the file being run, on stderr,
+before anything else, so above the `-p` preview when both are given:
+
+```sh
+api -spma catalog.api
+```
+
+```
+Katalog
+Innehåller x y z och andra intressanta saker, se till att köra bananer också.
+https://link-to-docs.com
+
+Preview — 1 request | PUT [http://localhost:5000]
+  PUT /products @products/*.json
+Run? [Y/n]
+```
+
+- Each text is shown in the reader's locale, from `LC_ALL`, `LC_MESSAGES` or
+  `LANG`: that locale's text, else one in the same language, else English,
+  else the first the file has. `title` and `description` are picked
+  separately, so a file with an English title and only a Swedish description
+  shows both.
+- It works without `-p` too (`api -sma catalog.api`), and for a file named as
+  a one-shot argument (`api -m catalog.api`).
+- A file without a describe block prints nothing for it. A block in an
+  included file is not printed.
+- It has no effect at the interactive prompt.
+
+### At the prompt and as an argument
+
+A pasted file that opens with a describe block runs as the file would, with
+the block read and not sent. A JSON object pasted alone is a body, as before.
+A describe block as the whole of a typed line or of the arguments
+(`api '{"title":{}}'`) would send nothing and is an error.
+
+## Listing a file's assertions: `--assert <file>`
+
+```sh
+api --assert seed.api
+```
+
+Prints the body of every `PUT /assert` the file sends, in the order it sends
+them, as one JSON array on stdout. Nothing is sent and no connection is needed.
+
+```
+# seed.api
+PUT /assert { "api/v1/people~count": { "is": 3 } }
+PUT /people/com.mi6.id=008 { "name": "Bill" }
+PUT /assert {
+  "api/v1/people~count": { "is": 4 },
+  "api/v1/people/com.mi6.id=008/givenName": { "is": "Bill" }
+}
+```
+
+```json
+[
+  {
+    "api/v1/people~count": {
+      "is": 3
+    }
+  },
+  {
+    "api/v1/people~count": {
+      "is": 4
+    },
+    "api/v1/people/com.mi6.id=008/givenName": {
+      "is": "Bill"
+    }
+  }
+]
+```
+
+- **One element per request, each exactly as it is written** (comments
+  stripped, members in their order). They are not merged into one object: two
+  requests may assert the same path, and an object holds one value per key.
+  Each element can be sent back as it is with `PUT /assert`.
+- **Includes and imports are followed**, since the question is what a run
+  asserts. An import that is not in the cache is fetched, and one that can't
+  be is an error.
+- A `PUT /assert` in a `&&`/`||` chain is listed, whether or not the chain
+  would reach it. An `@file` body is read.
+- The endpoint is recognised however it is written: `/assert`, `v1/assert`,
+  `/api/v1/assert`.
+- The `assert` keyword is not listed: only `PUT /assert` requests are.
+- A file that asserts nothing prints `[]`. `-r` prints the array on one line.
+- A body that is not JSON, or anything that would stop the file from being
+  read (a missing include, a misplaced describe block), is `error: …` on
+  stderr with exit 1 and nothing on stdout.
 
 ## 7. Directives: `sleep`, `sleep while`, `assert`, `confirm`, `export`, `url`
 
@@ -922,6 +1093,11 @@ Run it: `api -sa workshop.api`.
 
 ## 10. Common pitfalls
 
+- **A body on the line under its request** → `PUT /people/x` with `{ … }` on the next line is not a request with a body: `a describe block must come before the first request (a body starts on the request line)`. Start the body on the request line; it may continue below.
+- **A describe block that is not first** → only comments, blank lines and `url` lines may stand above it. Under an `import`, a `sleep` or a request it stops the batch.
+- **`"title": "Katalog"` in a describe block** → a warning: `title` and `description` are objects of texts by locale, `{ "sv-SE": "Katalog" }`. The batch still runs.
+- **Expecting `--describe` or `-m` to show an included file's block** → both show the block of the file named on the command line only.
+- **Expecting `--assert` to list `assert` lines** → it lists `PUT /assert` bodies. The `assert` keyword is a request judged by truthiness and is not part of the list.
 - **Trailing comma in JSON** → server returns 500 with a parse error. JSON is strict; don't trail commas in objects/arrays.
 - **`>` inside a body** → the parser uses `rfind(" >")` from the end of the request, which can mis-detect outfile when bodies contain `>`. Avoid bare `>` in bodies, or escape it inside strings.
 - **Unclosed brackets** → the whole run fails with `"unclosed body at end of bulk file"`. If a body looks wrong, check that `{}` and `[]` balance.
@@ -957,4 +1133,6 @@ Run it: `api -sa workshop.api`.
 - Use silent batch mode (`-sa`) when you want to verify that a long seeding script worked without drowning in response bodies.
 - To move data between environments, read it with `--export com.heads.seedID` (or under an `export com.heads.seedID` line in the `.api` file) into a file and `PUT` the file. Use the same identifier name every time, so a record exported twice is one record. The same file can be written back where it was read: a record is found by its identifiers, and one that had only a key by its `key?`.
 - Add `-f` (`-sfa`) so a failed request stops the batch: check the exit code, and on failure read the error body from the end of stdout (everything after the last `└─HTTP/1.1 …` line; it is usually several lines of JSON). Without it a batch exits 0 however many plain requests failed.
+- Open a file with a [describe block](#describe-block) (`title`, `description`, `docsLink`) so a tool or a person can tell what it does; read one with `api --describe file.api`, which sends nothing.
+- To see what a file checks without running it, `api --assert file.api` prints every `PUT /assert` body it sends as one JSON array.
 - Run with `--no-keychain` and an absolute `API_CREDENTIALS_FILE` so nothing depends on an unlocked keychain or on the working directory.

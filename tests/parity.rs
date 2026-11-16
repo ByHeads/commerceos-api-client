@@ -425,6 +425,20 @@ fn cases(dir: &Path) -> Vec<Case> {
             .fails("`ref` is required"),
         case("include then request", "seed.api\nGET /after", None, &["GET /inc1", "GET /inc2", "GET /after"]),
         case("missing include", "nope.api", Some(&["nope.api"]), &[]).fails("include not found: nope.api"),
+        // Describe blocks: read, never sent
+        case("describe block then request", "{ \"title\": { \"sv-SE\": \"Katalog\" } }\nGET /a", None, &["GET /a"]),
+        case(
+            "describe block over several lines",
+            "# seed\n{\n  \"title\": { \"sv-SE\": \"Katalog\" }, // name\n  \"docsLink\": \"https://link-to-docs.com\"\n}\n\nGET /a\nGET /b",
+            None,
+            &["GET /a", "GET /b"],
+        ),
+        case("describe block after a request", "GET /a\n\n{ \"title\": {} }", None, &[])
+            .fails("a describe block must come before the first request"),
+        case("body a line under its request", "PUT /a\n{ \"x\": 1 }", None, &[])
+            .fails("a body starts on the request line"),
+        case("array where a describe block goes", "[1]\nGET /a", None, &[])
+            .fails("a describe block is a JSON object, not an array"),
         // Several lines and noise
         case("three lines", "GET /a\nsleep 100ms\nGET /b", None, &["GET /a", "GET /b"]),
         case("comment line", "# just a note", Some(&["#", "just", "a", "note"]), &[]),

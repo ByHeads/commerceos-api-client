@@ -183,10 +183,19 @@ question nobody answered sends nothing and exits 1.
 ```sh
 api -sa seed.api
 api -spa seed.api        # preview first
+api -spma seed.api       # say what the file is, then preview
+api --describe seed.api  # its describe block as JSON, nothing sent
+api --assert seed.api    # every PUT /assert body it sends, as one JSON array, nothing sent
 ```
 
 ```
 # seed.api
+{                                             # describe block: what the file is, never sent
+  "title": { "en-US": "People seed" },
+  "description": { "en-US": "Seeds Joe and Ann and waits for the ERP import." },
+  "docsLink": "https://link-to-docs.com"
+}
+
 url has localhost:5000                        # refuse to run against anything else
 assert GET /companies/com.heads.seedID=ours   # stop unless this exists
 
@@ -207,6 +216,7 @@ GET /people~take(5) > /tmp/people.json
 |---|---|
 | `METHOD URI [BODY] [> file]` | a request; multi-line bodies continue until brackets balance |
 | `# …` | comment; `//`, `#`, and `/* */` also work inside JSON bodies |
+| `{ "title": {…}, "description": {…}, "docsLink": "…" }` | describe block: one per file, before its first request, import or include; texts are keyed by locale |
 | `path/to/file.api` | include, relative to the including file; globs allowed |
 | `import git <alias> {"url":…,"ref":…}` | fetch a git repository (tag, branch or SHA) and include from it as `alias/file.api`; the JSON may be `@file.json` |
 | `import dir <alias> {"path":…}` | the same for a local directory, used where it is |
@@ -316,6 +326,9 @@ Usage: api [OPTIONS] [METHOD] [URI] [BODY]
   -s, --silent                    No status output; with -a, one status line per request
   -p, --preview                   Show the request(s) and confirm before sending
   -f, --fail-fast                 Stop at the first response of 400 or above: print its body, exit 1
+  -m, --describe-first            With -a: print the file's describe block before running it
+      --describe <FILE>           Print the describe block of FILE as JSON; sends nothing
+      --assert <FILE>             Print every `PUT /assert` body FILE sends as one JSON array; sends nothing
       --export <EXTERNAL_ID>      Rewrite responses as seed data: keys dropped, a lone one kept as `key?` and EXTERNAL_ID
   -r, --raw                       No pretty-printing
   -i, --include-nulls             Include null values in the response

@@ -437,6 +437,72 @@ fn directives_and_chains_in_an_imported_file_run_as_they_would_in_the_batch() {
     }
 }
 
+/// A describe block is its file's: `-m` prints the batch's, not the one an
+/// imported file opens with, and neither is sent. `--assert` follows the
+/// import and lists what both files assert; `--describe` reads the batch
+/// alone, so it answers with nothing fetched.
+#[test]
+fn a_describe_block_in_an_imported_file_stays_there_and_its_assertions_are_listed() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", fixture_archive());
+    const BLOCK: &str = r#"{ "title": { "en-US": "The batch" }, "docsLink": "https://link-to-docs.com" }"#;
+    for (kind, import) in each_kind(&dir, &server) {
+        let batch = format!(
+            "{BLOCK}\n{import}\nlib/described.api\nPUT /assert {{ \"api/v1/described~count\": {{ \"is not\": 2 }} }}\n"
+        );
+        let ran = run_batch(&dir, server.port, "-sma", &batch);
+        assert!(ran.ok, "{kind}: {}", ran.stderr);
+        assert_eq!(
+            server.api_requests(),
+            vec![
+                r#"PUT /assert { "api/v1/described~count": { "is": 1 } }"#,
+                "GET /described/after",
+                r#"PUT /assert { "api/v1/described~count": { "is not": 2 } }"#,
+            ],
+            "{kind}"
+        );
+        assert!(ran.stderr.starts_with("The batch\nhttps://link-to-docs.com\n\n"), "{kind}: {:?}", ran.stderr);
+        assert!(!ran.stderr.contains("Described fixture"), "{kind}: {}", ran.stderr);
+        assert!(!ran.stdout.contains("title"), "{kind}: {}", ran.stdout);
+
+        // Without -m nothing of it is printed.
+        let ran = run_batch(&dir, server.port, "-sa", &batch);
+        assert!(ran.ok && ran.stderr.is_empty(), "{kind}: {}", ran.stderr);
+        server.sent();
+
+        let mut cmd = api(&dir, server.port);
+        cmd.args(["-r", "--assert", "batch.api"]);
+        let ran = finish(cmd, "");
+        assert!(ran.ok, "{kind}: {}", ran.stderr);
+        assert_eq!(
+            ran.stdout,
+            concat!(
+                r#"[{"api/v1/described~count":{"is":1}},"#,
+                r#"{"api/v1/described~count":{"is not":2}}]"#,
+                "\n"
+            ),
+            "{kind}"
+        );
+        assert!(server.api_requests().is_empty(), "{kind}: --assert sends nothing");
+    }
+
+    // An import that can't be fetched: `--describe` never tries, `--assert`
+    // has to and says why it could not.
+    let batch = format!("{BLOCK}\nimport dir lib {{ \"path\": \"no-such-directory\" }}\nlib/described.api\n");
+    std::fs::write(dir.join("batch.api"), batch).unwrap();
+    let mut cmd = api(&dir, server.port);
+    cmd.args(["-r", "--describe", "batch.api"]);
+    let ran = finish(cmd, "");
+    assert!(ran.ok, "{}", ran.stderr);
+    assert_eq!(ran.stdout, "{\"title\":{\"en-US\":\"The batch\"},\"docsLink\":\"https://link-to-docs.com\"}\n");
+    let mut cmd = api(&dir, server.port);
+    cmd.args(["--assert", "batch.api"]);
+    let ran = finish(cmd, "");
+    assert!(!ran.ok && ran.stdout.is_empty(), "{}", ran.stdout);
+    assert!(ran.stderr.starts_with("error: import lib: not a directory"), "{}", ran.stderr);
+    assert!(server.sent().is_empty());
+}
+
 #[test]
 fn every_kind_of_body_in_an_imported_file_is_read_from_the_import() {
     let (_guard, dir) = temp();
