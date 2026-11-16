@@ -25,6 +25,113 @@ use crossterm::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+/// Set once a write to stdout has failed: the reader has gone away
+/// (`api -sa seed.api | head -2`). Nothing more is written there.
+static STDOUT_CLOSED: AtomicBool = AtomicBool::new(false);
+
+/// Stdout for everything the client prints. A closed stdout is not a reason
+/// to stop: a batch is run for its requests, and its log is a by-product. So
+/// a failed write is remembered, what follows is dropped, and the run goes
+/// on to exit by how its requests went.
+struct Out;
+
+impl Write for Out {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if !STDOUT_CLOSED.load(Ordering::Relaxed) && io::stdout().write_all(buf).is_err() {
+            STDOUT_CLOSED.store(true, Ordering::Relaxed);
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if !STDOUT_CLOSED.load(Ordering::Relaxed) && io::stdout().flush().is_err() {
+            STDOUT_CLOSED.store(true, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+}
+
+/// `print!` to a stdout that may have closed. See `Out`.
+macro_rules! out {
+    ($($arg:tt)*) => {{
+        let _ = write!(Out, $($arg)*);
+    }};
+}
+
+/// `println!` to a stdout that may have closed. See `Out`.
+macro_rules! outln {
+    () => {{
+        let _ = writeln!(Out);
+    }};
+    ($($arg:tt)*) => {{
+        let _ = writeln!(Out, $($arg)*);
+    }};
+}
+
+/// Whether the prompt turned bracketed paste on, and whether it pushed the
+/// kitty keyboard flags: what `restore_terminal` has to undo.
+static BRACKETED_PASTE_ON: AtomicBool = AtomicBool::new(false);
+static KEYBOARD_FLAGS_PUSHED: AtomicBool = AtomicBool::new(false);
+
+/// Put the terminal back the way the shell had it: keyboard flags popped,
+/// bracketed paste off, cursor shown, raw mode off. Each part is undone only
+/// if it was done, so this is safe to call from anywhere, any number of
+/// times, and does nothing in a run that never touched the terminal.
+fn restore_terminal() {
+    let modes = leave_prompt_modes();
+    let raw = terminal::is_raw_mode_enabled().unwrap_or(false);
+    if !(modes || raw) {
+        return;
+    }
+    let _ = execute!(io::stdout(), cursor::Show);
+    let _ = terminal::disable_raw_mode();
+}
+
+/// Pop the keyboard flags and turn bracketed paste off, each only if the
+/// prompt turned it on and it has not been undone yet. Says whether there
+/// was anything to undo.
+fn leave_prompt_modes() -> bool {
+    let keyboard = KEYBOARD_FLAGS_PUSHED.swap(false, Ordering::SeqCst);
+    let paste = BRACKETED_PASTE_ON.swap(false, Ordering::SeqCst);
+    let mut stdout = io::stdout();
+    if keyboard {
+        let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+    }
+    if paste {
+        let _ = execute!(stdout, DisableBracketedPaste);
+    }
+    keyboard || paste
+}
+
+/// Restores the terminal when it goes out of scope, so every way out of the
+/// prompt does: a normal return, an error passed up with `?`, a panic.
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
+}
+
+/// End the process, with the terminal restored first. `std::process::exit`
+/// runs no destructors, so an exit from inside the prompt would otherwise
+/// leave the shell in raw mode with bracketed paste on.
+fn exit_process(code: i32) -> ! {
+    restore_terminal();
+    let _ = io::stdout().flush();
+    std::process::exit(code)
+}
+
+/// A panic prints its message through the default hook; before that, the
+/// terminal is restored so the message is readable and the shell usable.
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        default_hook(info);
+    }));
+}
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// How long a footer status message stays up before clearing.
@@ -1367,6 +1474,24 @@ fn fit_body_to_width(body: &str, budget: usize) -> String {
     fit_to_width(&collapse_newlines_for_log(body), budget)
 }
 
+/// The first `count` characters of `text`, or all of it. Cut on a character,
+/// never inside one, so a non-ASCII host or URL is as safe to cut as any.
+fn head_chars(text: &str, count: usize) -> &str {
+    match text.char_indices().nth(count) {
+        Some((i, _)) => &text[..i],
+        None => text,
+    }
+}
+
+/// The last `count` characters of `text`, or all of it.
+fn tail_chars(text: &str, count: usize) -> &str {
+    let len = char_len(text);
+    if len <= count {
+        return text;
+    }
+    &text[char_to_byte_idx(text, len - count)..]
+}
+
 /// Cut `text` to `budget` visible columns, keeping its start: the end gives
 /// way to an ellipsis, which is counted inside the budget.
 fn fit_to_width(text: &str, budget: usize) -> String {
@@ -1996,7 +2121,7 @@ impl ConnectionFlow {
             };
             if box_width > hint_section {
                 let host_space = box_width - hint_section;
-                let host_display = if display_url.len() > host_space { &display_url[display_url.len() - host_space..] } else { display_url };
+                let host_display = tail_chars(display_url, host_space);
                 execute!(stdout, Print(format!("{}{:width$}{}{}{}\r\n",
                     "│ ".dimmed(),
                     host_display.dimmed(),
@@ -2007,7 +2132,7 @@ impl ConnectionFlow {
                 )))?;
             } else {
                 let host_space = box_width.saturating_sub(4);
-                let host_display = if display_url.len() > host_space { &display_url[display_url.len() - host_space..] } else { display_url };
+                let host_display = tail_chars(display_url, host_space);
                 execute!(stdout, Print(format!("{}{:width$}{}\r\n",
                     "│ ".dimmed(),
                     host_display.dimmed(),
@@ -2253,23 +2378,15 @@ impl ConnectionFlow {
         let max_url_len = (self.width as usize).saturating_sub(21);
 
         if is_active {
-            let display_url = if url.len() > max_url_len {
-                &url[url.len() - max_url_len..]
-            } else {
-                url.as_str()
-            };
-            let ghost_budget = max_url_len.saturating_sub(display_url.len());
-            let display_ghost = if ghost.len() > ghost_budget { &ghost[..ghost_budget] } else { ghost.as_str() };
+            let display_url = tail_chars(url, max_url_len);
+            let ghost_budget = max_url_len.saturating_sub(char_len(display_url));
+            let display_ghost = head_chars(&ghost, ghost_budget);
             execute!(stdout, Print(format!("{}{:<14}{}\x1b[2m{}\x1b[0m\x1b[48;5;247m\x1b[38;5;0m \x1b[0m\r\n",
                 prefix, "URL:".dimmed(), display_url, display_ghost)))?;
         } else if url.is_empty() {
             execute!(stdout, Print(format!("{}{:<14}\r\n", prefix, "URL:".dimmed())))?;
         } else {
-            let display_url = if url.len() > max_url_len {
-                &url[url.len() - max_url_len..]
-            } else {
-                url.as_str()
-            };
+            let display_url = tail_chars(url, max_url_len);
             execute!(stdout, Print(format!("{}{:<14}{} ✓\r\n", prefix, "URL:".dimmed(), display_url)))?;
         }
 
@@ -2779,7 +2896,7 @@ impl ConnectionFlow {
                         terminal::disable_raw_mode()?;
 
                         // Clear screen and move to home
-                        print!("\x1b[2J\x1b[3J\x1b[H");
+                        out!("\x1b[2J\x1b[3J\x1b[H");
                         io::stdout().flush().ok();
 
                         // Redraw splash if showing
@@ -2822,7 +2939,7 @@ fn normalize_base_uri(uri: &str) -> String {
 fn require_base_uri(config: &Config) {
     if config.base_uri.is_empty() {
         eprintln!("{}", "Error: no base URL specified. Use -b <url> or -c <connection>.".red());
-        std::process::exit(1);
+        exit_process(1);
     }
 }
 
@@ -2843,7 +2960,7 @@ fn apply_connection_to_config(config: &mut Config, env: &SavedConnection) {
                 }
                 Err(e) => {
                     eprintln!("OAuth2 token exchange failed: {}", e);
-                    std::process::exit(1);
+                    exit_process(1);
                 }
             }
         }
@@ -2856,13 +2973,14 @@ fn apply_connection_to_config(config: &mut Config, env: &SavedConnection) {
 }
 
 fn main() {
+    install_panic_hook();
     let args = match Args::try_parse() {
         Ok(args) => args,
         Err(e) => {
             // Help and version are "success" errors in clap — print them normally
             if e.kind() == clap::error::ErrorKind::DisplayHelp || e.kind() == clap::error::ErrorKind::DisplayVersion {
-                print!("{}", e);
-                std::process::exit(0);
+                out!("{}", e);
+                exit_process(0);
             }
             // A value an option can't take (`--timeout abc`) is named with
             // its option; it is not an unexpected option.
@@ -2874,7 +2992,7 @@ fn main() {
                 ) {
                     let option = arg.split_whitespace().next().unwrap_or(&arg);
                     eprintln!("error: invalid value for {}: {}", option, value);
-                    std::process::exit(1);
+                    exit_process(1);
                 }
             }
             // For unexpected arguments, print a simple message
@@ -2884,27 +3002,27 @@ fn main() {
             } else {
                 eprintln!("error: {}", msg.lines().next().unwrap_or("invalid arguments"));
             }
-            std::process::exit(1);
+            exit_process(1);
         }
     };
 
     if args.version {
-        println!("v{}", VERSION);
-        std::process::exit(0);
+        outln!("v{}", VERSION);
+        exit_process(0);
     }
 
     // `--describe` and `--assert` read a file and print what it says. Nothing
     // is sent, so neither needs a connection.
     if args.describe.is_some() && args.assert.is_some() {
         eprintln!("error: --describe and --assert each print a document of their own: use one");
-        std::process::exit(1);
+        exit_process(1);
     }
     if let Some(file) = &args.describe {
-        std::process::exit(print_describe_block(file, args.raw));
+        exit_process(print_describe_block(file, args.raw));
     }
     if let Some(file) = &args.assert {
         let api_path = if args.me { "/api/me/v1" } else { "/api/v1" };
-        std::process::exit(print_assertions(file, api_path, args.raw));
+        exit_process(print_assertions(file, api_path, args.raw));
     }
 
     // Route all credential I/O to a file instead of the OS keychain.
@@ -2938,7 +3056,7 @@ fn main() {
     if let Some(name) = &args.export {
         if !is_namespaced_key(name) {
             eprintln!("error: invalid export identifier: {} ({})", name, NAMESPACED_KEY_HELP);
-            std::process::exit(1);
+            exit_process(1);
         }
         config.export_id = Some(name.clone());
         config.export_pinned = true;
@@ -2985,7 +3103,7 @@ fn main() {
             "{}",
             "error: -t is now --stream. Use --token <TOKEN> for a bearer token.".red()
         );
-        std::process::exit(1);
+        exit_process(1);
     }
 
     // The arguments as one line, read the way a `.api` file reads it: a body
@@ -3004,7 +3122,7 @@ fn main() {
             Ok(None) => (method, uri, body),
             Err(e) => {
                 eprintln!("error: {}", e);
-                std::process::exit(1);
+                exit_process(1);
             }
         }
     } else {
@@ -3065,7 +3183,7 @@ fn main() {
         if !found {
             eprintln!("Connection \"{}\" not found. Saved connections: {}", connection_selector,
                 if envs.is_empty() { "none".to_string() } else { envs.join(", ") });
-            std::process::exit(1);
+            exit_process(1);
         }
         // Show UI immediately with async loading (like 1P and picker)
         if !loaded_connection_alias.is_empty() && uri.is_empty() && io::stdout().is_terminal() {
@@ -3134,7 +3252,7 @@ fn main() {
                 execute!(stdout, cursor::MoveUp(total_lines), cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown)).unwrap();
                 terminal::disable_raw_mode().unwrap();
                 execute!(stdout, cursor::Show).unwrap();
-                std::process::exit(0);
+                exit_process(0);
             }
             Err(e) => {
                 let total_lines = flow.last_rendered_lines + if flow.show_splash { ConnectionFlow::splash_lines() } else { 0 };
@@ -3142,7 +3260,7 @@ fn main() {
                 terminal::disable_raw_mode().unwrap();
                 execute!(stdout, cursor::Show).unwrap();
                 eprintln!("Error: {}", e);
-                std::process::exit(1);
+                exit_process(1);
             }
         }
     }
@@ -3230,7 +3348,7 @@ fn main() {
                         execute!(stdout, cursor::MoveUp(total_lines), cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown)).unwrap();
                         terminal::disable_raw_mode().unwrap();
                         execute!(stdout, cursor::Show).unwrap();
-                        std::process::exit(0);
+                        exit_process(0);
                     }
                     Err(e) => {
                         let total_lines = flow.last_rendered_lines + if flow.show_splash { ConnectionFlow::splash_lines() } else { 0 };
@@ -3238,7 +3356,7 @@ fn main() {
                         terminal::disable_raw_mode().unwrap();
                         execute!(stdout, cursor::Show).unwrap();
                         eprintln!("Error: {}", e);
-                        std::process::exit(1);
+                        exit_process(1);
                     }
                 }
             }
@@ -3301,7 +3419,7 @@ fn main() {
                     execute!(stdout, cursor::MoveUp(total_lines), cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown)).unwrap();
                     terminal::disable_raw_mode().unwrap();
                     execute!(stdout, cursor::Show).unwrap();
-                    std::process::exit(0);
+                    exit_process(0);
                 }
                 Err(e) => {
                     let total_lines = flow.last_rendered_lines + if flow.show_splash { ConnectionFlow::splash_lines() } else { 0 };
@@ -3309,7 +3427,7 @@ fn main() {
                     terminal::disable_raw_mode().unwrap();
                     execute!(stdout, cursor::Show).unwrap();
                     eprintln!("Error: {}", e);
-                    std::process::exit(1);
+                    exit_process(1);
                 }
             }
         }
@@ -3326,7 +3444,7 @@ fn main() {
                 }
                 Err(e) => {
                     eprintln!("{}", e);
-                    std::process::exit(1);
+                    exit_process(1);
                 }
             }
         }
@@ -3334,7 +3452,7 @@ fn main() {
             let mut stdin_content = String::new();
             if io::stdin().read_to_string(&mut stdin_content).is_err() {
                 eprintln!("error: could not read stdin");
-                std::process::exit(1);
+                exit_process(1);
             }
             // No base_dir for stdin — includes can still use absolute paths
             run_bulk_from_str(&mut config, &stdin_content, None);
@@ -3354,7 +3472,7 @@ fn main() {
             && line.split_whitespace().next().is_some_and(|w| w.eq_ignore_ascii_case("export"));
         if alone {
             eprintln!("error: `export` alone sends nothing. Use --export <name> with a request, or put the line in a .api file.");
-            std::process::exit(1);
+            exit_process(1);
         }
         // The file named on the line is the file being run, so `-m` prints
         // its describe block, as `-ma` on the file would.
@@ -3372,7 +3490,7 @@ fn main() {
                 }
                 Err(e) => {
                     eprintln!("{}", e);
-                    std::process::exit(1);
+                    exit_process(1);
                 }
             }
         }
@@ -3380,11 +3498,11 @@ fn main() {
         match split_bulk_requests(&line, None) {
             Err(e) => {
                 eprintln!("error: {}", describe_program_error(&e));
-                std::process::exit(1);
+                exit_process(1);
             }
             Ok(program) if program.only_describes() => {
                 eprintln!("error: {}", DESCRIBE_ALONE);
-                std::process::exit(1);
+                exit_process(1);
             }
             Ok(_) => {}
         }
@@ -3403,7 +3521,7 @@ fn main() {
                 }
                 Err(e) => {
                     eprintln!("{}", e);
-                    std::process::exit(1);
+                    exit_process(1);
                 }
             }
         }
@@ -3419,7 +3537,7 @@ fn main() {
     let from_cli_auth = has_explicit_auth && !config.base_uri.is_empty();
     if let Err(e) = run_interactive(config, op_selector, from_setup, loaded_connection_alias, connecting_to, oauth2_creds, startup_preloaded, from_cli_auth) {
         eprintln!("Error: {}", e);
-        std::process::exit(1);
+        exit_process(1);
     }
 }
 
@@ -4892,14 +5010,13 @@ fn fail_fast_trips(config: &Config, status: u16) -> bool {
 /// This holds in `-sa` mode too, where bodies are otherwise not printed. The
 /// status line is already out.
 fn fail_fast_exit(body: &str) -> ! {
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
+    let mut out = Out;
     let _ = out.write_all(body.as_bytes());
     if !body.is_empty() && !body.ends_with('\n') {
         let _ = out.write_all(b"\n");
     }
     let _ = out.flush();
-    std::process::exit(1);
+    exit_process(1);
 }
 
 /// An `assert` or a poll got a response it could not judge (401/403/408/429/
@@ -4909,7 +5026,7 @@ fn fail_fast_exit(body: &str) -> ! {
 fn exit_on_unjudged_check(config: &mut Config) -> ! {
     match config.last_response.take() {
         Some((_, body)) if config.fail_fast => fail_fast_exit(&body),
-        _ => std::process::exit(1),
+        _ => exit_process(1),
     }
 }
 
@@ -6634,7 +6751,7 @@ fn read_api_file(file: &str) -> Result<(String, Option<PathBuf>), String> {
 /// JSON for stdout: indented, or on one line with `-r`.
 fn print_json_document(value: &serde_json::Value, raw: bool) {
     let text = if raw { serde_json::to_string(value) } else { serde_json::to_string_pretty(value) };
-    println!("{}", text.unwrap_or_else(|_| "null".to_string()));
+    outln!("{}", text.unwrap_or_else(|_| "null".to_string()));
 }
 
 /// `--describe <file>`: the file's describe block on stdout, `null` when it
@@ -7367,7 +7484,7 @@ fn ask_yes_no(prompt: &str) -> bool {
         // The prompt is still open on its line; end it before the message.
         eprintln!();
         eprintln!("aborted (could not read confirmation)");
-        std::process::exit(1);
+        exit_process(1);
     }
     let a = answer.trim().to_lowercase();
     let proceed = a.is_empty() || a == "y" || a == "yes";
@@ -7445,7 +7562,7 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
         Ok(p) => p,
         Err(e) => {
             eprintln!("error: {}", describe_program_error(&e));
-            std::process::exit(1);
+            exit_process(1);
         }
     };
 
@@ -7453,7 +7570,7 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
     // before any output or requests, so test data can't reach the wrong environment.
     if let Err(e) = evaluate_program_gates(&program, &config.base_uri) {
         eprintln!("error: {}", e);
-        std::process::exit(1);
+        exit_process(1);
     }
 
     for warning in &program.describe_warnings {
@@ -7512,14 +7629,14 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
         if io::stderr().is_terminal() {
             colored::control::set_override(true);
         }
-        println!("{}", format!("[{}]", config.base_uri).dimmed());
+        outln!("{}", format!("[{}]", config.base_uri).dimmed());
     }
 
     // The log says which commit each import was, since a branch moves. Outside
     // the log only a cached copy standing in for the remote is worth a line.
     for note in &program.import_notes {
         if config.bulk_silent {
-            println!("{}", note.text.dimmed());
+            outln!("{}", note.text.dimmed());
         } else if note.stale {
             eprintln!("warning: {}", note.text);
         }
@@ -7529,7 +7646,7 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
         match step {
             BulkStep::Sleep(d) => {
                 if config.bulk_silent {
-                    println!("{}", format!("sleep {}", format_duration(*d)).dimmed());
+                    outln!("{}", format!("sleep {}", format_duration(*d)).dimmed());
                 }
                 thread::sleep(*d);
             }
@@ -7554,10 +7671,10 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
             BulkStep::Export { name, written } => {
                 let applied = apply_export_step(config, name);
                 if *written && config.bulk_silent {
-                    println!("{}", format_export(name).dimmed());
+                    outln!("{}", format_export(name).dimmed());
                     if !applied {
                         let pinned = config.export_id.as_deref().unwrap_or_default();
-                        println!("{}", format!("↳ ignored: --export {} is set", pinned).dimmed());
+                        outln!("{}", format!("↳ ignored: --export {} is set", pinned).dimmed());
                     }
                 }
             }
@@ -7588,7 +7705,7 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
                         // answered — abort the run rather than quietly skipping
                         // the write, which is what a false would have done. A
                         // following `||` does NOT catch this.
-                        Some(RequestOutcome::Errored) => std::process::exit(1),
+                        Some(RequestOutcome::Errored) => exit_process(1),
                         // Preview declined — the user said no, so it isn't a failure.
                         Some(RequestOutcome::Aborted) => break,
                     }
@@ -7609,11 +7726,11 @@ fn run_assert(config: &mut Config, negate: bool, request: &str) -> bool {
     // Validated at parse time; a None here would be a parser bug.
     let Some((method, uri, body)) = parse_request_line(request) else {
         eprintln!("error: {} is not a request", request);
-        std::process::exit(1);
+        exit_process(1);
     };
     let line = format_assert(negate, request);
     if config.bulk_silent {
-        println!("{}", line);
+        outln!("{}", line);
     }
 
     config.check_only = true;
@@ -7634,7 +7751,7 @@ fn run_assert(config: &mut Config, negate: bool, request: &str) -> bool {
                 .map(|(status, body)| describe_check_response(status, &body))
                 .unwrap_or_default();
             eprintln!("error: assertion failed: {} ({})", line, why);
-            std::process::exit(1);
+            exit_process(1);
         }
         RequestOutcome::Errored => {
             eprintln!("error: {} — could not be evaluated, aborting", line);
@@ -7652,7 +7769,7 @@ fn run_assert(config: &mut Config, negate: bool, request: &str) -> bool {
 fn run_confirm(config: &Config, message: &Option<String>) -> bool {
     let line = format_confirm(message);
     if config.bulk_silent {
-        println!("{}", line);
+        outln!("{}", line);
     }
     ask_yes_no(&format!("{} [Y/n]", confirm_prompt_text(message)))
 }
@@ -7667,12 +7784,12 @@ fn run_confirm(config: &Config, message: &Option<String>) -> bool {
 fn run_sleep_while(config: &mut Config, interval: Duration, negate: bool, request: &str) -> bool {
     let line = format_sleep_while(interval, negate, request);
     if config.bulk_silent {
-        println!("{}", line.dimmed());
+        outln!("{}", line.dimmed());
     }
     // Validated at parse time; a None here would be a parser bug.
     let Some((method, uri, body)) = parse_request_line(request) else {
         eprintln!("error: {} is not a request", request);
-        std::process::exit(1);
+        exit_process(1);
     };
 
     let start = Instant::now();
@@ -7701,7 +7818,7 @@ fn run_sleep_while(config: &mut Config, interval: Duration, negate: bool, reques
 
     if config.bulk_silent {
         let plural = if checks == 1 { "check" } else { "checks" };
-        println!(
+        outln!(
             "{}",
             format!("↳ waited {} ({} {})", format_elapsed(start.elapsed()), checks, plural).dimmed()
         );
@@ -7716,7 +7833,7 @@ fn run_bulk_request(config: &mut Config, request: &str) -> Option<RequestOutcome
     if config.bulk_silent {
         // The line as the preview shows it: the body compacted, the outfile
         // last. Unstyled, like the TUI log.
-        println!("{}", format_request_preview(&method, &uri, &body));
+        outln!("{}", format_request_preview(&method, &uri, &body));
     }
     Some(run_non_interactive(config, &method, &uri, &body))
 }
@@ -7730,7 +7847,7 @@ fn note_skipped_chain(config: &Config, skipped: usize) {
     let plural = if skipped == 1 { "request" } else { "requests" };
     let note = format!("↳ skipped {} {}", skipped, plural).dimmed().to_string();
     if config.bulk_silent {
-        println!("{}", note);
+        outln!("{}", note);
     } else {
         eprintln!("{}", note);
     }
@@ -7755,7 +7872,7 @@ fn run_bulk(config: &mut Config, file_path: &str) {
         Ok(read) => read,
         Err(e) => {
             eprintln!("error: {}", e);
-            std::process::exit(1);
+            exit_process(1);
         }
     };
     run_bulk_from_str(config, &contents, base_dir.as_deref());
@@ -7871,7 +7988,7 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
             }
             Err(e) => {
                 eprintln!("{}", e);
-                std::process::exit(1);
+                exit_process(1);
             }
         }
     } else if !body.is_empty() {
@@ -7947,7 +8064,7 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                 ticker.interrupt(|| {
                     if config.bulk_silent {
                         // Bulk silent mode: print compact status to stdout with box-draw prefix
-                        println!(
+                        outln!(
                             "{}HTTP/1.1 {} {}",
                             "└─".dimmed(),
                             status_str,
@@ -7992,8 +8109,7 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                     // drained before the next request reuses the connection.
                     stream_to_sink(resp, &mut io::sink())
                 } else {
-                    let stdout = io::stdout();
-                    let mut lock = stdout.lock();
+                    let mut lock = Out;
                     let res = stream_to_sink(resp, &mut lock);
                     ticker.stop();
                     // Match the buffered path's trailing newline (and the blank
@@ -8077,7 +8193,7 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                         if is_clipboard {
                             if outfile_append {
                                 eprintln!("error: cannot append to clipboard — use > clipboard");
-                                std::process::exit(1);
+                                exit_process(1);
                             }
                             if let Err(e) = cli_clipboard::set_contents(output) {
                                 eprintln!("Error copying to clipboard: {}", e);
@@ -8114,7 +8230,7 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                 if is_clipboard {
                     if outfile_append {
                         eprintln!("error: cannot append to clipboard — use > clipboard");
-                        std::process::exit(1);
+                        exit_process(1);
                     }
                     let copied = output.len() as u64;
                     match cli_clipboard::set_contents(output) {
@@ -8125,7 +8241,7 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                         }
                         Err(e) => {
                             eprintln!("error: clipboard unavailable: {}", e);
-                            std::process::exit(1);
+                            exit_process(1);
                         }
                     }
                 } else if let Some(ref file_path) = outfile {
@@ -8146,9 +8262,9 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                         Ok(_) => {}
                     }
                 } else {
-                    print!("{}", output);
+                    out!("{}", output);
                     if !output.ends_with('\n') {
-                        println!();
+                        outln!();
                     }
                     if is_tty && !config.silent {
                         eprintln!();
@@ -8171,7 +8287,7 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
             } else {
                 eprintln!("Is COS running on {}? 🤔\n", host_of(&config.base_uri));
             }
-            std::process::exit(1);
+            exit_process(1);
         }
     }
 }
@@ -8191,7 +8307,7 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
     } else if !is_1p && !is_connecting {
         if config.base_uri.is_empty() {
             eprintln!("{}", "Error: no base URL specified. Use -b <url> or -c <connection>.".red());
-            std::process::exit(1);
+            exit_process(1);
         }
         let result = background_load(&config, None);
         if let Some(err) = &result.error {
@@ -8203,7 +8319,7 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
                     || config.base_uri.contains("[::1]");
                 if from_cli_auth || is_localhost {
                     eprintln!("{}", err);
-                    std::process::exit(1);
+                    exit_process(1);
                 }
                 // Otherwise launch connection flow with picker
                 let (term_width, _) = terminal::size().unwrap_or((80, 24));
@@ -8249,7 +8365,7 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
                         };
                         if let Some(new_err) = &new_result.error {
                             eprintln!("{}", new_err);
-                            std::process::exit(1);
+                            exit_process(1);
                         }
 
                         let total_lines = flow.last_rendered_lines + if flow.show_splash { ConnectionFlow::splash_lines() } else { 0 };
@@ -8264,7 +8380,7 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
                         execute!(stdout, cursor::MoveUp(total_lines), cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown)).unwrap();
                         terminal::disable_raw_mode().unwrap();
                         execute!(stdout, cursor::Show).unwrap();
-                        std::process::exit(0);
+                        exit_process(0);
                     }
                     Err(e) => {
                         let total_lines = flow.last_rendered_lines + if flow.show_splash { ConnectionFlow::splash_lines() } else { 0 };
@@ -8272,18 +8388,18 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
                         terminal::disable_raw_mode().unwrap();
                         execute!(stdout, cursor::Show).unwrap();
                         eprintln!("Error: {}", e);
-                        std::process::exit(1);
+                        exit_process(1);
                     }
                 }
             } else {
                 eprintln!("{}", err);
-                std::process::exit(1);
+                exit_process(1);
             }
         } else if !result.connected && !from_setup {
             // Connection failed - exit
             let host = config.base_uri.trim_start_matches("https://").trim_start_matches("http://");
             eprintln!("{}", format!("Could not connect to {}", host).red());
-            std::process::exit(1);
+            exit_process(1);
         } else {
             (Some(result), config)
         }
@@ -8302,7 +8418,8 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
         io::stdout().flush().ok();
     }
 
-    // Enter raw mode
+    // Enter raw mode. From here on every way out restores the terminal.
+    let _terminal_guard = TerminalGuard;
     terminal::enable_raw_mode()?;
 
     let mut stdout = io::stdout();
@@ -8316,11 +8433,13 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
             stdout,
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         );
+        KEYBOARD_FLAGS_PUSHED.store(true, Ordering::SeqCst);
     }
 
     // Enable bracketed paste so multi-character pastes arrive as one Event::Paste —
     // lets us recognize and expand pasted JSON identifier structures.
     let _ = execute!(stdout, EnableBracketedPaste);
+    BRACKETED_PASTE_ON.store(true, Ordering::SeqCst);
 
     let mut state = AppState::new(config.clone());
     state.width = width;
@@ -8428,7 +8547,7 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
                     terminal::disable_raw_mode()?;
 
                     // Clear screen and scrollback, move cursor to home
-                    print!("\x1b[2J\x1b[3J\x1b[H");
+                    out!("\x1b[2J\x1b[3J\x1b[H");
                     io::stdout().flush().ok();
 
                     // Re-print splash with current terminal width
@@ -8437,14 +8556,14 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
                     // Re-print previous output, re-fitting each request line to the
                     // new width rather than replaying it at the old one.
                     for block in &state.output_history {
-                        print!("{}", block.render(w as usize));
+                        out!("{}", block.render(w as usize));
                     }
 
                     // Placeholder lines for input area (match actual input height)
                     let input_lines = state.input.split('\n').count() as u16;
                     let placeholder_count = 2 + input_lines; // ruler + input lines + hint
                     for _ in 0..placeholder_count {
-                        println!();
+                        outln!();
                     }
                     io::stdout().flush().ok();
 
@@ -8485,10 +8604,7 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
                     let err_msg = err.clone();
 
                     // Restore terminal
-                    if enhanced_keyboard {
-                        let _ = execute!(stdout, PopKeyboardEnhancementFlags);
-                    }
-                    let _ = execute!(stdout, DisableBracketedPaste);
+                    leave_prompt_modes();
                     // Move up to top of splash and clear from there down:
                     // hint + input + ruler, then the splash itself.
                     let total_up = 2 + state.prev_input_lines + splash_line_count(state.width);
@@ -8505,7 +8621,7 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
                     } else {
                         eprintln!("Error: {}", err_msg);
                     }
-                    std::process::exit(1);
+                    exit_process(1);
                 }
             } else {
                 state.loading = false;
@@ -8541,12 +8657,12 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
                 let url_line = if show_hint {
                     let hint = "ctrl+b for docs";
                     let host_space = actual_width - 7 - hint.len();
-                    let host_display = if host.len() > host_space { &host[..host_space] } else { host };
+                    let host_display = head_chars(host, host_space);
                     let host_padded = format!("{:width$}", host_display, width = host_space);
                     format!("{}{}{}{}{}", "│ ".dimmed(), host_padded.dimmed(), " │ ".dimmed(), hint.dimmed(), " │".dimmed())
                 } else {
                     let host_space = actual_width.saturating_sub(4);
-                    let host_display = if host.len() > host_space { &host[..host_space] } else { host };
+                    let host_display = head_chars(host, host_space);
                     let host_padded = format!("{:width$}", host_display, width = host_space);
                     format!("{}{}{}", "│ ".dimmed(), host_padded.dimmed(), " │".dimmed())
                 };
@@ -8604,10 +8720,7 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
     )?;
 
     // Restore terminal
-    if enhanced_keyboard {
-        let _ = execute!(stdout, PopKeyboardEnhancementFlags);
-    }
-    let _ = execute!(stdout, DisableBracketedPaste);
+    leave_prompt_modes();
     terminal::disable_raw_mode()?;
 
     Ok(())
@@ -8986,11 +9099,11 @@ fn handle_key_event(
                 state.output_history.clear();
 
                 terminal::disable_raw_mode()?;
-                print!("\x1b[2J\x1b[3J\x1b[H");
+                out!("\x1b[2J\x1b[3J\x1b[H");
                 io::stdout().flush().ok();
                 print_splash_with_width(&state.config, state.width);
                 let input_lines = state.input.split('\n').count() as u16;
-                for _ in 0..(2 + input_lines) { println!(); }
+                for _ in 0..(2 + input_lines) { outln!(); }
                 io::stdout().flush().ok();
                 terminal::enable_raw_mode()?;
                 state.prev_input_lines = input_lines;
@@ -9004,14 +9117,14 @@ fn handle_key_event(
                 state.output_history.last_mut().unwrap().strip_body();
 
                 terminal::disable_raw_mode()?;
-                print!("\x1b[2J\x1b[3J\x1b[H");
+                out!("\x1b[2J\x1b[3J\x1b[H");
                 io::stdout().flush().ok();
                 print_splash_with_width(&state.config, state.width);
                 for block in &state.output_history {
-                    print!("{}", block.render(state.width as usize));
+                    out!("{}", block.render(state.width as usize));
                 }
                 let input_lines = state.input.split('\n').count() as u16;
-                for _ in 0..(2 + input_lines) { println!(); }
+                for _ in 0..(2 + input_lines) { outln!(); }
                 io::stdout().flush().ok();
                 terminal::enable_raw_mode()?;
                 state.prev_input_lines = input_lines;
@@ -11396,7 +11509,7 @@ fn read_inline_input_within(
     let mut buf = prefill.to_string();
 
     let shown = |buf: &str| -> (String, String) {
-        let value = if mask && !buf.is_empty() { "•".repeat(buf.len()) } else { buf.to_string() };
+        let value = if mask && !buf.is_empty() { "•".repeat(char_len(buf)) } else { buf.to_string() };
         inline_input_line(prompt, &value, cols)
     };
     let render_line = |stdout: &mut io::Stdout, buf: &str| -> io::Result<()> {
@@ -11454,7 +11567,7 @@ fn confirm_inline(stdout: &mut io::Stdout, prompt: &str) -> io::Result<bool> {
                 if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
                     execute!(stdout, cursor::Show)?;
                     terminal::disable_raw_mode()?;
-                    std::process::exit(0);
+                    exit_process(0);
                 }
                 if let Some(answer) = yes_no_from_key(&key) {
                     execute!(stdout, Print(if answer { "y\r\n" } else { "n\r\n" }))?;
@@ -11765,12 +11878,12 @@ fn handle_switch_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io
             // Full screen clear and fresh start for new connection
             state.output_history.clear();
             terminal::disable_raw_mode()?;
-            print!("\x1b[2J\x1b[3J\x1b[H");
+            out!("\x1b[2J\x1b[3J\x1b[H");
             io::stdout().flush().ok();
             print_splash_with_width(&state.config, state.width);
-            println!();
-            println!();
-            println!();
+            outln!();
+            outln!();
+            outln!();
             io::stdout().flush().ok();
             terminal::enable_raw_mode()?;
 
@@ -11790,10 +11903,10 @@ fn handle_switch_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io
         ConnectionFlowResult::Quit => {
             // Full screen clear before exit
             terminal::disable_raw_mode()?;
-            print!("\x1b[2J\x1b[3J\x1b[H");
+            out!("\x1b[2J\x1b[3J\x1b[H");
             io::stdout().flush().ok();
             execute!(stdout, cursor::Show)?;
-            std::process::exit(0);
+            exit_process(0);
         }
     }
 }
@@ -12371,10 +12484,10 @@ fn render<W: Write>(stdout: &mut W, state: &mut AppState) -> io::Result<()> {
 
     // Top ruler
     let ruler_line = format!("\x1b[38;5;239m{}\x1b[0m", "─".repeat(width));
-    if !state.config.base_uri.is_empty() && state.config.base_uri.len() + 11 <= width {
+    if !state.config.base_uri.is_empty() && char_len(&state.config.base_uri) + 11 <= width {
         let host_text = &state.config.base_uri;
         let host = format!(" {} ", host_text);
-        let host_len = host.len();
+        let host_len = char_len(&host);
         let right = 7;
         let left = width.saturating_sub(host_len).saturating_sub(right);
         let d = "\x1b[38;5;239m";
@@ -12526,7 +12639,7 @@ fn print_splash_with_width(config: &Config, term_width: u16) {
 
     // Don't print splash if terminal is too narrow
     if term_w < min_width {
-        println!();
+        outln!();
         return;
     }
 
@@ -12548,8 +12661,8 @@ fn print_splash_with_width(config: &Config, term_width: u16) {
     let title_len = title.len() + version.len() + 3;
     let top_padding = actual_width.saturating_sub(4 + title_len + 1);
 
-    println!();
-    println!(
+    outln!();
+    outln!(
         "{}{}{}{}",
         "╭───".dimmed(),
         format!(" {} {} ", title.bold(), version.dimmed()),
@@ -12560,10 +12673,10 @@ fn print_splash_with_width(config: &Config, term_width: u16) {
     if show_hint {
         // Full width with hint
         let host_space = actual_width - 7 - hint.len();
-        let host_display = if host.len() > host_space { &host[..host_space] } else { host };
+        let host_display = head_chars(host, host_space);
         let host_padded = format!("{:width$}", host_display, width = host_space);
         // Use \x1b[K to clear to end of line (prevents artifacts from previous content)
-        println!(
+        outln!(
             "{}{}{}{}{}\x1b[K",
             "│ ".dimmed(),
             host_padded.dimmed(),
@@ -12574,13 +12687,9 @@ fn print_splash_with_width(config: &Config, term_width: u16) {
     } else {
         // Truncated - no hint section
         let host_space = actual_width.saturating_sub(4);
-        let host_display = if host.len() > host_space {
-            &host[..host_space]
-        } else {
-            host
-        };
+        let host_display = head_chars(host, host_space);
         let host_padded = format!("{:width$}", host_display, width = host_space);
-        println!(
+        outln!(
             "{}{}{}",
             "│ ".dimmed(),
             host_padded.dimmed(),
@@ -12588,8 +12697,8 @@ fn print_splash_with_width(config: &Config, term_width: u16) {
         );
     }
 
-    println!("{}", format!("╰{}╯", "─".repeat(actual_width - 2)).dimmed());
-    println!();
+    outln!("{}", format!("╰{}╯", "─".repeat(actual_width - 2)).dimmed());
+    outln!();
 }
 
 /// How many lines `print_splash_with_width` prints at this width: the box
@@ -17083,6 +17192,17 @@ mod tests {
         assert!(!types_a_character(KeyModifiers::CONTROL));
         assert!(!types_a_character(KeyModifiers::ALT));
         assert!(!types_a_character(KeyModifiers::CONTROL | KeyModifiers::SHIFT));
+    }
+
+    #[test]
+    fn display_strings_are_cut_on_characters() {
+        assert_eq!(head_chars("blåbär.example.com", 4), "blåb");
+        assert_eq!(head_chars("abc", 10), "abc");
+        assert_eq!(head_chars("åäö", 0), "");
+        assert_eq!(tail_chars("https://blåbär.se", 6), "bär.se");
+        assert_eq!(tail_chars("abc", 10), "abc");
+        assert_eq!(tail_chars("åäö", 0), "");
+        assert_eq!(tail_chars("åäö", 2), "äö");
     }
 
     #[test]

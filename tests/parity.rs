@@ -592,6 +592,73 @@ fn a_file_with_a_byte_order_mark_and_crlf_runs() {
     assert_eq!(server.take(), ["GET /a"]);
 }
 
+/// A reader that stops reading (`api -sa seed.api | head -1`) does not stop
+/// the batch: every request is still sent, and the exit code is the one the
+/// requests earned.
+#[test]
+fn a_batch_keeps_running_when_its_stdout_is_closed() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let lines: String = (1..=6).map(|i| format!("GET /six{i}\n")).collect();
+    std::fs::write(dir.path().join("six.api"), lines).unwrap();
+
+    for args in [&["-sa", "six.api"][..], &["-a", "six.api"][..]] {
+        server.take();
+        let mut child = api(server.port, dir.path())
+            .args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn api");
+        // Read one byte and hang up, as `head` does once it has its lines.
+        let mut stdout = child.stdout.take().unwrap();
+        let mut one = [0u8; 1];
+        let _ = stdout.read(&mut one);
+        drop(stdout);
+        let out = child.wait_with_output().expect("wait");
+        server.settle(Duration::from_millis(150), Duration::from_secs(3));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!stderr.contains("panicked"), "{args:?}: {stderr}");
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {stderr}");
+        assert_eq!(
+            server.take(),
+            ["GET /six1", "GET /six2", "GET /six3", "GET /six4", "GET /six5", "GET /six6"],
+            "{args:?}: {stderr}"
+        );
+    }
+
+    // One request whose reader is already gone: sent, and no panic.
+    server.take();
+    let mut child = api(server.port, dir.path())
+        .args(["GET", "/alone"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn api");
+    drop(child.stdout.take());
+    let out = child.wait_with_output().expect("wait");
+    server.settle(Duration::from_millis(150), Duration::from_secs(3));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert_eq!(server.take(), ["GET /alone"]);
+
+    // `-f` still ends a run with exit 1 when nobody reads the body it prints.
+    std::fs::write(dir.path().join("fails.api"), "GET /a\nGET /missing\nGET /never\n").unwrap();
+    server.take();
+    let mut child = api(server.port, dir.path())
+        .args(["-sfa", "fails.api"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn api");
+    drop(child.stdout.take());
+    let out = child.wait_with_output().expect("wait");
+    server.settle(Duration::from_millis(150), Duration::from_secs(3));
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(server.take(), ["GET /a", "GET /missing"]);
+}
+
 /// A value an option can't take is reported with the option it was for.
 #[test]
 fn a_bad_option_value_names_its_option() {
@@ -1718,6 +1785,72 @@ fn ctrl_c_in_a_name_dialog_leaves_what_quitting_at_the_prompt_leaves() {
         );
         assert!(prompt.screen.rfind("\x1b[?25h") > prompt.screen.rfind("\x1b[?25l"), "{way}: the cursor is left hidden");
     }
+}
+
+/// Leaving from the connection dialog (ctrl+q, then ctrl+c) ends the process
+/// from inside the prompt. The terminal is handed back as any other way out
+/// hands it back: bracketed paste off, the cursor shown.
+#[cfg(unix)]
+#[test]
+fn ctrl_c_in_the_connection_dialog_restores_the_terminal() {
+    use pty::Prompt;
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    prepare(dir.path());
+    // ctrl+q needs a saved connection to offer.
+    std::fs::write(
+        dir.path().join(".api-credentials.json"),
+        format!(
+            r#"{{"connections":[{{"name":"other","url":"http://127.0.0.1:{}","auth_type":"key","credential":"k2","client_id":""}}],"default":""}}"#,
+            server.port
+        ),
+    )
+    .unwrap();
+    let mut prompt = Prompt::open_sized(api(server.port, dir.path()), 84);
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(600));
+    prompt.send(b"\x11");
+    prompt.wait_for("other", Duration::from_secs(5));
+    prompt.pump(Duration::from_millis(300));
+    prompt.send(b"\x03");
+    let start = Instant::now();
+    while prompt.exited().is_none() && start.elapsed() < Duration::from_secs(5) {
+        prompt.pump(Duration::from_millis(100));
+    }
+    assert_eq!(prompt.exited(), Some(true), "the client did not end");
+    assert!(
+        prompt.screen.rfind("\x1b[?2004l") > prompt.screen.rfind("\x1b[?2004h"),
+        "paste mode is left on"
+    );
+    assert!(prompt.screen.rfind("\x1b[?25h") > prompt.screen.rfind("\x1b[?25l"), "the cursor is left hidden");
+}
+
+/// Up and Down in a multi-line input that holds å/ä/ö move the cursor; they
+/// used to end the session with a panic and the terminal in raw mode.
+#[cfg(unix)]
+#[test]
+fn up_and_down_over_multi_byte_text_keep_the_session() {
+    use pty::{plain, Prompt};
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    prepare(dir.path());
+    let mut prompt = Prompt::open(api(server.port, dir.path()));
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(600));
+    prompt.send(b"\x15");
+    prompt.pump(Duration::from_millis(60));
+    prompt.send("ååå".as_bytes());
+    prompt.pump(Duration::from_millis(100));
+    prompt.send(b"\x0e"); // ctrl+n: a new line
+    prompt.pump(Duration::from_millis(100));
+    prompt.send(b"a");
+    prompt.pump(Duration::from_millis(100));
+    prompt.send(b"\x1b[A\x1b[B\x1b[A");
+    prompt.pump(Duration::from_millis(400));
+    assert_eq!(prompt.exited(), None, "the session ended:\n{}", plain(&prompt.screen));
+    assert!(!plain(&prompt.screen).contains("panicked"), "{}", plain(&prompt.screen));
 }
 
 /// A session started with `--export <name>` has its name: ctrl+r turns

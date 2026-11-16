@@ -1059,6 +1059,10 @@ A request line is logged as it is written, the body on one line and a
 `> outfile` last: `PUT /people [{"name":"Ann"}] > /tmp/put.json`. The `-p`
 preview and the interactive prompt show it the same way.
 
+A reader that stops reading does not stop the batch. With `api -sa seed.api |
+head -2` every request is still sent; what would have been printed after the
+pipe closed is dropped, and the exit code is the one the requests earned.
+
 A slow request shows a self-erasing progress line (`⠙ received 12.4 MB`) on
 stderr, but only when stderr is a terminal. Captured or piped output never
 contains it, so a log holds the same lines however long a request took.
