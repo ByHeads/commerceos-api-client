@@ -8219,12 +8219,16 @@ fn handle_key_event(
 
         // Toggle export mode (ctrl+r)
         (KeyModifiers::CONTROL, KeyCode::Char('r')) => {
-            handle_export_toggle(state, stdout)?;
+            if handle_export_toggle(state, stdout)? {
+                return Ok((true, None));
+            }
         }
 
         // Save connection (ctrl+s)
         (KeyModifiers::CONTROL, KeyCode::Char('s')) => {
-            handle_save_connection(state, stdout)?;
+            if handle_save_connection(state, stdout)? {
+                return Ok((true, None));
+            }
         }
 
         // Clear all output (ctrl+l)
@@ -10556,8 +10560,23 @@ fn cycle_method(state: &mut AppState) {
     state.method_auto_promoted = false;
 }
 
+/// How an inline input ended.
+#[derive(Debug, PartialEq)]
+enum InlineInput {
+    /// Enter, with what was typed.
+    Entered(String),
+    /// Esc.
+    Cancelled,
+    /// ctrl+c: the user wants out of the client, not just of the dialog. The
+    /// caller puts the command area's rows back and passes this on, so the
+    /// session ends the way it always does and clears what it drew. Exiting
+    /// from in here left the top ruler (and an unused session's splash) in
+    /// the shell, and the terminal's paste and keyboard modes switched on.
+    Quit,
+}
+
 // Read a line of input in raw mode (already in raw mode when called from interactive)
-fn read_inline_input(stdout: &mut io::Stdout, prompt: &str, mask: bool, prefill: &str) -> io::Result<Option<String>> {
+fn read_inline_input(stdout: &mut io::Stdout, prompt: &str, mask: bool, prefill: &str) -> io::Result<InlineInput> {
     read_inline_input_within(stdout, prompt, mask, prefill, None)
 }
 
@@ -10584,7 +10603,7 @@ fn read_inline_input_within(
     mask: bool,
     prefill: &str,
     cols: Option<usize>,
-) -> io::Result<Option<String>> {
+) -> io::Result<InlineInput> {
     let mut buf = prefill.to_string();
 
     let shown = |buf: &str| -> (String, String) {
@@ -10605,23 +10624,19 @@ fn read_inline_input_within(
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != event::KeyEventKind::Press { continue; }
-                if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
+                // Like esc, both leave the cursor on the row under the prompt.
+                let quit = key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c');
+                if quit || key.code == KeyCode::Esc {
                     execute!(stdout, cursor::MoveToColumn(0), Clear(ClearType::CurrentLine))?;
-                    execute!(stdout, cursor::Show)?;
-                    terminal::disable_raw_mode()?;
-                    std::process::exit(0);
+                    execute!(stdout, Print("\r\n"))?;
+                    return Ok(if quit { InlineInput::Quit } else { InlineInput::Cancelled });
                 }
                 match key.code {
                     KeyCode::Enter => {
                         execute!(stdout, cursor::MoveToColumn(0), Clear(ClearType::CurrentLine))?;
                         let (prompt, value) = shown(&buf);
                         execute!(stdout, Print(format!("{}{}\r\n", prompt, value)))?;
-                        return Ok(Some(buf));
-                    }
-                    KeyCode::Esc => {
-                        execute!(stdout, cursor::MoveToColumn(0), Clear(ClearType::CurrentLine))?;
-                        execute!(stdout, Print("\r\n"))?;
-                        return Ok(None);
+                        return Ok(InlineInput::Entered(buf));
                     }
                     KeyCode::Char(c) => { buf.push(c); }
                     KeyCode::Backspace => { buf.pop(); }
@@ -10668,11 +10683,14 @@ const EXPORT_NAME_REFUSED: &str = "export needs a namespaced key, like com.heads
 /// status message in the hint line. A name that is not a namespaced key
 /// closes the dialog with such a message and leaves export off; ctrl+r again
 /// opens the dialog with the name there to correct.
-fn handle_export_toggle(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<()> {
-    let notice = |state: &mut AppState, stdout: &mut io::Stdout, text: String| -> io::Result<()> {
+///
+/// Returns `true` when ctrl+c in the dialog asked to leave the client.
+fn handle_export_toggle(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<bool> {
+    let notice = |state: &mut AppState, stdout: &mut io::Stdout, text: String| -> io::Result<bool> {
         state.status_msg = text;
         state.status_msg_at = Some(Instant::now());
-        render(stdout, state)
+        render(stdout, state)?;
+        Ok(false)
     };
     if state.config.export_id.take().is_some() {
         return notice(state, stdout, "export off".to_string());
@@ -10682,12 +10700,13 @@ fn handle_export_toggle(state: &mut AppState, stdout: &mut io::Stdout) -> io::Re
         None => {
             let draft = std::mem::take(&mut state.export_name_draft);
             match ask_export_name(state, stdout, &draft)? {
-                None => return notice(state, stdout, "cancelled".to_string()),
-                Some(name) if !is_namespaced_key(&name) => {
+                InlineInput::Quit => return Ok(true),
+                InlineInput::Cancelled => return notice(state, stdout, "cancelled".to_string()),
+                InlineInput::Entered(name) if !is_namespaced_key(&name) => {
                     state.export_name_draft = name;
                     return notice(state, stdout, EXPORT_NAME_REFUSED.to_string());
                 }
-                Some(name) => name,
+                InlineInput::Entered(name) => name,
             }
         }
     };
@@ -10700,8 +10719,10 @@ fn handle_export_toggle(state: &mut AppState, stdout: &mut io::Stdout) -> io::Re
 /// Ask, in the command area, for the name export mode keeps a lone key
 /// under, the way ctrl+s asks for a connection's name: a prompt on the input
 /// line, and `enter to …, esc to cancel` under the ruler. Gives what was
-/// typed, trimmed; `None` for esc or an empty answer. Whether it is a name
-/// that can be used is the caller's to say.
+/// typed, trimmed; an empty answer is a cancel. Whether it is a name that can
+/// be used is the caller's to say. However it ends, ctrl+c included, the
+/// cursor is left on the command area's hint line, where `render` and the
+/// session's closing clear both start from.
 ///
 /// The dialog takes the command area's place, row for row: the top ruler
 /// stays, the prompt stands on the first input line, and the bottom ruler
@@ -10711,7 +10732,7 @@ fn handle_export_toggle(state: &mut AppState, stdout: &mut io::Stdout) -> io::Re
 /// ruler behind. So the hint is cut to the width, the input line keeps to
 /// it, and the two rows below the prompt are drawn with auto-wrap off, as
 /// `render` draws its own.
-fn ask_export_name(state: &mut AppState, stdout: &mut io::Stdout, prefill: &str) -> io::Result<Option<String>> {
+fn ask_export_name(state: &mut AppState, stdout: &mut io::Stdout, prefill: &str) -> io::Result<InlineInput> {
     let width = state.width as usize;
     let ruler_line = format!("\x1b[38;5;239m{}\x1b[0m", "─".repeat(width));
     let input_lines = state.prev_input_lines;
@@ -10737,17 +10758,22 @@ fn ask_export_name(state: &mut AppState, stdout: &mut io::Stdout, prefill: &str)
     )?;
     let typed = read_inline_input_within(stdout, prompt, false, prefill, Some(width))?;
 
-    // Enter and esc both leave the cursor on the row under the prompt. Clear
-    // from there, and go down to where the hint line of the command area is,
-    // for `render`.
+    // Enter, esc and ctrl+c all leave the cursor on the row under the prompt.
+    // Clear from there, and go down to where the hint line of the command
+    // area is.
     execute!(stdout, cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
     for _ in 0..input_lines {
         execute!(stdout, Print("\r\n"))?;
     }
-    Ok(typed.map(|name| name.trim().to_string()).filter(|name| !name.is_empty()))
+    Ok(match typed {
+        InlineInput::Entered(name) if name.trim().is_empty() => InlineInput::Cancelled,
+        InlineInput::Entered(name) => InlineInput::Entered(name.trim().to_string()),
+        other => other,
+    })
 }
 
-fn handle_save_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<()> {
+/// Returns `true` when ctrl+c at the name prompt asked to leave the client.
+fn handle_save_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<bool> {
     let width = state.width as usize;
     let ruler = "─".repeat(width);
     let input_lines = state.prev_input_lines;
@@ -10770,15 +10796,20 @@ fn handle_save_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io::
     execute!(stdout, cursor::MoveUp(2), cursor::MoveToColumn(0))?;
 
     let name = match read_inline_input(stdout, &prompt, false, &prefill)? {
-        Some(n) if !n.is_empty() => n,
-        _ => {
+        InlineInput::Entered(n) if !n.is_empty() => n,
+        ended => {
             // Restore normal command area
             execute!(stdout, cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
             for _ in 0..input_lines { execute!(stdout, Print("\r\n"))?; }
+            if ended == InlineInput::Quit {
+                // The cursor is on the hint line: the session's own closing
+                // clear takes it from here.
+                return Ok(true);
+            }
             state.status_msg = "cancelled".to_string();
             state.status_msg_at = Some(Instant::now());
             render(stdout, state)?;
-            return Ok(());
+            return Ok(false);
         }
     };
 
@@ -10793,7 +10824,7 @@ fn handle_save_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io::
             state.status_msg = "cancelled".to_string();
             state.status_msg_at = Some(Instant::now());
             render(stdout, state)?;
-            return Ok(());
+            return Ok(false);
         }
         // Move back up to prompt line area for cleanup
         execute!(stdout, cursor::MoveUp(2), cursor::MoveToColumn(0))?;
@@ -10838,7 +10869,7 @@ fn handle_save_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io::
     execute!(stdout, cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
     for _ in 0..input_lines { execute!(stdout, Print("\r\n"))?; }
     render(stdout, state)?;
-    Ok(())
+    Ok(false)
 }
 
 fn handle_switch_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<Option<std::sync::mpsc::Receiver<BackgroundLoadResult>>> {

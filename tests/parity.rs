@@ -633,6 +633,11 @@ mod pty {
             }
         }
 
+        /// Whether the client has ended, and if so whether it ended well.
+        pub fn exited(&mut self) -> Option<bool> {
+            self.child.try_wait().expect("wait for api").map(|status| status.success())
+        }
+
         pub fn wait_for(&mut self, text: &str, timeout: Duration) {
             let start = Instant::now();
             while !self.screen.contains(text) {
@@ -1119,6 +1124,77 @@ fn the_export_name_dialog_stays_in_the_command_area_at_any_width() {
         let now = keys(&mut prompt, b"com.example.exportID\r");
         closed(&now, "  export on: com.example.exportID", "answered");
         assert!(now[top + 3].ends_with("export"), "{cols}: {:?}", now[top + 3]);
+    }
+}
+
+/// ctrl+c in a name dialog ends the session, and ends it the way ctrl+c
+/// twice at the prompt does: the command area is cleared with its top ruler,
+/// an unused session takes its splash with it, a used one keeps its history,
+/// and the terminal gets its paste mode back.
+#[cfg(unix)]
+#[test]
+fn ctrl_c_in_a_name_dialog_leaves_what_quitting_at_the_prompt_leaves() {
+    use pty::Prompt;
+
+    const COLS: usize = 84;
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    prepare(dir.path());
+
+    // (what is pressed to leave, whether a request was sent first)
+    let ways: [(&str, &[u8], bool); 6] = [
+        ("ctrl+c twice at the prompt", b"\x03\x03", false),
+        ("ctrl+c in the export dialog", b"\x12\x03", false),
+        ("ctrl+c in the save dialog", b"\x13\x03", false),
+        ("ctrl+c twice at the prompt, after a request", b"\x03\x03", true),
+        ("ctrl+c in the export dialog, after a request", b"\x12\x03", true),
+        ("ctrl+c in the save dialog, after a request", b"\x13\x03", true),
+    ];
+    for (way, keys, used) in ways {
+        let mut prompt = Prompt::open_sized(api(server.port, dir.path()), COLS as u16);
+        prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+        prompt.pump(Duration::from_millis(600));
+        if used {
+            prompt.send(b"\x15");
+            prompt.pump(Duration::from_millis(60));
+            prompt.paste("GET /a");
+            prompt.pump(Duration::from_millis(80));
+            prompt.send(b"\r");
+            prompt.wait_for("\"ok\"", Duration::from_secs(5));
+            prompt.pump(Duration::from_millis(500));
+        }
+
+        // The command area is the last four rows; the rest is what a used
+        // session leaves in the scrollback.
+        let before = pty::rows(&prompt.screen, COLS);
+        let top = before.len() - 4;
+        assert!(before[top].starts_with('─') && before[top].contains("127.0.0.1"), "{way}:\n{}", before.join("\n"));
+        let mut kept: Vec<String> = if used { before[..top].to_vec() } else { Vec::new() };
+        while kept.last().is_some_and(|row| row.is_empty()) {
+            kept.pop();
+        }
+
+        for key in keys {
+            prompt.send(&[*key]);
+            prompt.pump(Duration::from_millis(450));
+        }
+        let start = Instant::now();
+        while prompt.exited().is_none() && start.elapsed() < Duration::from_secs(5) {
+            prompt.pump(Duration::from_millis(100));
+        }
+        assert_eq!(prompt.exited(), Some(true), "{way}: the client did not end");
+
+        let after = pty::rows(&prompt.screen, COLS);
+        let shown = after.join("\n");
+        assert_eq!(after, kept, "{way}: left on the screen\n{shown}");
+        assert!(!after.iter().any(|row| row.starts_with('─')), "{way}: a ruler is left\n{shown}");
+        assert_eq!(after.iter().any(|row| row.contains("CommerceOS API Client")), used, "{way}:\n{shown}");
+        // Bracketed paste is switched off again, and the cursor shown.
+        assert!(
+            prompt.screen.rfind("\x1b[?2004l") > prompt.screen.rfind("\x1b[?2004h"),
+            "{way}: paste mode is left on"
+        );
+        assert!(prompt.screen.rfind("\x1b[?25h") > prompt.screen.rfind("\x1b[?25l"), "{way}: the cursor is left hidden");
     }
 }
 
