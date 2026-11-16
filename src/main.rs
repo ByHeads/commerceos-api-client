@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, BufRead, Read as IoRead, Write};
+use std::io::{self, BufRead, IsTerminal, Read as IoRead, Write};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
@@ -12,7 +12,6 @@ use std::time::{Duration, Instant};
 
 use cli_clipboard;
 use reqwest::blocking::Client;
-use atty::Stream;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use clap::Parser;
 use colored::Colorize;
@@ -2891,7 +2890,7 @@ fn main() {
     };
 
     // Read from stdin if available and no body provided (and not bulk mode)
-    if body.is_empty() && args.all.is_none() && program_line.is_none() && !atty::is(Stream::Stdin) {
+    if body.is_empty() && args.all.is_none() && program_line.is_none() && !io::stdin().is_terminal() {
         let mut stdin_content = String::new();
         if io::stdin().read_to_string(&mut stdin_content).is_ok() {
             body = stdin_content.trim().to_string();
@@ -2901,7 +2900,7 @@ fn main() {
     // If method expects a body but none provided, read interactively from stdin
     if body.is_empty()
         && program_line.is_none()
-        && atty::is(Stream::Stdin)
+        && io::stdin().is_terminal()
         && ["POST", "PUT", "PATCH"].contains(&method.as_str())
         && !uri.is_empty()
     {
@@ -2947,13 +2946,13 @@ fn main() {
             std::process::exit(1);
         }
         // Show UI immediately with async loading (like 1P and picker)
-        if !loaded_connection_alias.is_empty() && uri.is_empty() && atty::is(Stream::Stdout) {
+        if !loaded_connection_alias.is_empty() && uri.is_empty() && io::stdout().is_terminal() {
             connecting_to = Some(loaded_connection_alias.clone());
         }
     }
 
     // If -b provided without auth, go straight to setup with URL pre-filled
-    if has_explicit_uri && !has_explicit_auth && uri.is_empty() && atty::is(Stream::Stdout) {
+    if has_explicit_uri && !has_explicit_auth && uri.is_empty() && io::stdout().is_terminal() {
         let (term_width, _) = terminal::size().unwrap_or((80, 24));
         let envs: Vec<String> = Vec::new();
         let mut flow = ConnectionFlow::for_startup(&envs, term_width, true);
@@ -3047,7 +3046,7 @@ fn main() {
                         apply_connection_to_config(&mut config, &env);
                     }
                 }
-            } else if !has_explicit_auth && uri.is_empty() && atty::is(Stream::Stdout) {
+            } else if !has_explicit_auth && uri.is_empty() && io::stdout().is_terminal() {
                 // No default set + interactive: show unified connection flow
                 let (term_width, _) = terminal::size().unwrap_or((80, 24));
                 let mut flow = ConnectionFlow::for_startup(&envs, term_width, true);
@@ -3121,7 +3120,7 @@ fn main() {
                     }
                 }
             }
-        } else if !has_explicit_auth && uri.is_empty() && atty::is(Stream::Stdout) {
+        } else if !has_explicit_auth && uri.is_empty() && io::stdout().is_terminal() {
             // No saved connections + interactive: show unified connection flow (setup only)
             let (term_width, _) = terminal::size().unwrap_or((80, 24));
             let envs: Vec<String> = Vec::new();
@@ -6634,7 +6633,7 @@ fn ask_yes_no(prompt: &str) -> bool {
 /// is a piped bulk file. Defaults to yes: an empty line (Enter) accepts.
 /// Returns true to proceed, false to abort.
 fn confirm_preview(lines: &[String], base_uri: &str) -> bool {
-    if atty::is(Stream::Stderr) {
+    if io::stderr().is_terminal() {
         colored::control::set_override(true);
     }
     // Count and summarize only actual request lines (first token is an HTTP
@@ -6748,7 +6747,7 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
 
     if config.bulk_silent && !config.base_uri.is_empty() {
         // Ensure colors work even when stdout is piped
-        if atty::is(Stream::Stderr) {
+        if io::stderr().is_terminal() {
             colored::control::set_override(true);
         }
         println!("{}", format!("[{}]", config.base_uri).dimmed());
@@ -7010,10 +7009,10 @@ fn run_bulk(config: &mut Config, file_path: &str) {
 /// printed here; deciding whether they end the run is the caller's business
 /// (bulk exits 1, the TUI stops the chain and stays open).
 fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str) -> RequestOutcome {
-    let is_tty = atty::is(Stream::Stdout);
+    let is_tty = io::stdout().is_terminal();
 
     // Ensure colors work on stderr even when stdout is piped
-    if atty::is(Stream::Stderr) {
+    if io::stderr().is_terminal() {
         colored::control::set_override(true);
     }
 
@@ -7153,7 +7152,7 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
     let progress = TransferProgress::new();
     let mut ticker = ProgressTicker::start(
         Arc::clone(&progress),
-        atty::is(Stream::Stderr) && !config.silent && !config.quiet,
+        io::stderr().is_terminal() && !config.silent && !config.quiet,
     );
 
     match request.send() {

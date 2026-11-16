@@ -8,7 +8,7 @@
 # resolve to rustup's shims -- a separately installed `rust` (e.g. the Homebrew
 # formula) shadows those shims and silently ignores this file.
 [toolchain]
-channel = "1.98.1"
+channel = "1.100.0"
 components = ["rustfmt", "clippy"]
 targets = [
     "aarch64-apple-darwin",
