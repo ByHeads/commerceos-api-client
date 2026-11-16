@@ -285,6 +285,9 @@ struct Config {
     /// lone database key is kept under, beside `key?`. `None` is off. See
     /// `export_value`.
     export_id: Option<String>,
+    /// Export mode was set for the whole run or session (`--export`, ctrl+r)
+    /// and an `export` line does not change it: the command line overrides.
+    export_pinned: bool,
     /// The status of the last response the prompt received, for `-f` there.
     last_status: Option<u16>,
 }
@@ -316,6 +319,7 @@ impl Default for Config {
             expect_falsy: false,
             fail_fast: false,
             export_id: None,
+            export_pinned: false,
             last_status: None,
         }
     }
@@ -2841,6 +2845,7 @@ fn main() {
             std::process::exit(1);
         }
         config.export_id = Some(name.clone());
+        config.export_pinned = true;
     }
 
     if args.me {
@@ -3248,6 +3253,13 @@ fn main() {
     // exits 1 and a chain chains. Includes resolve against the working
     // directory.
     if let Some(line) = program_line {
+        // `api export com.heads.seedID` would set a mode and send nothing.
+        let alone = line.lines().filter(|l| !l.trim().is_empty()).count() == 1
+            && line.split_whitespace().next().is_some_and(|w| w.eq_ignore_ascii_case("export"));
+        if alone {
+            eprintln!("error: `export` alone sends nothing. Use --export <name> with a request, or put the line in a .api file.");
+            std::process::exit(1);
+        }
         if let Some(selector) = &op_selector {
             match get_1password_credentials(selector) {
                 Ok((base_uri, api_key)) => {
@@ -4502,6 +4514,12 @@ enum BulkStep {
     /// continuing. If a message is provided, it's used as the prompt; otherwise
     /// the default "Continue?" is used.
     Confirm(Option<String>),
+    /// Export mode from here on: under `name`, or off. `written` is an
+    /// `export <name>` / `export off` line of a file and is shown in the
+    /// preview and the log. The rest are the parser's own, put around an
+    /// included file so that a file's export mode stays that file's: off on
+    /// the way in, back to what it was on the way out.
+    Export { name: Option<String>, written: bool },
 }
 
 /// Outcome of a single request, deciding whether a `&&` chain continues.
@@ -5123,6 +5141,37 @@ fn parse_condition(condition: &str, what: &str, usage: &str) -> Result<(bool, St
         ));
     }
     Ok((negate, request.to_string()))
+}
+
+/// Parse what follows `export`: the name of an external identifier, which
+/// turns export mode on for the rest of the file, or `off`.
+fn parse_export_step(rest: &str) -> Result<BulkStep, String> {
+    let mut words = rest.split_whitespace();
+    let name = match (words.next(), words.next()) {
+        (Some(word), None) if word.eq_ignore_ascii_case("off") => None,
+        (Some(word), None) if is_namespaced_key(word) => Some(word.to_string()),
+        (None, _) => {
+            return Err("export needs a name: `export com.heads.seedID`, or `export off`".to_string());
+        }
+        _ => return Err(format!("invalid export identifier: {} ({})", rest, NAMESPACED_KEY_HELP)),
+    };
+    Ok(BulkStep::Export { name, written: true })
+}
+
+/// The `export com.heads.seedID` line as shown in previews and the logs.
+fn format_export(name: &Option<String>) -> String {
+    format!("export {}", name.as_deref().unwrap_or("off"))
+}
+
+/// Apply an `export` step: the mode it sets holds until the next one. With
+/// `--export` (or ctrl+r at the prompt) the run has a mode of its own, and
+/// the step changes nothing. Returns whether it applied.
+fn apply_export_step(config: &mut Config, name: &Option<String>) -> bool {
+    if config.export_pinned {
+        return false;
+    }
+    config.export_id = name.clone();
+    true
 }
 
 /// The `assert not GET /x` line as shown in previews and the `-sa` log.
@@ -6315,7 +6364,10 @@ fn split_bulk_requests_inner(
     aliases: &mut ImportAliases,
     chain: &mut std::collections::HashSet<std::path::PathBuf>,
     program: &mut BulkProgram,
-) -> Result<(), String> {
+    // The export mode this text starts in: none for a file, the session's
+    // for a line typed at the prompt. Returns the one it ends in.
+    mut export: Option<String>,
+) -> Result<Option<String>, String> {
     let mut current = String::new();
     // Whether `current` is an `import` directive rather than a request. Its
     // JSON may span lines, so it is assembled the way a request body is.
@@ -6349,6 +6401,16 @@ fn split_bulk_requests_inner(
                 if first_word.eq_ignore_ascii_case("confirm") {
                     let rest = trimmed["confirm".len()..].trim();
                     program.steps.push(parse_confirm_step(rest)?);
+                    continue;
+                }
+                // `export <name>` / `export off` — export mode for the rest
+                // of this file, and for this file only.
+                if first_word.eq_ignore_ascii_case("export") {
+                    let step = parse_export_step(trimmed["export".len()..].trim())?;
+                    if let BulkStep::Export { name, .. } = &step {
+                        export = name.clone();
+                    }
+                    program.steps.push(step);
                     continue;
                 }
                 // `url has`/`url is` — environment gate, collected globally.
@@ -6385,14 +6447,23 @@ fn split_bulk_requests_inner(
                         .map_err(|e| format!("could not read include {}: {}", path.display(), e))?;
                     chain.insert(canonical.clone());
                     let new_base = canonical.parent().map(|p| p.to_path_buf());
-                    split_bulk_requests_inner(
+                    // This file's export mode is not the included file's:
+                    // that one starts without, and what it sets ends with it.
+                    if export.is_some() {
+                        program.steps.push(BulkStep::Export { name: None, written: false });
+                    }
+                    let left_in = split_bulk_requests_inner(
                         &included,
                         new_base.as_deref(),
                         repo.as_ref(),
                         &mut ImportAliases::new(),
                         chain,
                         program,
+                        None,
                     )?;
+                    if export.is_some() || left_in.is_some() {
+                        program.steps.push(BulkStep::Export { name: export.clone(), written: false });
+                    }
                     chain.remove(&canonical);
                 }
                 continue;
@@ -6449,7 +6520,7 @@ fn split_bulk_requests_inner(
         ));
     }
 
-    Ok(())
+    Ok(export)
 }
 
 /// Split a multi-line bulk file into an ordered program of requests and `sleep`
@@ -6461,7 +6532,7 @@ fn split_bulk_requests(
     contents: &str,
     base_dir: Option<&std::path::Path>,
 ) -> Result<BulkProgram, String> {
-    split_bulk_requests_with(contents, base_dir, &mut ImportAliases::new())
+    split_bulk_requests_with(contents, base_dir, &mut ImportAliases::new(), None)
 }
 
 /// `split_bulk_requests` starting from `aliases`, which also receives the
@@ -6470,21 +6541,24 @@ fn split_bulk_requests_with(
     contents: &str,
     base_dir: Option<&std::path::Path>,
     aliases: &mut ImportAliases,
+    export: Option<String>,
 ) -> Result<BulkProgram, String> {
     let mut program = BulkProgram::default();
     let mut chain = std::collections::HashSet::new();
-    split_bulk_requests_inner(contents, base_dir, None, aliases, &mut chain, &mut program)?;
+    split_bulk_requests_inner(contents, base_dir, None, aliases, &mut chain, &mut program, export)?;
     Ok(program)
 }
 
 /// `split_bulk_requests` for a line typed at the prompt: an alias imported
-/// there stays for the session, so a later line can include from it.
-fn split_bulk_requests_in_session(contents: &str) -> Result<BulkProgram, String> {
+/// there stays for the session, so a later line can include from it. The
+/// prompt is the file here: `export` is the mode an earlier line left on, and
+/// a file run from the line is kept out of it like any included file.
+fn split_bulk_requests_in_session(contents: &str, export: Option<String>) -> Result<BulkProgram, String> {
     // Each line asks the remote afresh: an `import` typed again after a push
     // gets the new commit, where a batch resolves a ref once per run.
     forget_resolved_imports();
     let mut aliases = session_imports().lock().unwrap().clone();
-    let program = split_bulk_requests_with(contents, None, &mut aliases)?;
+    let program = split_bulk_requests_with(contents, None, &mut aliases, export)?;
     *session_imports().lock().unwrap() = aliases;
     Ok(program)
 }
@@ -6855,6 +6929,8 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
                 }
                 BulkStep::Assert { negate, request } => vec![format_assert(*negate, request)],
                 BulkStep::Confirm(message) => vec![format_confirm(message)],
+                BulkStep::Export { name, written: true } => vec![format_export(name)],
+                BulkStep::Export { .. } => Vec::new(),
             }))
             .collect();
         if !confirm_preview(&preview_lines, &config.base_uri) {
@@ -6906,6 +6982,16 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
             BulkStep::Confirm(message) => {
                 if !run_confirm(config, message) {
                     return;
+                }
+            }
+            BulkStep::Export { name, written } => {
+                let applied = apply_export_step(config, name);
+                if *written && config.bulk_silent {
+                    println!("{}", format_export(name).dimmed());
+                    if !applied {
+                        let pinned = config.export_id.as_deref().unwrap_or_default();
+                        println!("{}", format!("↳ ignored: --export {} is set", pinned).dimmed());
+                    }
                 }
             }
             BulkStep::Chain(segments) => {
@@ -8560,7 +8646,7 @@ fn handle_key_event(
                 // prompt's own handling (the body editor); a chain runs as a
                 // chain; anything else — a directive, an include, several
                 // lines at once, a typo — runs as a program.
-                let (request, segments) = match classify_prompt_line(&input) {
+                let (request, segments) = match classify_prompt_line(&input, typed_export(&state.config)) {
                     PromptLine::Request(r) => (r, Vec::new()),
                     PromptLine::Chain(s) => (s[0].1.clone(), s),
                     PromptLine::Program => {
@@ -9820,7 +9906,14 @@ enum PromptLine {
     Program,
 }
 
-fn classify_prompt_line(input: &str) -> PromptLine {
+/// The export mode an `export` line typed at the prompt left on, which the
+/// next line starts in. A mode set for the whole session (`--export`,
+/// ctrl+r) is not a line's: no step touches it, and nothing is kept out of it.
+fn typed_export(config: &Config) -> Option<String> {
+    if config.export_pinned { None } else { config.export_id.clone() }
+}
+
+fn classify_prompt_line(input: &str, export: Option<String>) -> PromptLine {
     // An import fetches, and its alias belongs to the session: both are
     // `run_program_line`'s to do.
     let imports = input
@@ -9829,7 +9922,10 @@ fn classify_prompt_line(input: &str) -> PromptLine {
     if imports {
         return PromptLine::Program;
     }
-    match split_bulk_requests(input, None) {
+    // Read in the export mode the prompt is in: a file named on the line is
+    // then more than its one request, since it has to be kept out of that
+    // mode, and runs as the program it is.
+    match split_bulk_requests_with(input, None, &mut ImportAliases::new(), export) {
         Ok(mut program) if program.url_conditions.is_empty() && program.steps.len() == 1 => {
             match program.steps.pop() {
                 Some(BulkStep::Request(r)) => PromptLine::Request(r),
@@ -9883,10 +9979,10 @@ fn looks_like_a_path(word: &str) -> bool {
 /// a declined confirm, an errored request, or esc stops the remaining steps.
 fn run_program_line(state: &mut AppState, stdout: &mut io::Stdout, line: &str) -> io::Result<()> {
     // A fetch can take a moment; say what the prompt is busy with.
-    if matches!(classify_prompt_line(line), PromptLine::Program) && line.to_ascii_lowercase().contains("import") {
+    if matches!(classify_prompt_line(line, None), PromptLine::Program) && line.to_ascii_lowercase().contains("import") {
         show_program_status(state, stdout, "importing…".to_string())?;
     }
-    let program = match split_bulk_requests_in_session(line) {
+    let program = match split_bulk_requests_in_session(line, typed_export(&state.config)) {
         Ok(p) => p,
         Err(e) => return show_program_status(state, stdout, describe_program_error(&e)),
     };
@@ -9980,6 +10076,23 @@ fn run_program_steps(state: &mut AppState, stdout: &mut io::Stdout, steps: &[Bul
                     render(stdout, state)?;
                 }
                 yes
+            }
+            BulkStep::Export { name, written } => {
+                let applied = apply_export_step(&mut state.config, name);
+                if *written {
+                    log_directive_line(state, stdout, format_export(name).dimmed().to_string())?;
+                    let said = match (applied, name) {
+                        (true, Some(name)) => format!("export on: {}", name),
+                        (true, None) => "export off".to_string(),
+                        // Set for the session with --export or ctrl+r, which a line doesn't undo.
+                        (false, _) => format!(
+                            "export stays {}: set for the session (ctrl+r turns it off)",
+                            state.config.export_id.as_deref().unwrap_or_default()
+                        ),
+                    };
+                    show_program_status(state, stdout, said)?;
+                }
+                true
             }
         };
         if !keep_going {
@@ -10807,6 +10920,7 @@ fn handle_export_toggle(state: &mut AppState, stdout: &mut io::Stdout) -> io::Re
         Ok(false)
     };
     if state.config.export_id.take().is_some() {
+        state.config.export_pinned = false;
         return notice(state, stdout, "export off".to_string());
     }
     let name = match state.export_name.clone() {
@@ -10820,6 +10934,9 @@ fn handle_export_toggle(state: &mut AppState, stdout: &mut io::Stdout) -> io::Re
     state.streaming_flash_at = Some(Instant::now());
     state.export_name = Some(name.clone());
     state.config.export_id = Some(name.clone());
+    // For the session, as `--export` is for a run: an `export` line in a
+    // file run from here does not change it.
+    state.config.export_pinned = true;
     notice(state, stdout, format!("export on: {}", name))
 }
 
@@ -15503,7 +15620,7 @@ mod tests {
         handle_paste(&mut state, "assert /a\rassert /b\r\nassert /c\r", &mut out).unwrap();
         assert_eq!(state.input, "assert /a\nassert /b\nassert /c");
         assert_eq!(state.cursor_pos, char_len(&state.input));
-        assert!(matches!(classify_prompt_line(&state.input), PromptLine::Program));
+        assert!(matches!(classify_prompt_line(&state.input, None), PromptLine::Program));
 
         // A single copied line, newline and all, over the default prompt.
         let mut state = test_state();
@@ -15968,6 +16085,78 @@ mod tests {
     }
 
     #[test]
+    fn parse_export_step_takes_a_namespaced_key_or_off() {
+        let on = |name: &str| BulkStep::Export { name: Some(name.to_string()), written: true };
+        assert_eq!(parse_export_step("com.heads.seedID").unwrap(), on("com.heads.seedID"));
+        assert_eq!(parse_export_step("  my_co.my-org.seed-id$  ").unwrap(), on("my_co.my-org.seed-id$"));
+        for off in ["off", "OFF", "Off"] {
+            assert_eq!(parse_export_step(off).unwrap(), BulkStep::Export { name: None, written: true });
+        }
+        assert!(parse_export_step("").unwrap_err().contains("export needs a name"));
+        for bad in ["seedID", "com.heads", "a.b.c d", "off now", "on"] {
+            assert!(parse_export_step(bad).unwrap_err().contains("invalid export identifier"), "{bad}");
+        }
+        assert_eq!(format_export(&Some("a.b.c".to_string())), "export a.b.c");
+        assert_eq!(format_export(&None), "export off");
+    }
+
+    #[test]
+    fn an_export_line_is_scoped_to_its_file_by_steps_around_each_include() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("plain.api"), "GET /plain\n").unwrap();
+        fs::write(dir.path().join("own.api"), "export in.ner.id\nGET /own\n").unwrap();
+        let steps = |text: &str, export: Option<&str>| {
+            split_bulk_requests_with(text, Some(dir.path()), &mut ImportAliases::new(), export.map(String::from))
+                .unwrap()
+                .steps
+        };
+        let written = |name: Option<&str>| BulkStep::Export { name: name.map(String::from), written: true };
+        let scope = |name: Option<&str>| BulkStep::Export { name: name.map(String::from), written: false };
+        let get = |uri: &str| BulkStep::Request(format!("GET {}", uri));
+
+        // Without a line there is nothing to keep an include out of.
+        assert_eq!(steps("GET /a\nplain.api\n", None), [get("/a"), get("/plain")]);
+        // Under a line: off on the way in, back on the way out.
+        assert_eq!(
+            steps("export a.b.c\nplain.api\nGET /a\n", None),
+            [written(Some("a.b.c")), scope(None), get("/plain"), scope(Some("a.b.c")), get("/a")]
+        );
+        // What an included file sets ends with it, whatever the includer has.
+        assert_eq!(
+            steps("own.api\nGET /a\n", None),
+            [written(Some("in.ner.id")), get("/own"), scope(None), get("/a")]
+        );
+        assert_eq!(
+            steps("export a.b.c\nown.api\n", None),
+            [written(Some("a.b.c")), scope(None), written(Some("in.ner.id")), get("/own"), scope(Some("a.b.c"))]
+        );
+        // After `export off` an include needs nothing around it again.
+        assert_eq!(
+            steps("export a.b.c\nexport off\nplain.api\n", None),
+            [written(Some("a.b.c")), written(None), get("/plain")]
+        );
+        // A line typed at the prompt starts in the mode an earlier one left.
+        assert_eq!(steps("plain.api", Some("a.b.c")), [scope(None), get("/plain"), scope(Some("a.b.c"))]);
+        assert_eq!(steps("GET /a", Some("a.b.c")), [get("/a")]);
+
+        // So a one-request file is a program there, not a request of the prompt's.
+        let line = dir.path().join("plain.api").display().to_string();
+        assert!(matches!(classify_prompt_line(&line, None), PromptLine::Request(_)));
+        assert!(matches!(classify_prompt_line(&line, Some("a.b.c".to_string())), PromptLine::Program));
+        assert!(matches!(classify_prompt_line("export a.b.c", None), PromptLine::Program));
+
+        // `--export` and ctrl+r pin the mode: a step leaves it alone.
+        let mut config = Config::default();
+        assert!(apply_export_step(&mut config, &Some("a.b.c".to_string())));
+        assert_eq!(config.export_id.as_deref(), Some("a.b.c"));
+        assert_eq!(typed_export(&config).as_deref(), Some("a.b.c"));
+        config.export_pinned = true;
+        assert!(!apply_export_step(&mut config, &None));
+        assert_eq!(config.export_id.as_deref(), Some("a.b.c"));
+        assert_eq!(typed_export(&config), None);
+    }
+
+    #[test]
     fn format_confirm_lines() {
         assert_eq!(format_confirm(&None), "confirm");
         assert_eq!(
@@ -16081,14 +16270,14 @@ mod tests {
 
     #[test]
     fn classify_prompt_line_keeps_one_request_or_chain_apart_from_programs() {
-        assert!(matches!(classify_prompt_line("GET /a"), PromptLine::Request(r) if r == "GET /a"));
+        assert!(matches!(classify_prompt_line("GET /a", None), PromptLine::Request(r) if r == "GET /a"));
         assert!(matches!(
-            classify_prompt_line("PUT /a {\"x\":1 // c\n}"),
+            classify_prompt_line("PUT /a {\"x\":1 // c\n}", None),
             PromptLine::Request(r) if !r.contains("// c")
         ));
-        assert!(matches!(classify_prompt_line("GET /a && GET /b"), PromptLine::Chain(s) if s.len() == 2));
+        assert!(matches!(classify_prompt_line("GET /a && GET /b", None), PromptLine::Chain(s) if s.len() == 2));
         for program in ["sleep 1", "GET /a\nGET /b", "peple", "url has x\nGET /a", "# note", "/tmp/x.api"] {
-            assert!(matches!(classify_prompt_line(program), PromptLine::Program), "{program}");
+            assert!(matches!(classify_prompt_line(program, None), PromptLine::Program), "{program}");
         }
     }
 
@@ -19122,13 +19311,13 @@ mod tests {
     fn a_session_alias_outlives_the_line_and_completes() {
         let (_repo, url, _) = test_repo(&[("sv.api", "GET /sv\n"), ("seeds/a.api", "GET /a\n"), ("notes.txt", "x")]);
         let line = format!("import git zzsession {{ \"url\": \"{url}\", \"ref\": \"1.0\" }}");
-        assert!(matches!(classify_prompt_line(&line), PromptLine::Program));
-        let program = split_bulk_requests_in_session(&line).unwrap();
+        assert!(matches!(classify_prompt_line(&line, None), PromptLine::Program));
+        let program = split_bulk_requests_in_session(&line, None).unwrap();
         assert!(program.steps.is_empty());
         assert_eq!(program.import_notes.len(), 1);
 
         // A later line includes from it…
-        let program = split_bulk_requests_in_session("zzsession/sv.api").unwrap();
+        let program = split_bulk_requests_in_session("zzsession/sv.api", None).unwrap();
         assert_eq!(requests_of(&program), vec!["GET /sv".to_string()]);
         // …and a line that never declared it elsewhere still can't.
         assert!(split_bulk_requests("zzsession/sv.api", None).is_err());
@@ -19141,7 +19330,7 @@ mod tests {
         assert_eq!(get_include_completions("zzsession/seeds/"), vec!["zzsession/seeds/a.api".to_string()]);
 
         // Declaring it again at the prompt replaces it.
-        assert!(split_bulk_requests_in_session(&line).is_ok());
+        assert!(split_bulk_requests_in_session(&line, None).is_ok());
     }
 
     #[test]
@@ -19164,7 +19353,7 @@ mod tests {
         // only once is tested in tests/imports.rs, by counting what git was
         // asked: here another test may clear what this process remembers.)
         let at_prompt = import.replace(" moving ", " zzmoving ").replace("moving/a.api", "zzmoving/a.api");
-        let (requests, note) = ran(split_bulk_requests_in_session(&at_prompt).unwrap());
+        let (requests, note) = ran(split_bulk_requests_in_session(&at_prompt, None).unwrap());
         assert_eq!(requests, vec!["GET /second".to_string()]);
         assert!(note.ends_with(&format!("({})", &second[..7])), "{note}");
 
@@ -19172,9 +19361,9 @@ mod tests {
         // an `import` typed again looks the branch up.
         fs::write(repo.path().join("a.api"), "GET /third\n").unwrap();
         test_git(repo.path(), &["commit", "-q", "-am", "third"]);
-        let program = split_bulk_requests_in_session("zzmoving/a.api").unwrap();
+        let program = split_bulk_requests_in_session("zzmoving/a.api", None).unwrap();
         assert_eq!(requests_of(&program), vec!["GET /second".to_string()]);
-        let (requests, _) = ran(split_bulk_requests_in_session(&at_prompt).unwrap());
+        let (requests, _) = ran(split_bulk_requests_in_session(&at_prompt, None).unwrap());
         assert_eq!(requests, vec!["GET /third".to_string()]);
     }
 

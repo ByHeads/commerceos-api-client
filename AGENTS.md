@@ -378,7 +378,7 @@ import archive cl {
   says, relative to the working directory. Read an import with `-p` before
   running it for the first time: it sends requests with your credentials.
 
-## 7. Directives: `sleep`, `sleep while`, `assert`, `confirm`, `url`
+## 7. Directives: `sleep`, `sleep while`, `assert`, `confirm`, `export`, `url`
 
 Besides requests and includes, a few control lines are recognised. `sleep while`
 and `assert` send a request whose answer is only judged, never printed as data.
@@ -475,6 +475,55 @@ POST /deploy { "go": true }
 - When the program itself is on stdin (`api -a -`, `cat file.api | api -a`)
   there is nothing left there to answer with, so without a terminal a `confirm`
   in it always stops the run.
+
+### `export <external-id>` / `export off`
+
+Turn [export mode](#exporting-seed-data---export-external-id) on for the
+requests that follow in this file, as `--export <external-id>` does for a
+whole run, so that one file can read some things as seed data and others as
+they are:
+
+```
+GET /about > /tmp/about.json                 # as the server answers
+
+export com.heads.seedID
+
+GET /users > /tmp/users.json                 # seed data
+shared/checks.api                            # another file: not exported
+GET /companies > /tmp/companies.json         # seed data again
+
+export off
+
+GET /people~count > /tmp/count.json          # as the server answers
+```
+
+- It holds **from the line down, to `export off` or the end of the file**. A
+  second `export <name>` replaces the name from there on.
+- It is **the file's own**. A file it includes, and a file of an import, runs
+  without it, and export is back on when the including file carries on. An
+  included or imported file may have an `export` line of its own, which ends
+  with that file and never reaches the file that included it.
+- The name is a namespaced key, as for `--export`. A name that is not one, a
+  missing name, or an `export` line as a segment of a `&&`/`||` chain stops
+  the batch with exit 1 before anything is sent.
+- **`--export` on the command line overrides every `export` line**: the whole
+  run, included files too, is exported under the command line's name, and
+  `export off` does not turn it off. The `-sa` log says so under each line:
+  `↳ ignored: --export com.heads.seedID is set`.
+- Each request under it behaves as with `--export`: a 2xx JSON response is
+  rewritten wherever it goes, an error body is left alone, `&&`/`||`,
+  `assert` and `sleep while` judge what the server answered, and the request
+  is not streamed.
+- The `-p` preview and the `-sa` log list the line where it is written.
+- **At the prompt** the line works the same, with the session in the place of
+  the file: `export com.heads.seedID` holds for the lines typed after it until
+  `export off` (or ctrl+r), and a file run from the prompt is kept out of it
+  like an included file. A session's own export mode, from `--export` or
+  ctrl+r, is the command line's and overrides a typed line too: the hint line
+  says `export stays <name>`.
+- As a one-shot argument on its own (`api export com.heads.seedID`) it would
+  send nothing and is an error; use `--export`. In an argument of several
+  lines it is a line like any other.
 
 ### The same syntax at the prompt and on the command line
 
@@ -705,7 +754,8 @@ Rules:
   `>> file`, the clipboard. An error body is left as the server sent it, so
   `-f` output is unaffected, and request bodies are never touched.
 - It works for one request and in a batch (`api --export com.heads.seedID
-  -sa export.api`, with a `> file` per request).
+  -sa export.api`, with a `> file` per request). For only some requests of
+  a file, write an [`export` line](#export-external-id--export-off) in it.
 - **At the interactive prompt, `ctrl+r` turns export mode on and off**, the
   way `ctrl+t` does streaming, and `export` shows at the right of the hint
   line while it is on. The first time, it asks for the name: there is no
@@ -881,6 +931,8 @@ Run it: `api -sa workshop.api`.
 - **`import dir cl { "path": "cl" }`** → `import alias … clashes`. An alias can't share its name with a file or directory next to the `.api` file; name the alias something else.
 - **Seeding from a plain `GET`** → the response carries `identifiers.key`, a database key of the environment it was read from. Written elsewhere it is refused (`400 failed indexing`: a `key` that names nothing). Read it with `--export <external-id>`, which takes the key out and keeps a lone one as `key?` and under the name.
 - **Writing an export to a server without `key?`** → `400 failed coercion`, `The key 'key?' is not a valid namespaced key`, as soon as the export holds a record that had only a key. Such an export needs a server that knows the optional key.
+- **An `export` line and an included file** → the line is for its own file only: `shared/users.api` included under it is not exported. Put an `export` line in the included file as well, or run with `--export`, which applies to every file.
+- **An `export` line under `--export`** → the command line wins: the name on the line is not used and `export off` does not turn export off. The `-sa` log notes `↳ ignored: --export … is set`.
 - **Expecting secrets in an export** → the API masks them (`********`) and `--export` turns that into `null`, and says where (`Response had masked data, now null at …`). A password, an API key or a client secret has to be set separately.
 - **`-p` or `confirm` without a terminal** → up to 3.3.1, end of input was read as Enter, so an unattended `api -spa file.api` or a `confirm` gate sent everything. From 3.3.2 it sends nothing and exits 1 with `aborted (could not read confirmation)`. Pipe the answer (`yes | …`, `echo n | …`); a program read from stdin (`api -a -`) has no stdin left to answer with.
 - **Expecting a failed request to stop a batch** → it doesn't, unless the line is an `assert`, a chain or a poll, or the run has `-f`. A plain `PUT /assert {…}` that answers 409 is logged and the next line runs. Run with `-f`.
@@ -899,6 +951,6 @@ Run it: `api -sa workshop.api`.
 - For repeated boilerplate, factor it into a `shared/` directory and use includes.
 - When generating files programmatically, prefer compact single-line JSON bodies — they're easier to grep and diff.
 - Use silent batch mode (`-sa`) when you want to verify that a long seeding script worked without drowning in response bodies.
-- To move data between environments, read it with `--export com.heads.seedID` into a file and `PUT` the file. Use the same identifier name every time, so a record exported twice is one record. The same file can be written back where it was read: a record is found by its identifiers, and one that had only a key by its `key?`.
+- To move data between environments, read it with `--export com.heads.seedID` (or under an `export com.heads.seedID` line in the `.api` file) into a file and `PUT` the file. Use the same identifier name every time, so a record exported twice is one record. The same file can be written back where it was read: a record is found by its identifiers, and one that had only a key by its `key?`.
 - Add `-f` (`-sfa`) so a failed request stops the batch: check the exit code, and on failure read the error body from the end of stdout (everything after the last `└─HTTP/1.1 …` line; it is usually several lines of JSON). Without it a batch exits 0 however many plain requests failed.
 - Run with `--no-keychain` and an absolute `API_CREDENTIALS_FILE` so nothing depends on an unlocked keychain or on the working directory.

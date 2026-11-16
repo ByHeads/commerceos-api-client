@@ -1680,6 +1680,156 @@ fn ctrl_r_in_a_session_started_with_export_does_not_ask() {
     assert!(shown.contains("ctrl+r     Toggle export mode"), "{shown}");
 }
 
+/// `export <name>` typed at the prompt is the line a file would have: it
+/// holds for what is typed after it, until `export off`, and a file run from
+/// the prompt is kept out of it as an included file is.
+#[cfg(unix)]
+#[test]
+fn an_export_line_at_the_prompt_holds_for_the_lines_typed_after_it() {
+    use pty::{plain, Prompt};
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    prepare(dir.path());
+    std::fs::write(dir.path().join("plain.api"), "GET /keyed > from-file.json\n").unwrap();
+    std::fs::write(dir.path().join("own.api"), "export other.name.id\nGET /keyed > from-own.json\n").unwrap();
+    let mut prompt = Prompt::open(api(server.port, dir.path()));
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+
+    let mut run = |paste: &str| {
+        prompt.send(b"\x15");
+        prompt.pump(Duration::from_millis(60));
+        server.take();
+        prompt.paste(paste);
+        prompt.pump(Duration::from_millis(80));
+        let mark = prompt.screen.len();
+        prompt.send(b"\r");
+        let start = Instant::now();
+        let mut quiet = 0;
+        while quiet < 2 && start.elapsed() < Duration::from_secs(4) {
+            let before = server.seen();
+            prompt.pump(Duration::from_millis(120));
+            quiet = if server.seen() == before { quiet + 1 } else { 0 };
+        }
+        (server.take(), plain(&prompt.screen[mark..]))
+    };
+    // The name a written record was exported under, `None` when it wasn't.
+    let exported = |file: &str| -> Option<String> {
+        let text = std::fs::read_to_string(dir.path().join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let identifiers = value["identifiers"].as_object().unwrap();
+        identifiers.keys().find(|k| *k != "key?" && *k != "key").cloned()
+    };
+    let seed = Some("com.heads.seedID".to_string());
+
+    // Before the line, the response is the server's.
+    let (_, shown) = run("GET /keyed");
+    assert!(shown.contains("\"key\": \"k1\"") && !shown.contains("key?"), "{shown}");
+
+    // The line sends nothing, is logged, and says what it did.
+    let (sent, shown) = run("export com.heads.seedID");
+    assert_eq!(sent, Vec::<String>::new());
+    assert!(shown.contains("export on: com.heads.seedID"), "{shown}");
+    let (_, shown) = run("GET /keyed");
+    assert!(shown.contains("\"key?\": \"k1\"") && shown.contains("\"com.heads.seedID\": \"k1\""), "{shown}");
+
+    // A file run from here is another file: not exported, unless it says so
+    // itself, and then under its own name. Neither changes the prompt's.
+    let (sent, _) = run("plain.api");
+    assert_eq!(sent, ["GET /keyed"]);
+    assert_eq!(exported("from-file.json"), None);
+    let (sent, _) = run("own.api");
+    assert_eq!(sent, ["GET /keyed"]);
+    assert_eq!(exported("from-own.json"), Some("other.name.id".to_string()));
+    run("GET /keyed > typed.json");
+    assert_eq!(exported("typed.json"), seed);
+
+    // A name that can't be one is refused, and the mode stays.
+    let (sent, shown) = run("export nope");
+    assert_eq!(sent, Vec::<String>::new());
+    assert!(shown.contains("invalid export identifier: nope"), "{shown}");
+    run("GET /keyed > still.json");
+    assert_eq!(exported("still.json"), seed);
+
+    let (sent, shown) = run("export off");
+    assert_eq!(sent, Vec::<String>::new());
+    assert!(shown.contains("export off"), "{shown}");
+    run("GET /keyed > off.json");
+    assert_eq!(exported("off.json"), None);
+
+    // In a pasted block the line holds for the rest of the block, and after it.
+    let (sent, _) = run("GET /keyed > block-before.json\nexport com.heads.seedID\nGET /keyed > block-after.json");
+    assert_eq!(sent.len(), 2);
+    assert_eq!(exported("block-before.json"), None);
+    assert_eq!(exported("block-after.json"), seed);
+    run("GET /keyed > later.json");
+    assert_eq!(exported("later.json"), seed);
+
+    // ctrl+r turns it off, as it turns off any export mode.
+    let mark = prompt.screen.len();
+    prompt.send(b"\x12");
+    prompt.pump(Duration::from_millis(500));
+    assert!(plain(&prompt.screen[mark..]).contains("export off"), "{}", plain(&prompt.screen[mark..]));
+}
+
+/// A session's own export mode (`--export`, ctrl+r) is the command line's,
+/// and overrides an `export` line typed in it or read from a file.
+#[cfg(unix)]
+#[test]
+fn an_export_line_does_not_change_a_sessions_own_export_mode() {
+    use pty::{plain, Prompt};
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    prepare(dir.path());
+    std::fs::write(dir.path().join("own.api"), "export other.name.id\nGET /keyed > from-own.json\n").unwrap();
+    let mut cmd = api(server.port, dir.path());
+    cmd.args(["--export", "com.heads.seedID"]);
+    let mut prompt = Prompt::open(cmd);
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+
+    let run = |prompt: &mut Prompt, paste: &str| {
+        prompt.send(b"\x15");
+        prompt.pump(Duration::from_millis(60));
+        server.take();
+        prompt.paste(paste);
+        prompt.pump(Duration::from_millis(80));
+        let mark = prompt.screen.len();
+        prompt.send(b"\r");
+        let start = Instant::now();
+        let mut quiet = 0;
+        while quiet < 2 && start.elapsed() < Duration::from_secs(4) {
+            let before = server.seen();
+            prompt.pump(Duration::from_millis(120));
+            quiet = if server.seen() == before { quiet + 1 } else { 0 };
+        }
+        plain(&prompt.screen[mark..])
+    };
+    let name_in = |file: &str| -> String {
+        let text = std::fs::read_to_string(dir.path().join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        value["identifiers"].as_object().unwrap().keys().find(|k| *k != "key?").unwrap().clone()
+    };
+
+    for line in ["export off", "export other.name.id"] {
+        let shown = run(&mut prompt, line);
+        assert!(shown.contains("export stays com.heads.seedID"), "{line}: {shown}");
+        run(&mut prompt, "GET /keyed > typed.json");
+        assert_eq!(name_in("typed.json"), "com.heads.seedID", "{line}");
+    }
+    // A file's line is overridden the same way.
+    run(&mut prompt, "own.api");
+    assert_eq!(name_in("from-own.json"), "com.heads.seedID");
+
+    // With the session's mode off (ctrl+r), a line is taken again.
+    prompt.send(b"\x12");
+    prompt.pump(Duration::from_millis(500));
+    let shown = run(&mut prompt, "export other.name.id");
+    assert!(shown.contains("export on: other.name.id"), "{shown}");
+    run(&mut prompt, "GET /keyed > typed.json");
+    assert_eq!(name_in("typed.json"), "other.name.id");
+}
+
 /// `-f` means the same from a file, from stdin and as arguments: the run
 /// stops at the first response of 400 or above, exits 1, and the body of
 /// that response is the last thing on stdout.

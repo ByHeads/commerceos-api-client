@@ -2913,6 +2913,264 @@ fn export_does_not_ask_for_a_streamed_response() {
     assert_eq!(std::fs::read_to_string(run.dir.path().join("users.json")).unwrap(), USERS_EXPORTED);
 }
 
+// ----- `export <name>` in a .api file -----
+
+/// What a server answers every request with here: a record with only a key.
+const KEYED: &str = r#"{"identifiers":{"key":"k"},"n":1}"#;
+
+struct ExportLines {
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    seen: Vec<String>,
+    dir: tempfile::TempDir,
+}
+
+impl ExportLines {
+    /// The name a written file's record was exported under, `None` when it
+    /// was written as the server sent it.
+    fn exported(&self, file: &str) -> Option<String> {
+        let text = std::fs::read_to_string(self.dir.path().join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{file}: {e}: {text}"));
+        let identifiers = value["identifiers"].as_object().unwrap_or_else(|| panic!("{file}: {text}"));
+        if identifiers.contains_key("key") {
+            assert_eq!(identifiers.len(), 1, "{file}: {text}");
+            return None;
+        }
+        assert_eq!(identifiers["key?"], "k", "{file}: {text}");
+        let name = identifiers.keys().find(|k| *k != "key?").unwrap_or_else(|| panic!("{file}: {text}"));
+        Some(name.clone())
+    }
+}
+
+/// Write `files` to a fresh directory and run `batch.api` among them with
+/// `flags`, against a server that answers `KEYED` to everything.
+fn run_export_lines(flags: &[&str], files: &[(&str, &str)]) -> ExportLines {
+    let (port, server) = answering_server(vec![("200 OK", KEYED)]);
+    let dir = tempdir().unwrap();
+    for (name, contents) in files {
+        let path = dir.path().join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+    let out = api_against_port(port)
+        .env("NO_COLOR", "1")
+        .current_dir(dir.path())
+        .args(flags)
+        .arg("batch.api")
+        .write_stdin("n\n")
+        .output()
+        .expect("api runs");
+    ExportLines {
+        code: out.status.code(),
+        stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+        seen: server.join().expect("server thread"),
+        dir,
+    }
+}
+
+#[test]
+fn an_export_line_holds_from_where_it_is_written_to_the_end_of_its_file() {
+    let run = run_export_lines(
+        &["-sa"],
+        &[(
+            "batch.api",
+            "GET /a > a.json\n\
+             export com.heads.seedID\n\
+             GET /b > b.json\n\
+             GET /c && GET /d > d.json\n\
+             export other.name.id\n\
+             GET /e > e.json\n\
+             export off\n\
+             GET /f > f.json\n\
+             EXPORT com.heads.seedID\n\
+             GET /g > g.json\n",
+        )],
+    );
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.seen.len(), 7);
+    let seed = Some("com.heads.seedID".to_string());
+    assert_eq!(run.exported("a.json"), None, "before the line");
+    assert_eq!(run.exported("b.json"), seed);
+    assert_eq!(run.exported("d.json"), seed, "the last request of a chain");
+    assert_eq!(run.exported("e.json"), Some("other.name.id".to_string()), "a second line replaces the name");
+    assert_eq!(run.exported("f.json"), None, "after `export off`");
+    assert_eq!(run.exported("g.json"), seed, "and on again");
+    // The log has each line where it took effect.
+    let at = |needle: &str| run.stdout.find(needle).unwrap_or_else(|| panic!("{needle:?} not in\n{}", run.stdout));
+    assert!(at("GET /a > a.json") < at("\nexport com.heads.seedID\n"), "{}", run.stdout);
+    assert!(at("\nexport com.heads.seedID\n") < at("GET /b > b.json"), "{}", run.stdout);
+    assert!(at("\nexport other.name.id\n") < at("\nexport off\n"), "{}", run.stdout);
+    assert!(!run.stdout.contains("ignored"), "{}", run.stdout);
+}
+
+#[test]
+fn an_export_line_is_its_own_files_and_no_included_or_imported_files() {
+    let run = run_export_lines(
+        &["-sa"],
+        &[
+            (
+                "batch.api",
+                "import dir lib { \"path\": \"libdir\" }\n\
+                 export com.heads.seedID\n\
+                 GET /before > before.json\n\
+                 inc/plain.api\n\
+                 GET /between > between.json\n\
+                 lib/imported.api\n\
+                 inc/own.api\n\
+                 GET /after > after.json\n",
+            ),
+            // No line of its own: not exported, though its includer is.
+            ("inc/plain.api", "GET /plain > plain.json\n"),
+            ("libdir/imported.api", "GET /imported > imported.json\n"),
+            // A line of its own, around a file it includes in turn.
+            (
+                "inc/own.api",
+                "GET /own-before > own-before.json\n\
+                 export inner.name.id\n\
+                 GET /own > own.json\n\
+                 deep.api\n\
+                 GET /own-after > own-after.json\n",
+            ),
+            ("inc/deep.api", "GET /deep > deep.json\n"),
+        ],
+    );
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let seed = Some("com.heads.seedID".to_string());
+    let inner = Some("inner.name.id".to_string());
+    assert_eq!(run.exported("before.json"), seed);
+    assert_eq!(run.exported("plain.json"), None, "an included file");
+    assert_eq!(run.exported("between.json"), seed, "back on after the include");
+    assert_eq!(run.exported("imported.json"), None, "an imported file");
+    assert_eq!(run.exported("own-before.json"), None, "an included file starts without");
+    assert_eq!(run.exported("own.json"), inner);
+    assert_eq!(run.exported("deep.json"), None, "two includes down");
+    assert_eq!(run.exported("own-after.json"), inner, "back on in the included file");
+    assert_eq!(run.exported("after.json"), seed, "the includer's name again, not the included file's");
+}
+
+#[test]
+fn an_included_files_export_line_ends_with_that_file() {
+    let run = run_export_lines(
+        &["-sa"],
+        &[
+            ("batch.api", "GET /a > a.json\ninc.api\nGET /b > b.json\n"),
+            ("inc.api", "export com.heads.seedID\nGET /i > i.json\n"),
+        ],
+    );
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.exported("a.json"), None);
+    assert_eq!(run.exported("i.json"), Some("com.heads.seedID".to_string()));
+    assert_eq!(run.exported("b.json"), None, "the included file's mode did not leak out");
+}
+
+#[test]
+fn export_on_the_command_line_overrides_every_export_line() {
+    let run = run_export_lines(
+        &["--export", "from.the.cli", "-sa"],
+        &[
+            (
+                "batch.api",
+                "GET /a > a.json\nexport com.heads.seedID\nGET /b > b.json\ninc.api\nexport off\nGET /c > c.json\n",
+            ),
+            ("inc.api", "export inner.name.id\nGET /i > i.json\n"),
+        ],
+    );
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let cli = Some("from.the.cli".to_string());
+    for file in ["a.json", "b.json", "i.json", "c.json"] {
+        assert_eq!(run.exported(file), cli, "{file}");
+    }
+    // The log says that a line was passed over, and for what.
+    assert_eq!(run.stdout.matches("↳ ignored: --export from.the.cli is set").count(), 3, "{}", run.stdout);
+}
+
+#[test]
+fn an_export_line_that_names_nothing_usable_stops_the_batch_before_any_request() {
+    for (line, says) in [
+        ("export", "export needs a name: `export com.heads.seedID`, or `export off`"),
+        ("export seedID", "invalid export identifier: seedID"),
+        ("export com.heads", "invalid export identifier: com.heads"),
+        ("export com.heads.seedID extra", "invalid export identifier: com.heads.seedID extra"),
+        ("export off now", "invalid export identifier: off now"),
+        // A directive is not a step of a chain, in either place.
+        ("GET /a && export com.heads.seedID", "chain segment is not a request"),
+        ("export com.heads.seedID && GET /a", "invalid export identifier"),
+    ] {
+        let run = run_export_lines(&["-sa"], &[("batch.api", &format!("GET /first\n{line}\nGET /never\n"))]);
+        assert_eq!(run.code, Some(1), "{line}");
+        assert!(run.stderr.contains(says), "{line}: {}", run.stderr);
+        assert_eq!(run.seen, Vec::<String>::new(), "{line}");
+    }
+    // The same in a file that is only included.
+    let run = run_export_lines(&["-sa"], &[("batch.api", "GET /first\ninc.api\n"), ("inc.api", "export nope\n")]);
+    assert_eq!(run.code, Some(1));
+    assert_eq!(run.seen, Vec::<String>::new());
+}
+
+#[test]
+fn the_preview_lists_export_lines_and_an_error_body_is_left_alone() {
+    let files = [("batch.api", "GET /a\nexport com.heads.seedID\nGET /b\ninc.api\nexport off\nGET /c\n"), ("inc.api", "GET /i\n")];
+    let run = run_export_lines(&["-spa"], &files);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.seen, Vec::<String>::new());
+    let listed: Vec<&str> = run.stderr.lines().filter(|l| l.starts_with("  ")).map(str::trim).collect();
+    // What the parser puts around the include is its own and is not shown.
+    assert_eq!(listed, ["GET /a", "export com.heads.seedID", "GET /b", "GET /i", "export off", "GET /c"], "{}", run.stderr);
+    assert!(run.stderr.contains("Preview — 4 requests | GET"), "{}", run.stderr);
+
+    // Without `-s` the bodies are printed: seed data under the line, the
+    // server's own above it.
+    let run = run_export_lines(&["-ra"], &[("batch.api", "GET /a\nexport com.heads.seedID\nGET /b\n")]);
+    assert_eq!(
+        run.stdout,
+        format!("{KEYED}\n{}\n", r#"{"identifiers":{"key?":"k","com.heads.seedID":"k"},"n":1}"#),
+        "{}",
+        run.stderr
+    );
+
+    // An error is no seed data, and `-f` passes it on as it came.
+    let (port, server) = answering_server(vec![("409 Conflict", KEYED)]);
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("batch.api"), "export com.heads.seedID\nGET /refused\nGET /never\n").unwrap();
+    let out = api_against_port(port).env("NO_COLOR", "1").current_dir(dir.path()).args(["-sfa", "batch.api"]).output().unwrap();
+    assert_eq!(server.join().unwrap(), vec!["GET /refused"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stdout).ends_with(&format!("{KEYED}\n")));
+}
+
+#[test]
+fn an_export_line_works_from_stdin_and_in_one_argument_but_not_alone() {
+    const EXPORTED: &str = r#"{"identifiers":{"key?":"k","com.heads.seedID":"k"},"n":1}"#;
+    // The program on stdin.
+    let (port, server) = answering_server(vec![("200 OK", KEYED)]);
+    let out = api_against_port(port)
+        .env("NO_COLOR", "1")
+        .args(["-ra", "-"])
+        .write_stdin("GET /a\nexport com.heads.seedID\nGET /b\n")
+        .output()
+        .unwrap();
+    assert_eq!(server.join().unwrap().len(), 2);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), format!("{KEYED}\n{EXPORTED}\n"));
+
+    // Several lines in one argument are a program like any other.
+    let (port, server) = answering_server(vec![("200 OK", KEYED)]);
+    let out = api_against_port(port).env("NO_COLOR", "1").args(["-r", "export com.heads.seedID\nGET /b"]).output().unwrap();
+    assert_eq!(server.join().unwrap(), vec!["GET /b"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), format!("{EXPORTED}\n"));
+
+    // The line alone would set a mode and send nothing: that is `--export`'s job.
+    for args in [&["export", "com.heads.seedID"][..], &["export com.heads.seedID"], &["export", "off"]] {
+        let (port, server) = answering_server(vec![("200 OK", KEYED)]);
+        let out = api_against_port(port).env("NO_COLOR", "1").args(args).output().unwrap();
+        assert_eq!(server.join().unwrap(), Vec::<String>::new(), "{args:?}");
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("`export` alone sends nothing. Use --export <name>"), "{args:?}: {stderr}");
+    }
+}
+
 /// Against a local CommerceOS: what is echoed, and what is really there.
 /// Nothing is stored by either.
 #[test]
