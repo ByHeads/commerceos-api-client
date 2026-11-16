@@ -439,6 +439,24 @@ fn cases(dir: &Path) -> Vec<Case> {
             .fails("a body starts on the request line"),
         case("array where a describe block goes", "[1]\nGET /a", None, &[])
             .fails("a describe block is a JSON object, not an array"),
+        // Directives are read in any case and with any blanks between words
+        case("URL gate in capitals", "URL has 127.0.0.1\nGET /a", None, &["GET /a"]),
+        case("url gate with doubled blanks", "url  has  127.0.0.1\nGET /a", None, &["GET /a"]),
+        case("a sleep no clock can hold", "sleep 1e20", Some(&["sleep", "1e20"]), &[])
+            .fails("invalid sleep duration: `1e20`"),
+        // `||` and `&&` inside the parentheses of a URI operator are the URI's
+        case(
+            "|| inside parentheses",
+            "GET /a~where(x=1||y=2)",
+            Some(&["GET", "/a~where(x=1||y=2)"]),
+            &["GET /a~where(x=1||y=2)"],
+        ),
+        case(
+            "&& inside parentheses, then a chain",
+            "GET /a~where(x=1&&y=2) && GET /b",
+            Some(&["GET", "/a~where(x=1&&y=2)", "&&", "GET", "/b"]),
+            &["GET /a~where(x=1&&y=2)", "GET /b"],
+        ),
         // Several lines and noise
         case("three lines", "GET /a\nsleep 100ms\nGET /b", None, &["GET /a", "GET /b"]),
         case("comment line", "# just a note", Some(&["#", "just", "a", "note"]), &[]),
@@ -542,6 +560,49 @@ fn a_file_read_from_stdin_is_the_same_file() {
         let shown = String::from_utf8_lossy(&out.stderr).to_string();
         check(&case, "stdin", &got, &shown, &case.sent);
     }
+}
+
+/// A file saved by an editor that puts a byte order mark in front of it
+/// (Windows Notepad), with CRLF line ends, runs as the same file without.
+#[test]
+fn a_file_with_a_byte_order_mark_and_crlf_runs() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("inc.api"), "\u{feff}GET /inc\r\n").unwrap();
+    std::fs::write(dir.path().join("bom.api"), "\u{feff}GET /a\r\ninc.api\r\nPUT /b {\"x\":1}\r\n").unwrap();
+    let (got, shown) = run_cli(&server, dir.path(), &["-sa".to_string(), "bom.api".to_string()]);
+    assert!(got.exit_ok, "{shown}");
+    assert_eq!(got.sent, ["GET /a", "GET /inc", r#"PUT /b {"x":1}"#], "{shown}");
+
+    // The same file on stdin.
+    server.take();
+    let out = api(server.port, dir.path())
+        .args(["-sa", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            child.stdin.take().unwrap().write_all("\u{feff}GET /a\r\n".as_bytes())?;
+            child.wait_with_output()
+        })
+        .expect("spawn api");
+    server.settle(Duration::from_millis(150), Duration::from_secs(3));
+    assert!(out.status.success());
+    assert_eq!(server.take(), ["GET /a"]);
+}
+
+/// A value an option can't take is reported with the option it was for.
+#[test]
+fn a_bad_option_value_names_its_option() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let args: Vec<String> = ["--timeout", "abc", "GET", "/a"].iter().map(|s| s.to_string()).collect();
+    let (got, shown) = run_cli(&server, dir.path(), &args);
+    assert!(!got.exit_ok);
+    assert!(got.sent.is_empty());
+    assert!(shown.contains("error: invalid value for --timeout: abc"), "{shown}");
+    assert!(!shown.contains("unexpected option"), "{shown}");
 }
 
 /// What a confirmation run did: what the server received, the exit code, stderr.

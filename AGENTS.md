@@ -206,8 +206,10 @@ GET /people~where(givenName=Test)~count && DELETE /people~where(givenName=Test)
   skipped quietly and noted as `↳ skipped 1 request`.
 - Error: 401/403, 5xx, 408/429, or a timeout aborts the whole batch with exit 1.
   `||` never catches an error.
-- `&&`/`||` inside a JSON string or body are not separators. Multi-line bodies
-  work in any segment, and a `> outfile` belongs to the segment it follows.
+- `&&`/`||` inside a JSON string or body are not separators, and neither are
+  they inside the parentheses of a URI operator: `GET /x~where(a=1||b=2)` is
+  one request. Multi-line bodies work in any segment, and a `> outfile`
+  belongs to the segment it follows.
 - Every segment must be a request. A directive or an include in a chain
   (`GET /a && sleep 2`) is an error, not a step that is quietly dropped.
 

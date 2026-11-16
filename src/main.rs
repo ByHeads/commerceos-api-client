@@ -507,6 +507,21 @@ fn set_default_connection(name: &str) -> Result<(), String> {
     save_keychain_data(&data)
 }
 
+/// A value as it is written in an `application/x-www-form-urlencoded` body:
+/// letters, digits and `-._*` as they are, a space as `+`, every other byte
+/// as `%XX`. A secret holding `&`, `=`, `+` or `%` arrives as it was given.
+fn form_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'*' => out.push(byte as char),
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    out
+}
+
 // OAuth2 client credentials token exchange
 fn oauth2_token_exchange(base_uri: &str, client_id: &str, client_secret: &str) -> Result<(String, u64), String> {
     let token_url = format!("{}/oauth2/v1/token", base_uri.trim_end_matches('/'));
@@ -520,7 +535,8 @@ fn oauth2_token_exchange(base_uri: &str, client_id: &str, client_secret: &str) -
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(format!(
             "grant_type=client_credentials&client_id={}&client_secret={}",
-            client_id, client_secret
+            form_encode(client_id),
+            form_encode(client_secret)
         ))
         .send()
         .map_err(|e| format!("token request failed: {}", e))?;
@@ -1208,6 +1224,42 @@ fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {
         .nth(char_idx)
         .map(|(i, _)| i)
         .unwrap_or(s.len())
+}
+
+/// Where the cursor lands one line up in a multi-line input: the same column,
+/// or the end of that line if it is shorter. Positions and columns are
+/// counted in characters, so a line of `å` is as wide as a line of `a`. On the
+/// first line the cursor stays where it is.
+fn cursor_line_up(input: &str, cursor_pos: usize) -> usize {
+    let chars: Vec<char> = input.chars().collect();
+    let pos = cursor_pos.min(chars.len());
+    let Some(line_start) = chars[..pos].iter().rposition(|&c| c == '\n').map(|i| i + 1) else {
+        return cursor_pos;
+    };
+    let col = pos - line_start;
+    let prev_end = line_start - 1;
+    let prev_start = chars[..prev_end].iter().rposition(|&c| c == '\n').map_or(0, |i| i + 1);
+    prev_start + col.min(prev_end - prev_start)
+}
+
+/// Where the cursor lands one line down, as `cursor_line_up` does it. On the
+/// last line the cursor stays where it is.
+fn cursor_line_down(input: &str, cursor_pos: usize) -> usize {
+    let chars: Vec<char> = input.chars().collect();
+    let pos = cursor_pos.min(chars.len());
+    let line_start = chars[..pos].iter().rposition(|&c| c == '\n').map_or(0, |i| i + 1);
+    let col = pos - line_start;
+    let Some(next_start) = chars[pos..].iter().position(|&c| c == '\n').map(|i| pos + i + 1) else {
+        return cursor_pos;
+    };
+    let next_end = chars[next_start..].iter().position(|&c| c == '\n').map_or(chars.len(), |i| next_start + i);
+    next_start + col.min(next_end - next_start)
+}
+
+/// Whether a key typed this character, as opposed to a shortcut that happens
+/// to carry a letter (`ctrl+a`, `alt+b`). Shift is part of typing.
+fn types_a_character(modifiers: KeyModifiers) -> bool {
+    (modifiers - KeyModifiers::SHIFT).is_empty()
 }
 
 /// A "word character" for readline-style word navigation: alphanumeric + underscore.
@@ -2550,7 +2602,7 @@ impl ConnectionFlow {
                     }
                     self.render(stdout, false)?;
                 }
-                KeyCode::Char(c) => {
+                KeyCode::Char(c) if types_a_character(key.modifiers) => {
                     self.setup_url.push(c);
                     self.render(stdout, false)?;
                 }
@@ -2607,7 +2659,7 @@ impl ConnectionFlow {
                     self.setup_active_field = SetupField::Credential;
                     self.render(stdout, false)?;
                 }
-                KeyCode::Char(c) => {
+                KeyCode::Char(c) if types_a_character(key.modifiers) => {
                     self.setup_client_id.push(c);
                     self.render(stdout, false)?;
                 }
@@ -2659,7 +2711,7 @@ impl ConnectionFlow {
                         self.render(stdout, false)?;
                     }
                 }
-                KeyCode::Char(c) => {
+                KeyCode::Char(c) if types_a_character(key.modifiers) => {
                     self.setup_credential.push(c);
                     self.render(stdout, false)?;
                 }
@@ -2811,6 +2863,19 @@ fn main() {
             if e.kind() == clap::error::ErrorKind::DisplayHelp || e.kind() == clap::error::ErrorKind::DisplayVersion {
                 print!("{}", e);
                 std::process::exit(0);
+            }
+            // A value an option can't take (`--timeout abc`) is named with
+            // its option; it is not an unexpected option.
+            if matches!(e.kind(), clap::error::ErrorKind::ValueValidation | clap::error::ErrorKind::InvalidValue) {
+                let context = |kind| e.get(kind).map(|v| v.to_string());
+                if let (Some(arg), Some(value)) = (
+                    context(clap::error::ContextKind::InvalidArg),
+                    context(clap::error::ContextKind::InvalidValue),
+                ) {
+                    let option = arg.split_whitespace().next().unwrap_or(&arg);
+                    eprintln!("error: invalid value for {}: {}", option, value);
+                    std::process::exit(1);
+                }
             }
             // For unexpected arguments, print a simple message
             let msg = e.to_string();
@@ -5006,8 +5071,9 @@ fn split_request_chain(input: &str) -> Vec<(ChainOp, String)> {
         }
         if !in_string {
             match ch {
-                '{' | '[' => depth += 1,
-                '}' | ']' => depth -= 1,
+                // Parentheses count too: `~where(a=1||b=2)` is one request.
+                '{' | '[' | '(' => depth += 1,
+                '}' | ']' | ')' => depth -= 1,
                 // Only a top-level doubled `&&` / `||` separates requests.
                 c @ ('&' | '|') if depth <= 0 && chars.peek() == Some(&c) => {
                     chars.next();
@@ -5115,7 +5181,8 @@ fn parse_sleep_directive(rest: &str) -> Result<Duration, String> {
         return Err(format!("invalid sleep duration: `{}`", v));
     }
     let secs = if is_ms { num / 1000.0 } else { num };
-    Ok(Duration::from_secs_f64(secs))
+    // A number of seconds no `Duration` can hold (`1e20`) is not a duration.
+    Duration::try_from_secs_f64(secs).map_err(|_| format!("invalid sleep duration: `{}`", v))
 }
 
 /// Poll interval when `sleep while` names none.
@@ -5336,12 +5403,15 @@ fn format_latency(d: Duration) -> String {
 /// `Ok(None)` if it isn't one (so the caller falls through to include handling),
 /// or `Err` for a malformed `url` directive.
 fn parse_url_condition(trimmed: &str) -> Result<Option<UrlCondition>, String> {
-    let mut it = trimmed.splitn(3, char::is_whitespace);
-    if it.next() != Some("url") {
+    // Words may be separated by any run of blanks, and the keywords are read
+    // in any case, as every other directive's are.
+    let (keyword, rest) = split_first_word(trimmed);
+    if !keyword.eq_ignore_ascii_case("url") {
         return Ok(None);
     }
-    let op = it.next().unwrap_or("");
-    let value = it.next().unwrap_or("").trim();
+    let (op, value) = split_first_word(rest);
+    let op = op.to_ascii_lowercase();
+    let op = op.as_str();
     match op {
         "has" | "is" if !value.is_empty() => Ok(Some(if op == "has" {
             UrlCondition::Has(value.to_string())
@@ -6536,20 +6606,29 @@ fn scan_describe_block(contents: &str) -> Result<Option<(DescribeBlock, Vec<Stri
     Ok(found)
 }
 
+/// A file's text without the byte order mark some editors (Windows Notepad)
+/// put in front of it, which would otherwise be read as part of the first line.
+fn strip_bom(mut text: String) -> String {
+    if text.starts_with('\u{feff}') {
+        text.drain(..'\u{feff}'.len_utf8());
+    }
+    text
+}
+
 /// A `.api` file named on the command line, with the directory its includes
 /// start from. `-` is stdin, `~/` the home directory.
 fn read_api_file(file: &str) -> Result<(String, Option<PathBuf>), String> {
     if file == "-" {
         let mut contents = String::new();
         io::stdin().read_to_string(&mut contents).map_err(|_| "could not read stdin".to_string())?;
-        return Ok((contents, None));
+        return Ok((strip_bom(contents), None));
     }
     let path = match (file.strip_prefix("~/"), dirs::home_dir()) {
         (Some(rest), Some(home)) => format!("{}/{}", home.display(), rest),
         _ => file.to_string(),
     };
     let contents = fs::read_to_string(&path).map_err(|e| format!("could not read {}: {}", path, e))?;
-    Ok((contents, std::path::Path::new(&path).parent().map(|p| p.to_path_buf())))
+    Ok((strip_bom(contents), std::path::Path::new(&path).parent().map(|p| p.to_path_buf())))
 }
 
 /// JSON for stdout: indented, or on one line with `-r`.
@@ -6819,6 +6898,9 @@ fn split_bulk_requests_inner(
     // it; none for the file being run, whose describe block is the program's.
     included_as: Option<&str>,
 ) -> Result<Option<String>, String> {
+    // Whatever the text came from (a file, an include, stdin), a byte order
+    // mark in front of it is not part of its first line.
+    let contents = contents.strip_prefix('\u{feff}').unwrap_or(contents);
     let mut current = String::new();
     let mut place = DescribePlacement::default();
     // Whether `current` is a describe block.
@@ -8950,13 +9032,7 @@ fn handle_key_event(
             let on_first_line = !state.input[..byte_idx].contains('\n');
             if !on_first_line {
                 // Move cursor to same column on previous line
-                let line_start = state.input[..byte_idx].rfind('\n').unwrap(); // safe: not first line
-                let col = byte_idx - line_start - 1;
-                let prev_line_start = state.input[..line_start].rfind('\n')
-                    .map_or(0, |p| p + 1);
-                let prev_line_len = line_start - prev_line_start;
-                let target_col = col.min(prev_line_len);
-                state.cursor_pos = char_len(&state.input[..prev_line_start + target_col]);
+                state.cursor_pos = cursor_line_up(&state.input, state.cursor_pos);
                 render(stdout, state)?;
             } else if !state.history.is_empty() && state.history_idx < state.history.len() as i32 - 1 {
                 if state.history_idx == -1 {
@@ -8976,16 +9052,7 @@ fn handle_key_event(
             let on_last_line = !state.input[byte_idx..].contains('\n');
             if !on_last_line && state.history_idx == -1 {
                 // Move cursor to same column on next line
-                let line_start = state.input[..byte_idx].rfind('\n')
-                    .map_or(0, |p| p + 1);
-                let col = byte_idx - line_start;
-                let next_newline = byte_idx + state.input[byte_idx..].find('\n').unwrap(); // safe: not last line
-                let next_line_start = next_newline + 1;
-                let next_line_end = state.input[next_line_start..].find('\n')
-                    .map_or(state.input.len(), |p| next_line_start + p);
-                let next_line_len = next_line_end - next_line_start;
-                let target_col = col.min(next_line_len);
-                state.cursor_pos = char_len(&state.input[..next_line_start + target_col]);
+                state.cursor_pos = cursor_line_down(&state.input, state.cursor_pos);
                 render(stdout, state)?;
             } else if state.history_idx > 0 {
                 state.history_idx -= 1;
@@ -9230,14 +9297,14 @@ fn handle_key_event(
             }
         }
 
-        // Word navigation back (ctrl+left or alt+b)
-        (KeyModifiers::CONTROL, KeyCode::Left) | (KeyModifiers::ALT, KeyCode::Char('b')) => {
+        // Word navigation back (ctrl+left, alt+left or alt+b)
+        (KeyModifiers::CONTROL, KeyCode::Left) | (KeyModifiers::ALT, KeyCode::Left) | (KeyModifiers::ALT, KeyCode::Char('b')) => {
             state.cursor_pos = word_boundary_back(&state.input, state.cursor_pos);
             render(stdout, state)?;
         }
 
-        // Word navigation forward (ctrl+right or alt+f)
-        (KeyModifiers::CONTROL, KeyCode::Right) | (KeyModifiers::ALT, KeyCode::Char('f')) => {
+        // Word navigation forward (ctrl+right, alt+right or alt+f)
+        (KeyModifiers::CONTROL, KeyCode::Right) | (KeyModifiers::ALT, KeyCode::Right) | (KeyModifiers::ALT, KeyCode::Char('f')) => {
             state.cursor_pos = word_boundary_forward(&state.input, state.cursor_pos);
             render(stdout, state)?;
         }
@@ -11365,7 +11432,7 @@ fn read_inline_input_within(
                         execute!(stdout, Print(format!("{}{}\r\n", prompt, value)))?;
                         return Ok(InlineInput::Entered(buf));
                     }
-                    KeyCode::Char(c) => { buf.push(c); }
+                    KeyCode::Char(c) if types_a_character(key.modifiers) => { buf.push(c); }
                     KeyCode::Backspace => { buf.pop(); }
                     _ => {}
                 }
@@ -16414,6 +16481,13 @@ mod tests {
         assert!(parse_sleep_directive("").is_err());
         assert!(parse_sleep_directive("abc").is_err());
         assert!(parse_sleep_directive("-3").is_err());
+        // More seconds than a Duration holds is an error, not a panic.
+        for too_long in ["1e20", "1e300", "1e23ms", "inf", "nan"] {
+            assert_eq!(
+                parse_sleep_directive(too_long).unwrap_err(),
+                format!("invalid sleep duration: `{too_long}`"),
+            );
+        }
     }
 
     #[test]
@@ -16945,6 +17019,70 @@ mod tests {
         // Malformed url directives → error.
         assert!(parse_url_condition("url has").is_err());
         assert!(parse_url_condition("url foo bar").is_err());
+        // Any case, and any run of blanks between the words.
+        let has = Some(UrlCondition::Has("localhost:5000".to_string()));
+        for line in ["URL has localhost:5000", "Url HAS localhost:5000", "url  has   localhost:5000", "url\thas\tlocalhost:5000"] {
+            assert_eq!(parse_url_condition(line).unwrap(), has, "{line:?}");
+        }
+        assert_eq!(
+            parse_url_condition("URL IS  http://Localhost:5000").unwrap(),
+            Some(UrlCondition::Is("http://Localhost:5000".to_string())),
+        );
+        assert!(parse_url_condition("URL has").is_err());
+        assert_eq!(parse_url_condition("urls.api").unwrap(), None);
+    }
+
+    #[test]
+    fn a_byte_order_mark_is_not_part_of_the_first_line() {
+        assert_eq!(strip_bom("\u{feff}GET /a\n".to_string()), "GET /a\n");
+        assert_eq!(strip_bom("GET /a\n".to_string()), "GET /a\n");
+        assert_eq!(strip_bom(String::new()), "");
+        // Only at the very start.
+        assert_eq!(strip_bom("GET /a\u{feff}".to_string()), "GET /a\u{feff}");
+    }
+
+    #[test]
+    fn form_encode_escapes_what_a_form_body_reserves() {
+        assert_eq!(form_encode("abc-XYZ_0.9*"), "abc-XYZ_0.9*");
+        assert_eq!(form_encode("s&x=1+2%"), "s%26x%3D1%2B2%25");
+        assert_eq!(form_encode("a b"), "a+b");
+        assert_eq!(form_encode("å/~"), "%C3%A5%2F%7E");
+    }
+
+    #[test]
+    fn up_and_down_keep_the_column_in_characters() {
+        // The crash this guards: `ååå`, a new line, `a`, Up.
+        let input = "ååå\na";
+        assert_eq!(cursor_line_up(input, 5), 1);
+        assert_eq!(cursor_line_down(input, 1), 5);
+        // A shorter target line takes the cursor to its end.
+        assert_eq!(cursor_line_down(input, 3), 5);
+        assert_eq!(cursor_line_up("a\nååå", 5), 1);
+        // Three lines, column kept through the middle one.
+        let three = "åäö\nxy\nåäö";
+        assert_eq!(cursor_line_up(three, 9), 6); // col 2 of line 3 → end of `xy`
+        assert_eq!(cursor_line_up(three, 6), 2);
+        assert_eq!(cursor_line_down(three, 3), 6);
+        assert_eq!(cursor_line_down(three, 5), 8);
+        // Nowhere to go: stays put.
+        assert_eq!(cursor_line_up(three, 2), 2);
+        assert_eq!(cursor_line_down(three, 8), 8);
+        assert_eq!(cursor_line_up("", 0), 0);
+        assert_eq!(cursor_line_down("", 0), 0);
+        // Every position of a multi-byte text is a valid place to move from.
+        for pos in 0..=three.chars().count() {
+            assert!(cursor_line_up(three, pos) <= three.chars().count());
+            assert!(cursor_line_down(three, pos) <= three.chars().count());
+        }
+    }
+
+    #[test]
+    fn only_a_plain_or_shifted_key_types_a_character() {
+        assert!(types_a_character(KeyModifiers::NONE));
+        assert!(types_a_character(KeyModifiers::SHIFT));
+        assert!(!types_a_character(KeyModifiers::CONTROL));
+        assert!(!types_a_character(KeyModifiers::ALT));
+        assert!(!types_a_character(KeyModifiers::CONTROL | KeyModifiers::SHIFT));
     }
 
     #[test]
@@ -18806,6 +18944,15 @@ mod tests {
         // An escaped quote must not end the string early and expose the `&&`.
         let escaped = r#"PUT /x { "s": "he said \"hi\" && bye" }"#;
         assert_eq!(chain_texts(escaped), vec![escaped.to_string()]);
+
+        // Inside the parentheses of a URI operator — one request.
+        for in_parens in ["GET /x~where(a=1||b=2)", "GET /x~where(a=1&&b=2)~take(5)"] {
+            assert_eq!(chain_texts(in_parens), vec![in_parens.to_string()]);
+        }
+        assert_eq!(
+            chain_texts("GET /x~where(a=1||b=2) || GET /y"),
+            vec!["GET /x~where(a=1||b=2)".to_string(), "GET /y".to_string()],
+        );
 
         // A separator after a body closes is a real split.
         assert_eq!(
