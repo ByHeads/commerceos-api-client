@@ -13,7 +13,7 @@ METHOD URI [BODY] [> OUTFILE]
 - `METHOD` is one of `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS`.
 - If the first token starts with `/`, `GET` is implied — `/people` is the same as `GET /people`.
 - `URI` may be written **with or without its leading slash**, and with or without the `/api/v1` prefix — `GET api/v1/people`, `GET /api/v1/people`, `GET v1/people`, and `GET /people` all request the same thing. That makes a path copied out of a browser URL or a log usable as-is. In a `.api` file this needs an explicit method, because a bare line that doesn't start with `/` is an [include](#6-includes).
-- `BODY` and `OUTFILE` are optional. If both are present, `BODY` comes first; the `> path` suffix is parsed off the end.
+- `BODY` and `OUTFILE` are optional. If both are present, `BODY` comes first; the `> path` suffix is parsed off the end. A ` >` inside a JSON string, inside brackets or inside the parentheses of a URI operator is not an outfile: `PUT /x {"a":"b > c"}` and `GET /x~where(name="a > b")` are sent as written.
 - A body starts on the request line. A `{` that starts a line of its own is a [describe block](#describe-block), which belongs at the top of the file.
 - A line may hold several requests joined by `&&` / `||`, see [chaining](#5-chaining).
 
@@ -149,7 +149,8 @@ GET /people > clipboard                  # system clipboard, case-insensitive
 - `~/` expands to the home directory.
 - `>> file` appends by content: JSON is spliced into one array, `.ndjson`/`.njson`
   targets get one compact object per line, `.csv` appends drop the duplicate
-  header row, anything else is text-appended. `>> clipboard` is rejected.
+  header row, anything else is text-appended. `>> clipboard` is rejected
+  when the line is read, before anything is sent.
 - A `.ndjson`/`.njson` target always holds one compact JSON value per line,
   after `>` and after any number of `>>`: a single record is one line, and a
   list is one line per element. Other JSON targets are indented.
@@ -760,7 +761,13 @@ api -sa parent.api                    # silent batch mode (see below)
 api -spa parent.api                   # preview the requests, confirm before sending
 api -sfa parent.api                   # stop at the first failed request (see below)
 api --export com.heads.seedID GET /users > users.json   # a response as seed data (see below)
+echo '{"name":"Ann"}' | api PUT /people/com.mi6.id=008  # a body from stdin
 ```
+
+A single request reads a piped stdin as its body only when it is a `POST`,
+`PUT` or `PATCH` and no body argument was given. Any other request leaves
+stdin alone, so it never waits for a pipe and can sit inside a `while read`
+loop.
 
 ### Previewing (`-p`, `--preview`)
 
@@ -1105,7 +1112,7 @@ Run it: `api -sa workshop.api`.
 - **Expecting `--describe` or `-m` to show an included file's block** → both show the block of the file named on the command line only.
 - **Expecting `--assert` to list `assert` lines** → it lists `PUT /assert` bodies. The `assert` keyword is a request judged by truthiness and is not part of the list.
 - **Trailing comma in JSON** → server returns 500 with a parse error. JSON is strict; don't trail commas in objects/arrays.
-- **`>` inside a body** → the parser uses `rfind(" >")` from the end of the request, which can mis-detect outfile when bodies contain `>`. Avoid bare `>` in bodies, or escape it inside strings.
+- **Piping a body to a `GET`** → it is not sent. Stdin is read as a body only for `POST`, `PUT` and `PATCH` without a body argument. And `echo '{…}' | api -p PUT /x` with no terminal is an error: stdin can't be the body and the answer to `-p`. Give the body as an argument or an `@file`.
 - **Unclosed brackets** → the whole run fails with `"unclosed body at end of bulk file"`. If a body looks wrong, check that `{}` and `[]` balance.
 - **Glob with no matches** → hard error. Check the directory and pattern.
 - **Include loops** → `a.api` including `b.api` which includes `a.api` is detected and refused.

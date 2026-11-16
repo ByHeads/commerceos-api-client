@@ -260,6 +260,7 @@ fn cases(dir: &Path) -> Vec<Case> {
     let redirect2 = format!("> {out2}");
     let redirect3 = format!("> {out3}");
     let append4 = format!(">> {out4}");
+    let out5 = out("out5.json").display().to_string();
     let uri_with_redirect1 = format!("/a > {out1}");
     let uri_with_append2 = format!("/a >> {out2}");
     let import_json = format!(r#"{{"url":"{}","ref":"1.0"}}"#, repo_url(dir));
@@ -439,6 +440,28 @@ fn cases(dir: &Path) -> Vec<Case> {
             .fails("a body starts on the request line"),
         case("array where a describe block goes", "[1]\nGET /a", None, &[])
             .fails("a describe block is a JSON object, not an array"),
+        // A `>` inside a JSON string or a URI operator is the request's own
+        case(
+            "> inside a JSON string",
+            r#"PUT /a {"x":"b > c"}"#,
+            Some(&["PUT", "/a", r#"{"x":"b > c"}"#]),
+            &[r#"PUT /a {"x":"b > c"}"#],
+        ),
+        case(
+            "> inside a JSON string, then an outfile",
+            &format!(r#"PUT /a {{"x":"b > c"}} > {out5}"#),
+            Some(&["PUT", "/a", r#"{"x":"b > c"}"#, ">", &out5]),
+            &[r#"PUT /a {"x":"b > c"}"#],
+        )
+        .writes(out("out5.json")),
+        case(
+            "> inside a URI operator",
+            r#"GET /a~where(n="x > y")"#,
+            Some(&["GET", r#"/a~where(n="x > y")"#]),
+            &["GET /a~where(n=%22x%20%3E%20y%22)"],
+        ),
+        case("appending to the clipboard", r#"PUT /a {"x":1} >> clipboard"#, Some(&["PUT", "/a", r#"{"x":1}"#, ">>", "clipboard"]), &[])
+            .fails("cannot append to clipboard"),
         // Directives are read in any case and with any blanks between words
         case("URL gate in capitals", "URL has 127.0.0.1\nGET /a", None, &["GET /a"]),
         case("url gate with doubled blanks", "url  has  127.0.0.1\nGET /a", None, &["GET /a"]),
@@ -560,6 +583,78 @@ fn a_file_read_from_stdin_is_the_same_file() {
         let shown = String::from_utf8_lossy(&out.stderr).to_string();
         check(&case, "stdin", &got, &shown, &case.sent);
     }
+}
+
+/// Stdin is the body of a one-shot request that takes a body and was given
+/// none. A GET leaves it alone, and so can be answered a `-p` from it; a PUT
+/// under `-p` with no terminal would need stdin twice and says so.
+#[cfg(unix)]
+#[test]
+fn a_one_shot_reads_stdin_only_as_a_body_it_needs() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+
+    let put = ask(&server, dir.path(), &["PUT", "/a"], Some(r#"{"x":1}"#));
+    assert_eq!((put.code, &put.sent[..]), (Some(0), &[r#"PUT /a {"x":1}"#.to_string()][..]), "{}", put.stderr);
+
+    // A GET sends no piped body.
+    let get = ask(&server, dir.path(), &["GET", "/a"], Some("not a body"));
+    assert_eq!((get.code, &get.sent[..]), (Some(0), &["GET /a".to_string()][..]), "{}", get.stderr);
+    let delete = ask(&server, dir.path(), &["DELETE", "/a"], Some("not a body"));
+    assert_eq!((delete.code, &delete.sent[..]), (Some(0), &["DELETE /a".to_string()][..]), "{}", delete.stderr);
+
+    // `-p` on a GET is answered from the pipe.
+    let yes = ask(&server, dir.path(), &["-p", "GET", "/a"], Some("y\n"));
+    assert_eq!((yes.code, &yes.sent[..]), (Some(0), &["GET /a".to_string()][..]), "{}", yes.stderr);
+    assert!(yes.stderr.contains("  GET /a\n"), "{}", yes.stderr);
+    let no = ask(&server, dir.path(), &["-p", "GET", "/a"], Some("n\n"));
+    assert_eq!((no.code, no.sent.len()), (Some(0), 0), "{}", no.stderr);
+    let unanswered = ask(&server, dir.path(), &["-p", "GET", "/a"], Some(""));
+    assert_eq!((unanswered.code, unanswered.sent.len()), (Some(1), 0), "{}", unanswered.stderr);
+    assert!(unanswered.stderr.contains(UNANSWERED), "{}", unanswered.stderr);
+
+    // A PUT under `-p`: stdin can't be the body and the answer.
+    let both = ask(&server, dir.path(), &["-p", "PUT", "/a"], Some(r#"{"x":1}"#));
+    assert_eq!((both.code, both.sent.len()), (Some(1), 0), "{}", both.stderr);
+    assert!(both.stderr.contains("the body can't come from stdin too"), "{}", both.stderr);
+    // With the body as an argument, the pipe is the answer.
+    let split = ask(&server, dir.path(), &["-p", "PUT", "/a", r#"{"x":1}"#], Some("y\n"));
+    assert_eq!((split.code, &split.sent[..]), (Some(0), &[r#"PUT /a {"x":1}"#.to_string()][..]), "{}", split.stderr);
+}
+
+/// A GET does not wait for a stdin that stays open, and leaves it for
+/// whoever reads next (a `while read` loop around the client).
+#[test]
+fn a_get_does_not_wait_for_an_open_stdin() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    server.take();
+    let mut child = api(server.port, dir.path())
+        .args(["GET", "/a"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn api");
+    // The pipe is held open and nothing is written to it.
+    let held = child.stdin.take().unwrap();
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if start.elapsed() > Duration::from_secs(10) {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    if status.is_none() {
+        let _ = child.kill();
+    }
+    drop(held);
+    assert!(status.is_some_and(|s| s.success()), "the client waited for stdin");
+    server.settle(Duration::from_millis(150), Duration::from_secs(3));
+    assert_eq!(server.take(), ["GET /a"]);
 }
 
 /// A file saved by an editor that puts a byte order mark in front of it

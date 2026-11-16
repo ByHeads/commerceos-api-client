@@ -3112,7 +3112,7 @@ fn main() {
     let (method, uri, mut body) = if program_line.is_none() && !method.is_empty() {
         // A `> file` given in the URI argument with the body after it
         // (`api PUT "/x > out.json" '{…}'`) goes last, where a line keeps it.
-        let (uri, redirect) = match uri.find(" >") {
+        let (uri, redirect) = match outfile_marker_at(&uri) {
             Some(i) => (uri[..i].trim().to_string(), uri[i..].to_string()),
             None => (uri, String::new()),
         };
@@ -3129,8 +3129,29 @@ fn main() {
         (method, uri, body)
     };
 
-    // Read from stdin if available and no body provided (and not bulk mode)
-    if body.is_empty() && args.all.is_none() && program_line.is_none() && !io::stdin().is_terminal() {
+    // A one-shot request that can't be sent is refused before anything else
+    // happens (`>> clipboard`), as a line of a file is.
+    if program_line.is_none() && !method.is_empty() {
+        if let Err(e) = refuse_request(&format!("{} {}", method, uri)) {
+            eprintln!("error: {}", e);
+            exit_process(1);
+        }
+    }
+
+    // A piped stdin is the body of a request that takes one and was given
+    // none. A GET or a DELETE never reads it: it would wait for a pipe that
+    // stays open, and swallow the input of a `while read` loop around it.
+    let takes_body = ["POST", "PUT", "PATCH"].contains(&method.as_str()) && !uri.is_empty();
+    if body.is_empty() && takes_body && args.all.is_none() && program_line.is_none() && !io::stdin().is_terminal() {
+        // `-p` asks a question, and with no terminal its answer comes from
+        // stdin too. Stdin can't be both.
+        if args.preview && !terminal_can_answer() {
+            eprintln!(
+                "error: -p reads its answer from stdin here, so the body can't come from stdin too. \
+                 Give the body as an argument or an @file, or leave -p off."
+            );
+            exit_process(1);
+        }
         let mut stdin_content = String::new();
         if io::stdin().read_to_string(&mut stdin_content).is_ok() {
             body = stdin_content.trim().to_string();
@@ -3909,6 +3930,93 @@ fn normalize_request_text(text: &str) -> Result<String, String> {
     Ok(escape_newlines_in_strings(&cleaned))
 }
 
+/// Where the ` > outfile` (or ` >> outfile`) of a request starts: the last
+/// ` >` that is outside a JSON string and outside brackets and parentheses.
+/// A `>` in a body (`{"a":"b > c"}`) or in a URI operator
+/// (`~where(name="a > b")`) is the request's own, as `&&` there is.
+///
+/// A text whose quotes or brackets don't balance has no inside or outside to
+/// go by, so there the last ` >` is taken, as it always was.
+fn outfile_marker_at(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut found = None;
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, ch) in text.char_indices() {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' | '[' | '(' => depth += 1,
+            '}' | ']' | ')' => depth -= 1,
+            ' ' if depth <= 0 && bytes.get(i + 1) == Some(&b'>') => found = Some(i),
+            _ => {}
+        }
+    }
+    if in_string || depth > 0 {
+        return text.rfind(" >");
+    }
+    found
+}
+
+/// A URI as `parse_request_line` hands it back, split into the URI and its
+/// ` > outfile` suffix (empty when there is none).
+fn split_uri_outfile(uri: &str) -> (&str, &str) {
+    match outfile_marker_at(uri) {
+        Some(at) => uri.split_at(at),
+        None => (uri, ""),
+    }
+}
+
+/// Where the URI ends in the text that follows a method: at the first blank
+/// that is outside quotes and parentheses, so `/x~where(name="a b")` is one
+/// URI. With unbalanced quotes or parentheses it ends at the first blank.
+fn uri_end(text: &str) -> usize {
+    let mut depth = 0i32;
+    let mut in_string = false;
+    for (i, ch) in text.char_indices() {
+        if in_string {
+            in_string = ch != '"';
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            c if c.is_whitespace() && depth <= 0 => return i,
+            _ => {}
+        }
+    }
+    if in_string || depth > 0 {
+        return text.find(char::is_whitespace).unwrap_or(text.len());
+    }
+    text.len()
+}
+
+/// A request that could be parsed but must not be sent, and why. Checked
+/// while a file or a line is read, so nothing has been sent when it is said.
+fn refuse_request(request: &str) -> Result<(), String> {
+    let Some((_, uri, _)) = parse_request_line(request) else {
+        return Ok(());
+    };
+    let (_, redirect) = split_uri_outfile(&uri);
+    if let Some(target) = redirect.strip_prefix(" >>") {
+        if is_clipboard_target(target) {
+            return Err("cannot append to clipboard — use > clipboard".to_string());
+        }
+    }
+    Ok(())
+}
+
 fn parse_request_line(line: &str) -> Option<(String, String, String)> {
     let mut working = line.trim().to_string();
     if working.is_empty() || working.starts_with('#') {
@@ -3917,7 +4025,7 @@ fn parse_request_line(line: &str) -> Option<(String, String, String)> {
 
     // Strip ` > outfile` / ` >> outfile` from the end (matches parse_input),
     // preserving which marker it was so append survives the round-trip.
-    let outfile_suffix: String = if let Some(idx) = working.rfind(" >") {
+    let outfile_suffix: String = if let Some(idx) = outfile_marker_at(&working) {
         let mut rest = &working[idx + 2..];
         let append = rest.starts_with('>');
         if append {
@@ -3945,20 +4053,21 @@ fn parse_request_line(line: &str) -> Option<(String, String, String)> {
         if after_method.is_empty() {
             (first_upper, "/".to_string(), String::new())
         } else {
-            let uri_end = after_method.find(|c: char| c.is_whitespace()).unwrap_or(after_method.len());
+            let uri_end = uri_end(after_method);
             let uri = after_method[..uri_end].to_string();
             let body = after_method[uri_end..].trim_start_matches(|c: char| c == ' ' || c == '\t').to_string();
             (first_upper, uri, body)
         }
     } else if starts_a_request(first_word) {
-        let uri = first_word.to_string();
+        let first_end = uri_end(&working);
+        let uri = working[..first_end].to_string();
         let body = working[first_end..].trim_start_matches(|c: char| c == ' ' || c == '\t').to_string();
         ("GET".to_string(), uri, body)
     } else {
         return None;
     };
 
-    // Append outfile suffix to URI so run_non_interactive's `uri.find(" >")` picks it up
+    // Append outfile suffix to URI, where `split_uri_outfile` finds it again
     Some((method, format!("{}{}", uri, outfile_suffix), body))
 }
 
@@ -5383,7 +5492,7 @@ fn parse_condition(condition: &str, what: &str, usage: &str) -> Result<(bool, St
     }
     let (_, uri, _) = parse_request_line(request)
         .ok_or_else(|| format!("{} condition is not a request: `{}` — {}", what, request, usage))?;
-    if uri.contains(" >") {
+    if outfile_marker_at(&uri).is_some() {
         return Err(format!(
             "{} condition can't write to a file (its output is discarded): `{}`",
             what, request
@@ -6433,10 +6542,7 @@ fn rebase_at_body(
     let functions = &body[file_body.len()..];
     let raw = file_body.trim_start_matches('@').trim();
     let path = rebase_import_path(raw, file_dir, repo)?;
-    let (uri, outfile) = match uri_and_outfile.find(" >") {
-        Some(i) => uri_and_outfile.split_at(i),
-        None => (uri_and_outfile.as_str(), ""),
-    };
+    let (uri, outfile) = split_uri_outfile(&uri_and_outfile);
     Ok(format!("{} {} @{}{}{}", method, uri, path, functions, outfile))
 }
 
@@ -6870,7 +6976,7 @@ fn print_describe_first(block: &DescribeBlock) {
 
 /// Whether a request URI is the `/assert` endpoint of an API version.
 fn is_assert_uri(api_path: &str, uri: &str) -> bool {
-    let uri = uri.split(" >").next().unwrap_or("").trim();
+    let uri = split_uri_outfile(uri).0.trim();
     let path = resolve_request_path(api_path, uri);
     let Some(prefix) = path.trim_end_matches('/').strip_suffix("/assert") else {
         return false;
@@ -6906,7 +7012,7 @@ fn collect_assertions(program: &BulkProgram, api_path: &str) -> Result<Vec<serde
             None => body.clone(),
         };
         let value = serde_json::from_str(text.trim())
-            .map_err(|e| format!("the body of `PUT {}` is not JSON: {}", uri.split(" >").next().unwrap_or("").trim(), e))?;
+            .map_err(|e| format!("the body of `PUT {}` is not JSON: {}", split_uri_outfile(&uri).0.trim(), e))?;
         assertions.push(value);
     }
     Ok(assertions)
@@ -7170,6 +7276,9 @@ fn split_bulk_requests_inner(
                     return Err(format!("chain segment is not a request: `{}`", bad.trim()));
                 }
             }
+            for (_, segment) in &segments {
+                refuse_request(segment)?;
+            }
             place.request(if segments.len() > 1 { "" } else { &assembled });
             program.steps.push(if segments.len() > 1 {
                 BulkStep::Chain(segments)
@@ -7247,10 +7356,8 @@ fn format_request_preview(method: &str, uri: &str, body: &str) -> String {
     }
     // `parse_request_line` hands the ` > outfile` back on the URI. It is shown
     // where it is written and where the prompt's log has it: behind the body.
-    match uri.find(" >") {
-        Some(at) => format!("{} {} {}{}", method, &uri[..at], display_body, &uri[at..]),
-        None => format!("{} {} {}", method, uri, display_body),
-    }
+    let (uri, redirect) = split_uri_outfile(uri);
+    format!("{} {} {}{}", method, uri, display_body, redirect)
 }
 
 /// Format the request line echoed above a response in the TUI log:
@@ -7468,6 +7575,18 @@ fn note_last_block(state: &mut AppState, stdout: &mut io::Stdout, note: &str) ->
 /// terminal and nothing on stdin (CI, cron, a closed or empty pipe), or ctrl+D
 /// at a terminal, nobody agreed. That, like a read error, prints an abort
 /// message and exits 1 with nothing sent. A decline returns false (exit 0).
+/// The terminal a question is asked on when there is one, whatever stdin is:
+/// `/dev/tty`. Without it the answer is read from stdin.
+fn open_answer_terminal() -> io::Result<fs::File> {
+    fs::File::open("/dev/tty")
+}
+
+/// Whether a `confirm` or a `-p` can be answered at a terminal, so that stdin
+/// is free to be something else.
+fn terminal_can_answer() -> bool {
+    open_answer_terminal().is_ok()
+}
+
 fn ask_yes_no(prompt: &str) -> bool {
     eprint!("{} ", prompt.bold());
     let _ = io::stderr().flush();
@@ -7475,7 +7594,7 @@ fn ask_yes_no(prompt: &str) -> bool {
     // Read a single line of input, preferring /dev/tty so a piped stdin
     // (e.g. `-a -`) does not consume the request data as the answer.
     let mut answer = String::new();
-    let read = match fs::File::open("/dev/tty") {
+    let read = match open_answer_terminal() {
         Ok(tty) => io::BufReader::new(tty).read_line(&mut answer),
         Err(_) => io::stdin().read_line(&mut answer),
     };
@@ -7904,7 +8023,7 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
 
     // Parse > / >> outfile from URI (space required before >, optional after;
     // `>>` appends instead of overwriting)
-    let (actual_uri, outfile, display_outfile, outfile_append) = if let Some(idx) = uri.find(" >") {
+    let (actual_uri, outfile, display_outfile, outfile_append) = if let Some(idx) = outfile_marker_at(uri) {
         let mut rest = &uri[idx + 2..];
         let append = rest.starts_with('>');
         if append {
@@ -9887,7 +10006,7 @@ fn parse_input(state: &mut AppState, input: &str) {
     state.config.outfile.clear();
     state.config.outfile_append = false;
     state.display_outfile.clear();
-    if let Some(idx) = input.rfind(" >") {
+    if let Some(idx) = outfile_marker_at(&input) {
         let mut after_gt = &input[idx + 2..];
         let append = after_gt.starts_with('>');
         if append {
@@ -9929,7 +10048,7 @@ fn parse_input(state: &mut AppState, input: &str) {
             state.uri = "/".to_string();
             state.body = String::new();
         } else {
-            let uri_end = after_method_trimmed.find(|c: char| c.is_whitespace()).unwrap_or(after_method_trimmed.len());
+            let uri_end = uri_end(after_method_trimmed);
             state.uri = after_method_trimmed[..uri_end].to_string();
             // Body is everything after URI; trim leading spaces/tabs but preserve newlines
             let after_uri = &after_method_trimmed[uri_end..];
@@ -9938,7 +10057,8 @@ fn parse_input(state: &mut AppState, input: &str) {
         }
     } else if starts_a_request(first_word) {
         state.method = "GET".to_string();
-        state.uri = first_word.to_string();
+        let first_end = uri_end(trimmed);
+        state.uri = trimmed[..first_end].to_string();
         // Body is everything after URI; trim leading spaces/tabs but preserve newlines
         let after_uri = &trimmed[first_end..];
         let body = after_uri.trim_start_matches(|c: char| c == ' ' || c == '\t');
@@ -14378,7 +14498,10 @@ fn extract_file_path_context(input: &str, cursor_pos: usize) -> Option<FilePathC
     // ` >` (outfile, including ` >>` append) takes precedence over ` @`, as
     // before. Space before the marker required, optional space after.
     for (marker, is_outfile) in [(" >", true), (" @", false)] {
-        if let Some(idx) = segment.rfind(marker) {
+        // The outfile marker is found the way the parser finds it, so a `>`
+        // inside a body being typed is not taken for one.
+        let at = if is_outfile { outfile_marker_at(segment) } else { segment.rfind(marker) };
+        if let Some(idx) = at {
             let mut after = idx + 2;
             // ` >>` — the second `>` is part of the marker, not the path.
             let is_append = is_outfile && segment[after..].starts_with('>');
@@ -17192,6 +17315,75 @@ mod tests {
         assert!(!types_a_character(KeyModifiers::CONTROL));
         assert!(!types_a_character(KeyModifiers::ALT));
         assert!(!types_a_character(KeyModifiers::CONTROL | KeyModifiers::SHIFT));
+    }
+
+    #[test]
+    fn the_outfile_marker_is_found_outside_strings_and_brackets() {
+        // (line, where the redirect starts)
+        let cases: [(&str, Option<&str>); 12] = [
+            ("GET /people > out.json", Some(" > out.json")),
+            ("GET /people >> out.json", Some(" >> out.json")),
+            ("GET /people >out.json", Some(" >out.json")),
+            ("GET /people", None),
+            (r#"PUT /x {"a":"b > c"}"#, None),
+            (r#"PUT /x {"a":"b > c"} > out.json"#, Some(" > out.json")),
+            (r#"PUT /x {"a":"he said \"x > y\""} >> o.json"#, Some(" >> o.json")),
+            (r#"PUT /x [1 > 2]"#, None),
+            (r#"GET /x~where(name="a > b")"#, None),
+            (r#"GET /x~where(a >1) > o.csv"#, Some(" > o.csv")),
+            // The last one outside wins, as it always did.
+            ("GET /x > a > b", Some(" > b")),
+            // Unbalanced: nothing to go by, so the last ` >` is taken.
+            (r#"PUT /x {"a":"b > c"#, Some(r#" > c"#)),
+        ];
+        for (line, redirect) in cases {
+            assert_eq!(outfile_marker_at(line).map(|at| &line[at..]), redirect, "{line}");
+        }
+        assert_eq!(split_uri_outfile(r#"/x~where(n="a > b") > o.json"#), (r#"/x~where(n="a > b")"#, " > o.json"));
+        assert_eq!(split_uri_outfile("/x"), ("/x", ""));
+    }
+
+    #[test]
+    fn a_request_line_keeps_a_gt_that_is_its_own() {
+        let parsed = |line: &str| parse_request_line(line).unwrap();
+        let s = |v: &str| v.to_string();
+        assert_eq!(parsed(r#"PUT /x {"a":"b > c"}"#), (s("PUT"), s("/x"), s(r#"{"a":"b > c"}"#)));
+        assert_eq!(
+            parsed(r#"PUT /x {"a":"b > c"} > out.json"#),
+            (s("PUT"), s("/x > out.json"), s(r#"{"a":"b > c"}"#))
+        );
+        // A URI operator with blanks and a `>` in its parentheses is one URI.
+        assert_eq!(parsed(r#"GET /x~where(name="a > b")"#), (s("GET"), s(r#"/x~where(name="a > b")"#), s("")));
+        assert_eq!(parsed(r#"/x~where(name="a b") > o.json"#), (s("GET"), s(r#"/x~where(name="a b") > o.json"#), s("")));
+        assert_eq!(
+            parsed(r#"PUT /x~where(a=1 || b=2) {"y":1}"#),
+            (s("PUT"), s("/x~where(a=1 || b=2)"), s(r#"{"y":1}"#))
+        );
+        // Unbalanced: the URI ends at the first blank, as before.
+        assert_eq!(parsed(r#"PUT /x(y {"a":1}"#), (s("PUT"), s("/x(y"), s(r#"{"a":1}"#)));
+
+        // The prompt reads the same line the same way.
+        let mut state = AppState::new(Config::default());
+        parse_input(&mut state, r#"PUT /x {"a":"b > c"}"#);
+        assert_eq!((state.uri.as_str(), state.body.as_str()), ("/x", r#"{"a":"b > c"}"#));
+        assert!(state.config.outfile.is_empty());
+        parse_input(&mut state, r#"GET /x~where(name="a > b") >> o.json"#);
+        assert_eq!((state.uri.as_str(), state.body.as_str()), (r#"/x~where(name="a > b")"#, ""));
+        assert_eq!((state.config.outfile.as_str(), state.config.outfile_append), ("o.json", true));
+    }
+
+    #[test]
+    fn appending_to_the_clipboard_is_refused_when_the_line_is_read() {
+        for line in ["GET /a >> clipboard", "PUT /a {\"x\":1} >> CLIPBOARD", "GET /a && GET /b >> clipboard"] {
+            let err = split_bulk_requests(line, None).unwrap_err();
+            assert_eq!(err, "cannot append to clipboard — use > clipboard", "{line}");
+        }
+        for line in ["GET /a > clipboard", "GET /a >> clipboard.json", r#"PUT /a {"x":" >> clipboard"}"#] {
+            assert!(split_bulk_requests(line, None).is_ok(), "{line}");
+        }
+        // An assert may not write anywhere, and says that first.
+        assert!(split_bulk_requests(r#"assert PUT /x {"a":"b > c"}"#, None).is_ok());
+        assert!(split_bulk_requests("assert GET /x > o.json", None).unwrap_err().contains("can't write to a file"));
     }
 
     #[test]
