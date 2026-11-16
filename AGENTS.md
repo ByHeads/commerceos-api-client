@@ -613,7 +613,11 @@ PUT /assert {"api/v1/people~count":{"is":3}}
   keyword. So `PUT /assert {…} && PUT /x {…}` never runs the write, and
   `assert PUT /assert {…}` fails when the assertions hold.
 - The `assert` keyword still works and still reports its own failures, with
-  or without `-f`.
+  or without `-f`. A failed assertion is a verdict and prints no body.
+- An `assert` or a `sleep while` poll that gets a status that is never an
+  answer (401/403/408/429/5xx) says so on stderr (`… could not be evaluated,
+  aborting`) and, under `-f`, the body of that response is the last thing on
+  stdout, as for any other response that ends the run.
 - **A question may still be answered "no".** A chain segment with another
   after it (`GET /x || PUT /x {…}`), `assert not`, and a `sleep while` poll
   ask something, and a 404 or 409 is their answer, so they don't trip `-f`.
@@ -821,6 +825,10 @@ GET /people > out.json
 Use this when you only care that requests succeeded or want a tidy log of a
 seeding run.
 
+A request line is logged as it is written, the body on one line and a
+`> outfile` last: `PUT /people [{"name":"Ann"}] > /tmp/put.json`. The `-p`
+preview and the interactive prompt show it the same way.
+
 A slow request shows a self-erasing progress line (`⠙ received 12.4 MB`) on
 stderr, but only when stderr is a terminal. Captured or piped output never
 contains it, so a log holds the same lines however long a request took.
@@ -877,6 +885,7 @@ Run it: `api -sa workshop.api`.
 - **`assert` on a list endpoint** → `[]` is truthy, so `assert GET /people~where(x)` passes even when nothing matches. Assert a `~count` or a single item by identifier instead.
 - **A slashless URI on its own line in a `.api` file** → `api/v1/people` alone is read as an *include* path and fails with "could not read include". Write `GET api/v1/people`, or lead with the slash: `/api/v1/people`.
 - **`sleep while` that never ends** → `[]` and `{}` are truthy, so `sleep while GET /people~where(x)` loops forever once the list is merely empty. Poll a `~count` (or a single scalar field) instead, so the answer can become `0`/`null`.
+- **`https://` to a server with a self-signed or private certificate** → `The certificate of <host> is not trusted: it is not signed by a public certificate authority.` The client trusts the public authorities compiled into it and nothing from the machine, so such a certificate can't be made to pass; use `http://` for a local server. `Is COS running on <host>?` is kept for a host that did not answer at all.
 - **`API_CREDENTIALS_FILE` without `--no-keychain`** → the variable is ignored and the keychain is read instead. A bad path or malformed credentials file fails the same silent way: no warning, just `Error: no base URL specified`.
 
 ## 11. Tips for agents

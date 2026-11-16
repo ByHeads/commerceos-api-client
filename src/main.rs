@@ -4092,20 +4092,76 @@ fn io_error_is_timeout(e: &io::Error) -> bool {
             .unwrap_or(false)
 }
 
+/// The TLS failure behind a request that got no response, if that is what
+/// stopped it. rustls's error sits some levels down, and where an `io::Error`
+/// carries it, inside that error rather than behind it.
+fn tls_failure<'a>(e: &'a (dyn std::error::Error + 'static)) -> Option<&'a rustls::Error> {
+    let mut next = Some(e);
+    while let Some(err) = next {
+        if let Some(tls) = err.downcast_ref::<rustls::Error>() {
+            return Some(tls);
+        }
+        let carried = err
+            .downcast_ref::<io::Error>()
+            .and_then(|io| io.get_ref())
+            .and_then(|inner| tls_failure(inner));
+        if carried.is_some() {
+            return carried;
+        }
+        next = err.source();
+    }
+    None
+}
+
+/// What to say when the server answered the connection but not with a
+/// certificate the client accepts, or not with TLS at all. A server that is
+/// there must not be reported as one that isn't.
+fn describe_tls_failure(e: &rustls::Error, host: &str) -> String {
+    use rustls::CertificateError as Cert;
+    match e {
+        rustls::Error::InvalidCertificate(why) => {
+            let why = match why {
+                Cert::Expired | Cert::ExpiredContext { .. } => "it has expired".to_string(),
+                Cert::NotValidYet | Cert::NotValidYetContext { .. } => "it is not valid yet".to_string(),
+                Cert::NotValidForName | Cert::NotValidForNameContext { .. } => {
+                    "it is for another host name".to_string()
+                }
+                Cert::Revoked => "it has been revoked".to_string(),
+                // Self-signed, or signed by an authority of one's own. The
+                // roots are the public ones compiled into the client, so
+                // such a certificate can't be made to pass on this machine.
+                _ => "it is not signed by a public certificate authority".to_string(),
+            };
+            format!("The certificate of {} is not trusted: {}.", host, why)
+        }
+        other => format!("No secure connection to {}: {}", host, other),
+    }
+}
+
+/// The host part of a base URL, as the connection messages name it.
+fn host_of(base_uri: &str) -> &str {
+    base_uri.trim_start_matches("https://").trim_start_matches("http://")
+}
+
 /// Why a request produced no response to show.
 struct RequestFailure {
     timed_out: bool,
+    /// A refused certificate or a failed handshake, described.
+    tls: Option<String>,
 }
 
-impl From<reqwest::Error> for RequestFailure {
-    fn from(e: reqwest::Error) -> Self {
-        RequestFailure { timed_out: e.is_timeout() }
+impl RequestFailure {
+    fn of(e: reqwest::Error, base_uri: &str) -> Self {
+        RequestFailure {
+            timed_out: e.is_timeout(),
+            tls: tls_failure(&e).map(|tls| describe_tls_failure(tls, host_of(base_uri))),
+        }
     }
 }
 
 impl From<io::Error> for RequestFailure {
     fn from(e: io::Error) -> Self {
-        RequestFailure { timed_out: io_error_is_timeout(&e) }
+        RequestFailure { timed_out: io_error_is_timeout(&e), tls: None }
     }
 }
 
@@ -4661,7 +4717,8 @@ fn export_warning(exported: &ExportedBody) -> Option<String> {
 /// `assert not`) may be answered "no", so its 404 or 409 is an answer and the
 /// run goes on; 401/403/408/429/5xx are never an answer and still end it. A
 /// poll and an `assert` report their own failure, with the reason, and are
-/// not `-f`'s to cut short.
+/// not `-f`'s to cut short; when one ends the run on a status that is never
+/// an answer, `exit_on_unjudged_check` prints the body for `-f`.
 fn fail_fast_trips(config: &Config, status: u16) -> bool {
     config.fail_fast
         && status >= 400
@@ -4684,6 +4741,17 @@ fn fail_fast_exit(body: &str) -> ! {
     }
     let _ = out.flush();
     std::process::exit(1);
+}
+
+/// An `assert` or a poll got a response it could not judge (401/403/408/429/
+/// 5xx) and is ending the run. It has said so itself on stderr; under `-f`
+/// the body follows on stdout, last, as for any response that ends a run.
+/// Without `-f`, or when there was no response (a timeout), it exits 1 as is.
+fn exit_on_unjudged_check(config: &mut Config) -> ! {
+    match config.last_response.take() {
+        Some((_, body)) if config.fail_fast => fail_fast_exit(&body),
+        _ => std::process::exit(1),
+    }
 }
 
 /// How a status line should read at a glance.
@@ -6404,9 +6472,13 @@ fn split_bulk_requests_in_session(contents: &str) -> Result<BulkProgram, String>
 fn format_request_preview(method: &str, uri: &str, body: &str) -> String {
     let display_body = compact_body_for_display(body);
     if display_body.is_empty() {
-        format!("{} {}", method, uri)
-    } else {
-        format!("{} {} {}", method, uri, display_body)
+        return format!("{} {}", method, uri);
+    }
+    // `parse_request_line` hands the ` > outfile` back on the URI. It is shown
+    // where it is written and where the prompt's log has it: behind the body.
+    match uri.find(" >") {
+        Some(at) => format!("{} {} {}{}", method, &uri[..at], display_body, &uri[at..]),
+        None => format!("{} {} {}", method, uri, display_body),
     }
 }
 
@@ -6890,7 +6962,8 @@ fn run_assert(config: &mut Config, negate: bool, request: &str) -> bool {
         }
         RequestOutcome::Errored => {
             eprintln!("error: {} — could not be evaluated, aborting", line);
-            std::process::exit(1);
+            config.last_response = response;
+            exit_on_unjudged_check(config);
         }
         RequestOutcome::Aborted => false,
     }
@@ -6931,6 +7004,7 @@ fn run_sleep_while(config: &mut Config, interval: Duration, negate: bool, reques
     loop {
         checks += 1;
         config.quiet = true;
+        config.last_response = None;
         let outcome = run_non_interactive(config, &method, &uri, &body);
         config.quiet = false;
         match outcome {
@@ -6942,7 +7016,7 @@ fn run_sleep_while(config: &mut Config, interval: Duration, negate: bool, reques
                     "error: {} — condition could not be evaluated (check {}), aborting",
                     line, checks
                 );
-                std::process::exit(1);
+                exit_on_unjudged_check(config);
             }
             RequestOutcome::Aborted => return false,
         }
@@ -6964,15 +7038,9 @@ fn run_sleep_while(config: &mut Config, interval: Duration, negate: bool, reques
 fn run_bulk_request(config: &mut Config, request: &str) -> Option<RequestOutcome> {
     let (method, uri, body) = parse_request_line(request)?;
     if config.bulk_silent {
-        // Compact the body for display: parse as JSON and re-serialize without whitespace,
-        // falling back to the raw body if it's not JSON (e.g., @file references).
-        // Unstyled, like the TUI log.
-        let display_body = compact_body_for_display(&body);
-        if display_body.is_empty() {
-            println!("{} {}", method, uri);
-        } else {
-            println!("{} {} {}", method, uri, display_body);
-        }
+        // The line as the preview shows it: the body compacted, the outfile
+        // last. Unstyled, like the TUI log.
+        println!("{}", format_request_preview(&method, &uri, &body));
     }
     Some(run_non_interactive(config, &method, &uri, &body))
 }
@@ -7437,9 +7505,10 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                     "Timed out after {} — raise it with --timeout <seconds> (0 = no timeout)\n",
                     describe_timeout(config.timeout_secs)
                 );
+            } else if let Some(tls) = tls_failure(&e) {
+                eprintln!("{}\n", describe_tls_failure(tls, host_of(&config.base_uri)));
             } else {
-                let host = config.base_uri.trim_start_matches("https://").trim_start_matches("http://");
-                eprintln!("Is COS running on {}? 🤔\n", host);
+                eprintln!("Is COS running on {}? 🤔\n", host_of(&config.base_uri));
             }
             std::process::exit(1);
         }
@@ -9278,8 +9347,9 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     let response_result_clone = Arc::clone(&response_result);
     let progress = TransferProgress::new();
     let thread_progress = Arc::clone(&progress);
+    let failure_base_uri = state.config.base_uri.clone();
     let request_handle = thread::spawn(move || {
-        let result = request.send().map_err(RequestFailure::from).and_then(|resp| {
+        let result = request.send().map_err(|e| RequestFailure::of(e, &failure_base_uri)).and_then(|resp| {
             let status = resp.status();
             thread_progress.headers_arrived(&resp);
             if let Some(path) = stream_outfile {
@@ -9596,9 +9666,10 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
                     "\nTimed out after {} — raise it with --timeout <seconds> (0 = no timeout)\n\n",
                     describe_timeout(state.config.timeout_secs)
                 )
+            } else if let Some(tls) = &e.tls {
+                format!("\n{}\n\n", tls)
             } else {
-                let host = state.config.base_uri.trim_start_matches("https://").trim_start_matches("http://");
-                format!("\nIs COS running on {}? 🤔\n\n", host)
+                format!("\nIs COS running on {}? 🤔\n\n", host_of(&state.config.base_uri))
             };
         }
         None => {
@@ -15836,6 +15907,45 @@ mod tests {
             parse_confirm_step("  Ready?  ").unwrap(),
             BulkStep::Confirm(Some("Ready?".to_string()))
         );
+    }
+
+    #[test]
+    fn a_previewed_request_reads_as_it_is_written() {
+        let shown = |line: &str| {
+            let (method, uri, body) = parse_request_line(line).unwrap();
+            format_request_preview(&method, &uri, &body)
+        };
+        assert_eq!(shown("GET /a"), "GET /a");
+        assert_eq!(shown("GET /a > out.json"), "GET /a > out.json");
+        // The body is compacted and the outfile stays behind it.
+        assert_eq!(shown("PUT /f { \"y\": 2 } > out.json"), "PUT /f {\"y\":2} > out.json");
+        assert_eq!(shown("PUT /f {\"y\":2} >> out.json"), "PUT /f {\"y\":2} >> out.json");
+        assert_eq!(shown("PUT /f @body.json > out.json"), "PUT /f @body.json > out.json");
+        assert_eq!(format_assert(true, "PUT /c {\"z\": 3}"), "assert not PUT /c {\"z\":3}");
+    }
+
+    #[test]
+    fn a_tls_failure_is_found_wherever_the_error_carries_it() {
+        let cert = || rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer);
+        // On its own, inside an `io::Error`, and behind another error.
+        assert!(tls_failure(&cert()).is_some());
+        let wrapped = io::Error::new(io::ErrorKind::InvalidData, cert());
+        assert!(tls_failure(&wrapped).is_some());
+        assert!(tls_failure(&io::Error::new(io::ErrorKind::ConnectionRefused, "refused")).is_none());
+
+        let says = |why| describe_tls_failure(&rustls::Error::InvalidCertificate(why), "example.com");
+        assert_eq!(
+            says(rustls::CertificateError::UnknownIssuer),
+            "The certificate of example.com is not trusted: it is not signed by a public certificate authority."
+        );
+        assert_eq!(says(rustls::CertificateError::Expired), "The certificate of example.com is not trusted: it has expired.");
+        assert_eq!(
+            says(rustls::CertificateError::NotValidForName),
+            "The certificate of example.com is not trusted: it is for another host name."
+        );
+        assert!(describe_tls_failure(&rustls::Error::HandshakeNotComplete, "h:1").starts_with("No secure connection to h:1: "));
+        assert_eq!(host_of("https://cos.example.com"), "cos.example.com");
+        assert_eq!(host_of("http://localhost:5000"), "localhost:5000");
     }
 
     #[test]

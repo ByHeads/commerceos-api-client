@@ -2138,6 +2138,35 @@ fn self_signed_https_server() -> (u16, std::thread::JoinHandle<(bool, String)>) 
 }
 
 #[test]
+fn a_port_that_speaks_no_tls_and_one_nobody_listens_on_are_told_apart() {
+    // Plain http behind an https URL: there is a server, and that is said.
+    let (port, server) = whole_request_server(vec![("200 OK", "{}")]);
+    let run = |port: u16| {
+        Command::cargo_bin("api")
+            .unwrap()
+            .arg("--no-keychain")
+            .env("API_CREDENTIALS_FILE", "/nonexistent/credentials.json")
+            .env("NO_COLOR", "1")
+            .args(["-b", &format!("https://127.0.0.1:{port}"), "-k", "k", "--timeout", "5", "GET", "/x"])
+            .output()
+            .expect("api runs")
+    };
+    let out = run(port);
+    drop(server);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(stderr.contains(&format!("No secure connection to 127.0.0.1:{port}: ")), "{stderr}");
+    assert!(!stderr.contains("Is COS running"), "{stderr}");
+
+    // Nothing there at all is still asked about as before.
+    let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let out = run(free);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(stderr.contains(&format!("Is COS running on 127.0.0.1:{free}?")), "{stderr}");
+}
+
+#[test]
 fn a_certificate_nobody_signed_is_refused_and_nothing_is_sent_over_it() {
     for host in ["localhost", "127.0.0.1"] {
         let (port, server) = self_signed_https_server();
@@ -2156,7 +2185,12 @@ fn a_certificate_nobody_signed_is_refused_and_nothing_is_sent_over_it() {
         assert!(!shook, "{host}: the client accepted the certificate");
         assert_eq!(heard, "", "{host}");
         assert_eq!(String::from_utf8_lossy(&out.stdout), "", "{host}");
-        assert!(!stderr.is_empty(), "{host}: a refused certificate has to be said");
+        // And it is said as what it is, not as a server that isn't there.
+        assert!(
+            stderr.contains(&format!("The certificate of {host}:{port} is not trusted: it is not signed by a public certificate authority.")),
+            "{host}: {stderr}"
+        );
+        assert!(!stderr.contains("Is COS running"), "{host}: {stderr}");
     }
 }
 
@@ -2368,7 +2402,8 @@ fn a_request_timeout_and_a_rate_limit_are_never_an_answer() {
             assert_eq!(run.seen, vec!["GET /q"], "{status}: {batch}");
             assert!(run.stdout.ends_with("slow down\n"), "{status}: {batch}\n{:?}", run.stdout);
         }
-        // An assert and a poll report it themselves, with `-f` too.
+        // An assert and a poll say so themselves, and `-f` adds the body:
+        // last on stdout, as for any response that ends a run.
         for (batch, says) in [
             ("assert not GET /q\nGET /never\n", "assert not GET /q — could not be evaluated"),
             ("sleep 10ms while GET /q\nGET /never\n", "condition could not be evaluated (check 1)"),
@@ -2377,6 +2412,12 @@ fn a_request_timeout_and_a_rate_limit_are_never_an_answer() {
             assert_eq!(run.code, Some(1), "{status}: {batch}\n{}", run.stderr);
             assert_eq!(run.seen, vec!["GET /q"], "{status}: {batch}");
             assert!(run.stderr.contains(says), "{status}: {batch}\n{}", run.stderr);
+            assert!(run.stdout.ends_with("s\nslow down\n"), "{status}: {batch}\n{:?}", run.stdout);
+            // Without `-f` the body stays out, as it always did.
+            let run = run_fail_fast("-sa", batch, vec![(status, "slow down"), OK]);
+            assert_eq!(run.code, Some(1), "{status}: {batch}\n{}", run.stderr);
+            assert!(run.stderr.contains(says), "{status}: {batch}\n{}", run.stderr);
+            assert!(!run.stdout.contains("slow down"), "{status}: {batch}\n{:?}", run.stdout);
         }
         // Without `-f` it ends the run from a question all the same…
         let run = run_fail_fast("-sa", "GET /q || PUT /x {\"a\":1}\nGET /never\n", vec![(status, "slow down"), OK]);

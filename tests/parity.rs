@@ -772,6 +772,22 @@ fn the_preview_lists_directives_and_chains_and_counts_only_requests() {
     assert!(ran.stderr.starts_with("Preview — 1 request | PUT ["), "{}", ran.stderr);
     assert_eq!(ran.sent, Vec::<String>::new());
 
+    // An outfile is shown where it is written, behind the body, in the
+    // preview and in the log of the run: as the prompt logs it.
+    std::fs::write(dir.path().join("o.api"), "PUT /f {\"y\": 2} > out.json\nGET /a && PUT /b {\"x\":1} >> more.json\n").unwrap();
+    let ran = ask(&server, dir.path(), &["-spa", "o.api"], Some("n\n"));
+    for line in ["  PUT /f {\"y\":2} > out.json\n", "  GET /a\n", "  && PUT /b {\"x\":1} >> more.json\n"] {
+        assert!(ran.stderr.contains(line), "{line:?} not in\n{}", ran.stderr);
+    }
+    let ran = ask(&server, dir.path(), &["-sp", "PUT", "/f", "{\"y\":2}", ">", "out.json"], Some("n\n"));
+    assert!(ran.stderr.contains("  PUT /f {\"y\":2} > out.json\n"), "{}", ran.stderr);
+    let out = api(server.port, dir.path()).args(["-sa", "o.api"]).output().expect("spawn api");
+    let log = String::from_utf8_lossy(&out.stdout);
+    for line in ["\nPUT /f {\"y\":2} > out.json\n", "\nPUT /b {\"x\":1} >> more.json\n"] {
+        assert!(log.contains(line), "{line:?} not in\n{log}");
+    }
+    assert!(dir.path().join("out.json").is_file() && dir.path().join("more.json").is_file());
+
     // Accepted once, the preview is not asked again per request.
     std::fs::write(dir.path().join("two.api"), "GET /a\nGET /b\n").unwrap();
     let ran = ask(&server, dir.path(), &["-spa", "two.api"], Some("y\n"));
