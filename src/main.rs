@@ -669,9 +669,6 @@ struct AppState {
     /// export on. Kept while export is off, so turning it on again does not
     /// ask twice.
     export_name: Option<String>,
-    /// A name typed for export mode that was refused, kept so the next
-    /// ctrl+r opens with it there to correct. Esc discards it.
-    export_name_draft: String,
     ctrl_c_pending: bool,
     ctrl_c_at: Option<std::time::Instant>,
     width: u16,
@@ -758,7 +755,6 @@ impl AppState {
             status_msg_at: None,
             streaming_flash_at: None,
             export_name,
-            export_name_draft: String::new(),
             ctrl_c_pending: false,
             ctrl_c_at: None,
             width: 80,
@@ -10577,7 +10573,7 @@ enum InlineInput {
 
 // Read a line of input in raw mode (already in raw mode when called from interactive)
 fn read_inline_input(stdout: &mut io::Stdout, prompt: &str, mask: bool, prefill: &str) -> io::Result<InlineInput> {
-    read_inline_input_within(stdout, prompt, mask, prefill, None)
+    read_inline_input_within(stdout, prompt, mask, prefill, None, None)
 }
 
 /// The prompt and the value of an inline input as one line of at most `cols`
@@ -10597,12 +10593,17 @@ fn inline_input_line(prompt: &str, value: &str, cols: Option<usize>) -> (String,
 /// `read_inline_input` on a line that must not wrap. With `cols`, the
 /// terminal's width, what is drawn never reaches the right margin however
 /// much is typed, so the rows drawn around the line stay where they are.
+///
+/// `idle` is called while the input waits for a key, with the cursor on the
+/// input's row, where it has to leave it. A dialog uses it to keep the row
+/// under its ruler up to date.
 fn read_inline_input_within(
     stdout: &mut io::Stdout,
     prompt: &str,
     mask: bool,
     prefill: &str,
     cols: Option<usize>,
+    mut idle: Option<&mut dyn FnMut(&mut io::Stdout) -> io::Result<()>>,
 ) -> io::Result<InlineInput> {
     let mut buf = prefill.to_string();
 
@@ -10620,8 +10621,13 @@ fn read_inline_input_within(
 
     render_line(stdout, &buf)?;
 
+    // Often enough for a notice's pulse to be seen when there is one to draw.
+    let wait = Duration::from_millis(if idle.is_some() { 30 } else { 100 });
     loop {
-        if event::poll(Duration::from_millis(100))? {
+        if let Some(idle) = idle.as_mut() {
+            idle(stdout)?;
+        }
+        if event::poll(wait)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != event::KeyEventKind::Press { continue; }
                 // Like esc, both leave the cursor on the row under the prompt.
@@ -10679,11 +10685,6 @@ const EXPORT_NAME_REFUSED: &str = "export needs a namespaced key, like com.heads
 /// default: it is asked for the first time, and remembered until the session
 /// ends (a session started with `--export <name>` knows it already).
 ///
-/// Everything it has to say goes where the prompt says everything else: the
-/// status message in the hint line. A name that is not a namespaced key
-/// closes the dialog with such a message and leaves export off; ctrl+r again
-/// opens the dialog with the name there to correct.
-///
 /// Returns `true` when ctrl+c in the dialog asked to leave the client.
 fn handle_export_toggle(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<bool> {
     let notice = |state: &mut AppState, stdout: &mut io::Stdout, text: String| -> io::Result<bool> {
@@ -10697,18 +10698,11 @@ fn handle_export_toggle(state: &mut AppState, stdout: &mut io::Stdout) -> io::Re
     }
     let name = match state.export_name.clone() {
         Some(name) => name,
-        None => {
-            let draft = std::mem::take(&mut state.export_name_draft);
-            match ask_export_name(state, stdout, &draft)? {
-                InlineInput::Quit => return Ok(true),
-                InlineInput::Cancelled => return notice(state, stdout, "cancelled".to_string()),
-                InlineInput::Entered(name) if !is_namespaced_key(&name) => {
-                    state.export_name_draft = name;
-                    return notice(state, stdout, EXPORT_NAME_REFUSED.to_string());
-                }
-                InlineInput::Entered(name) => name,
-            }
-        }
+        None => match ask_export_name(state, stdout)? {
+            InlineInput::Quit => return Ok(true),
+            InlineInput::Cancelled => return notice(state, stdout, "cancelled".to_string()),
+            InlineInput::Entered(name) => name,
+        },
     };
     state.streaming_flash_at = Some(Instant::now());
     state.export_name = Some(name.clone());
@@ -10718,26 +10712,29 @@ fn handle_export_toggle(state: &mut AppState, stdout: &mut io::Stdout) -> io::Re
 
 /// Ask, in the command area, for the name export mode keeps a lone key
 /// under, the way ctrl+s asks for a connection's name: a prompt on the input
-/// line, and `enter to …, esc to cancel` under the ruler. Gives what was
-/// typed, trimmed; an empty answer is a cancel. Whether it is a name that can
-/// be used is the caller's to say. However it ends, ctrl+c included, the
-/// cursor is left on the command area's hint line, where `render` and the
-/// session's closing clear both start from.
+/// line, and `enter to …, esc to cancel` under the ruler.
+///
+/// The dialog stays open until it has a name that can be used, or is left:
+/// `Entered` holds a namespaced key, esc or an empty answer is `Cancelled`,
+/// ctrl+c is `Quit`. A name that is not a namespaced key is refused with the
+/// prompt's regular notice, in the hint line, styled and timed as `render`
+/// shows one, and what was typed stays on the line to correct.
 ///
 /// The dialog takes the command area's place, row for row: the top ruler
 /// stays, the prompt stands on the first input line, and the bottom ruler
-/// and the hint follow. Nothing in it may wrap. A row more than was counted
-/// would put the prompt a row too low, over the bottom ruler, and every
-/// redraw after the dialog would start a row too low as well and leave a
-/// ruler behind. So the hint is cut to the width, the input line keeps to
-/// it, and the two rows below the prompt are drawn with auto-wrap off, as
-/// `render` draws its own.
-fn ask_export_name(state: &mut AppState, stdout: &mut io::Stdout, prefill: &str) -> io::Result<InlineInput> {
+/// and the hint line follow. Nothing in it may wrap. A row more than was
+/// counted would put the prompt a row too low, over the bottom ruler, and
+/// every redraw after the dialog would start a row too low as well and leave
+/// a ruler behind. So the input line keeps to the width, and the rows below
+/// it are drawn with auto-wrap off, as `render` draws its own. However it
+/// ends, the cursor is left on the command area's hint line, where `render`
+/// and the session's closing clear both start from.
+fn ask_export_name(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<InlineInput> {
     let width = state.width as usize;
     let ruler_line = format!("\x1b[38;5;239m{}\x1b[0m", "─".repeat(width));
     let input_lines = state.prev_input_lines;
     let prompt = "› Export with external identifier: ";
-    let hint = fit_to_width("enter to turn export on, esc to cancel", width.saturating_sub(3));
+    let hint = "enter to turn export on, esc to cancel";
 
     // From the hint line, where `render` leaves the cursor, up to the first
     // input line. Clear the command area from there; the top ruler is kept.
@@ -10751,12 +10748,61 @@ fn ask_export_name(state: &mut AppState, stdout: &mut io::Stdout, prefill: &str)
         Print("\x1b[?7l"),
         Print("\r\n"),
         Print(format!("{}\r\n", ruler_line)),
-        Print(format!("  {}", hint.dimmed())),
+        Print(format!("  {}", hint.chars().take(width.saturating_sub(2)).collect::<String>().dimmed())),
         Print("\x1b[?7h"),
         cursor::MoveUp(2),
         cursor::MoveToColumn(0)
     )?;
-    let typed = read_inline_input_within(stdout, prompt, false, prefill, Some(width))?;
+
+    // When the name was last refused. The notice stands in the hint line for
+    // as long as a status message does, then the hint is back.
+    let refused_at: std::cell::Cell<Option<Instant>> = std::cell::Cell::new(None);
+    let mut notice_shown = false;
+    let mut draw_hint_line = |stdout: &mut io::Stdout| -> io::Result<()> {
+        let active = refused_at.get().filter(|at| at.elapsed() < STATUS_MSG_TTL);
+        // Cut at the margin: with auto-wrap off a terminal would otherwise
+        // pile the rest of the text onto its last column.
+        let fits = |text: &str| -> String { text.chars().take(width.saturating_sub(2)).collect() };
+        let line = match active {
+            Some(at) => status_msg_styled(&fits(EXPORT_NAME_REFUSED), Some(at)),
+            None if notice_shown => fits(hint).dimmed().to_string(),
+            None => return Ok(()),
+        };
+        notice_shown = active.is_some();
+        // The hint line is two rows under the prompt's.
+        execute!(
+            stdout,
+            cursor::MoveDown(2),
+            cursor::MoveToColumn(0),
+            Clear(ClearType::CurrentLine),
+            Print("\x1b[?7l"),
+            Print(format!("  {}", line)),
+            Print("\x1b[?7h"),
+            cursor::MoveUp(2),
+            cursor::MoveToColumn(0)
+        )
+    };
+
+    let mut typed = String::new();
+    let answer = loop {
+        match read_inline_input_within(stdout, prompt, false, &typed, Some(width), Some(&mut draw_hint_line))? {
+            InlineInput::Entered(name) => {
+                let name = name.trim().to_string();
+                if name.is_empty() {
+                    break InlineInput::Cancelled;
+                }
+                if is_namespaced_key(&name) {
+                    break InlineInput::Entered(name);
+                }
+                // Refused: say so, and ask again with the name left to
+                // correct. Enter left the cursor a row down, on the ruler.
+                refused_at.set(Some(Instant::now()));
+                typed = name;
+                execute!(stdout, cursor::MoveUp(1), cursor::MoveToColumn(0))?;
+            }
+            ended => break ended,
+        }
+    };
 
     // Enter, esc and ctrl+c all leave the cursor on the row under the prompt.
     // Clear from there, and go down to where the hint line of the command
@@ -10765,11 +10811,7 @@ fn ask_export_name(state: &mut AppState, stdout: &mut io::Stdout, prefill: &str)
     for _ in 0..input_lines {
         execute!(stdout, Print("\r\n"))?;
     }
-    Ok(match typed {
-        InlineInput::Entered(name) if name.trim().is_empty() => InlineInput::Cancelled,
-        InlineInput::Entered(name) => InlineInput::Entered(name.trim().to_string()),
-        other => other,
-    })
+    Ok(answer)
 }
 
 /// Returns `true` when ctrl+c at the name prompt asked to leave the client.
@@ -11459,6 +11501,42 @@ fn flash_rulers(stdout: &mut io::Stdout, state: &mut AppState, color: &str, ms: 
     Ok(())
 }
 
+/// A status message as the hint line shows it: dimmed, pulsing twice in its
+/// first 350ms when `at` says when it was put up. Used by `render`, and by a
+/// dialog that has something to say while it is open, so a notice looks the
+/// same wherever it appears.
+fn status_msg_styled(msg: &str, at: Option<Instant>) -> String {
+    if msg.contains("ctrl+c again") {
+        // Stay white for the full duration
+        return format!("\x1b[97m{}\x1b[0m", msg);
+    }
+    if msg.starts_with("connected to:") {
+        // No flash, just dimmed gray for 3 seconds
+        return msg.dimmed().to_string();
+    }
+    let Some(at) = at else {
+        return msg.dimmed().to_string();
+    };
+    // Two smooth pulses: 0-150ms and 200-350ms
+    // Each pulse fades from 240 (dim) up to 250 (light) and back
+    let ms = at.elapsed().as_millis() as u16;
+    let (base, peak): (u16, u16) = (240, 250);
+    let into_pulse = if ms < 150 {
+        Some(ms)
+    } else if (200..350).contains(&ms) {
+        Some(ms - 200)
+    } else {
+        None
+    };
+    match into_pulse {
+        Some(t) => {
+            let v = (t as f32 / 150.0 * std::f32::consts::PI).sin();
+            format!("\x1b[38;5;{}m{}\x1b[0m", base + (v * (peak - base) as f32) as u16, msg)
+        }
+        None => msg.dimmed().to_string(),
+    }
+}
+
 fn render<W: Write>(stdout: &mut W, state: &mut AppState) -> io::Result<()> {
     let width = state.width as usize;
     state.prev_width = state.width;
@@ -11629,35 +11707,7 @@ fn render<W: Write>(stdout: &mut W, state: &mut AppState) -> io::Result<()> {
         // Hint line (only if terminal is wide enough - "ctrl+h for shortcuts" is 21 chars + 2 indent)
         if width >= 22 {
             if !state.status_msg.is_empty() {
-                let msg_style = if state.status_msg.contains("ctrl+c again") {
-                    // Stay white for the full duration
-                    format!("\x1b[97m{}\x1b[0m", state.status_msg)
-                } else if state.status_msg.starts_with("connected to:") {
-                    // No flash, just dimmed gray for 3 seconds
-                    state.status_msg.dimmed().to_string()
-                } else if let Some(at) = state.status_msg_at {
-                    let ms = at.elapsed().as_millis() as u16;
-                    // Two smooth pulses: 0-150ms and 200-350ms
-                    // Each pulse fades from 240 (dim) up to 250 (light) and back
-                    let base: u16 = 240;
-                    let peak: u16 = 250;
-                    let range = peak - base;
-                    if ms < 150 {
-                        let t = ms as f32 / 150.0;
-                        let v = (t * std::f32::consts::PI).sin();
-                        let shade = base + (v * range as f32) as u16;
-                        format!("\x1b[38;5;{}m{}\x1b[0m", shade, state.status_msg)
-                    } else if ms >= 200 && ms < 350 {
-                        let t = (ms - 200) as f32 / 150.0;
-                        let v = (t * std::f32::consts::PI).sin();
-                        let shade = base + (v * range as f32) as u16;
-                        format!("\x1b[38;5;{}m{}\x1b[0m", shade, state.status_msg)
-                    } else {
-                        state.status_msg.dimmed().to_string()
-                    }
-                } else {
-                    state.status_msg.dimmed().to_string()
-                };
+                let msg_style = status_msg_styled(&state.status_msg, state.status_msg_at);
                 queue!(stdout, Print(format!("  {}", msg_style)))?;
                 queue!(stdout, Print(streaming_indicator(state, visible_len(&state.status_msg))))?;
             } else {

@@ -992,16 +992,17 @@ fn ctrl_r_toggles_export_at_the_prompt_and_asks_for_the_name_once() {
     let shown = get_keyed(&mut prompt, &server);
     assert!(shown.contains("\"key\": \"k1\""), "{shown}");
 
-    // A name that is no namespaced key is refused the way anything is said at
-    // the prompt, in the hint line, and export stays off.
+    // A name that is no namespaced key is refused with the prompt's notice,
+    // and the dialog stays open with what was typed left to correct.
     keys(&mut prompt, b"\x12");
     let shown = keys(&mut prompt, b"seedID\r");
     assert!(shown.contains("export needs a namespaced key, like com.heads.seedID"), "{shown}");
-    let shown = get_keyed(&mut prompt, &server);
-    assert!(shown.contains("\"key\": \"k1\""), "{shown}");
-    // ctrl+r again opens the dialog with what was typed left to correct.
-    let shown = keys(&mut prompt, b"\x12");
     assert!(shown.contains("Export with external identifier: seedID"), "{shown}");
+    assert!(!shown.contains("cancelled") && !shown.contains("GET /"), "the dialog closed:\n{shown}");
+    // Refused a second time, it is still there.
+    let shown = keys(&mut prompt, b"2\r");
+    assert!(shown.contains("Export with external identifier: seedID2"), "{shown}");
+    keys(&mut prompt, b"\x7f");
     // Six backspaces, then a good one.
     let shown = keys(&mut prompt, b"\x7f\x7f\x7f\x7f\x7f\x7fcom.example.exportID\r");
     assert!(shown.contains("export on: com.example.exportID"), "{shown}");
@@ -1047,6 +1048,8 @@ fn the_export_name_dialog_stays_in_the_command_area_at_any_width() {
         prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
         prompt.pump(Duration::from_millis(600));
 
+        const HINT: &str = "  enter to turn export on, esc to cancel";
+        const NOTICE: &str = "  export needs a namespaced key, like com.heads.seedID";
         let width = cols as usize;
         let ruler = "─".repeat(width);
         let keys = |prompt: &mut Prompt, keys: &[u8]| {
@@ -1073,9 +1076,7 @@ fn the_export_name_dialog_stays_in_the_command_area_at_any_width() {
             assert!(now[top + 1].starts_with("› Export with external identifier:"), "{cols}, {what}:\n{shown}");
             assert_eq!(now[top + 2], ruler, "{cols}, {what}: no bottom ruler under the prompt\n{shown}");
             assert!(now[top + 3].starts_with("  ") && now[top + 3].len() > 2, "{cols}, {what}: no hint\n{shown}");
-            for row in [&now[top + 1], &now[top + 3]] {
-                assert!(row.chars().count() < width, "{cols}, {what}: a row reaches the margin\n{shown}");
-            }
+            assert!(now[top + 1].chars().count() < width, "{cols}, {what}: the prompt reaches the margin\n{shown}");
         };
         // And the command area once it is closed again.
         let closed = |now: &[String], hint: &str, what: &str| {
@@ -1088,18 +1089,21 @@ fn the_export_name_dialog_stays_in_the_command_area_at_any_width() {
         let now = keys(&mut prompt, b"\x12");
         dialog(&now, "opened");
         // The hint is the one every dialog of the prompt has.
-        assert_eq!(now[top + 3], "  enter to turn export on, esc to cancel", "{cols}");
+        assert_eq!(now[top + 3], HINT, "{cols}");
 
-        // A name that is refused: the dialog closes, and the reason is the
-        // hint line's status message, as any notice is.
+        // A name that is refused: the dialog stays, in place, with the name
+        // there to correct, and the reason is in the hint line as any notice
+        // is (cut at the margin where the terminal is narrower than it).
+        let refused = |now: &[String], what: &str| {
+            dialog(now, what);
+            let notice: String = NOTICE.chars().take(width).collect();
+            assert_eq!(now[top + 3], notice, "{cols}, {what}");
+        };
         let now = keys(&mut prompt, b"seedID\r");
-        closed(&now, "  export needs a namespaced key", "refused");
+        refused(&now, "refused");
+        assert!(now[top + 1].ends_with(": seedID"), "{cols}: {:?}", now[top + 1]);
 
-        // Opened again, the name is there to correct. More than the line
-        // holds: the end of what is typed stays in view.
-        let now = keys(&mut prompt, b"\x12");
-        dialog(&now, "opened to correct");
-        assert!(now[top + 1].ends_with("seedID"), "{cols}: {:?}", now[top + 1]);
+        // More than the line holds: the end of what is typed stays in view.
         let long = "x".repeat(150);
         let now = keys(&mut prompt, format!("{long}Z").as_bytes());
         dialog(&now, "a long name");
@@ -1107,14 +1111,26 @@ fn the_export_name_dialog_stays_in_the_command_area_at_any_width() {
         // 35 columns of prompt, `seedID`, and the 151 typed now.
         assert_eq!(now[top + 1].contains('…'), width < 35 + 6 + 151 + 2, "{cols}: {:?}", now[top + 1]);
         let now = keys(&mut prompt, b"\r");
-        closed(&now, "  export needs a namespaced key", "a long name refused");
+        refused(&now, "a long name refused");
+        assert!(now[top + 1].ends_with("xZ"), "{cols}: {:?}", now[top + 1]);
 
-        // Opened and cancelled, again and again: nothing is left behind, and
-        // esc discards what was typed.
+        // The notice goes when a status message would, and the hint is back.
+        if cols == 84 {
+            prompt.pump(Duration::from_millis(3200));
+            let now = pty::rows(&prompt.screen, width);
+            dialog(&now, "after the notice");
+            assert_eq!(now[top + 3], HINT, "{cols}");
+        }
+
+        // Cancelled, and opened and cancelled again: nothing is left behind,
+        // and esc discards what was typed.
+        let now = keys(&mut prompt, b"\x1b");
+        closed(&now, "  cancelled", "cancelled");
         for round in 0..3 {
             let now = keys(&mut prompt, b"\x12");
             dialog(&now, &format!("opened again, {round}"));
-            assert_eq!(now[top + 1].ends_with("xZ"), round == 0, "{cols}, {round}: {:?}", now[top + 1]);
+            assert!(now[top + 1].ends_with("identifier:"), "{cols}, {round}: {:?}", now[top + 1]);
+            assert_eq!(now[top + 3], HINT, "{cols}, {round}");
             let now = keys(&mut prompt, b"\x1b");
             closed(&now, "  cancelled", &format!("cancelled, {round}"));
         }

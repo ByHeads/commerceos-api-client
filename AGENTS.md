@@ -680,9 +680,9 @@ Rules:
   way `ctrl+t` does streaming, and `export` shows at the right of the hint
   line while it is on. The first time, it asks for the name: there is no
   default. A name that is not a namespaced key is refused with a notice in
-  the hint line and export stays off; `ctrl+r` again opens the dialog with
-  the name there to correct. The name is remembered until the session ends,
-  so turning export on again doesn't ask. A session started with `--export <name>` starts with export
+  the hint line, and the dialog stays open with the name there to correct,
+  until it is given one or left with `esc`. The name is remembered until the
+  session ends, so turning export on again doesn't ask. A session started with `--export <name>` starts with export
   on and has its name. The masked-data line shows in the hint line.
 - Output is indented; `-r` prints it on one line. NDJSON (`--ndjson`, or a
   `> file.ndjson`) is rewritten line by line.
