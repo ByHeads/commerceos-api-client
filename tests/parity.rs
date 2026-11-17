@@ -987,6 +987,21 @@ fn an_outfile_that_cannot_be_written_is_a_failure() {
         assert!(one.stderr.contains("Error writing to no-such-dir/x.json"), "stream={stream}: {}", one.stderr);
         let appended = run_in(&server, d, &with(&["GET", "/a", ">>", "no-such-dir/x.json"]));
         assert_eq!(appended.code, Some(1), "stream={stream}: {}", appended.stderr);
+        // However the one request is quoted, it is one request.
+        for quoted in [&["GET /a > no-such-dir/x.json"][..], &["GET", "/a > no-such-dir/x.json"], &["/a > no-such-dir/x.json"]] {
+            let one = run_in(&server, d, &with(quoted));
+            assert_eq!((one.code, one.sent.len()), (Some(1), 1), "stream={stream} {quoted:?}: {}", one.stderr);
+            assert!(one.stderr.contains("Error writing to no-such-dir/x.json"), "stream={stream} {quoted:?}: {}", one.stderr);
+        }
+        // A file named as the argument is a batch, with one request or more.
+        file("one.api", "GET /a > no-such-dir/x.json\n");
+        for named in [&["one.api"][..], &["-a", "one.api"]] {
+            let batch = run_in(&server, d, &with(named));
+            assert_eq!((batch.code, batch.sent.len()), (Some(0), 1), "stream={stream} {named:?}: {}", batch.stderr);
+        }
+        // And so are two lines in one argument.
+        let two = run_in(&server, d, &with(&["GET /a > no-such-dir/x.json\nGET /b"]));
+        assert_eq!((two.code, two.sent.len()), (Some(0), 2), "stream={stream}: {}", two.stderr);
 
         file("w.api", "GET /a > no-such-dir/x.json\nGET /b\n");
         let plain = run_in(&server, d, &with(&["-sa", "w.api"]));
@@ -1766,6 +1781,70 @@ fn a_file_with_a_byte_order_mark_and_crlf_runs() {
     server.settle(Duration::from_millis(150), Duration::from_secs(3));
     assert!(out.status.success());
     assert_eq!(server.take(), ["GET /a"]);
+}
+
+/// A run whose stdout, stderr or both are pipes that nobody reads and that
+/// are closed as soon as it has started: its exit code and what it sent.
+fn run_unheard(server: &RecordingServer, dir: &Path, args: &[&str], out: bool, err: bool) -> (Option<i32>, Vec<String>) {
+    use std::process::Stdio;
+    server.take();
+    let mut child = api(server.port, dir)
+        .args(args)
+        .stdout(if out { Stdio::piped() } else { Stdio::null() })
+        .stderr(if err { Stdio::piped() } else { Stdio::null() })
+        .spawn()
+        .expect("spawn api");
+    drop(child.stdout.take());
+    drop(child.stderr.take());
+    let status = child.wait().expect("wait");
+    server.settle(Duration::from_millis(150), Duration::from_secs(3));
+    (status.code(), server.take())
+}
+
+/// The same holds for stderr, where `-a` writes its status lines, and for
+/// every kind of line a batch has: a closed pipe changes neither what is
+/// sent nor the exit code.
+#[test]
+fn a_batch_keeps_running_when_nobody_reads_what_it_says() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let file = |name: &str, text: &str| std::fs::write(d.join(name), text).unwrap();
+    let lines: String = (1..=6).map(|i| format!("GET /six{i}\n")).collect();
+    file("six.api", &lines);
+    file("inner.api", "GET /inner\n");
+    file("fails.api", "GET /a\nassert GET /missing\nGET /never\n");
+    file(
+        "mixed.api",
+        "import dir d {\"path\":\"libdir\"}\nGET /a > out.json\nsleep 0 while GET /zero\nGET /missing && GET /never\nassert not GET /missing\ninner.api\nGET /last\n",
+    );
+    std::fs::create_dir(d.join("libdir")).unwrap();
+    let six: Vec<String> = (1..=6).map(|i| format!("GET /six{i}")).collect();
+    let mixed = ["GET /a", "GET /zero", "GET /missing", "GET /missing", "GET /inner", "GET /last"];
+
+    for (out, err) in [(false, true), (true, true), (true, false)] {
+        for flags in ["-a", "-sa", "-sfa"] {
+            let how = format!("{flags} stdout closed={out} stderr closed={err}");
+            assert_eq!(run_unheard(&server, d, &[flags, "six.api"], out, err), (Some(0), six.clone()), "{how}");
+            let (code, sent) = run_unheard(&server, d, &[flags, "fails.api"], out, err);
+            assert_eq!((code, &sent[..]), (Some(1), &["GET /a".to_string(), "GET /missing".to_string()][..]), "{how}");
+        }
+        for flags in ["-a", "-sa"] {
+            let how = format!("{flags} stdout closed={out} stderr closed={err}");
+            let (code, sent) = run_unheard(&server, d, &[flags, "mixed.api"], out, err);
+            assert_eq!((code, &sent[..]), (Some(0), &mixed.map(String::from)[..]), "{how}");
+        }
+        let how = format!("stdout closed={out} stderr closed={err}");
+        assert_eq!(run_unheard(&server, d, &["GET", "/alone"], out, err), (Some(0), vec!["GET /alone".to_string()]), "{how}");
+        assert_eq!(
+            run_unheard(&server, d, &["--stream", "GET", "/alone"], out, err),
+            (Some(0), vec!["GET /alone".to_string()]),
+            "{how}"
+        );
+        // An error is still an error.
+        assert_eq!(run_unheard(&server, d, &["-f", "GET", "/missing"], out, err).0, Some(1), "{how}");
+        assert_eq!(run_unheard(&server, d, &["-a", "nofile.api"], out, err), (Some(1), Vec::new()), "{how}");
+    }
 }
 
 /// A reader that stops reading (`api -sa seed.api | head -1`) does not stop

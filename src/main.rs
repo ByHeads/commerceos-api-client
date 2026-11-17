@@ -68,6 +68,48 @@ macro_rules! outln {
     }};
 }
 
+/// Set once a write to stderr has failed. See `STDOUT_CLOSED`.
+static STDERR_CLOSED: AtomicBool = AtomicBool::new(false);
+
+/// Stderr for everything the client says there: in `-a` mode that is the
+/// status line of every request. Like `Out`, a reader that has gone away
+/// (`api -a seed.api 2>&1 | head -1`) does not stop the batch, where
+/// `eprintln!` would panic on the first line nobody took.
+struct ErrOut;
+
+impl Write for ErrOut {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if !STDERR_CLOSED.load(Ordering::Relaxed) && io::stderr().write_all(buf).is_err() {
+            STDERR_CLOSED.store(true, Ordering::Relaxed);
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if !STDERR_CLOSED.load(Ordering::Relaxed) && io::stderr().flush().is_err() {
+            STDERR_CLOSED.store(true, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+}
+
+/// `eprint!` to a stderr that may have closed. See `ErrOut`.
+macro_rules! err {
+    ($($arg:tt)*) => {{
+        let _ = write!(ErrOut, $($arg)*);
+    }};
+}
+
+/// `eprintln!` to a stderr that may have closed. See `ErrOut`.
+macro_rules! errln {
+    () => {{
+        let _ = writeln!(ErrOut);
+    }};
+    ($($arg:tt)*) => {{
+        let _ = writeln!(ErrOut, $($arg)*);
+    }};
+}
+
 /// Whether the prompt turned bracketed paste on, and whether it pushed the
 /// kitty keyboard flags: what `restore_terminal` has to undo.
 static BRACKETED_PASTE_ON: AtomicBool = AtomicBool::new(false);
@@ -124,10 +166,17 @@ fn exit_process(code: i32) -> ! {
 
 /// A panic prints its message through the default hook; before that, the
 /// terminal is restored so the message is readable and the shell usable.
+///
+/// Only for a panic on the thread that installs the hook, which is the one
+/// the prompt runs on. A panic on a background loader thread ends that
+/// thread alone: the prompt goes on, and still needs its terminal modes.
 fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
+    let owner = thread::current().id();
     std::panic::set_hook(Box::new(move |info| {
-        restore_terminal();
+        if thread::current().id() == owner {
+            restore_terminal();
+        }
         default_hook(info);
     }));
 }
@@ -751,7 +800,7 @@ fn load_keychain_data() -> KeychainData {
         }
         let data = read_store().unwrap_or_else(|problem| {
             if !terminal::is_raw_mode_enabled().unwrap_or(false) {
-                eprintln!("WARNING: {}. No saved connection is used.", problem);
+                errln!("WARNING: {}. No saved connection is used.", problem);
             }
             if let Ok(mut kept) = STORE_PROBLEM.lock() {
                 *kept = Some(problem);
@@ -3281,7 +3330,7 @@ fn normalize_base_uri(uri: &str) -> String {
 /// empty string.
 fn require_base_uri(config: &Config) {
     if config.base_uri.is_empty() {
-        eprintln!("{}", "Error: no base URL specified. Use -b <url> or -c <connection>.".red());
+        errln!("{}", "Error: no base URL specified. Use -b <url> or -c <connection>.".red());
         exit_process(1);
     }
 }
@@ -3382,16 +3431,16 @@ fn main() {
                     context(clap::error::ContextKind::InvalidValue),
                 ) {
                     let option = arg.split_whitespace().next().unwrap_or(&arg);
-                    eprintln!("error: invalid value for {}: {}", option, value);
+                    errln!("error: invalid value for {}: {}", option, value);
                     exit_process(1);
                 }
             }
             // For unexpected arguments, print a simple message
             let msg = e.to_string();
             if let Some(arg) = msg.split('\'').nth(1) {
-                eprintln!("error: unexpected option {}", arg);
+                errln!("error: unexpected option {}", arg);
             } else {
-                eprintln!("error: {}", msg.lines().next().unwrap_or("invalid arguments"));
+                errln!("error: {}", msg.lines().next().unwrap_or("invalid arguments"));
             }
             exit_process(1);
         }
@@ -3405,7 +3454,7 @@ fn main() {
     // `--describe` and `--assert` read a file and print what it says. Nothing
     // is sent, so neither needs a connection.
     if args.describe.is_some() && args.assert.is_some() {
-        eprintln!("error: --describe and --assert each print a document of their own: use one");
+        errln!("error: --describe and --assert each print a document of their own: use one");
         exit_process(1);
     }
     if let Some(file) = &args.describe {
@@ -3446,7 +3495,7 @@ fn main() {
     config.describe_first = args.describe_first;
     if let Some(name) = &args.export {
         if !is_namespaced_key(name) {
-            eprintln!("error: invalid export identifier: {} ({})", name, NAMESPACED_KEY_HELP);
+            errln!("error: invalid export identifier: {} ({})", name, NAMESPACED_KEY_HELP);
             exit_process(1);
         }
         config.export_id = Some(name.clone());
@@ -3490,7 +3539,7 @@ fn main() {
     // invocation leaves the token sitting in the method slot. Say so rather
     // than letting it become a request to a nonsense method.
     if args.stream && looks_like_bearer_token(&method) {
-        eprintln!(
+        errln!(
             "{}",
             "error: -t is now --stream. Use --token <TOKEN> for a bearer token.".red()
         );
@@ -3512,7 +3561,7 @@ fn main() {
             Ok(Some(parts)) => parts,
             Ok(None) => (method, uri, body),
             Err(e) => {
-                eprintln!("error: {}", e);
+                errln!("error: {}", e);
                 exit_process(1);
             }
         }
@@ -3524,7 +3573,7 @@ fn main() {
     // happens (`>> clipboard`), as a line of a file is.
     if program_line.is_none() && !method.is_empty() {
         if let Err(e) = refuse_request(&format!("{} {}", method, uri)) {
-            eprintln!("error: {}", e);
+            errln!("error: {}", e);
             exit_process(1);
         }
     }
@@ -3537,7 +3586,7 @@ fn main() {
         // `-p` asks a question, and with no terminal its answer comes from
         // stdin too. Stdin can't be both.
         if args.preview && !terminal_can_answer() {
-            eprintln!(
+            errln!(
                 "error: -p reads its answer from stdin here, so the body can't come from stdin too. \
                  Give the body as an argument or an @file, or leave -p off."
             );
@@ -3556,7 +3605,7 @@ fn main() {
         && ["POST", "PUT", "PATCH"].contains(&method.as_str())
         && !uri.is_empty()
     {
-        eprintln!("Reading body from stdin (ctrl+d to finish):");
+        errln!("Reading body from stdin (ctrl+d to finish):");
         let mut stdin_content = String::new();
         if io::stdin().read_to_string(&mut stdin_content).is_ok() {
             body = stdin_content.trim().to_string();
@@ -3579,7 +3628,7 @@ fn main() {
             })
         });
         let Some(env) = found else {
-            eprintln!("Connection \"{}\" not found. Saved connections: {}", connection_selector,
+            errln!("Connection \"{}\" not found. Saved connections: {}", connection_selector,
                 if envs.is_empty() { "none".to_string() } else { envs.join(", ") });
             exit_process(1);
         };
@@ -3588,7 +3637,7 @@ fn main() {
         let env = override_connection(&env, args.base_uri.as_deref(), args.key.as_deref(), args.token.as_deref());
         config.connection_overridden = args.base_uri.is_some() || args.key.is_some() || args.token.is_some();
         if let Err(e) = apply_connection_to_config(&mut config, &env) {
-            eprintln!("{}", e);
+            errln!("{}", e);
             // The prompt opens all the same, where another connection can
             // be picked; a batch has nothing to run against.
             if !(wants_prompt && io::stdout().is_terminal()) {
@@ -3621,7 +3670,7 @@ fn main() {
                     oauth2_creds = Some((env.client_id.clone(), env.credential.clone()));
                 }
                 if let Err(e) = connect(&mut config, &env, resolved_config) {
-                    eprintln!("{}\r", e);
+                    errln!("{}\r", e);
                 }
 
                 // Stay on form with animated spinner while loading
@@ -3667,7 +3716,7 @@ fn main() {
                 execute!(stdout, cursor::MoveUp(total_lines), cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown)).unwrap();
                 terminal::disable_raw_mode().unwrap();
                 execute!(stdout, cursor::Show).unwrap();
-                eprintln!("Error: {}", e);
+                errln!("Error: {}", e);
                 exit_process(1);
             }
         }
@@ -3692,7 +3741,7 @@ fn main() {
                     } else {
                         loaded_connection_alias = env.name.clone();
                         if let Err(e) = apply_connection_to_config(&mut config, &env) {
-                            eprintln!("{}", e);
+                            errln!("{}", e);
                             if !(wants_prompt && io::stdout().is_terminal()) {
                                 exit_process(1);
                             }
@@ -3721,7 +3770,7 @@ fn main() {
                         }
                         // Use resolved config if available (avoids duplicate token exchange)
                         if let Err(e) = connect(&mut config, &env, resolved_config) {
-                            eprintln!("{}\r", e);
+                            errln!("{}\r", e);
                         }
 
                         // Stay on form with animated spinner while loading
@@ -3766,7 +3815,7 @@ fn main() {
                         execute!(stdout, cursor::MoveUp(total_lines), cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown)).unwrap();
                         terminal::disable_raw_mode().unwrap();
                         execute!(stdout, cursor::Show).unwrap();
-                        eprintln!("Error: {}", e);
+                        errln!("Error: {}", e);
                         exit_process(1);
                     }
                 }
@@ -3790,7 +3839,7 @@ fn main() {
 
                     // Apply config first so splash shows correct URL
                     if let Err(e) = connect(&mut config, &env, resolved_config) {
-                        eprintln!("{}\r", e);
+                        errln!("{}\r", e);
                     }
 
                     // Stay on form with animated spinner while loading
@@ -3835,7 +3884,7 @@ fn main() {
                     execute!(stdout, cursor::MoveUp(total_lines), cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown)).unwrap();
                     terminal::disable_raw_mode().unwrap();
                     execute!(stdout, cursor::Show).unwrap();
-                    eprintln!("Error: {}", e);
+                    errln!("Error: {}", e);
                     exit_process(1);
                 }
             }
@@ -3852,7 +3901,7 @@ fn main() {
                     config.api_key = api_key;
                 }
                 Err(e) => {
-                    eprintln!("{}", e);
+                    errln!("{}", e);
                     exit_process(1);
                 }
             }
@@ -3860,7 +3909,7 @@ fn main() {
         if bulk_arg == "-" {
             let mut stdin_content = String::new();
             if io::stdin().read_to_string(&mut stdin_content).is_err() {
-                eprintln!("error: could not read stdin");
+                errln!("error: could not read stdin");
                 exit_process(1);
             }
             // No base_dir for stdin — includes can still use absolute paths
@@ -3880,7 +3929,7 @@ fn main() {
         let alone = line.lines().filter(|l| !l.trim().is_empty()).count() == 1
             && line.split_whitespace().next().is_some_and(|w| w.eq_ignore_ascii_case("export"));
         if alone {
-            eprintln!("error: `export` alone sends nothing. Use --export <name> with a request, or put the line in a .api file.");
+            errln!("error: `export` alone sends nothing. Use --export <name> with a request, or put the line in a .api file.");
             exit_process(1);
         }
         // The file named on the line is the file being run, so `-m` prints
@@ -3898,7 +3947,7 @@ fn main() {
                     config.api_key = api_key;
                 }
                 Err(e) => {
-                    eprintln!("{}", e);
+                    errln!("{}", e);
                     exit_process(1);
                 }
             }
@@ -3906,14 +3955,16 @@ fn main() {
         // A mistyped request would otherwise be reported as a missing include.
         match split_bulk_requests(&line, None) {
             Err(e) => {
-                eprintln!("error: {}", describe_program_error(&e));
+                errln!("error: {}", describe_program_error(&e));
                 exit_process(1);
             }
             Ok(program) if program.only_describes() => {
-                eprintln!("error: {}", DESCRIBE_ALONE);
+                errln!("error: {}", DESCRIBE_ALONE);
                 exit_process(1);
             }
-            Ok(_) => {}
+            // One request in one quoted argument is the same single request
+            // as when the shell split it, so what it can't write is exit 1.
+            Ok(program) => config.one_shot = is_one_typed_request(&line, &program),
         }
         run_bulk_from_str(&mut config, &line, None);
         return;
@@ -3929,7 +3980,7 @@ fn main() {
                     config.api_key = api_key;
                 }
                 Err(e) => {
-                    eprintln!("{}", e);
+                    errln!("{}", e);
                     exit_process(1);
                 }
             }
@@ -3946,7 +3997,7 @@ fn main() {
     // reopening the picker.
     let from_cli_auth = has_explicit_auth && !config.base_uri.is_empty();
     if let Err(e) = run_interactive(config, op_selector, from_setup, loaded_connection_alias, connecting_to, oauth2_creds, startup_preloaded, from_cli_auth) {
-        eprintln!("Error: {}", e);
+        errln!("Error: {}", e);
         exit_process(1);
     }
 }
@@ -3992,6 +4043,14 @@ fn one_shot_program_line(method: &Option<String>, uri: &Option<String>, body: &[
     } else {
         None
     }
+}
+
+/// Whether the arguments, read as the program `program`, are one plain
+/// request: not a chain, a directive, or several lines. Judged on the line as
+/// typed, so a file named as the argument stays a batch however few requests
+/// it holds (`api one.api` is `api -a one.api`).
+fn is_one_typed_request(line: &str, program: &BulkProgram) -> bool {
+    !is_program_line(line) && matches!(&program.steps[..], [BulkStep::Request(_)])
 }
 
 fn parse_positional_args(
@@ -7328,13 +7387,13 @@ fn print_describe_block(file: &str, raw: bool) -> i32 {
         Ok(found) => {
             let (block, warnings) = found.map_or((serde_json::Value::Null, Vec::new()), |(b, w)| (b.into(), w));
             for warning in warnings {
-                eprintln!("warning: describe block: {}", warning);
+                errln!("warning: describe block: {}", warning);
             }
             print_json_document(&block, raw);
             0
         }
         Err(e) => {
-            eprintln!("error: {}", e);
+            errln!("error: {}", e);
             1
         }
     }
@@ -7429,9 +7488,9 @@ fn print_describe_first(block: &DescribeBlock) {
         return;
     }
     for line in lines {
-        eprintln!("{}", line);
+        errln!("{}", line);
     }
-    eprintln!();
+    errln!();
 }
 
 /// Whether a request URI is the `/assert` endpoint of an API version.
@@ -7491,7 +7550,7 @@ fn print_assertions(file: &str, api_path: &str, raw: bool) -> i32 {
             0
         }
         Err(e) => {
-            eprintln!("error: {}", e);
+            errln!("error: {}", e);
             1
         }
     }
@@ -8050,7 +8109,7 @@ fn terminal_can_answer() -> bool {
 }
 
 fn ask_yes_no(prompt: &str) -> bool {
-    eprint!("{} ", prompt.bold());
+    err!("{} ", prompt.bold());
     let _ = io::stderr().flush();
 
     // Read a single line of input, preferring /dev/tty so a piped stdin
@@ -8063,14 +8122,14 @@ fn ask_yes_no(prompt: &str) -> bool {
     // `Ok(0)` is end of input: no line was read, not even an empty one.
     if !matches!(read, Ok(n) if n > 0) {
         // The prompt is still open on its line; end it before the message.
-        eprintln!();
-        eprintln!("aborted (could not read confirmation)");
+        errln!();
+        errln!("aborted (could not read confirmation)");
         exit_process(1);
     }
     let a = answer.trim().to_lowercase();
     let proceed = a.is_empty() || a == "y" || a == "yes";
     if !proceed {
-        eprintln!("aborted");
+        errln!("aborted");
     }
     proceed
 }
@@ -8119,12 +8178,12 @@ fn confirm_preview(lines: &[String], base_uri: &str) -> bool {
     };
 
     if base_uri.is_empty() {
-        eprintln!("{}", header.bold());
+        errln!("{}", header.bold());
     } else {
-        eprintln!("{} {}", header.bold(), format!("[{}]", base_uri).dimmed());
+        errln!("{} {}", header.bold(), format!("[{}]", base_uri).dimmed());
     }
     for line in lines {
-        eprintln!("  {}", line);
+        errln!("  {}", line);
     }
     ask_yes_no("Run? [Y/n]")
 }
@@ -8142,7 +8201,7 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
     let program = match split_bulk_requests(contents, base_dir) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("error: {}", describe_program_error(&e));
+            errln!("error: {}", describe_program_error(&e));
             exit_process(1);
         }
     };
@@ -8150,12 +8209,12 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
     // URL gate: validate the configured base URI against all collected conditions
     // before any output or requests, so test data can't reach the wrong environment.
     if let Err(e) = evaluate_program_gates(&program, &config.base_uri) {
-        eprintln!("error: {}", e);
+        errln!("error: {}", e);
         exit_process(1);
     }
 
     for warning in &program.describe_warnings {
-        eprintln!("warning: {}", warning);
+        errln!("warning: {}", warning);
     }
     // `-m`: say what the file is before the preview asks whether to run it.
     if config.describe_first {
@@ -8219,7 +8278,7 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
         if config.bulk_silent {
             outln!("{}", note.text.dimmed());
         } else if note.stale {
-            eprintln!("warning: {}", note.text);
+            errln!("warning: {}", note.text);
         }
     }
 
@@ -8306,7 +8365,7 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
 fn run_assert(config: &mut Config, negate: bool, request: &str) -> bool {
     // Validated at parse time; a None here would be a parser bug.
     let Some((method, uri, body)) = parse_request_line(request) else {
-        eprintln!("error: {} is not a request", request);
+        errln!("error: {} is not a request", request);
         exit_process(1);
     };
     let line = format_assert(negate, request);
@@ -8331,11 +8390,11 @@ fn run_assert(config: &mut Config, negate: bool, request: &str) -> bool {
             let why = response
                 .map(|(status, body)| describe_check_response(status, &body))
                 .unwrap_or_default();
-            eprintln!("error: assertion failed: {} ({})", line, why);
+            errln!("error: assertion failed: {} ({})", line, why);
             exit_process(1);
         }
         RequestOutcome::Errored => {
-            eprintln!("error: {} — could not be evaluated, aborting", line);
+            errln!("error: {} — could not be evaluated, aborting", line);
             config.last_response = response;
             exit_on_unjudged_check(config);
         }
@@ -8369,7 +8428,7 @@ fn run_sleep_while(config: &mut Config, interval: Duration, negate: bool, reques
     }
     // Validated at parse time; a None here would be a parser bug.
     let Some((method, uri, body)) = parse_request_line(request) else {
-        eprintln!("error: {} is not a request", request);
+        errln!("error: {} is not a request", request);
         exit_process(1);
     };
 
@@ -8386,7 +8445,7 @@ fn run_sleep_while(config: &mut Config, interval: Duration, negate: bool, reques
             RequestOutcome::Falsy if !negate => break,
             RequestOutcome::Truthy | RequestOutcome::Falsy => {}
             RequestOutcome::Errored => {
-                eprintln!(
+                errln!(
                     "error: {} — condition could not be evaluated (check {}), aborting",
                     line, checks
                 );
@@ -8430,7 +8489,7 @@ fn note_skipped_chain(config: &Config, skipped: usize) {
     if config.bulk_silent {
         outln!("{}", note);
     } else {
-        eprintln!("{}", note);
+        errln!("{}", note);
     }
 }
 
@@ -8452,7 +8511,7 @@ fn run_bulk(config: &mut Config, file_path: &str) {
     let (contents, base_dir) = match read_api_file(file_path) {
         Ok(read) => read,
         Err(e) => {
-            eprintln!("error: {}", e);
+            errln!("error: {}", e);
             exit_process(1);
         }
     };
@@ -8817,8 +8876,8 @@ fn describe_body_failure(e: &io::Error, timeout_secs: u64) -> String {
 /// is no answer at all, like a request that got no response: the run ends
 /// with exit 1, with or without `-f`, from a plain line, a chain or a check.
 fn exit_on_body_failure(config: &Config, e: &io::Error) -> ! {
-    eprintln!();
-    eprintln!("{}\n", describe_body_failure(e, config.timeout_secs));
+    errln!();
+    errln!("{}\n", describe_body_failure(e, config.timeout_secs));
     exit_process(1);
 }
 
@@ -8887,7 +8946,7 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
     let built = match build_request(config, &parts) {
         Ok(built) => built,
         Err(e) => {
-            eprintln!("{}", e);
+            errln!("{}", e);
             exit_process(1);
         }
     };
@@ -8911,16 +8970,16 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
         }
         Err(e) => {
             ticker.stop();
-            eprintln!();
+            errln!();
             if e.is_timeout() {
-                eprintln!(
+                errln!(
                     "Timed out after {} — raise it with --timeout <seconds> (0 = no timeout)\n",
                     describe_timeout(config.timeout_secs)
                 );
             } else if let Some(tls) = tls_failure(&e) {
-                eprintln!("{}\n", describe_tls_failure(tls, host_of(&config.base_uri)));
+                errln!("{}\n", describe_tls_failure(tls, host_of(&config.base_uri)));
             } else {
-                eprintln!("Is COS running on {}? 🤔\n", host_of(&config.base_uri));
+                errln!("Is COS running on {}? 🤔\n", host_of(&config.base_uri));
             }
             exit_process(1);
         }
@@ -8957,7 +9016,7 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                     format_latency(elapsed).dimmed()
                 );
             } else {
-                eprintln!(
+                errln!(
                     "HTTP/1.1 {} {}",
                     status_str,
                     format_latency(elapsed).dimmed()
@@ -8982,12 +9041,12 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                 Ok(body) => {
                     if !config.silent && !config.bulk_silent {
                         // Match the buffered path: status line, then `> outfile`.
-                        eprintln!("{}", target.marker(body.bytes).dimmed());
+                        errln!("{}", target.marker(body.bytes).dimmed());
                     }
                     Ok(body)
                 }
                 Err(StreamFailure::Write(e)) => {
-                    eprintln!("{}", target.failure(&e));
+                    errln!("{}", target.failure(&e));
                     return local_write_failed(config);
                 }
                 Err(StreamFailure::Body(e)) => Err(e),
@@ -9008,7 +9067,7 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                 }
                 let _ = lock.flush();
                 if is_tty && !config.silent {
-                    eprintln!();
+                    errln!();
                 }
             }
             res
@@ -9061,7 +9120,7 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                 config.raw,
             );
             if let Some(warning) = export_warning(&exported) {
-                eprintln!("{}", warning);
+                errln!("{}", warning);
             }
             exported.text
         }
@@ -9076,11 +9135,11 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                 // Match interactive output: status line already printed,
                 // now ">/>> outfile (size)" (dimmed) on the next line.
                 if !config.silent && !config.bulk_silent {
-                    eprintln!("{}", target.marker(written).dimmed());
+                    errln!("{}", target.marker(written).dimmed());
                 }
             }
             Err(e) => {
-                eprintln!("{}", target.failure(&e));
+                errln!("{}", target.failure(&e));
                 return local_write_failed(config);
             }
         }
@@ -9096,7 +9155,7 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
             outln!();
         }
         if is_tty && !config.silent {
-            eprintln!();
+            errln!();
         }
     }
 
@@ -9117,7 +9176,7 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
         (Some(pre), config)
     } else if !is_1p && !is_connecting {
         if config.base_uri.is_empty() {
-            eprintln!("{}", "Error: no base URL specified. Use -b <url> or -c <connection>.".red());
+            errln!("{}", "Error: no base URL specified. Use -b <url> or -c <connection>.".red());
             exit_process(1);
         }
         let result = background_load(&config, None);
@@ -9129,7 +9188,7 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
                     || config.base_uri.contains("127.0.0.1")
                     || config.base_uri.contains("[::1]");
                 if from_cli_auth || is_localhost {
-                    eprintln!("{}", err);
+                    errln!("{}", err);
                     exit_process(1);
                 }
                 // Otherwise launch connection flow with picker
@@ -9172,7 +9231,7 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
                             }
                         };
                         if let Some(new_err) = &new_result.error {
-                            eprintln!("{}", new_err);
+                            errln!("{}", new_err);
                             exit_process(1);
                         }
 
@@ -9195,18 +9254,18 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
                         execute!(stdout, cursor::MoveUp(total_lines), cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown)).unwrap();
                         terminal::disable_raw_mode().unwrap();
                         execute!(stdout, cursor::Show).unwrap();
-                        eprintln!("Error: {}", e);
+                        errln!("Error: {}", e);
                         exit_process(1);
                     }
                 }
             } else {
-                eprintln!("{}", err);
+                errln!("{}", err);
                 exit_process(1);
             }
         } else if !result.connected && !from_setup {
             // Connection failed - exit
             let host = config.base_uri.trim_start_matches("https://").trim_start_matches("http://");
-            eprintln!("{}", format!("Could not connect to {}", host).red());
+            errln!("{}", format!("Could not connect to {}", host).red());
             exit_process(1);
         } else {
             (Some(result), config)
@@ -9396,9 +9455,9 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
                     )?;
                     terminal::disable_raw_mode()?;
                     if err_msg.starts_with("HTTP/") {
-                        eprintln!("{}", err_msg);
+                        errln!("{}", err_msg);
                     } else {
-                        eprintln!("Error: {}", err_msg);
+                        errln!("Error: {}", err_msg);
                     }
                     exit_process(1);
                 }
