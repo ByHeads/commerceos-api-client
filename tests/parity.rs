@@ -192,6 +192,12 @@ fn answer(
     } else if path.contains("/keyed") {
         // A record with only a database key and a masked value, for `--export`.
         ("200 OK", r#"{"name":"Ann","identifiers":{"key":"k1"},"secret":"********"}"#.to_string())
+    } else if path.contains("/openapi") && header("authorization") == Some("Basic OmJhZHNwZWM=") {
+        // For a session with the key `badspec`: an answer that is no spec.
+        ("200 OK", r#""not a spec""#.to_string())
+    } else if path.contains("/about") && header("authorization") == Some("Basic OmJhZHNwZWM=") {
+        // …from a server that says it has one.
+        ("200 OK", r#"{"feature-flags":[],"openapi-metadata-version":"1.1"}"#.to_string())
     } else if path.contains("/about") {
         ("200 OK", r#"{"feature-flags":[]}"#.to_string())
     } else {
@@ -2466,6 +2472,13 @@ mod pty {
             }
         }
 
+        /// Give the terminal a new size, as dragging its window does.
+        pub fn resize(&mut self, cols: u16, rows: u16) {
+            let size = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+            let rc = unsafe { libc::ioctl(self.master, libc::TIOCSWINSZ as _, &size) };
+            assert_eq!(rc, 0, "TIOCSWINSZ");
+        }
+
         /// Whether the client has ended, and if so whether it ended well.
         pub fn exited(&mut self) -> Option<bool> {
             self.child.try_wait().expect("wait for api").map(|status| status.success())
@@ -3271,6 +3284,270 @@ fn a_paste_fills_a_name_dialog() {
     let shown = plain(&prompt.screen[mark..]);
     assert!(!shown.contains("cancelled"), "{shown}");
     assert!(pty::rows(&prompt.screen, 200).last().unwrap().ends_with("export"), "{shown}");
+}
+
+/// A prompt on `server` with the test's own key, waited for until it is up.
+#[cfg(unix)]
+fn open_prompt(server: &RecordingServer, dir: &Path, args: &[&str]) -> pty::Prompt {
+    let mut cmd = api(server.port, dir);
+    cmd.args(args);
+    let mut prompt = pty::Prompt::open(cmd);
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(500));
+    prompt
+}
+
+/// Pump until `done` holds or `timeout` has passed.
+#[cfg(unix)]
+fn pump_until(prompt: &mut pty::Prompt, timeout: Duration, mut done: impl FnMut(&pty::Prompt) -> bool) -> bool {
+    let start = Instant::now();
+    while !done(prompt) {
+        if start.elapsed() > timeout {
+            return false;
+        }
+        prompt.pump(Duration::from_millis(50));
+    }
+    true
+}
+
+/// The last rows of the screen, for a failure message.
+#[cfg(unix)]
+fn screen_tail(prompt: &pty::Prompt) -> String {
+    let rows = pty::rows(&prompt.screen, 200);
+    rows[rows.len().saturating_sub(14)..].join("\n")
+}
+
+/// A paste of several lines into a dialog that takes one fills it with the
+/// first, however the terminal wrote the line breaks.
+#[cfg(unix)]
+#[test]
+fn a_paste_of_several_lines_gives_a_name_dialog_its_first() {
+    let server = RecordingServer::start();
+    for (pasted, name) in [("first\rsecond", "first"), ("one\r\ntwo\r\n", "one"), ("  uno\ndos", "uno")] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut prompt = open_prompt(&server, dir.path(), &[]);
+        prompt.send(b"\x13");
+        prompt.wait_for("Save connection as", Duration::from_secs(5));
+        prompt.paste(pasted);
+        prompt.pump(Duration::from_millis(200));
+        prompt.send(b"\r");
+        prompt.wait_for(&format!("connection {name} saved"), Duration::from_secs(5));
+        assert_eq!(stored(dir.path()).0, [format!("{name}=k")], "{pasted:?}");
+
+        // In the export dialog the first line is the name, where the whole
+        // paste would be refused.
+        prompt.pump(Duration::from_millis(300));
+        prompt.send(b"\x12");
+        prompt.wait_for("Export with external identifier", Duration::from_secs(5));
+        prompt.paste("com.heads.seedID\rcom.heads.other");
+        prompt.pump(Duration::from_millis(200));
+        let mark = prompt.screen.len();
+        prompt.send(b"\r");
+        prompt.pump(Duration::from_millis(600));
+        let shown = pty::plain(&prompt.screen[mark..]);
+        assert!(!shown.contains("export needs a namespaced key"), "{shown}");
+        assert!(pty::rows(&prompt.screen, 200).last().unwrap().ends_with("export"), "{shown}");
+    }
+}
+
+/// Lines of NDJSON pasted behind a typed request go in as its body. They are
+/// not a file that opens with a describe block, which would take the
+/// request's place on the line.
+#[cfg(unix)]
+#[test]
+fn pasted_ndjson_is_the_body_of_the_request_being_typed() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = open_prompt(&server, dir.path(), &[]);
+    prompt.send(b"\x15");
+    prompt.pump(Duration::from_millis(60));
+    prompt.send(b"PUT /events ");
+    prompt.pump(Duration::from_millis(150));
+    server.take();
+    prompt.paste("{\"a\":1}\r{\"a\":2}");
+    prompt.pump(Duration::from_millis(200));
+    let typed = pty::rows(&prompt.screen, 200).join("\n");
+    assert!(typed.contains("PUT /events {\"a\":1}"), "{typed}");
+    assert!(typed.contains("\n{\"a\":2}"), "{typed}");
+    // Nothing was run by the paste itself.
+    assert_eq!(server.seen(), 0);
+}
+
+/// A response whose body stops before its end is said to be that at the
+/// prompt too, not taken for a server that is not there.
+#[cfg(unix)]
+#[test]
+fn the_prompt_says_a_response_was_cut_short() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = open_prompt(&server, dir.path(), &["--timeout", "2"]);
+    for (line, says) in [
+        ("GET /trunc", "The response was cut short"),
+        ("GET /midfail > f.json", "The response was cut short"),
+        ("GET /stall", "Timed out after 2s"),
+    ] {
+        prompt.send(b"\x15");
+        prompt.pump(Duration::from_millis(60));
+        let mark = prompt.screen.len();
+        prompt.paste(line);
+        prompt.pump(Duration::from_millis(60));
+        prompt.send(b"\r");
+        let said = pump_until(&mut prompt, Duration::from_secs(8), |p| pty::plain(&p.screen[mark..]).contains(says));
+        let shown = pty::plain(&prompt.screen[mark..]);
+        assert!(said, "{line}: {shown}");
+        assert!(!shown.contains("Is COS running"), "{line}: {shown}");
+        prompt.pump(Duration::from_millis(200));
+    }
+    assert!(!dir.path().join("f.json").exists());
+}
+
+/// A server whose spec can't be read is said so once, in the hint line,
+/// however the session was started: with `-c` the notice takes the place of
+/// `connected to: <name>`.
+#[cfg(unix)]
+#[test]
+fn a_spec_that_cannot_be_read_is_said_with_b_and_with_c() {
+    let server = RecordingServer::start();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    let notice = "completion unavailable: the API spec could not be read";
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write_credentials(d, &[("bad", url.clone(), "key", "badspec", ""), ("good", url.clone(), "key", "k", "")], "");
+    for (args, said) in [
+        (&["-b", &url, "-k", "badspec"][..], true),
+        (&["-c", "bad"][..], true),
+        (&["-c", "good"][..], false),
+    ] {
+        let mut cmd = api_bare(d);
+        cmd.args(args);
+        let mut prompt = pty::Prompt::open(cmd);
+        prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+        let seen = pump_until(&mut prompt, Duration::from_secs(4), |p| pty::plain(&p.screen).contains(notice));
+        assert_eq!(seen, said, "{args:?}: {}", pty::plain(&prompt.screen));
+    }
+}
+
+/// `ctrl+q` shows what is saved now. A file that was broken when the session
+/// started and has been fixed since is read; one that broke since is not
+/// picked from, and is left as it is.
+#[cfg(unix)]
+#[test]
+fn the_connection_picker_reads_the_store_afresh() {
+    let server = RecordingServer::start();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let file = d.join(".api-credentials.json");
+    let broken = r#"{"connections":[],"default":"",}"#;
+
+    std::fs::write(&file, broken).unwrap();
+    let mut prompt = open_prompt(&server, d, &[]);
+    prompt.send(b"\x11");
+    prompt.wait_for("could not read", Duration::from_secs(5));
+    prompt.pump(Duration::from_millis(300));
+
+    // Fixed from outside: the next ctrl+q lists it.
+    write_credentials(d, &[("fixed-one", url.clone(), "key", "k", "")], "");
+    let mark = prompt.screen.len();
+    prompt.send(b"\x11");
+    let listed = pump_until(&mut prompt, Duration::from_secs(5), |p| pty::plain(&p.screen[mark..]).contains("fixed-one"));
+    assert!(listed, "{}", pty::plain(&prompt.screen[mark..]));
+    assert!(!pty::plain(&prompt.screen[mark..]).contains("could not read"), "{}", pty::plain(&prompt.screen[mark..]));
+    prompt.send(b"\x1b");
+    prompt.pump(Duration::from_millis(400));
+
+    // Broken from outside: nothing to pick from, and nothing written.
+    std::fs::write(&file, broken).unwrap();
+    let mark = prompt.screen.len();
+    prompt.send(b"\x11");
+    let told = pump_until(&mut prompt, Duration::from_secs(5), |p| pty::plain(&p.screen[mark..]).contains("could not read"));
+    assert!(told, "{}", pty::plain(&prompt.screen[mark..]));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), broken);
+}
+
+/// The width of the last ruler drawn in `output`.
+#[cfg(unix)]
+fn last_ruler(output: &str) -> usize {
+    pty::plain(output)
+        .split(|c: char| c != '─')
+        .filter(|run| !run.is_empty())
+        .last()
+        .map_or(0, |run| run.chars().count())
+}
+
+/// A terminal resized while the prompt is busy with something else (a wait,
+/// a name dialog, a yes or no) is drawn at its new size when that ends.
+#[cfg(unix)]
+#[test]
+fn a_resize_during_a_wait_or_a_dialog_is_drawn_when_it_ends() {
+    use pty::Prompt;
+
+    let server = RecordingServer::start();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write_credentials(d, &[("a", url.clone(), "key", "k", ""), ("x", url.clone(), "key", "k", "")], "a");
+    let mut cmd = api_bare(d);
+    cmd.args(["-c", "a"]);
+    let mut prompt = Prompt::open_with(cmd, 100, 40);
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(500));
+    assert_eq!(last_ruler(&prompt.screen), 100);
+
+    // During a `sleep`.
+    prompt.send(b"\x15");
+    prompt.pump(Duration::from_millis(60));
+    prompt.paste("sleep 1");
+    prompt.pump(Duration::from_millis(60));
+    prompt.send(b"\r");
+    prompt.pump(Duration::from_millis(300));
+    let mark = prompt.screen.len();
+    prompt.resize(60, 40);
+    prompt.pump(Duration::from_millis(1800));
+    assert_eq!(last_ruler(&prompt.screen[mark..]), 60, "{}", pty::plain(&prompt.screen[mark..]));
+
+    // In the save dialog, left with esc.
+    prompt.send(b"\x13");
+    prompt.wait_for("Save connection as", Duration::from_secs(5));
+    prompt.pump(Duration::from_millis(200));
+    let mark = prompt.screen.len();
+    prompt.resize(80, 40);
+    prompt.pump(Duration::from_millis(300));
+    prompt.send(b"\x1b");
+    prompt.pump(Duration::from_millis(600));
+    assert_eq!(last_ruler(&prompt.screen[mark..]), 80, "{}", pty::plain(&prompt.screen[mark..]));
+
+    // In the export dialog.
+    prompt.send(b"\x12");
+    prompt.wait_for("Export with external identifier", Duration::from_secs(5));
+    prompt.pump(Duration::from_millis(200));
+    let mark = prompt.screen.len();
+    prompt.resize(70, 40);
+    prompt.pump(Duration::from_millis(300));
+    // The input keeps to the new width from here on.
+    prompt.send("com.heads.".repeat(9).as_bytes());
+    prompt.pump(Duration::from_millis(300));
+    let asks = "› Export with external identifier: ";
+    let drawn = pty::plain(&prompt.screen[mark..]);
+    let input = drawn.rsplit(asks).next().unwrap().trim_end();
+    assert!(input.starts_with('…') && asks.chars().count() + input.chars().count() < 70, "{input:?}");
+    prompt.send(b"\x1b");
+    prompt.pump(Duration::from_millis(600));
+    assert_eq!(last_ruler(&prompt.screen[mark..]), 70, "{}", pty::plain(&prompt.screen[mark..]));
+
+    // At the question whether to write over a saved connection.
+    prompt.send(b"\x13");
+    prompt.wait_for("Save connection as", Duration::from_secs(5));
+    prompt.pump(Duration::from_millis(150));
+    prompt.send(&[0x7f; 8]);
+    prompt.send(b"x\r");
+    let mark = prompt.screen.len();
+    prompt.wait_for("\"x\" already exists. Overwrite?", Duration::from_secs(5));
+    prompt.resize(90, 40);
+    prompt.pump(Duration::from_millis(300));
+    prompt.send(b"n");
+    prompt.pump(Duration::from_millis(600));
+    assert_eq!(last_ruler(&prompt.screen[mark..]), 90, "{}", pty::plain(&prompt.screen[mark..]));
 }
 
 /// On a terminal narrower than its text, the save dialog keeps to its rows

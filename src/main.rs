@@ -812,6 +812,20 @@ fn load_keychain_data() -> KeychainData {
     })
 }
 
+/// Read the saved connections again, in the place of what this run read
+/// before: a store that was fixed since is found good, and one that broke is
+/// found broken. For the connection picker, which shows what is there now.
+fn refresh_store() {
+    let (data, problem) = match read_store() {
+        Ok(data) => (data, None),
+        Err(problem) => (KeychainData::default(), Some(problem)),
+    };
+    KEYCHAIN_CACHE.with(|cache| *cache.borrow_mut() = Some(data));
+    if let Ok(mut kept) = STORE_PROBLEM.lock() {
+        *kept = problem;
+    }
+}
+
 fn save_keychain_data(data: &KeychainData) -> Result<(), String> {
     if let Some(path) = no_keychain_file() {
         write_store_file(&path, data)?;
@@ -4953,6 +4967,8 @@ struct RequestFailure {
     timed_out: bool,
     /// A refused certificate or a failed handshake, described.
     tls: Option<String>,
+    /// The response came, and its body stopped before its end or stalled.
+    body: Option<io::Error>,
 }
 
 impl RequestFailure {
@@ -4960,13 +4976,14 @@ impl RequestFailure {
         RequestFailure {
             timed_out: e.is_timeout(),
             tls: tls_failure(&e).map(|tls| describe_tls_failure(tls, host_of(base_uri))),
+            body: None,
         }
     }
 }
 
 impl From<io::Error> for RequestFailure {
     fn from(e: io::Error) -> Self {
-        RequestFailure { timed_out: io_error_is_timeout(&e), tls: None }
+        RequestFailure { timed_out: io_error_is_timeout(&e), tls: None, body: Some(e) }
     }
 }
 
@@ -7310,6 +7327,16 @@ fn check_describe_block(block: DescribeBlock) -> (DescribeBlock, Vec<String>) {
     (out, warnings)
 }
 
+/// Whether a line that starts something new in a `.api` file is whole as it
+/// stands: a directive or an include. Its brackets are not counted, where a
+/// request, an `import` and a describe block go on until theirs are closed.
+/// The batch parser and `scan_describe_block` both ask here, so that they
+/// read the lines above a describe block the same way.
+fn is_one_line_step(trimmed: &str) -> bool {
+    let first_word = trimmed.split_whitespace().next().unwrap_or("");
+    !trimmed.starts_with('{') && !first_word.eq_ignore_ascii_case("import") && !starts_a_request(first_word)
+}
+
 /// The describe block of a `.api` text, checked, without running anything it
 /// names: includes are not opened and imports not fetched. Placement is
 /// judged as the batch parser judges it (`DescribePlacement`), so a block
@@ -7327,6 +7354,11 @@ fn scan_describe_block(contents: &str) -> Result<Option<(DescribeBlock, Vec<Stri
                 continue;
             }
             describing = place.begin(trimmed)?;
+            // A directive or an include is its one line, whatever brackets
+            // it holds, as the batch parser reads it.
+            if is_one_line_step(trimmed) {
+                continue;
+            }
             current.push_str(line);
         } else {
             current.push('\n');
@@ -7656,7 +7688,7 @@ fn split_bulk_requests_inner(
             describing = place.begin(trimmed)?;
             let first_word = trimmed.split_whitespace().next().unwrap_or("");
             importing = first_word.eq_ignore_ascii_case("import");
-            if !describing && !importing && !starts_a_request(first_word) {
+            if is_one_line_step(trimmed) {
                 // `sleep N` — timing directive.
                 if first_word.eq_ignore_ascii_case("sleep") {
                     let rest = trimmed["sleep".len()..].trim();
@@ -10618,8 +10650,10 @@ fn paste_is_api_text(paste: &str) -> bool {
         || (first.starts_with('{') && describe_block_leads(trimmed))
 }
 
-/// True if `text` is a JSON object with more lines under it: a `.api` file
-/// that opens with its describe block, where an object alone is a body.
+/// True if `text` is a JSON object with the lines of a file under it: a
+/// `.api` file that opens with its describe block. An object alone is a
+/// body, and so is an object with more JSON under it (`{` or `[`: lines of
+/// NDJSON), since nothing in a file under its describe block starts so.
 fn describe_block_leads(text: &str) -> bool {
     let mut current = String::new();
     let mut lines = text.lines();
@@ -10627,7 +10661,10 @@ fn describe_block_leads(text: &str) -> bool {
         current.push_str(line);
         current.push('\n');
         if strip_body_comments_and_count(&current).1 <= 0 {
-            return lines.any(|rest| !rest.trim().is_empty());
+            return lines
+                .map(str::trim_start)
+                .find(|rest| !rest.is_empty())
+                .is_some_and(|rest| !rest.starts_with(['{', '[']));
         }
     }
     false
@@ -11224,7 +11261,11 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
             }
         }
         Some(Err(e)) => {
-            block.head = if e.timed_out {
+            block.head = if let Some(body) = &e.body {
+                // The server answered and the body did not arrive whole:
+                // said as a batch says it, not as a server that is not there.
+                format!("\n{}\n\n", describe_body_failure(body, state.config.timeout_secs))
+            } else if e.timed_out {
                 format!(
                     "\nTimed out after {} — raise it with --timeout <seconds> (0 = no timeout)\n\n",
                     describe_timeout(state.config.timeout_secs)
@@ -12267,7 +12308,7 @@ enum InlineInput {
 
 // Read a line of input in raw mode (already in raw mode when called from interactive)
 fn read_inline_input(stdout: &mut io::Stdout, prompt: &str, mask: bool, prefill: &str) -> io::Result<InlineInput> {
-    read_inline_input_within(stdout, prompt, mask, prefill, None, None)
+    read_inline_input_within(stdout, prompt, mask, prefill, None, None, None)
 }
 
 /// The prompt and the value of an inline input as one line of at most `cols`
@@ -12298,12 +12339,17 @@ fn read_inline_input_within(
     prefill: &str,
     cols: Option<usize>,
     mut idle: Option<&mut dyn FnMut(&mut io::Stdout) -> io::Result<()>>,
+    // Where a resize that arrives while the input is open is left for the
+    // caller, who has the session to tell. The input keeps to the new width
+    // from then on.
+    resized: Option<&Resized>,
 ) -> io::Result<InlineInput> {
     let mut buf = prefill.to_string();
+    let cols = std::cell::Cell::new(cols);
 
     let shown = |buf: &str| -> (String, String) {
         let value = if mask && !buf.is_empty() { "•".repeat(char_len(buf)) } else { buf.to_string() };
-        inline_input_line(prompt, &value, cols)
+        inline_input_line(prompt, &value, cols.get())
     };
     let render_line = |stdout: &mut io::Stdout, buf: &str| -> io::Result<()> {
         execute!(stdout, cursor::MoveToColumn(0), Clear(ClearType::CurrentLine))?;
@@ -12325,7 +12371,15 @@ fn read_inline_input_within(
             let event = event::read()?;
             // A paste fills the input: its first line, since the input is one.
             if let Event::Paste(text) = &event {
-                buf.push_str(text.lines().next().unwrap_or("").trim());
+                buf.push_str(&first_pasted_line(text));
+            }
+            if let Event::Resize(w, h) = &event {
+                if let Some(resized) = resized {
+                    resized.set(Some((*w, *h)));
+                }
+                if cols.get().is_some() {
+                    cols.set(Some(*w as usize));
+                }
             }
             if let Event::Key(key) = event {
                 if key.kind != event::KeyEventKind::Press { continue; }
@@ -12354,13 +12408,35 @@ fn read_inline_input_within(
     }
 }
 
+/// The first line of a paste, for an input that is one line. A terminal
+/// sends the line breaks of a bracketed paste as carriage returns, which
+/// `str::lines` does not split on.
+fn first_pasted_line(paste: &str) -> String {
+    normalize_paste_newlines(paste).lines().next().unwrap_or("").trim().to_string()
+}
+
+/// The size of the terminal after a resize that a dialog saw, if it saw one.
+type Resized = std::cell::Cell<Option<(u16, u16)>>;
+
+/// What a dialog saw of a resize, told to the session: the new size is taken
+/// at once and the command area is drawn again at it when the dialog closes.
+fn take_resize(state: &mut AppState, resized: &Resized) {
+    if let Some((w, h)) = resized.take() {
+        note_resize(state, &Event::Resize(w, h));
+    }
+}
+
 // Inline yes/no prompt in raw mode
-fn confirm_inline(stdout: &mut io::Stdout, prompt: &str) -> io::Result<bool> {
+fn confirm_inline(stdout: &mut io::Stdout, prompt: &str, resized: &Resized) -> io::Result<bool> {
     execute!(stdout, Print(format!("{} (Y/n) ", prompt)))?;
     stdout.flush()?;
     loop {
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
+            let event = event::read()?;
+            if let Event::Resize(w, h) = &event {
+                resized.set(Some((*w, *h)));
+            }
+            if let Event::Key(key) = event {
                 if key.kind != event::KeyEventKind::Press { continue; }
                 if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
                     execute!(stdout, cursor::Show)?;
@@ -12460,11 +12536,13 @@ fn ask_export_name(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     // When the name was last refused. The notice stands in the hint line for
     // as long as a status message does, then the hint is back.
     let refused_at: std::cell::Cell<Option<Instant>> = std::cell::Cell::new(None);
+    let resized = Resized::new(None);
     let mut notice_shown = false;
     let mut draw_hint_line = |stdout: &mut io::Stdout| -> io::Result<()> {
         let active = refused_at.get().filter(|at| at.elapsed() < STATUS_MSG_TTL);
         // Cut at the margin: with auto-wrap off a terminal would otherwise
         // pile the rest of the text onto its last column.
+        let width = resized.get().map_or(width, |(w, _)| w as usize);
         let fits = |text: &str| -> String { text.chars().take(width.saturating_sub(2)).collect() };
         let line = match active {
             Some(at) => status_msg_styled(&fits(EXPORT_NAME_REFUSED), Some(at)),
@@ -12488,7 +12566,8 @@ fn ask_export_name(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
 
     let mut typed = String::new();
     let answer = loop {
-        match read_inline_input_within(stdout, prompt, false, &typed, Some(width), Some(&mut draw_hint_line))? {
+        let cols = resized.get().map_or(width, |(w, _)| w as usize);
+        match read_inline_input_within(stdout, prompt, false, &typed, Some(cols), Some(&mut draw_hint_line), Some(&resized))? {
             InlineInput::Entered(name) => {
                 let name = name.trim().to_string();
                 if name.is_empty() {
@@ -12514,6 +12593,7 @@ fn ask_export_name(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     for _ in 0..input_lines {
         execute!(stdout, Print("\r\n"))?;
     }
+    take_resize(state, &resized);
     Ok(answer)
 }
 
@@ -12561,7 +12641,10 @@ fn handle_save_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io::
     // Move back up to prompt line
     execute!(stdout, cursor::MoveUp(2), cursor::MoveToColumn(0))?;
 
-    let name = match read_inline_input_within(stdout, &prompt, false, &prefill, Some(width), None)? {
+    let resized = Resized::new(None);
+    let entered = read_inline_input_within(stdout, &prompt, false, &prefill, Some(width), None, Some(&resized))?;
+    take_resize(state, &resized);
+    let name = match entered {
         InlineInput::Entered(n) if !n.is_empty() => n,
         ended => {
             // Restore normal command area
@@ -12584,7 +12667,9 @@ fn handle_save_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io::
     if save_asks_to_overwrite(&envs, &name, &state.connection_alias) {
         // Move down past bottom ruler, replace hint with confirm prompt
         execute!(stdout, Print("\r\n"), cursor::MoveDown(1), cursor::MoveToColumn(0), Clear(ClearType::CurrentLine))?;
-        if !confirm_inline(stdout, &format!("  \"{}\" already exists. Overwrite?", name))? {
+        let confirmed = confirm_inline(stdout, &format!("  \"{}\" already exists. Overwrite?", name), &resized)?;
+        take_resize(state, &resized);
+        if !confirmed {
             execute!(stdout, cursor::MoveUp(1), cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
             for _ in 0..input_lines { execute!(stdout, Print("\r\n"))?; }
             state.status_msg = "cancelled".to_string();
@@ -12639,6 +12724,8 @@ fn handle_save_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io::
 }
 
 fn handle_switch_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<Option<std::sync::mpsc::Receiver<BackgroundLoadResult>>> {
+    // What is saved now, not what was when the session started.
+    refresh_store();
     let envs = list_connections();
     if envs.is_empty() {
         // A store that could not be read is not the same as none saved.
@@ -13689,8 +13776,10 @@ fn apply_background_result(state: &mut AppState, result: BackgroundLoadResult) {
         show_streaming_info(state);
     }
     state.config.complete = result.complete && !result.spec_unreadable;
-    if result.spec_unreadable && state.status_msg.is_empty() {
-        // Said once, where everything is said: the regular notification.
+    if result.spec_unreadable {
+        // Said once, where everything is said: the regular notification. It
+        // takes the place of `connected to: <name>`: it is the more useful
+        // of the two, and the prompt has nowhere to keep a notice waiting.
         state.status_msg = "completion unavailable: the API spec could not be read".to_string();
         state.status_msg_at = Some(Instant::now());
     }
@@ -19422,6 +19511,13 @@ mod tests {
         assert!(!paste_is_api_text("/people\n"));            // one path, newline and all
         assert!(!paste_is_api_text("{\"a\":1}"));            // JSON body
         assert!(!paste_is_api_text("{\n  \"a\": 1\n}"));     // multi-line body
+        // An object with a file's lines under it is that file's describe block…
+        assert!(paste_is_api_text("{\"title\":{}}\nGET /a"));
+        assert!(paste_is_api_text("{\n \"title\": {}\n}\n\n# seed\n/a\n"));
+        // …and one with more JSON under it is a body: lines of NDJSON.
+        assert!(!paste_is_api_text("{\"a\":1}\n{\"a\":2}"));
+        assert!(!paste_is_api_text("{\"a\":1}\n\n  {\"a\":2}\n"));
+        assert!(!paste_is_api_text("{\"a\":1}\n[1,2]"));
         assert!(!paste_is_api_text("@people/*.json"));
         assert!(!paste_is_api_text("> out.json"));
         assert!(!paste_is_api_text("urls"));                  // not a directive
@@ -22472,6 +22568,10 @@ mod tests {
             ("GET /a\n\n{ \"title\": {} }\n", late.to_string()),
             ("sleep 1ms\n{ \"title\": {} }\n", late.to_string()),
             ("confirm\n{ \"title\": {} }\n", late.to_string()),
+            // A directive is its one line: a bracket it leaves open does not
+            // take the block below into it.
+            ("confirm Send [x?\n{ \"title\": {} }\n", late.to_string()),
+            ("confirm Send {x?\n\n{ \"title\": {} }\n", late.to_string()),
             ("export com.heads.seedID\n{ \"title\": {} }\n", late.to_string()),
             ("import dir d { \"path\": \".\" }\n{ \"title\": {} }\n", late.to_string()),
             // Under a request with no body it is most likely the body.
@@ -22605,6 +22705,16 @@ mod tests {
         // The same block the batch parser reads.
         let src = "{ \"title\": { \"SV-se\": \"Katalog\" }, \"docsLink\": \"https://x\" }\nGET /a\n";
         assert_eq!(scan_describe_block(src).unwrap().unwrap().0, describe_of(src));
+        // A `url` line may stand above it, with a bracket it never closes.
+        for above in ["url has [x", "URL  HAS {x", "# [\nurl is http://[::1"] {
+            let src = format!("{above}\n{{ \"title\": {{ \"en\": \"T\" }} }}\nGET /a\n");
+            let scanned = scan_describe_block(&src).unwrap().expect(above).0;
+            assert_eq!(scanned["title"]["en"], "T", "{above}");
+            assert_eq!(scanned, describe_of(&src), "{above}");
+        }
+        assert!(is_one_line_step("confirm Send [x?") && is_one_line_step("seed.api") && is_one_line_step("sleep 2"));
+        assert!(!is_one_line_step("PUT /a [") && !is_one_line_step("/a") && !is_one_line_step("{"));
+        assert!(!is_one_line_step("import git cl {") && is_one_line_step("/tmp/seed.api"));
     }
 
     #[test]
