@@ -1399,6 +1399,100 @@ fn a_failed_token_exchange_does_not_end_the_prompt() {
     assert_eq!(server.log.lock().unwrap().clone(), ["GET /still-here"]);
 }
 
+/// A request from an imported file is logged as its line has it, with the
+/// `@file` path as written and not the path the import resolved it to. And
+/// an `@file` that is a link leading out of an imported directory is refused,
+/// as an include through such a link is.
+#[cfg(unix)]
+#[test]
+fn an_imported_file_body_is_logged_as_written_and_stays_inside() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    prepare(d);
+    std::fs::write(d.join("main.api"), "import dir d {\"path\":\"libdir\"}\nd/d.api\n").unwrap();
+
+    let batch = run_in(&server, d, &["-sa", "main.api"]);
+    assert_eq!(batch.code, Some(0), "{}", batch.stderr);
+    assert_eq!(batch.sent, ["GET /dir1", r#"PUT /dir2 {"from":"dir"}"#]);
+    assert!(batch.stdout.contains("\nPUT /dir2 @body.json\n"), "{}", batch.stdout);
+    assert!(!batch.stdout.contains("libdir/body.json"), "{}", batch.stdout);
+
+    // The preview shows the same line.
+    let preview = ask(&server, d, &["-spa", "main.api"], Some("n\n"));
+    assert!(preview.stderr.contains("  PUT /dir2 @body.json\n"), "{}", preview.stderr);
+    assert!(preview.sent.is_empty());
+
+    // A file of the import that is a link to one outside it.
+    std::fs::write(d.join("outside.json"), r#"{"secret":"outside"}"#).unwrap();
+    std::os::unix::fs::symlink(d.join("outside.json"), d.join("libdir/link.json")).unwrap();
+    std::fs::write(d.join("libdir/leak.api"), "PUT /leak @link.json\n").unwrap();
+    std::fs::write(d.join("leak.api"), "import dir d {\"path\":\"libdir\"}\nGET /first\nd/leak.api\n").unwrap();
+    let leak = run_in(&server, d, &["-sa", "leak.api"]);
+    assert_eq!((leak.code, leak.sent.len()), (Some(1), 0), "{}", leak.stderr);
+    assert!(leak.stderr.contains("`@link.json` must be a relative path inside the import"), "{}", leak.stderr);
+
+    // A link that stays inside is a file like any other.
+    std::fs::remove_file(d.join("libdir/link.json")).unwrap();
+    std::os::unix::fs::symlink(d.join("libdir/body.json"), d.join("libdir/link.json")).unwrap();
+    let inside = run_in(&server, d, &["-sa", "leak.api"]);
+    assert_eq!(inside.code, Some(0), "{}", inside.stderr);
+    assert_eq!(inside.sent, ["GET /first", r#"PUT /leak {"from":"dir"}"#]);
+}
+
+/// A body of several lines sent from the prompt is one entry of the history
+/// file, which is the user's alone.
+#[cfg(unix)]
+#[test]
+fn the_history_file_keeps_a_multi_line_entry_on_one_line() {
+    use pty::Prompt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let history = d.join(".api_history");
+    {
+        let mut prompt = Prompt::open(api(server.port, d));
+        prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+        prompt.pump(Duration::from_millis(500));
+        for line in ["GET /one", "PUT /two {\r  \"a\": 1\r}"] {
+            prompt.send(b"\x15");
+            prompt.pump(Duration::from_millis(60));
+            server.take();
+            prompt.paste(line);
+            prompt.pump(Duration::from_millis(80));
+            prompt.send(b"\r");
+            let start = Instant::now();
+            while server.seen() == 0 && start.elapsed() < Duration::from_secs(5) {
+                prompt.pump(Duration::from_millis(50));
+            }
+            prompt.pump(Duration::from_millis(200));
+        }
+    }
+    let text = std::fs::read_to_string(&history).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text:?}");
+    assert_eq!(lines[0], "GET /one");
+    assert!(lines[1].starts_with("PUT /two {") && lines[1].ends_with('}'), "{text:?}");
+    assert_eq!(std::fs::metadata(&history).unwrap().permissions().mode() & 0o777, 0o600);
+
+    // The next session has both, the second one whole: Up brings it back
+    // and Enter sends it again.
+    let mut prompt = Prompt::open(api(server.port, d));
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(500));
+    server.take();
+    prompt.send(b"\x1b[A");
+    prompt.pump(Duration::from_millis(200));
+    prompt.send(b"\r");
+    let start = Instant::now();
+    while server.seen() == 0 && start.elapsed() < Duration::from_secs(5) {
+        prompt.pump(Duration::from_millis(50));
+    }
+    assert_eq!(server.take(), ["PUT /two {\n  \"a\": 1\n}"]);
+}
+
 /// Stdin is the body of a one-shot request that takes a body and was given
 /// none. A GET leaves it alone, and so can be answered a `-p` from it; a PUT
 /// under `-p` with no terminal would need stdin twice and says so.

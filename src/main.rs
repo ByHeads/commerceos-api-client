@@ -809,6 +809,9 @@ fn oauth2_token_exchange(base_uri: &str, client_id: &str, client_secret: &str) -
 // OpenAPI spec structures for tab completion
 #[derive(Debug, Deserialize, Default)]
 struct ApiSpec {
+    // What a spec leaves out is left out of completion; it does not make the
+    // whole spec unreadable.
+    #[serde(default)]
     paths: HashMap<String, PathItem>,
     components: Option<Components>,
     tags: Option<Vec<TagItem>>,
@@ -816,6 +819,7 @@ struct ApiSpec {
 
 #[derive(Debug, Deserialize, Default)]
 struct TagItem {
+    #[serde(default)]
     name: String,
     #[serde(rename = "x-type")]
     x_type: Option<String>,
@@ -823,6 +827,7 @@ struct TagItem {
 
 #[derive(Debug, Deserialize, Default)]
 struct Components {
+    #[serde(default)]
     schemas: HashMap<String, SchemaDefinition>,
 }
 
@@ -844,6 +849,7 @@ struct PathParameter {
 
 #[derive(Debug, Deserialize, Default)]
 struct OperationItem {
+    #[serde(default)]
     responses: HashMap<String, ResponseItem>,
     parameters: Option<Vec<PathParameter>>,
     tags: Option<Vec<String>>,
@@ -919,6 +925,9 @@ struct IndexerInfo {
 struct BackgroundLoadResult {
     streaming: bool,
     complete: bool,
+    /// The server answered the request for its API spec, and the answer was
+    /// not a spec the client could read: completion has nothing to go by.
+    spec_unreadable: bool,
     connected: bool,  // true if server responded (even without metadata)
     // 1Password resolved credentials (if applicable)
     base_uri: Option<String>,
@@ -958,6 +967,10 @@ struct AppState {
     prev_uri: String,
     prev_body: String,
     prev_outfile: String,
+    /// The last request's outfile as written (`clipboard` among them), and
+    /// whether it was `>>`.
+    prev_display_outfile: String,
+    prev_outfile_append: bool,
     display_outfile: String,  // Original outfile path (with ~ unexpanded) for display
     last_outfile: String,
     last_display_outfile: String,  // Display version of last outfile
@@ -1050,6 +1063,8 @@ impl AppState {
             prev_uri: String::new(),
             prev_body: String::new(),
             prev_outfile: String::new(),
+            prev_display_outfile: String::new(),
+            prev_outfile_append: false,
             display_outfile: String::new(),
             last_outfile: String::new(),
             last_display_outfile: String::new(),
@@ -1841,31 +1856,95 @@ fn get_history_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".api_history"))
 }
 
-fn load_history() -> Vec<String> {
-    if let Some(path) = get_history_path() {
-        if let Ok(file) = fs::File::open(&path) {
-            let reader = io::BufReader::new(file);
-            return reader.lines().filter_map(|l| l.ok()).collect();
-        }
-    }
-    Vec::new()
+/// The history file never holds more entries than this.
+const HISTORY_LIMIT: usize = 1000;
+
+/// Stands for a line break inside a history entry. The file holds one entry
+/// per line, and an entry may be a body of several lines; this character
+/// (the "symbol for newline") takes the place of each of its line breaks.
+/// A line of a file written before entries were kept this way holds none,
+/// and is read as it always was.
+const HISTORY_NEWLINE: char = '\u{2424}';
+
+fn history_line(entry: &str) -> String {
+    entry.replace("\r\n", "\n").replace(['\n', '\r'], &HISTORY_NEWLINE.to_string())
 }
 
-fn save_history(history: &[String]) {
-    if let Some(path) = get_history_path() {
-        if let Ok(mut file) = fs::File::create(&path) {
-            for entry in history.iter().rev().take(1000).collect::<Vec<_>>().iter().rev() {
-                let _ = writeln!(file, "{}", entry);
+fn history_entry(line: &str) -> String {
+    line.replace(HISTORY_NEWLINE, "\n")
+}
+
+/// The history file holds every line and body typed, secrets among them, so
+/// it is the user's alone. (On Windows the profile directory's own access
+/// rules are what keep it so.)
+fn keep_history_private(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = fs::metadata(path) {
+            if meta.permissions().mode() & 0o777 != 0o600 {
+                let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
             }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+fn load_history() -> Vec<String> {
+    get_history_path().map(|path| load_history_from(&path)).unwrap_or_default()
+}
+
+/// Read the history, and bring the file within its limits while at it: an
+/// older file may be readable by others, and may have grown without bound.
+fn load_history_from(path: &std::path::Path) -> Vec<String> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    keep_history_private(path);
+    let mut entries: Vec<String> = text.lines().filter(|line| !line.is_empty()).map(history_entry).collect();
+    if entries.len() > HISTORY_LIMIT {
+        entries.drain(..entries.len() - HISTORY_LIMIT);
+        save_history_to(path, &entries);
+    }
+    entries
+}
+
+/// Write the last `HISTORY_LIMIT` entries as the whole file, in one step.
+fn save_history_to(path: &std::path::Path, history: &[String]) {
+    let kept = &history[history.len().saturating_sub(HISTORY_LIMIT)..];
+    let mut text = String::new();
+    for entry in kept {
+        text.push_str(&history_line(entry));
+        text.push('\n');
+    }
+    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(format!(".tmp-{}", std::process::id()));
+    let tmp = path.with_file_name(name);
+    if fs::write(&tmp, text).is_ok() {
+        keep_history_private(&tmp);
+        if fs::rename(&tmp, path).is_err() {
+            let _ = fs::remove_file(&tmp);
         }
     }
 }
 
 fn append_history(entry: &str) {
     if let Some(path) = get_history_path() {
-        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
-            let _ = writeln!(file, "{}", entry);
-        }
+        append_history_to(&path, entry);
+    }
+}
+
+fn append_history_to(path: &std::path::Path, entry: &str) {
+    let mut options = fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    if let Ok(mut file) = options.open(path) {
+        let _ = writeln!(file, "{}", history_line(entry));
     }
 }
 
@@ -6751,7 +6830,35 @@ fn rebase_import_path(
     if !resolved.starts_with(&repo.checkout) {
         return Err(outside());
     }
+    // And where it really is: a link that leads out of the import (possible
+    // in an `import dir`, whose files are used where they are) is refused as
+    // an include through such a link is. A file that is not there is left to
+    // fail where it is read, and a glob to the files it matches.
+    if let Ok(real) = resolved.canonicalize() {
+        let inside = repo.checkout.canonicalize().map(|root| real.starts_with(root)).unwrap_or(true);
+        if !inside {
+            return Err(outside());
+        }
+    }
     Ok(resolved.to_string_lossy().to_string())
+}
+
+/// The `@file` bodies of imported files as they were written, by the body
+/// they were rebased to. A request from an import is sent with the path its
+/// file really has, and logged with the one its line has.
+static WRITTEN_BODIES: std::sync::Mutex<Option<HashMap<String, String>>> = std::sync::Mutex::new(None);
+
+/// A body as its line wrote it: for the `@file` body of an imported file,
+/// the path in the file, not the one in the cache it was resolved to.
+fn body_as_written(body: &str) -> String {
+    if !body.starts_with('@') {
+        return body.to_string();
+    }
+    WRITTEN_BODIES
+        .lock()
+        .ok()
+        .and_then(|written| written.as_ref().and_then(|map| map.get(body).cloned()))
+        .unwrap_or_else(|| body.to_string())
 }
 
 /// A request from an imported file with its `@file` body, if it has one,
@@ -6772,8 +6879,12 @@ fn rebase_at_body(
     let functions = &body[file_body.len()..];
     let raw = file_body.trim_start_matches('@').trim();
     let path = rebase_import_path(raw, file_dir, repo)?;
+    let rebased = format!("@{}{}", path, functions);
+    if let Ok(mut written) = WRITTEN_BODIES.lock() {
+        written.get_or_insert_with(HashMap::new).insert(rebased.clone(), body.clone());
+    }
     let (uri, outfile) = split_uri_outfile(&uri_and_outfile);
-    Ok(format!("{} {} @{}{}{}", method, uri, path, functions, outfile))
+    Ok(format!("{} {} {}{}", method, uri, rebased, outfile))
 }
 
 /// An include that starts with a declared alias (`cl/sv.api`): the repository
@@ -7569,7 +7680,7 @@ fn split_bulk_requests_in_session(contents: &str, export: Option<String>) -> Res
 /// The body is compacted (JSON re-serialized without whitespace) when possible,
 /// matching the bulk-silent status-line format.
 fn format_request_preview(method: &str, uri: &str, body: &str) -> String {
-    let display_body = compact_body_for_display(body);
+    let display_body = compact_body_for_display(&body_as_written(body));
     if display_body.is_empty() {
         return format!("{} {}", method, uri);
     }
@@ -9269,11 +9380,6 @@ fn handle_key_event(
                 state.history.push(input.clone());
                 append_history(&input);
                 state.history_idx = -1;
-                state.prev_method = state.method.clone();
-                state.prev_uri = state.uri.clone();
-                state.prev_body = state.body.clone();
-                state.prev_outfile = state.config.outfile.clone();
-
                 execute_request(state, stdout)?;
 
                 state.input = format!("{} {}", state.method, state.uri);
@@ -9512,11 +9618,6 @@ fn handle_key_event(
                     state.config.outfile_append = false;
                     state.display_outfile.clear();
                     state.method_auto_promoted = false;
-                    state.prev_method = state.method.clone();
-                    state.prev_uri = state.uri.clone();
-                    state.prev_body = String::new();
-                    state.prev_outfile = String::new();
-
                     execute_request(state, stdout)?;
 
                     (state.input, state.cursor_pos) = typed;
@@ -9869,10 +9970,6 @@ fn handle_key_event(
                         state.history.push(input.clone());
                         append_history(&input);
                         state.history_idx = -1;
-                        state.prev_method = state.method.clone();
-                        state.prev_uri = state.uri.clone();
-                        state.prev_body = state.body.clone();
-                        state.prev_outfile = state.config.outfile.clone();
 
                         if is_chain {
                             // The per-segment restore keeps the full chain on the
@@ -10530,7 +10627,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     let mut block = OutputBlock {
         method: state.method.clone(),
         uri: state.uri.clone(),
-        body: state.body.clone(),
+        body: body_as_written(&state.body),
         display_outfile: state.display_outfile.clone(),
         outfile_append: state.config.outfile_append,
         prefix: std::mem::take(&mut state.log_prefix),
@@ -10540,6 +10637,18 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     // No status yet: one left from the request before would otherwise be
     // read as this one's if it is aborted or never sent.
     state.config.last_status = None;
+
+    // This is the last request now, for ctrl+y, however it came to be sent:
+    // typed, a segment of a chain, a line of a file, ctrl+g. A poll is not
+    // something anyone sent by hand.
+    if !state.config.quiet {
+        state.prev_method = state.method.clone();
+        state.prev_uri = state.uri.clone();
+        state.prev_body = state.body.clone();
+        state.prev_outfile = state.config.outfile.clone();
+        state.prev_display_outfile = state.display_outfile.clone();
+        state.prev_outfile_append = state.config.outfile_append;
+    }
 
     // `--export` rewrites the whole body, so it is read whole.
     let streaming = state.config.streaming && state.config.export_id.is_none();
@@ -12327,99 +12436,94 @@ fn handle_switch_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io
     }
 }
 
-fn copy_curl(state: &AppState) -> bool {
-    if state.prev_uri.is_empty() {
-        return false;
-    }
+/// One word for a POSIX shell, whatever it holds: in single quotes, where
+/// nothing is special, with each `'` of its own written as `'\''`.
+fn sh_quote(word: &str) -> String {
+    format!("'{}'", word.replace('\'', "'\\''"))
+}
 
-    // Build content type and accept headers
+/// The last request sent, as a curl command that sends the same thing: the
+/// same method, URL, authorization, headers and body. Every value is one
+/// quoted shell word, so a body with a `'`, or a URI with `$` or a backtick,
+/// is passed as it is and nothing in it is run. `None` before any request.
+///
+/// The command holds the credential: that is what a command that can be run
+/// as it is takes.
+fn build_curl(state: &AppState) -> Option<String> {
+    if state.prev_uri.is_empty() {
+        return None;
+    }
+    let config = &state.config;
+
     let mut content_type = "application/json".to_string();
     let mut accept = "application/json".to_string();
-
-    if state.config.ndjson {
+    if config.ndjson {
         content_type = "application/x-ndjson".to_string();
         accept = "application/x-ndjson".to_string();
     }
 
-    // Parse file body info early so we can detect content-type from extension
-    let mut file_path_clean = String::new();
-    let mut body_extra_headers: Vec<(String, String)> = Vec::new();
-    let is_file_body = state.prev_body.starts_with("@") || state.prev_body.starts_with("@ ");
+    // An `@file` body: its extension says what it is, and `~map()` is a header.
+    let is_file_body = state.prev_body.starts_with('@');
+    let mut file_path = String::new();
+    let mut body_headers: Vec<(String, String)> = Vec::new();
     if is_file_body {
         let (clean_body, extra_headers) = parse_body_functions(&state.prev_body);
-        file_path_clean = clean_body.trim_start_matches("@ ").trim_start_matches('@').trim().to_string();
-        body_extra_headers = extra_headers;
-
-        // Auto-detect content type from input file extension
-        if file_path_clean.ends_with(".ndjson") || file_path_clean.ends_with(".njson") {
-            content_type = "application/x-ndjson".to_string();
-            accept = "application/x-ndjson".to_string();
-        } else if file_path_clean.ends_with(".csv") {
-            content_type = "text/csv".to_string();
+        file_path = expand_home(clean_body.trim_start_matches("@ ").trim_start_matches('@').trim());
+        body_headers = extra_headers;
+        match outfile_format(&file_path) {
+            OutFormat::Ndjson => {
+                content_type = "application/x-ndjson".to_string();
+                accept = "application/x-ndjson".to_string();
+            }
+            OutFormat::Csv => content_type = "text/csv".to_string(),
+            _ => {}
         }
     }
 
-    // Override accept based on outfile extension
-    if !state.prev_outfile.is_empty() {
-        if state.prev_outfile.ends_with(".ndjson") {
-            accept = "application/x-ndjson".to_string();
-        } else if state.prev_outfile.ends_with(".csv") {
-            accept = "text/csv".to_string();
-        } else if state.prev_outfile.ends_with(".sql") {
-            accept = "application/sql".to_string();
-        }
+    let to_clipboard = is_clipboard_target(&state.prev_display_outfile);
+    let to_file = !state.prev_outfile.is_empty() && !to_clipboard;
+    if let Some(asked) = to_file.then(|| accept_for_outfile(&state.prev_outfile)).flatten() {
+        accept = asked.to_string();
     }
-
-    if state.config.streaming {
+    if config.streaming {
         content_type.push_str(";stream=true");
         accept.push_str(";stream=true");
     }
-
-    if state.config.include_nulls {
+    if config.include_nulls {
         accept.push_str(";skipNulls=false");
     }
 
-    let mut cmd = format!(
-        "curl -gfsSL -X {} \"{}{}\"",
-        state.prev_method,
-        state.config.base_uri,
-        resolve_request_path(&state.config.api_path, &state.prev_uri)
-    );
-
-    if !state.config.token.is_empty() {
-        cmd.push_str(&format!(" -H \"Authorization: Bearer {}\"", state.config.token));
-    } else if !state.config.api_key.is_empty() {
-        cmd.push_str(&format!(" -u \":{}\"", state.config.api_key));
+    let url = format!("{}{}", config.base_uri, resolve_request_path(&config.api_path, &state.prev_uri));
+    let mut cmd = format!("curl -gfsSL -X {} {}", state.prev_method, sh_quote(&url));
+    // The header the request itself carried: Bearer for a token and for a
+    // key shaped like a JWT, Basic otherwise.
+    if let Some(authorization) = auth_header(config) {
+        cmd.push_str(&format!(" -H {}", sh_quote(&format!("Authorization: {}", authorization))));
     }
-
-    cmd.push_str(&format!(" -H \"Accept: {}\"", accept));
-
+    cmd.push_str(&format!(" -H {}", sh_quote(&format!("Accept: {}", accept))));
     if ["PUT", "PATCH", "POST"].contains(&state.prev_method.as_str()) {
-        cmd.push_str(&format!(" -H \"Content-Type: {}\"", content_type));
+        cmd.push_str(&format!(" -H {}", sh_quote(&format!("Content-Type: {}", content_type))));
     }
-
-    if !state.prev_body.is_empty() {
-        if is_file_body {
-            for (name, value) in &body_extra_headers {
-                cmd.push_str(&format!(" -H \"{}: {}\"", name, value));
-            }
-            cmd.push_str(&format!(" --data-binary @{}", file_path_clean));
-        } else {
-            cmd.push_str(&format!(" --data-binary '{}'", state.prev_body));
+    if is_file_body {
+        for (name, value) in &body_headers {
+            cmd.push_str(&format!(" -H {}", sh_quote(&format!("{}: {}", name, value))));
         }
+        cmd.push_str(&format!(" --data-binary {}", sh_quote(&format!("@{}", file_path))));
+    } else if !state.prev_body.is_empty() {
+        cmd.push_str(&format!(" --data-binary {}", sh_quote(&state.prev_body)));
     }
-
-    // Output file
-    if !state.prev_outfile.is_empty() {
-        cmd.push_str(&format!(" -o '{}'", state.prev_outfile));
+    // `> file` is curl's `-o`; `>> file` is the shell's; the clipboard is
+    // nothing a command line has.
+    if to_file && state.prev_outfile_append {
+        cmd.push_str(&format!(" >> {}", sh_quote(&state.prev_outfile)));
+    } else if to_file {
+        cmd.push_str(&format!(" -o {}", sh_quote(&state.prev_outfile)));
     }
+    Some(cmd)
+}
 
-    // Copy to clipboard
-    if cli_clipboard::set_contents(cmd.clone()).is_ok() {
-        return true;
-    }
-
-    false
+fn copy_curl(state: &AppState) -> bool {
+    build_curl(state).is_some_and(|cmd| cli_clipboard::set_contents(cmd).is_ok())
 }
 
 fn render_input_content(state: &mut AppState, width: usize) -> (String, u16, String) {
@@ -13136,6 +13240,7 @@ fn background_load(config: &Config, op_selector: Option<String>) -> BackgroundLo
             }
             Err(e) => {
                 return BackgroundLoadResult {
+                    spec_unreadable: false,
                     streaming: false,
                     complete: false,
                     connected: false,
@@ -13168,6 +13273,7 @@ fn background_load(config: &Config, op_selector: Option<String>) -> BackgroundLo
         Ok(v) => v,
         Err(status) => {
             return BackgroundLoadResult {
+                spec_unreadable: false,
                 streaming: false,
                 complete: false,
                 connected: true,  // got a response, just auth error
@@ -13199,6 +13305,7 @@ fn background_load(config: &Config, op_selector: Option<String>) -> BackgroundLo
     };
 
     let mut result = BackgroundLoadResult {
+        spec_unreadable: false,
         streaming,
         complete,
         connected,
@@ -13293,7 +13400,12 @@ fn apply_background_result(state: &mut AppState, result: BackgroundLoadResult) {
         state.streaming_flash_at = Some(Instant::now());
         show_streaming_info(state);
     }
-    state.config.complete = result.complete;
+    state.config.complete = result.complete && !result.spec_unreadable;
+    if result.spec_unreadable && state.status_msg.is_empty() {
+        // Said once, where everything is said: the regular notification.
+        state.status_msg = "completion unavailable: the API spec could not be read".to_string();
+        state.status_msg_at = Some(Instant::now());
+    }
     state.endpoints = result.endpoints;
     state.schema_props = result.schema_props;
     state.endpoint_types = result.endpoint_types;
@@ -13328,7 +13440,13 @@ fn load_openapi_spec_into(config: &Config, result: &mut BackgroundLoadResult) {
     }
 
     if let Ok(resp) = request.send() {
-        if let Ok(spec) = resp.json::<ApiSpec>() {
+        // A server without a spec (a 404) simply has none. One that answers
+        // with something that is not a spec is worth a word: see
+        // `apply_background_result`.
+        let answered = resp.status().is_success();
+        let spec = resp.json::<ApiSpec>();
+        result.spec_unreadable = answered && spec.is_err();
+        if let Ok(spec) = spec {
             let mut endpoints: Vec<String> = spec.paths.keys().cloned().collect();
             endpoints.sort();
             result.endpoints = endpoints;
@@ -17821,6 +17939,156 @@ mod tests {
         // Onto a name that exists: that entry is replaced, not doubled.
         put_connection(&mut data, &connection("c", "5"), Some("d"));
         assert_eq!((names(&data), data.connections[0].credential.as_str()), (vec!["c".to_string()], "5"));
+    }
+
+    #[test]
+    fn history_keeps_an_entry_of_several_lines_as_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".api_history");
+        assert!(load_history_from(&path).is_empty());
+
+        let body = "PUT /x {\n  \"a\": \"C:\\\\dir\\n\",\n  \"b\": 1\n}";
+        append_history_to(&path, "GET /a");
+        append_history_to(&path, body);
+        append_history_to(&path, "GET /b");
+        // One line per entry in the file…
+        assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 3);
+        // …and the entries come back as they were typed, backslashes and all.
+        assert_eq!(load_history_from(&path), ["GET /a", body, "GET /b"]);
+
+        // A file from before: every line is an entry, read as it is.
+        let old = "GET /a\nPUT /x {\"s\":\"a\\nb \\\\ c\"}\n\nGET /c\n";
+        fs::write(&path, old).unwrap();
+        assert_eq!(load_history_from(&path), ["GET /a", "PUT /x {\"s\":\"a\\nb \\\\ c\"}", "GET /c"]);
+    }
+
+    #[test]
+    fn history_is_capped_and_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".api_history");
+        let lines: String = (0..HISTORY_LIMIT + 250).map(|i| format!("GET /{i}\n")).collect();
+        fs::write(&path, lines).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        // Loading keeps the last 1000 and rewrites the file to match.
+        let loaded = load_history_from(&path);
+        assert_eq!(loaded.len(), HISTORY_LIMIT);
+        assert_eq!((loaded[0].as_str(), loaded.last().unwrap().as_str()), ("GET /250", "GET /1249"));
+        assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), HISTORY_LIMIT);
+        // A file within the limit is left as it is.
+        let before = fs::read_to_string(&path).unwrap();
+        load_history_from(&path);
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &std::path::Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&path), 0o600, "an existing file is made private");
+            let fresh = dir.path().join("fresh");
+            append_history_to(&fresh, "GET /a");
+            assert_eq!(mode(&fresh), 0o600, "a new file is created private");
+            // A world-readable file within the limit is made private too.
+            fs::set_permissions(&fresh, fs::Permissions::from_mode(0o644)).unwrap();
+            load_history_from(&fresh);
+            assert_eq!(mode(&fresh), 0o600);
+        }
+        // Nothing is left beside it.
+        assert!(fs::read_dir(dir.path()).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().contains(".tmp-")));
+    }
+
+    #[test]
+    fn a_curl_command_quotes_every_value_for_the_shell() {
+        assert_eq!(sh_quote("plain"), "'plain'");
+        assert_eq!(sh_quote("O'Brien"), r#"'O'\''Brien'"#);
+        assert_eq!(sh_quote("$HOME `id` \"x\""), "'$HOME `id` \"x\"'");
+
+        let mut state = AppState::new(Config {
+            base_uri: "http://localhost:5000".to_string(),
+            api_key: "k".to_string(),
+            ..Config::default()
+        });
+        assert_eq!(build_curl(&state), None, "nothing was sent yet");
+
+        // A body with an apostrophe, a URI with `$` and a backtick.
+        state.prev_method = "PUT".to_string();
+        state.prev_uri = "/people~where(name=$USER`id`)".to_string();
+        state.prev_body = r#"{"name":"O'Brien"}"#.to_string();
+        assert_eq!(
+            build_curl(&state).unwrap(),
+            concat!(
+                "curl -gfsSL -X PUT 'http://localhost:5000/api/v1/people~where(name=$USER`id`)'",
+                " -H 'Authorization: Basic Oms='",
+                " -H 'Accept: application/json'",
+                " -H 'Content-Type: application/json'",
+                r#" --data-binary '{"name":"O'\''Brien"}'"#,
+            )
+        );
+
+        // A key shaped like a JWT went out as Bearer, and so does the command.
+        let jwt = format!("ey{}", "a".repeat(200));
+        state.config.api_key = jwt.clone();
+        state.prev_method = "GET".to_string();
+        state.prev_uri = "/people".to_string();
+        state.prev_body.clear();
+        assert_eq!(
+            build_curl(&state).unwrap(),
+            format!("curl -gfsSL -X GET 'http://localhost:5000/api/v1/people' -H 'Authorization: Bearer {jwt}' -H 'Accept: application/json'")
+        );
+        state.config.api_key.clear();
+        state.config.token = "tok".to_string();
+        assert!(build_curl(&state).unwrap().contains(" -H 'Authorization: Bearer tok' "));
+
+        // Outfiles: `>` is -o, `>>` is the shell's, the clipboard is neither.
+        let tail = |state: &AppState| build_curl(state).unwrap().split(" -H 'Accept: ").nth(1).unwrap().to_string();
+        state.prev_outfile = "it's.CSV".to_string();
+        state.prev_display_outfile = "it's.CSV".to_string();
+        assert_eq!(tail(&state), r#"text/csv' -o 'it'\''s.CSV'"#);
+        state.prev_outfile_append = true;
+        assert_eq!(tail(&state), r#"text/csv' >> 'it'\''s.CSV'"#);
+        state.prev_outfile = "clipboard".to_string();
+        state.prev_display_outfile = "Clipboard".to_string();
+        state.prev_outfile_append = false;
+        assert_eq!(tail(&state), "application/json'");
+
+        // A file body with `~map()`.
+        state.prev_outfile.clear();
+        state.prev_display_outfile.clear();
+        state.prev_method = "PUT".to_string();
+        state.prev_body = "@data's.csv~map(com.heads.t)".to_string();
+        assert_eq!(
+            tail(&state),
+            r#"application/json' -H 'Content-Type: text/csv' -H 'X-Request-Map: com.heads.t' --data-binary '@data'\''s.csv'"#
+        );
+    }
+
+    #[test]
+    fn a_spec_that_leaves_things_out_is_still_a_spec() {
+        // An operation without `responses`, a tag without a name, components
+        // without schemas: none of them makes the spec unreadable.
+        let spec: ApiSpec = serde_json::from_str(
+            r#"{
+                "paths": {
+                    "/people": { "get": { "tags": ["people"] }, "put": { "responses": {} } },
+                    "/things": {}
+                },
+                "components": {},
+                "tags": [{ "x-type": "person" }, { "name": "people" }]
+            }"#,
+        )
+        .unwrap();
+        let mut paths: Vec<&String> = spec.paths.keys().collect();
+        paths.sort();
+        assert_eq!(paths, ["/people", "/things"]);
+        assert!(spec.components.unwrap().schemas.is_empty());
+        // No paths at all is an empty spec, not an error.
+        assert!(serde_json::from_str::<ApiSpec>("{}").unwrap().paths.is_empty());
+        // What is not a spec still is not one.
+        assert!(serde_json::from_str::<ApiSpec>("[1]").is_err());
     }
 
     #[test]

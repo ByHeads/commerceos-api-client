@@ -378,7 +378,10 @@ import archive cl {
   bodies resolve relative to the imported file itself, and one that points
   outside (`@/etc/hosts`, `@~/…`, `../../x.api`) is an error. Its own
   `import dir` may only name a directory inside the same import. Symlinks in
-  a repository or an archive are not followed. `path` only says where the
+  a repository or an archive are not followed. In an `import dir`, whose
+  files are used where they are, a link is followed only when it stays
+  inside the directory: an include or an `@file` through a link that leads
+  out of it is an error. `path` only says where the
   alias starts: the boundary is still the whole repository or archive, so a
   file under `path` may include or send a file above it.
 - **An imported `url` line can only narrow.** The `url` lines of an import
@@ -1093,7 +1096,9 @@ seeding run.
 
 A request line is logged as it is written, the body on one line and a
 `> outfile` last: `PUT /people [{"name":"Ann"}] > /tmp/put.json`. The `-p`
-preview and the interactive prompt show it the same way.
+preview and the interactive prompt show it the same way. An `@file` body of
+an imported file is logged with the path its line has (`@data/body.json`),
+not the path in the import cache it was read from.
 
 A reader that stops reading does not stop the batch. With `api -sa seed.api |
 head -2` every request is still sent; what would have been printed after the

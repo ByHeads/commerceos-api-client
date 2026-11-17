@@ -296,7 +296,7 @@ two can't be told apart: set the terminal to send DEL (`0x7f`) for Backspace.
 | `alt+←` / `alt+→` | Move by word (also `ctrl+←/→`, `alt+b/f`) |
 | `alt+backspace` / `ctrl+w` | Delete word backward |
 | `alt+d` | Delete word forward |
-| `ctrl+y` | Copy last request as curl |
+| `ctrl+y` | Copy the last request sent as a curl command. It holds the credential, and every value is quoted for the shell |
 | `ctrl+j` | Erase last response body |
 | `ctrl+l` | Clear output |
 | `ctrl+o` | Open the last saved file |
