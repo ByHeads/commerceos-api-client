@@ -819,7 +819,8 @@ table of lines through all three and compares what reached the server.
 **Interactive prompt.** The line is read as `.api` syntax. One request is sent
 as typed (a body-less `PUT` opens the body editor, which is the prompt's own;
 ctrl+d there sends the body, and a body that is not closed is refused as on the
-line: nothing is sent and the editor stays open);
+line: nothing is sent and the editor stays open. A `> file` on the line is
+kept, and written when the body is sent);
 anything else runs in the session: `confirm` asks in the hint line (`y`/enter or
 `n`/esc), `sleep` and `sleep while` show a spinner and stop on esc, `assert`
 logs the line as typed (`assert GET /x`) with its status but not the body and
@@ -1148,6 +1149,12 @@ always wins.
 `-b` without `-c` uses no saved connection at all: the default connection's
 credential was saved for another host and is not sent to this one. Give the
 credential too (`-b … -k …`), or name the connection that lends it (`-c`).
+
+A `-b` that names no host (`-b ""` from a variable that is not set, `-b
+http://`) is not a base URL. A request or a batch ends with `Error: no base URL
+specified. Use -b <url> or -c <connection>.` and exit 1: it is not sent to the
+default connection in its place. Only the interactive prompt opens as it does
+without `-b`.
 
 ```sh
 api --no-keychain -c staging -k "$OTHER_KEY" GET /people      # staging's URL, another key

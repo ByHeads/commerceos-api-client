@@ -228,17 +228,36 @@ fn answer(
     } else if header("authorization") == Some("Basic Om5va2V5") || header("authorization") == Some("Bearer nokey") {
         // The key `nokey` is no key here.
         ("401 Unauthorized", r#"{"error":"no such key"}"#.to_string())
+    } else if header("authorization") == Some("Basic OmZvcmJpZGRlbg==") {
+        // The key `forbidden` is known, and let in nowhere.
+        ("403 Forbidden", r#"{"error":"forbidden"}"#.to_string())
     } else if path.contains("/about") && header("authorization") == Some("Basic OnNwZWM=") {
         // For a session with the key `spec`: a server with a spec to complete from.
         ("200 OK", r#"{"feature-flags":[],"openapi-metadata-version":"1.2"}"#.to_string())
     } else if path.contains("/openapi") && header("authorization") == Some("Basic OnNwZWM=") {
         ("200 OK", PROMPT_SPEC.to_string())
+    } else if path.contains("/mapped-types") && method != "GET" {
+        ("200 OK", "null".to_string())
     } else if path.contains("/mapped-types") && header("authorization") == Some("Basic OnNwZWM=") {
-        (
-            "200 OK",
-            r#"[{"identifiers":{"mappedTypeName":"com.heads.sql"}},{"name":"unnamed"},{"identifiers":{"mappedTypeName":"com.heads.csv"}}]"#
-                .to_string(),
-        )
+        // The list follows the last of two requests the session has sent:
+        // after `/more-types` there is one more type, after `/break-types`
+        // the list can't be had.
+        let log = log.lock().unwrap();
+        let last = log.iter().rev().find(|line| line.contains("-types"));
+        let base = r#"{"identifiers":{"mappedTypeName":"com.heads.sql"}},{"name":"unnamed"},{"identifiers":{"mappedTypeName":"com.heads.csv"}}"#;
+        match last {
+            Some(line) if line.contains("/break-types") => ("500 Internal Server Error", "{}".to_string()),
+            Some(line) if line.contains("/more-types") => {
+                ("200 OK", format!(r#"[{base},{{"identifiers":{{"mappedTypeName":"com.heads.xml"}}}}]"#))
+            }
+            _ => ("200 OK", format!("[{base}]")),
+        }
+    } else if path.contains("/openapi") && header("authorization") == Some("Basic OnNsb3dzcGVj") {
+        // For a session with the key `slowspec`: the spec takes its time.
+        std::thread::sleep(Duration::from_secs(4));
+        ("200 OK", PROMPT_SPEC.to_string())
+    } else if path.contains("/about") && header("authorization") == Some("Basic OnNsb3dzcGVj") {
+        ("200 OK", r#"{"feature-flags":[],"openapi-metadata-version":"1.2"}"#.to_string())
     } else if path.contains("/openapi") && header("authorization") == Some("Basic OmJhZHNwZWM=") {
         // For a session with the key `badspec`: an answer that is no spec.
         ("200 OK", r#""not a spec""#.to_string())
@@ -6445,10 +6464,11 @@ fn the_connection_form_takes_a_key_a_token_or_a_client() {
     keys_then(&mut prompt, "\x1b[C", "API key");
     keys_then(&mut prompt, "\x1b[D", "OAuth2 Client Credentials");
     keys_then(&mut prompt, "\x1b[C\r", "Type your API key");
-    // Esc goes back a field, and from the method to the URL as it was typed.
     keys_then(&mut prompt, "wrong\x7f\x7f\x1b", "Use ← → to choose auth method");
-    let shown = keys_then(&mut prompt, "\x1b", "Type the API base URL");
-    assert!(!shown.contains("http://"), "{shown}");
+    // Esc goes back a field, and from the method to the URL as it was confirmed.
+    keys_then(&mut prompt, "\x1b", "Type the API base URL");
+    prompt.pump(Duration::from_millis(200));
+    assert_eq!(row_with(&prompt, 200, "URL:"), format!("  › {:<14}{url}", "URL:"));
     keys_then(&mut prompt, "\r\r", "Type your API key");
     // What was typed of the key is still there. A key the server refuses
     // is said to be that, and is typed again from nothing.
@@ -6950,9 +6970,16 @@ fn clearing_a_body_and_cycling_a_method_leave_the_rest_of_the_line() {
     let mut prompt = pty::Prompt::open(api(server.port, dir.path()));
     prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
 
-    // The outfile stays, so the request is sent and the file written.
+    // The outfile stays. A PUT without a body asks for one, and sent with
+    // none from there the request goes out and the file is written.
     press(&mut prompt, &["PUT /x {\"a\":1} > kept.json", "\x18"]);
-    assert_eq!(entered(&mut prompt, &server), ["PUT /x"]);
+    server.take();
+    prompt.send(b"\r");
+    prompt.wait_for("Enter body", Duration::from_secs(3));
+    prompt.send(b"\x04");
+    pump_until(&mut prompt, Duration::from_secs(4), |_| server.seen() > 0);
+    prompt.pump(Duration::from_millis(250));
+    assert_eq!(server.log.lock().unwrap().clone(), ["PUT /x"]);
     assert!(dir.path().join("kept.json").is_file());
     // In a chain only the request the cursor is in loses its body.
     press(&mut prompt, &["GET /a && PUT /b {\"n\":1}", "\x18"]);
@@ -7169,4 +7196,1146 @@ fn without_fail_fast_an_error_body_replaces_an_outfile_and_is_not_appended() {
     let got = run_in(&server, d, &["-sfa", "case.api"]);
     assert_eq!((got.code, &got.sent[..]), (Some(1), &["GET /missing".to_string()][..]), "{}", got.stderr);
     assert_eq!(json("out.json"), serde_json::json!([{ "kept": 1 }]));
+}
+
+/// The command area as the screen has it now: the rows from its top ruler
+/// to its hint. There is one top ruler and one bottom ruler on the screen,
+/// and nothing under the hint.
+#[cfg(unix)]
+fn command_area(prompt: &pty::Prompt, cols: usize, what: &str) -> Vec<String> {
+    let rows = pty::rows(&prompt.screen, cols);
+    let rulers = ruler_rows(&rows);
+    assert_eq!(rulers.len(), 2, "{what}: a ruler was left behind\n{}", rows.join("\n"));
+    assert_eq!(rows.len(), rulers[1] + 2, "{what}:\n{}", rows.join("\n"));
+    assert!(rows.iter().all(|row| row.chars().count() <= cols), "{what}:\n{}", rows.join("\n"));
+    rows[rulers[0]..].to_vec()
+}
+
+/// A line of an input of several lines that is exactly as wide as the
+/// terminal takes one row, on the input line and in the body editor: the
+/// rows drawn are the rows the next redraw clears. It used to draw a blank
+/// row under such a line and leave a ruler behind on every key.
+#[cfg(unix)]
+#[test]
+fn a_line_as_wide_as_the_terminal_takes_one_row() {
+    const COLS: usize = 40;
+    const LEFT: &str = "\x1b[D";
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = pty::Prompt::open_with(api(server.port, dir.path()), COLS as u16, 40);
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(500));
+
+    // A first line of 40 columns, and one of 39 with the cursor at its end.
+    for (first, lefts) in [(format!("GET /{}", "a".repeat(35)), 2), (format!("GET /{}", "b".repeat(34)), 7)] {
+        prompt.send(b"\x06\x15");
+        prompt.pump(Duration::from_millis(100));
+        prompt.paste(&format!("{first}\rGET /c"));
+        prompt.pump(Duration::from_millis(300));
+        for _ in 0..lefts {
+            prompt.send(LEFT.as_bytes());
+            prompt.pump(Duration::from_millis(120));
+        }
+        let area = command_area(&prompt, COLS, &first);
+        assert_eq!(area.len(), 5, "{first}:\n{}", area.join("\n"));
+        assert_eq!(area[1], first, "{}", area.join("\n"));
+        assert_eq!(area[2], "GET /c", "{}", area.join("\n"));
+    }
+
+    // The body editor: a line of 40 columns that is not the last.
+    prompt.send(b"\x06\x15");
+    prompt.pump(Duration::from_millis(100));
+    prompt.send(b"PUT /wide\r");
+    prompt.wait_for("Enter body, ctrl+d when done", Duration::from_secs(5));
+    let wide = format!("{{\"k\":\"{}\",", "x".repeat(32));
+    assert_eq!(wide.len(), COLS);
+    prompt.send(wide.as_bytes());
+    prompt.pump(Duration::from_millis(150));
+    for key in ["\r", "\"", "n", "\"", ":", "1", "}"] {
+        prompt.send(key.as_bytes());
+        prompt.pump(Duration::from_millis(120));
+    }
+    let area = command_area(&prompt, COLS, "body editor");
+    // The ruler, the request, the editor's own line (two rows at this
+    // width), the two lines of the body, the ruler and the hint.
+    assert_eq!(area.len(), 8, "{}", area.join("\n"));
+    assert_eq!((area[4].as_str(), area[5].as_str()), (wide.as_str(), "\"n\":1}"), "{}", area.join("\n"));
+    server.take();
+    prompt.send(b"\x04");
+    pump_until(&mut prompt, Duration::from_secs(4), |_| server.seen() > 0);
+    assert_eq!(server.take(), [format!("PUT /wide {wide}\n\"n\":1}}")]);
+}
+
+/// One line taller than the terminal (a compact body pasted as one line) is
+/// shown by the rows around the cursor: the command area never takes more
+/// rows than the terminal has, so nothing scrolls and no copy of it is left
+/// behind, and the cursor's row is shown wherever the cursor goes.
+#[cfg(unix)]
+#[test]
+fn a_line_taller_than_the_terminal_is_shown_around_the_cursor() {
+    const COLS: usize = 80;
+    const ROWS: usize = 12;
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = pty::Prompt::open_with(api(server.port, dir.path()), COLS as u16, ROWS as u16);
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(500));
+
+    let members: Vec<String> = (0..150).map(|i| format!("\"key{i:03}\":{i}")).collect();
+    let line = format!("PUT /tall {{{}}}", members.join(","));
+    assert!(line.len() > COLS * ROWS, "{}", line.len());
+    let shown = |prompt: &mut pty::Prompt, keys: &[&str], what: &str| -> Vec<String> {
+        for key in keys {
+            prompt.send(key.as_bytes());
+            prompt.pump(Duration::from_millis(150));
+        }
+        let area = command_area(prompt, COLS, what);
+        assert!(area.len() <= ROWS, "{what}: {} rows on {ROWS}\n{}", area.len(), area.join("\n"));
+        area
+    };
+
+    prompt.send(b"\x15");
+    prompt.pump(Duration::from_millis(60));
+    prompt.paste(&line);
+    prompt.pump(Duration::from_millis(400));
+    // Pasted, the cursor is at the end: the last rows, under a marker.
+    let area = shown(&mut prompt, &[], "pasted");
+    assert_eq!(area[1], "⋯", "{}", area.join("\n"));
+    assert!(area[2..area.len() - 2].concat().ends_with("\"key148\":148,\"key149\":149}"), "{}", area.join("\n"));
+    assert!(!area.iter().any(|row| row.contains("PUT /tall")), "{}", area.join("\n"));
+    // Every key redraws it in place.
+    let area = shown(&mut prompt, &[LEFT, LEFT, LEFT, "x", "\x7f"], "edited at the end");
+    assert!(area[2..area.len() - 2].concat().ends_with("\"key148\":148,\"key149\":149}"), "{}", area.join("\n"));
+    // At the start: the first rows, over a marker.
+    let area = shown(&mut prompt, &[HOME], "at the start");
+    assert!(area[1].starts_with("PUT /tall {\"key000\":0,"), "{}", area.join("\n"));
+    assert_eq!(area[area.len() - 3], "⋯", "{}", area.join("\n"));
+    assert!(!area.iter().any(|row| row.contains("key149")), "{}", area.join("\n"));
+    // In the middle: a marker on both sides.
+    let rights: Vec<&str> = std::iter::repeat("\x1b[C").take(COLS * 6).collect();
+    prompt.send(rights.concat().as_bytes());
+    prompt.pump(Duration::from_millis(1500));
+    let area = shown(&mut prompt, &["\x1b[C"], "in the middle");
+    assert_eq!((area[1].as_str(), area[area.len() - 3].as_str()), ("⋯", "⋯"), "{}", area.join("\n"));
+    // It is sent whole.
+    prompt.send(END.as_bytes());
+    prompt.pump(Duration::from_millis(150));
+    assert_eq!(entered(&mut prompt, &server), [line]);
+}
+
+/// The last row of the screen that holds `text`.
+#[cfg(unix)]
+fn row_with(prompt: &pty::Prompt, cols: usize, text: &str) -> String {
+    let rows = pty::rows(&prompt.screen, cols);
+    rows.iter().rev().find(|row| row.contains(text)).cloned().unwrap_or_else(|| panic!("{text:?}:\n{}", rows.join("\n")))
+}
+
+/// A paste into the connection picker or the form for a new connection
+/// fills the field that is active with its first line, as it does in the
+/// other dialogs. The form a session starts with takes a paste too: it
+/// switches bracketed paste on, so a pasted line break is not an Enter.
+#[cfg(unix)]
+#[test]
+fn a_paste_fills_the_field_of_the_connection_dialog() {
+    let server = RecordingServer::start();
+    let host = format!("127.0.0.1:{}", server.port);
+    let url = format!("http://{host}");
+
+    // The form at startup: URL and key.
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = pty::Prompt::open(api_bare(dir.path()));
+    prompt.wait_for("Type the API base URL", Duration::from_secs(15));
+    assert!(prompt.screen.contains("\x1b[?2004h"), "bracketed paste is not on in the startup form");
+    prompt.pump(Duration::from_millis(300));
+    prompt.paste(&format!("  {host}\rGET /second-line\r"));
+    prompt.pump(Duration::from_millis(300));
+    assert_eq!(row_with(&prompt, 200, "URL:"), format!("  › {:<14}{host}", "URL:"));
+    keys_then(&mut prompt, "\r", "Use ← → to choose auth method");
+    // The method is chosen, not typed: a paste there is nothing.
+    prompt.paste("x\r");
+    prompt.pump(Duration::from_millis(200));
+    keys_then(&mut prompt, "\r", "Type your API key");
+    prompt.paste("k9\rmore\r");
+    prompt.pump(Duration::from_millis(300));
+    assert_eq!(row_with(&prompt, 200, "API key:"), format!("  › {:<14}••", "API key:"));
+    keys_then(&mut prompt, "\r", "ctrl+s to save this connection");
+    prompt.pump(Duration::from_millis(400));
+    press(&mut prompt, &["GET /pasted-key"]);
+    assert_eq!(entered(&mut prompt, &server), ["GET /pasted-key"]);
+    assert!(server.heads()[0].contains("authorization=Basic Oms5;"), "{:?}", server.heads());
+    drop(prompt);
+
+    // A token, and a client with its secret.
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = pty::Prompt::open(api_bare(dir.path()));
+    prompt.wait_for("Type the API base URL", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(300));
+    prompt.paste(&url);
+    keys_then(&mut prompt, "\r", "Use ← → to choose auth method");
+    keys_then(&mut prompt, "\x1b[C\r", "Type your bearer token");
+    prompt.paste("tok\r");
+    prompt.pump(Duration::from_millis(300));
+    keys_then(&mut prompt, "\r", "ctrl+s to save this connection");
+    prompt.pump(Duration::from_millis(400));
+    press(&mut prompt, &["GET /pasted-token"]);
+    assert_eq!(entered(&mut prompt, &server), ["GET /pasted-token"]);
+    assert!(server.heads()[0].contains("authorization=Bearer tok;"), "{:?}", server.heads());
+    drop(prompt);
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = pty::Prompt::open(api_bare(dir.path()));
+    prompt.wait_for("Type the API base URL", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(300));
+    prompt.paste(&url);
+    keys_then(&mut prompt, "\r", "Use ← → to choose auth method");
+    keys_then(&mut prompt, "\x1b[D\r", "Type your OAuth2 client ID");
+    prompt.paste("client-1\r");
+    prompt.pump(Duration::from_millis(300));
+    assert_eq!(row_with(&prompt, 200, "Client ID:"), format!("  › {:<14}client-1", "Client ID:"));
+    keys_then(&mut prompt, "\r", "Type your client secret");
+    prompt.paste("s3cret\r");
+    prompt.pump(Duration::from_millis(300));
+    assert_eq!(row_with(&prompt, 200, "Secret:"), format!("  › {:<14}••••••", "Secret:"));
+    keys_then(&mut prompt, "\r", "ctrl+s to save this connection");
+    drop(prompt);
+
+    // The picker of a running session: the paste is what is searched for.
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write_credentials(
+        d,
+        &[("alpha", url.clone(), "key", "k1", ""), ("zeta", url.clone(), "key", "k4", "")],
+        "alpha",
+    );
+    let mut prompt = pty::Prompt::open(api_bare(d));
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(500));
+    keys_then(&mut prompt, "\x11", "+ Add new connection");
+    prompt.paste("zet\ralpha\r");
+    prompt.pump(Duration::from_millis(300));
+    assert_eq!(row_with(&prompt, 200, "search:"), "    search: zet");
+    assert!(selected_row(&prompt).contains("zeta"), "{}", selected_row(&prompt));
+    keys_then(&mut prompt, "\r", "connected to: zeta");
+}
+
+/// A saved connection whose name starts with `+` is a connection like any
+/// other: listed above the line that adds one, found by a search, connected
+/// to and deleted. Its name used to make it the line that adds one.
+#[cfg(unix)]
+#[test]
+fn a_connection_named_with_a_plus_is_one_of_the_list() {
+    let server = RecordingServer::start();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write_credentials(d, &[("beta", url.clone(), "key", "k2", ""), ("+plus", url.clone(), "key", "k1", "")], "");
+    let open = |d: &Path| {
+        let mut prompt = pty::Prompt::open(api_bare(d));
+        prompt.wait_for("+ Add new connection", Duration::from_secs(15));
+        prompt.pump(Duration::from_millis(400));
+        prompt
+    };
+    // The picker as the screen has it: from its top ruler to its hint.
+    let picker = |prompt: &pty::Prompt, what: &str| -> Vec<String> {
+        let rows = pty::rows(&prompt.screen, 200);
+        let rulers = ruler_rows(&rows);
+        assert_eq!(rulers.len(), 2, "{what}: a ruler was left behind\n{}", rows.join("\n"));
+        assert_eq!(rows.len(), rulers[1] + 2, "{what}:\n{}", rows.join("\n"));
+        rows[rulers[0]..].iter().map(|row| row.trim().to_string()).collect()
+    };
+
+    let mut prompt = open(d);
+    let shown = picker(&prompt, "opened");
+    assert!(shown[0].contains("Choose a connection"), "{shown:#?}");
+    assert_eq!(
+        shown[1..5],
+        [format!("› beta      {url}"), format!("+plus     {url}"), "─".repeat(10 + url.len()), "+ Add new connection".to_string()],
+        "{shown:#?}"
+    );
+    // Down goes through it to the line that adds one, and every redraw is in place.
+    prompt.send(b"\x1b[B");
+    prompt.pump(Duration::from_millis(200));
+    assert!(picker(&prompt, "down").iter().any(|row| row.starts_with("› +plus")));
+    prompt.send(b"\x1b[B");
+    prompt.pump(Duration::from_millis(200));
+    assert!(picker(&prompt, "down twice").iter().any(|row| row == "› + Add new connection"));
+    // A search finds it.
+    prompt.send(b"pl");
+    prompt.pump(Duration::from_millis(300));
+    let shown = picker(&prompt, "searched");
+    assert_eq!(shown[1..4], [format!("› +plus     {url}"), "─".repeat(10 + url.len()), "search: pl".to_string()], "{shown:#?}");
+    // It is connected to.
+    keys_then(&mut prompt, "\r", "connected to: +plus");
+    prompt.pump(Duration::from_millis(400));
+    press(&mut prompt, &["GET /plus"]);
+    assert_eq!(entered(&mut prompt, &server), ["GET /plus"]);
+    assert!(server.heads()[0].contains("authorization=Basic Omsx;"), "{:?}", server.heads());
+    drop(prompt);
+
+    // And deleted.
+    let mut prompt = open(d);
+    prompt.send(b"\x1b[B");
+    prompt.pump(Duration::from_millis(200));
+    keys_then(&mut prompt, "\x1b[3~", "Delete? y/n");
+    keys_then(&mut prompt, "y", "+plus deleted");
+    assert_eq!(stored(d).0, ["beta=k2"]);
+    prompt.pump(Duration::from_millis(200));
+    let shown = picker(&prompt, "deleted");
+    assert_eq!(shown[1..4], [format!("› beta     {url}"), "─".repeat(9 + url.len()), "+ Add new connection".to_string()], "{shown:#?}");
+}
+
+/// The picker keeps to the terminal's width: a connection with a long URL
+/// is one row, cut, and so is the line under the list. Every redraw is in
+/// place. A row that wrapped left a ruler behind on every key.
+#[cfg(unix)]
+#[test]
+fn the_connection_picker_keeps_to_a_narrow_terminal() {
+    const COLS: usize = 40;
+    let server = RecordingServer::start();
+    let url = format!("http://127.0.0.1:{}/a/long/path/under/the/host/that/goes/on", server.port);
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write_credentials(
+        d,
+        &[("first", url.clone(), "key", "k", ""), ("second-with-a-long-name", url.clone(), "key", "k", "")],
+        "",
+    );
+    let picker = |prompt: &pty::Prompt, cols: usize, from: usize, what: &str| -> Vec<String> {
+        let rows = pty::rows(&prompt.screen[from..], cols);
+        let shown = rows.join("\n");
+        let rulers = ruler_rows(&rows);
+        assert_eq!(rulers.len(), 2, "{what}: a ruler was left behind\n{shown}");
+        assert_eq!(rows.len(), rulers[1] + 2, "{what}:\n{shown}");
+        assert!(rows.iter().all(|row| row.chars().count() <= cols), "{what}:\n{shown}");
+        rows[rulers[0]..].to_vec()
+    };
+
+    let mut prompt = pty::Prompt::open_sized(api_bare(d), COLS as u16);
+    prompt.wait_for("+ Add new connection", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(400));
+    let shown = picker(&prompt, COLS, 0, "opened");
+    assert_eq!(shown.len(), 7, "{}", shown.join("\n"));
+    assert!(shown[1].starts_with("  › first") && shown[1].ends_with('…'), "{}", shown.join("\n"));
+    assert!(shown[2].starts_with("    second-with-a-long-name") && shown[2].ends_with('…'), "{}", shown.join("\n"));
+    assert_eq!(shown[3], format!("    {}", "─".repeat(COLS - 4)), "{}", shown.join("\n"));
+    assert_eq!(shown[4], "    + Add new connection");
+    assert!(shown[6].starts_with("  type to search") && shown[6].ends_with('…'), "{}", shown.join("\n"));
+
+    // Moving, searching, asking before a delete: all in place.
+    for (keys, what) in [("\x1b[B", "down"), ("\x1b[A", "up"), ("sec", "searched"), ("\x7f\x7f\x7f", "search cleared"), ("\x1b[3~", "delete?"), ("n", "kept")] {
+        prompt.send(keys.as_bytes());
+        prompt.pump(Duration::from_millis(300));
+        let shown = picker(&prompt, COLS, 0, what);
+        match what {
+            "searched" => assert_eq!(shown[3], "    search: sec", "{}", shown.join("\n")),
+            "delete?" => assert!(shown[1].starts_with("  › first") && shown[1].contains("Delete? y/n"), "{}", shown.join("\n")),
+            _ => assert_eq!(shown.len(), 7, "{what}:\n{}", shown.join("\n")),
+        }
+    }
+    // A connection that is being tried, and one that failed: its row has a
+    // spinner behind it, and the reason is under the ruler.
+    let down = "http://127.0.0.1:1/a/long/path/under/the/host/that/goes/on".to_string();
+    write_credentials(d, &[("first", down, "key", "k", ""), ("second-with-a-long-name", url.clone(), "key", "k", "")], "");
+    drop(prompt);
+    let mut prompt = pty::Prompt::open_sized(api_bare(d), COLS as u16);
+    prompt.wait_for("+ Add new connection", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(400));
+    keys_then(&mut prompt, "\r", "first: connection failed");
+    prompt.pump(Duration::from_millis(200));
+    let shown = picker(&prompt, COLS, 0, "failed");
+    assert_eq!(shown[6], "  first: connection failed", "{}", shown.join("\n"));
+
+    // A window made narrower, and wider again, with the picker open: it is
+    // drawn anew at that width, and stays in place from there.
+    prompt.pump(Duration::from_millis(3200));
+    for cols in [30usize, 28, 100] {
+        let mark = prompt.screen.len();
+        prompt.resize(cols as u16, 50);
+        prompt.pump(Duration::from_millis(700));
+        let shown = picker(&prompt, cols, mark, &format!("resized to {cols}"));
+        assert_eq!(shown.len(), 7, "{cols}:\n{}", shown.join("\n"));
+        prompt.send(b"\x1b[B");
+        prompt.pump(Duration::from_millis(250));
+        prompt.send(b"\x1b[A");
+        prompt.pump(Duration::from_millis(250));
+        let shown = picker(&prompt, cols, mark, &format!("moved at {cols}"));
+        assert!(shown[1].starts_with("  › first"), "{cols}:\n{}", shown.join("\n"));
+        if cols == 100 {
+            assert!(shown[2].ends_with(&url), "{}", shown.join("\n"));
+        }
+    }
+    drop(prompt);
+
+    // The same in the picker of a running session, and the session has the
+    // new width when the picker is left.
+    let mut cmd = api_bare(d);
+    cmd.args(["-c", "second-with-a-long-name"]);
+    let mut prompt = pty::Prompt::open_sized(cmd, 60);
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(600));
+    keys_then(&mut prompt, "\x11", "+ Add new connection");
+    let mark = prompt.screen.len();
+    prompt.resize(COLS as u16, 50);
+    prompt.pump(Duration::from_millis(700));
+    let shown = picker(&prompt, COLS, mark, "resized in a session");
+    assert_eq!(shown.len(), 7, "{}", shown.join("\n"));
+    prompt.send(b"\x1b");
+    prompt.pump(Duration::from_millis(600));
+    // The session clears the screen and draws itself at the new width.
+    let mark = prompt.screen.rfind("\x1b[2J").unwrap();
+    assert!(mark > prompt.screen.rfind("Choose a connection").unwrap(), "the session did not draw itself again");
+    let shown = picker(&prompt, COLS, mark, "back in the session");
+    assert_eq!(shown.len(), 4, "{}", shown.join("\n"));
+    assert_eq!(shown[2], "─".repeat(COLS), "{}", shown.join("\n"));
+    // A line longer than the window is now wide takes two rows.
+    let line = format!("GET /after-resize/{}", "x".repeat(30));
+    press(&mut prompt, &[&line]);
+    let shown = picker(&prompt, COLS, mark, "a long line in the session");
+    assert_eq!(shown.len(), 5, "{}", shown.join("\n"));
+    assert_eq!(format!("{}{}", shown[1], shown[2]), line, "{}", shown.join("\n"));
+    let sent = entered(&mut prompt, &server);
+    assert!(sent.len() == 1 && sent[0].ends_with(&line[4..]), "{sent:?}");
+}
+
+/// The URL field of the form for a new connection. Tab writes what the
+/// ghost shows and nothing where there is none, a scheme is one in any
+/// case, a URL that names no host is not confirmed, and Esc from the method
+/// comes back to the URL as it was confirmed, its scheme included.
+#[cfg(unix)]
+#[test]
+fn the_url_field_completes_confirms_and_keeps_what_it_shows() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = pty::Prompt::open(api_bare(dir.path()));
+    prompt.wait_for("Type the API base URL", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(300));
+    let field = |prompt: &pty::Prompt| row_with(prompt, 200, "URL:").split_once("URL:").unwrap().1.trim().to_string();
+    let typed = |prompt: &mut pty::Prompt, keys: &str| -> String {
+        prompt.send(&[0x7f; 40]);
+        prompt.pump(Duration::from_millis(150));
+        prompt.send(keys.as_bytes());
+        prompt.pump(Duration::from_millis(300));
+        row_with(prompt, 200, "URL:").split_once("URL:").unwrap().1.trim().to_string()
+    };
+
+    // An address has no ghost, and Tab adds nothing to it.
+    assert_eq!(typed(&mut prompt, "10.0.0.5"), "10.0.0.5");
+    assert_eq!(typed(&mut prompt, "10.0.0.5\t"), "10.0.0.5");
+    // A name has one, and Tab writes it.
+    assert_eq!(typed(&mut prompt, "acme"), "acme.app.heads.com");
+    assert_eq!(typed(&mut prompt, "acme\t\t"), "acme.app.heads.com");
+    assert_eq!(typed(&mut prompt, "acme.app.h\tX"), "acme.app.heads.comX");
+    assert_eq!(typed(&mut prompt, "loc\tX"), "localhost:5000X");
+    // A URL with a scheme is whole, however the scheme is written.
+    for url in ["https://host", "HTTPS://host", "Http://host"] {
+        assert_eq!(typed(&mut prompt, url), url);
+        assert_eq!(typed(&mut prompt, &format!("{url}\t")), url);
+    }
+
+    // What names no host is not a URL: Enter stays in the field.
+    for none in ["http://", "HTTPS://", "/", "   ", "http:///api/v1"] {
+        typed(&mut prompt, none);
+        let mark = prompt.screen.len();
+        prompt.send(b"\r");
+        prompt.pump(Duration::from_millis(400));
+        let shown = pty::plain(&prompt.screen[mark..]);
+        assert!(!shown.contains("choose auth method"), "{none:?}: {shown}");
+        assert!(row_with(&prompt, 200, "URL:").starts_with("  › "), "{none:?}");
+    }
+
+    // Confirmed, the URL has its scheme, and keeps it over Esc and Enter.
+    for (typed_url, confirmed) in [
+        ("https://127.0.0.1:18731", "https://127.0.0.1:18731"),
+        ("http://example.com", "http://example.com"),
+        ("example.com", "https://example.com"),
+        ("127.0.0.1:18731", "http://127.0.0.1:18731"),
+    ] {
+        typed(&mut prompt, typed_url);
+        keys_then(&mut prompt, "\r", "Use ← → to choose auth method");
+        prompt.pump(Duration::from_millis(200));
+        assert_eq!(field(&prompt), format!("{confirmed} ✓"), "{typed_url}");
+        keys_then(&mut prompt, "\x1b", "Type the API base URL");
+        prompt.pump(Duration::from_millis(200));
+        assert_eq!(field(&prompt), confirmed, "{typed_url}, back from the method");
+        keys_then(&mut prompt, "\r", "Use ← → to choose auth method");
+        prompt.pump(Duration::from_millis(200));
+        assert_eq!(field(&prompt), format!("{confirmed} ✓"), "{typed_url}, confirmed again");
+        keys_then(&mut prompt, "\x1b", "Type the API base URL");
+    }
+}
+
+/// `-b` with nothing in it (an empty variable, `-b http://`) names no host.
+/// At the prompt it is as no `-b`: the session opens on the default
+/// connection, or on the form at its URL field. It used to open the form at
+/// the method, with an empty URL. With a request it is still an error:
+/// what was meant for a host that was not named is not sent to another.
+#[cfg(unix)]
+#[test]
+fn an_empty_base_url_is_no_base_url() {
+    let server = RecordingServer::start();
+    let url = format!("http://127.0.0.1:{}", server.port);
+
+    for empty in ["", "http://", " / "] {
+        // Nothing saved: the form, at the URL.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cmd = api_bare(dir.path());
+        cmd.args(["-b", empty]);
+        let mut prompt = pty::Prompt::open(cmd);
+        prompt.wait_for("New connection", Duration::from_secs(15));
+        prompt.pump(Duration::from_millis(500));
+        let shown = pty::plain(&prompt.screen);
+        assert!(shown.contains("Type the API base URL") && !shown.contains("choose auth method"), "{empty:?}: {shown}");
+        drop(prompt);
+
+        // A default connection: the session opens on it.
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        write_credentials(d, &[("home", url.clone(), "key", "k", "")], "home");
+        let mut cmd = api_bare(d);
+        cmd.args(["-b", empty]);
+        let mut prompt = pty::Prompt::open(cmd);
+        prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+        prompt.pump(Duration::from_millis(500));
+        press(&mut prompt, &["GET /home"]);
+        assert_eq!(entered(&mut prompt, &server), ["GET /home"], "{empty:?}");
+        drop(prompt);
+
+        // A request is not sent to the default connection in its place.
+        let ran = run_bare(&server, d, &["-b", empty, "-k", "k", "PUT", "/x", "{}"]);
+        assert_eq!((ran.code, ran.sent.len()), (Some(1), 0), "{empty:?}: {}", ran.stderr);
+        assert!(ran.stderr.contains("no base URL specified"), "{empty:?}: {}", ran.stderr);
+        std::fs::write(d.join("seed.api"), "PUT /x {}\n").unwrap();
+        let ran = run_bare(&server, d, &["-b", empty, "-sa", "seed.api"]);
+        assert_eq!((ran.code, ran.sent.len()), (Some(1), 0), "{empty:?}: {}", ran.stderr);
+    }
+}
+
+/// What the picker and the form say when a connection can't be used, and
+/// that the form's own request carries a key as every later request does:
+/// a key shaped like a JWT is a bearer token there too.
+#[cfg(unix)]
+#[test]
+fn the_connection_dialog_says_why_a_connection_is_refused() {
+    let server = RecordingServer::start();
+    let host = format!("127.0.0.1:{}", server.port);
+    let url = format!("http://{host}");
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write_credentials(
+        d,
+        &[
+            ("Zulu", url.clone(), "key", "forbidden", ""),
+            ("down", "http://127.0.0.1:1".to_string(), "key", "k", ""),
+            ("refused", url.clone(), "key", "nokey", ""),
+        ],
+        "",
+    );
+    let mut prompt = pty::Prompt::open(api_bare(d));
+    prompt.wait_for("+ Add new connection", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(400));
+    // The reason is under the ruler, and the picker stays.
+    keys_then(&mut prompt, "\r", "Zulu: forbidden");
+    keys_then(&mut prompt, "\x1b[B\r", "down: connection failed");
+    keys_then(&mut prompt, "\x1b[B\r", "refused: unauthorized");
+    prompt.pump(Duration::from_millis(200));
+    assert_eq!(pty::rows(&prompt.screen, 200).last().unwrap(), "  refused: unauthorized");
+    // A search takes capital letters too.
+    prompt.send(b"Zu");
+    prompt.pump(Duration::from_millis(300));
+    assert_eq!(row_with(&prompt, 200, "search:"), "    search: Zu");
+    assert!(selected_row(&prompt).contains("Zulu"), "{}", selected_row(&prompt));
+    assert_eq!(server.take(), Vec::<String>::new());
+    drop(prompt);
+
+    // The form: a server that answers its request with an error of its own.
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = pty::Prompt::open(api_bare(dir.path()));
+    prompt.wait_for("Type the API base URL", Duration::from_secs(15));
+    keys_then(&mut prompt, &format!("{host}/boom\r"), "Use ← → to choose auth method");
+    keys_then(&mut prompt, "\r", "Type your API key");
+    keys_then(&mut prompt, "k\r", "server returned 500 Internal Server Error, try again");
+    // The key is still there to send again, and the form is where it was.
+    keys_then(&mut prompt, "\r", "server returned 500 Internal Server Error, try again");
+    keys_then(&mut prompt, "\x1b", "Use ← → to choose auth method");
+    keys_then(&mut prompt, "\x1b", "Type the API base URL");
+    // Back at the URL, with the host alone, a key that is shaped like a JWT
+    // is tried as the bearer token it is sent as from then on.
+    prompt.send(&[0x7f; 5]);
+    keys_then(&mut prompt, "\r", "Use ← → to choose auth method");
+    keys_then(&mut prompt, "\r", "Type your API key");
+    let jwt = format!("ey{}", "A".repeat(200));
+    prompt.send(&[0x7f; 2]);
+    prompt.pump(Duration::from_millis(200));
+    server.take();
+    keys_then(&mut prompt, &format!("{jwt}\r"), "ctrl+s to save this connection");
+    let tried = server.heads();
+    assert!(tried[0].contains(&format!("authorization=Bearer {jwt};")), "{tried:?}");
+    prompt.pump(Duration::from_millis(400));
+    press(&mut prompt, &["GET /with-jwt"]);
+    assert_eq!(entered(&mut prompt, &server), ["GET /with-jwt"]);
+    assert!(server.heads()[0].contains(&format!("authorization=Bearer {jwt};")), "{:?}", server.heads());
+}
+
+/// The form for a new connection keeps to the terminal's width, and a
+/// window resized while it is open gets the form drawn anew at that width,
+/// with what was typed, in place from there on.
+#[cfg(unix)]
+#[test]
+fn the_connection_form_keeps_to_the_width_and_follows_a_resize() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = pty::Prompt::open_sized(api_bare(dir.path()), 44);
+    prompt.wait_for("New connection", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(400));
+    let form = |prompt: &pty::Prompt, cols: usize, from: usize, what: &str| -> Vec<String> {
+        let rows = pty::rows(&prompt.screen[from..], cols);
+        let shown = rows.join("\n");
+        let rulers = ruler_rows(&rows);
+        assert_eq!(rulers.len(), 2, "{what}: a ruler was left behind\n{shown}");
+        assert_eq!(rows.len(), rulers[1] + 2, "{what}:\n{shown}");
+        assert!(rows.iter().all(|row| row.chars().count() <= cols), "{what}:\n{shown}");
+        rows[rulers[0]..].to_vec()
+    };
+
+    // Every step of the form, each drawn several times over.
+    let steps = [
+        ("a-host-with-a-name-that-is-long.example.com", "url"),
+        ("\r", "method"),
+        ("\x1b[D", "oauth2"),
+        ("\r", "client id"),
+        ("a-client-id-that-is-longer-than-the-row", "client id typed"),
+        ("\r", "secret"),
+        ("a-secret-that-is-longer-than-the-row-too", "secret typed"),
+    ];
+    for (keys, what) in steps {
+        prompt.send(keys.as_bytes());
+        prompt.pump(Duration::from_millis(400));
+        let shown = form(&prompt, 44, 0, what);
+        let expected = if what == "url" || what == "method" { 6 } else { 7 };
+        assert_eq!(shown.len(), expected, "{what}:\n{}", shown.join("\n"));
+    }
+
+    for cols in [30usize, 60] {
+        let mark = prompt.screen.len();
+        prompt.resize(cols as u16, 50);
+        prompt.pump(Duration::from_millis(700));
+        let shown = form(&prompt, cols, mark, &format!("resized to {cols}"));
+        assert_eq!(shown.len(), 7, "{cols}:\n{}", shown.join("\n"));
+        assert!(shown[1].contains("URL:") && shown[1].ends_with(".com ✓"), "{cols}:\n{}", shown.join("\n"));
+        assert!(shown[4].contains("Secret:") && shown[4].contains("•••"), "{cols}:\n{}", shown.join("\n"));
+        prompt.send(b"x");
+        prompt.pump(Duration::from_millis(250));
+        prompt.send(b"\x7f");
+        prompt.pump(Duration::from_millis(250));
+        form(&prompt, cols, mark, &format!("typed at {cols}"));
+    }
+}
+
+/// `PUT /x > out.json` with no body opens the body editor, as `PUT /x` does,
+/// and so do POST and PATCH. The redirect is kept: the body is sent and the
+/// answer written where the line said, appended for `>>`. A file body is a
+/// body, and is sent at once.
+#[cfg(unix)]
+#[test]
+fn a_write_with_an_outfile_and_no_body_opens_the_body_editor() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::write(d.join("body.json"), r#"{"f":1}"#).unwrap();
+    let mut prompt = open_prompt(&server, d, &[]);
+
+    for (line, file) in [("PUT /x > put.json", "put.json"), ("POST /y > post.json", "post.json"), ("PATCH /z >> patch.json", "patch.json")] {
+        press(&mut prompt, &[line]);
+        server.take();
+        prompt.send(b"\r");
+        let opened = pump_until(&mut prompt, Duration::from_secs(3), |p| screen_tail(p).contains("Enter body"));
+        assert!(opened, "{line}: {}", screen_tail(&prompt));
+        assert_eq!(server.seen(), 0, "{line}: sent before a body was given");
+        assert!(!d.join(file).exists(), "{line}");
+        prompt.send(br#"{"a":1}"#);
+        prompt.pump(Duration::from_millis(150));
+        prompt.send(b"\x04");
+        pump_until(&mut prompt, Duration::from_secs(4), |_| server.seen() > 0);
+        prompt.pump(Duration::from_millis(300));
+        let request = line.split(" >").next().unwrap();
+        assert_eq!(server.take(), [format!("{request} {{\"a\":1}}")], "{}", screen_tail(&prompt));
+        let written = std::fs::read_to_string(d.join(file)).unwrap_or_else(|_| panic!("{line}: {file} not written"));
+        assert!(written.contains(&request[request.find('/').unwrap()..]), "{line}: {written}");
+        // The line is back as it was sent, redirect and all.
+        assert!(screen_tail(&prompt).contains(&format!("{request} {{\"a\":1}} >")), "{}", screen_tail(&prompt));
+    }
+
+    // A file body is a body: nothing to ask for.
+    press(&mut prompt, &["PUT /f @body.json > file.json"]);
+    assert_eq!(entered(&mut prompt, &server), [r#"PUT /f {"f":1}"#]);
+    assert!(d.join("file.json").is_file());
+    assert!(!screen_tail(&prompt).contains("Enter body"), "{}", screen_tail(&prompt));
+}
+
+/// A chain that esc cuts short says that the request was aborted, not how
+/// many requests it skipped. A chain that ran to its end with a request left
+/// out says `↳ skipped`, in the hint line.
+#[cfg(unix)]
+#[test]
+fn an_aborted_chain_says_the_abort_and_a_finished_one_what_it_skipped() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = open_prompt(&server, dir.path(), &[]);
+
+    for chain in ["GET /slow && GET /never", "GET /missing && GET /left-out || GET /slow && GET /never"] {
+        press(&mut prompt, &[chain]);
+        server.take();
+        let mark = prompt.screen.len();
+        prompt.send(b"\r");
+        pump_until(&mut prompt, Duration::from_secs(4), |_| server.log.lock().unwrap().iter().any(|l| l.contains("/slow")));
+        prompt.pump(Duration::from_millis(900));
+        prompt.send(b"\x1b");
+        prompt.pump(Duration::from_millis(700));
+        let shown = pty::plain(&prompt.screen[mark..]);
+        assert!(!shown.contains("skipped"), "{chain}: {shown}");
+        let rows = pty::rows(&prompt.screen, 200);
+        assert_eq!(rows.last().unwrap().trim(), "request aborted", "{chain}:\n{}", screen_tail(&prompt));
+        assert!(!server.take().iter().any(|line| line.contains("/never")), "{chain}");
+        // The notice goes like any other, and the session is still there.
+        prompt.pump(Duration::from_millis(3200));
+    }
+
+    for (chain, sent, says) in [
+        ("GET /missing && GET /left-out", vec!["GET /missing"], "↳ skipped 1 request"),
+        ("GET /missing && GET /b && GET /c", vec!["GET /missing"], "↳ skipped 2 requests"),
+        ("GET /a || GET /left-out", vec!["GET /a"], "↳ skipped 1 request"),
+        ("GET /missing && GET /left-out || GET /c", vec!["GET /missing", "GET /c"], "↳ skipped 1 request"),
+    ] {
+        press(&mut prompt, &[chain]);
+        server.take();
+        prompt.send(b"\r");
+        pump_until(&mut prompt, Duration::from_secs(4), |_| server.seen() >= sent.len());
+        prompt.pump(Duration::from_millis(500));
+        assert_eq!(server.take(), sent, "{chain}");
+        let rows = pty::rows(&prompt.screen, 200);
+        assert_eq!(rows.last().unwrap().trim(), says, "{chain}:\n{}", screen_tail(&prompt));
+    }
+    // A chain that sent everything has nothing to say.
+    press(&mut prompt, &["GET /a && GET /b"]);
+    let mark = prompt.screen.len();
+    prompt.send(b"\r");
+    pump_until(&mut prompt, Duration::from_secs(4), |_| server.seen() >= 2);
+    prompt.pump(Duration::from_millis(500));
+    assert!(!pty::plain(&prompt.screen[mark..]).contains("skipped"), "{}", screen_tail(&prompt));
+}
+
+/// A paste is input like a typed character: it takes back a first ctrl+c,
+/// so the next ctrl+c does not end the session, and it closes the shortcuts.
+#[cfg(unix)]
+#[test]
+fn a_paste_takes_back_a_first_ctrl_c_and_closes_the_shortcuts() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = open_prompt(&server, dir.path(), &[]);
+
+    prompt.send(b"\x15");
+    prompt.pump(Duration::from_millis(100));
+    prompt.send(b"\x03");
+    prompt.wait_for("ctrl+c again to exit", Duration::from_secs(3));
+    prompt.paste("GET /pasted");
+    prompt.pump(Duration::from_millis(300));
+    assert!(!pty::rows(&prompt.screen, 200).last().unwrap().contains("ctrl+c again"), "{}", screen_tail(&prompt));
+    let mark = prompt.screen.len();
+    prompt.send(b"\x03");
+    prompt.pump(Duration::from_millis(600));
+    assert_eq!(prompt.exited(), None, "a ctrl+c after a paste ended the session");
+    assert!(pty::plain(&prompt.screen[mark..]).contains("ctrl+c again to exit"), "{}", screen_tail(&prompt));
+    prompt.send(b" ");
+    prompt.pump(Duration::from_millis(200));
+
+    // The shortcuts close for a paste as for a key, and the paste is taken.
+    prompt.send(b"\x15\x08");
+    prompt.wait_for("ctrl+q", Duration::from_secs(3));
+    prompt.pump(Duration::from_millis(200));
+    prompt.paste("GET /after-help");
+    prompt.pump(Duration::from_millis(400));
+    let rows = pty::rows(&prompt.screen, 200);
+    assert_eq!(ruler_rows(&rows).len(), 2, "{}", rows.join("\n"));
+    assert!(rows[rows.len() - 3].starts_with("GET /after-help"), "{}", rows.join("\n"));
+    assert_eq!(entered(&mut prompt, &server), ["GET /after-help"]);
+}
+
+/// The spinner of a wait and the progress of a slow request stay on the hint
+/// row of a narrow terminal: cut to its width, with nothing wrapped onto a
+/// row that the next redraw does not know of.
+#[cfg(unix)]
+#[test]
+fn a_spinner_and_a_progress_line_keep_to_a_narrow_terminal() {
+    const COLS: usize = 16;
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = pty::Prompt::open_sized(api(server.port, dir.path()), COLS as u16);
+    prompt.wait_for("─", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(1200));
+
+    for (line, during, ends_with) in [("GET /slow", "200 OK", "\x1b"), ("sleep 300", "sleep", "\x1b")] {
+        prompt.send(b"\x15");
+        prompt.pump(Duration::from_millis(100));
+        prompt.paste(line);
+        prompt.pump(Duration::from_millis(200));
+        prompt.send(b"\r");
+        prompt.pump(Duration::from_millis(1600));
+        // Many frames have been drawn by now.
+        let rows = pty::rows(&prompt.screen, COLS);
+        let shown = rows.join("\n");
+        let rulers = ruler_rows(&rows);
+        assert_eq!(rulers.len(), 2, "{line}: a ruler was left behind\n{shown}");
+        assert_eq!(rows.len(), rulers[1] + 2, "{line}: the hint row wrapped\n{shown}");
+        assert!(rows.last().unwrap().contains(during), "{line}:\n{shown}");
+        assert!(rows.iter().all(|row| row.chars().count() <= COLS), "{line}:\n{shown}");
+        prompt.send(ends_with.as_bytes());
+        prompt.pump(Duration::from_millis(900));
+        let rows = pty::rows(&prompt.screen, COLS);
+        let rulers = ruler_rows(&rows);
+        assert_eq!(rulers.len(), 2, "{line}: a ruler was left behind\n{}", rows.join("\n"));
+        assert_eq!(rows.len(), rulers[1] + 2, "{line}: after the wait\n{}", rows.join("\n"));
+        assert!(rows.iter().all(|row| row.chars().count() <= COLS), "{line}:\n{}", rows.join("\n"));
+        prompt.pump(Duration::from_millis(3200));
+    }
+    assert_eq!(prompt.exited(), None);
+}
+
+/// The progress line of a single slow request at a terminal is one row
+/// however narrow the terminal is, and is gone when the answer is printed.
+#[cfg(unix)]
+#[test]
+fn the_progress_line_of_a_single_request_keeps_to_a_narrow_terminal() {
+    const COLS: usize = 12;
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut cmd = api(server.port, dir.path());
+    cmd.args(["-r", "GET", "/slow"]);
+    let mut term = pty::Prompt::open_sized(cmd, COLS as u16);
+    // The status line is on screen by then, and may take two rows here:
+    // what counts is that the progress under it is one row, the last.
+    let start = Instant::now();
+    let mut heights = std::collections::BTreeSet::new();
+    while term.exited().is_none() && start.elapsed() < Duration::from_secs(15) {
+        term.pump(Duration::from_millis(100));
+        let rows = pty::rows(&term.screen, COLS);
+        if let Some(at) = rows.iter().position(|row| row.contains("receiv")) {
+            heights.insert(rows.len());
+            assert_eq!(at + 1, rows.len(), "the progress line wrapped:\n{}", rows.join("\n"));
+            assert!(rows[at].chars().count() < COLS, "{}", rows.join("\n"));
+        }
+    }
+    term.pump(Duration::from_millis(200));
+    assert_eq!(heights.len(), 1, "the progress line moved or was never seen: {heights:?}\n{}", pty::plain(&term.screen));
+    let rows = pty::rows(&term.screen, COLS);
+    assert!(!rows.iter().any(|row| row.contains("receiv")), "{}", rows.join("\n"));
+}
+
+/// A line recalled from history is the line as it was sent: a PUT that was
+/// typed as one stays a PUT when its body is cleared, whatever the line
+/// before it on the input line had been promoted from.
+#[cfg(unix)]
+#[test]
+fn a_recalled_line_keeps_its_method_when_its_body_is_cleared() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = open_prompt(&server, dir.path(), &[]);
+
+    press(&mut prompt, &["PUT /a {\"x\":1}"]);
+    assert_eq!(entered(&mut prompt, &server), ["PUT /a {\"x\":1}"]);
+    // A body typed on a GET makes it a PUT, which clearing the body undoes…
+    let shown = press(&mut prompt, &["GET /a {"]);
+    assert!(shown.contains("PUT /a {"), "{shown}");
+    // …but not on the line that Up brings back.
+    server.take();
+    prompt.send(b"\x1b[A");
+    prompt.pump(Duration::from_millis(200));
+    prompt.send(b"\x18");
+    prompt.pump(Duration::from_millis(200));
+    prompt.send(b"\r");
+    prompt.pump(Duration::from_millis(600));
+    assert_eq!(server.take(), Vec::<String>::new(), "{}", screen_tail(&prompt));
+    assert!(screen_tail(&prompt).contains("Enter body"), "{}", screen_tail(&prompt));
+    prompt.send(b"{\"y\":2}\x04");
+    pump_until(&mut prompt, Duration::from_secs(4), |_| server.seen() > 0);
+    assert_eq!(server.take(), ["PUT /a {\"y\":2}"], "{}", screen_tail(&prompt));
+    prompt.pump(Duration::from_millis(300));
+
+    // The same for a line that Down brings back, and for the one put aside.
+    press(&mut prompt, &["GET /a {"]);
+    prompt.send(b"\x1b[A\x1b[A\x1b[B");
+    prompt.pump(Duration::from_millis(200));
+    prompt.send(b"\x18\r");
+    prompt.pump(Duration::from_millis(600));
+    assert_eq!(server.take(), Vec::<String>::new(), "{}", screen_tail(&prompt));
+    assert!(screen_tail(&prompt).contains("Enter body"), "{}", screen_tail(&prompt));
+    prompt.send(b"\x1b");
+    prompt.pump(Duration::from_millis(200));
+}
+
+/// ctrl+x on a block of lines takes the body of the line the cursor is on.
+/// The other lines are requests of their own and stay as they are.
+#[cfg(unix)]
+#[test]
+fn clearing_a_body_in_a_block_leaves_the_other_lines() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = open_prompt(&server, dir.path(), &[]);
+    let block = "GET /a\rPUT /b {\"x\":1}\rGET /c";
+
+    // The cursor on the first line, which has no body: nothing goes.
+    prompt.send(b"\x15");
+    prompt.pump(Duration::from_millis(60));
+    prompt.paste(block);
+    prompt.pump(Duration::from_millis(150));
+    prompt.send(b"\x1b[A\x1b[A\x18");
+    prompt.pump(Duration::from_millis(200));
+    server.take();
+    prompt.send(b"\r");
+    pump_until(&mut prompt, Duration::from_secs(4), |_| server.seen() >= 3);
+    prompt.pump(Duration::from_millis(300));
+    assert_eq!(server.take(), ["GET /a", "PUT /b {\"x\":1}", "GET /c"], "{}", screen_tail(&prompt));
+
+    // On the second line it is that line's body, and only that.
+    prompt.send(b"\x15");
+    prompt.pump(Duration::from_millis(60));
+    prompt.paste("GET /a\rPUT /b {\"x\":1} > b.json\rPUT /c {\"y\":2}");
+    prompt.pump(Duration::from_millis(150));
+    prompt.send(b"\x1b[A\x18");
+    prompt.pump(Duration::from_millis(200));
+    let rows = pty::rows(&prompt.screen, 200);
+    let area = &rows[ruler_rows(&rows)[0] + 1..];
+    assert_eq!(&area[..3], ["GET /a", "PUT /b > b.json", "PUT /c {\"y\":2}"], "{}", rows.join("\n"));
+}
+
+/// A character typed with AltGr on Windows arrives as a key with ctrl and
+/// alt held. It is typed, on the input line, in the body editor and in a
+/// dialog; ctrl or alt alone still types nothing.
+#[cfg(unix)]
+#[test]
+fn a_character_that_comes_with_ctrl_and_alt_is_typed() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = open_prompt(&server, dir.path(), &[]);
+    // `{`, `}` and `@` as a terminal that reports modifiers sends them with
+    // ctrl+alt (CSI code ; 7 u); `~` with ctrl+alt+shift (; 8 u).
+    let (open, close, at, tilde) = ("\x1b[123;7u", "\x1b[125;7u", "\x1b[64;7u", "\x1b[126;8u");
+
+    press(&mut prompt, &["PUT /typed ", open, "\"a\":1", close]);
+    assert_eq!(entered(&mut prompt, &server), ["PUT /typed {\"a\":1}"], "{}", screen_tail(&prompt));
+    prompt.pump(Duration::from_millis(200));
+    press(&mut prompt, &["GET /people", tilde, "count"]);
+    assert_eq!(entered(&mut prompt, &server), ["GET /people~count"], "{}", screen_tail(&prompt));
+    prompt.pump(Duration::from_millis(200));
+
+    // In the body editor.
+    press(&mut prompt, &["PUT /edited"]);
+    server.take();
+    prompt.send(b"\r");
+    prompt.wait_for("Enter body", Duration::from_secs(3));
+    for key in [open, "\"b\":\"", at, "\"", close] {
+        prompt.send(key.as_bytes());
+        prompt.pump(Duration::from_millis(90));
+    }
+    prompt.send(b"\x04");
+    pump_until(&mut prompt, Duration::from_secs(4), |_| server.seen() > 0);
+    assert_eq!(server.take(), ["PUT /edited {\"b\":\"@\"}"], "{}", screen_tail(&prompt));
+    prompt.pump(Duration::from_millis(300));
+
+    // In a dialog: the name a connection is saved under.
+    prompt.send(b"\x13");
+    prompt.wait_for("Save connection as", Duration::from_secs(3));
+    for key in ["a", at, "b", "\r"] {
+        prompt.send(key.as_bytes());
+        prompt.pump(Duration::from_millis(90));
+    }
+    prompt.wait_for("connection a@b saved", Duration::from_secs(3));
+    assert_eq!(stored(dir.path()).0, ["a@b=k"]);
+}
+
+/// While a connection made in the form is loading, ctrl+c leaves the client
+/// with the terminal as a shell wants it. Anything else typed or pasted
+/// meanwhile is not kept for the prompt that opens when the load is done.
+#[cfg(unix)]
+#[test]
+fn ctrl_c_leaves_while_a_connection_is_loading_and_other_keys_are_dropped() {
+    let server = RecordingServer::start();
+    let host = format!("127.0.0.1:{}", server.port);
+    let to_loading = |prompt: &mut pty::Prompt| {
+        prompt.wait_for("Type the API base URL", Duration::from_secs(15));
+        keys_then(prompt, &format!("{host}\r"), "Use ← → to choose auth method");
+        keys_then(prompt, "\r", "Type your API key");
+        keys_then(prompt, "slowspec\r", "loading...");
+        prompt.pump(Duration::from_millis(300));
+    };
+
+    // ctrl+c ends it, well before the load is done.
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = pty::Prompt::open(api_bare(dir.path()));
+    to_loading(&mut prompt);
+    assert!(!prompt.is_cooked());
+    prompt.send(b"\x03");
+    let start = Instant::now();
+    while prompt.exited().is_none() && start.elapsed() < Duration::from_millis(2500) {
+        prompt.pump(Duration::from_millis(50));
+    }
+    assert_eq!(prompt.exited(), Some(true), "ctrl+c did not end the client:\n{}", screen_tail(&prompt));
+    assert!(prompt.is_cooked(), "the terminal is left in raw mode");
+    assert!(prompt.screen.rfind("\x1b[?2004l") > prompt.screen.rfind("\x1b[?2004h"), "paste mode is left on");
+    assert!(prompt.screen.rfind("\x1b[?25h") > prompt.screen.rfind("\x1b[?25l"), "the cursor is left hidden");
+    let rows = pty::rows(&prompt.screen, 200);
+    assert!(!rows.iter().any(|row| row.contains("loading") || row.starts_with("──")), "{}", rows.join("\n"));
+
+    // Keys and a paste during the load are not the prompt's.
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = pty::Prompt::open(api_bare(dir.path()));
+    to_loading(&mut prompt);
+    prompt.send(b"typed");
+    prompt.pump(Duration::from_millis(200));
+    prompt.paste("GET /pasted-early");
+    prompt.wait_for("ctrl+s to save this connection", Duration::from_secs(10));
+    prompt.pump(Duration::from_millis(500));
+    let rows = pty::rows(&prompt.screen, 200);
+    let shown = rows.join("\n");
+    assert!(!shown.contains("typed") && !shown.contains("pasted-early"), "{shown}");
+    assert_eq!(entered(&mut prompt, &server), ["GET /"], "{}", screen_tail(&prompt));
+}
+
+/// After a write to `/mapped-types`, however the path is spelled, the types
+/// that `~map(` completes from are read again, without the prompt waiting
+/// for it. A list that can't be had leaves the one there was.
+#[cfg(unix)]
+#[test]
+fn the_mapped_types_are_read_again_after_one_is_written() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = open_completing(&server, dir.path(), &[]);
+    let completes = |prompt: &mut pty::Prompt, typed: &str| -> String {
+        prompt.pump(Duration::from_millis(700));
+        press(prompt, &[typed, "\t"]);
+        entered(prompt, &server).pop().unwrap_or_default()
+    };
+    let send = |prompt: &mut pty::Prompt, line: &str| {
+        press(prompt, &[line]);
+        prompt.send(b"\r");
+        prompt.pump(Duration::from_millis(500));
+    };
+
+    assert_eq!(completes(&mut prompt, "GET /people~map(com.heads.x"), "GET /people~map(com.heads.x");
+    for written in ["PUT mapped-types {\"a\":1}", "POST /api/v1/mapped-types {\"a\":1}", "PATCH v1/mapped-types/x {\"a\":1}", "PUT /mapped-types {\"a\":1}"] {
+        // One type more on the server, then the write, then one fewer again.
+        send(&mut prompt, "GET /more-types");
+        send(&mut prompt, written);
+        assert_eq!(completes(&mut prompt, "GET /people~map(com.heads.x"), "GET /people~map(com.heads.xml)", "{written}");
+        send(&mut prompt, "GET /fewer-types");
+        send(&mut prompt, written);
+        assert_eq!(completes(&mut prompt, "GET /people~map(com.heads.x"), "GET /people~map(com.heads.x", "{written}");
+    }
+
+    // The list can't be read: the one there was stays.
+    send(&mut prompt, "GET /break-types");
+    send(&mut prompt, "PUT /mapped-types {\"a\":1}");
+    assert_eq!(completes(&mut prompt, "GET /people~map(com.heads.c"), "GET /people~map(com.heads.csv)");
+}
+
+/// A name typed into the save dialog is trimmed, as a pasted one is, and a
+/// name of blanks alone is no name: nothing is saved.
+#[cfg(unix)]
+#[test]
+fn a_connection_name_is_trimmed_and_blanks_are_no_name() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = open_prompt(&server, dir.path(), &[]);
+
+    prompt.send(b"\x13");
+    prompt.wait_for("Save connection as", Duration::from_secs(3));
+    let mark = prompt.screen.len();
+    prompt.send(b"   \r");
+    let said = pump_until(&mut prompt, Duration::from_secs(3), |p| pty::plain(&p.screen[mark..]).contains("cancelled"));
+    assert!(said, "{}", screen_tail(&prompt));
+    assert!(!dir.path().join(".api-credentials.json").exists() || stored(dir.path()).0.is_empty());
+    command_area(&prompt, 200, "after blanks");
+
+    prompt.pump(Duration::from_millis(300));
+    prompt.send(b"\x13");
+    prompt.pump(Duration::from_millis(400));
+    prompt.send(b"  local dev  \r");
+    prompt.wait_for("connection local dev saved", Duration::from_secs(3));
+    assert_eq!(stored(dir.path()).0, ["local dev=k"]);
+}
+
+/// ctrl+o with no file written yet does nothing, and says nothing.
+#[cfg(unix)]
+#[test]
+fn ctrl_o_with_nothing_to_open_does_nothing() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = open_prompt(&server, dir.path(), &[]);
+    press(&mut prompt, &["GET /a"]);
+    assert_eq!(entered(&mut prompt, &server), ["GET /a"]);
+    prompt.pump(Duration::from_millis(3200));
+    let before = pty::rows(&prompt.screen, 200);
+    prompt.send(b"\x0f");
+    prompt.pump(Duration::from_millis(500));
+    assert_eq!(pty::rows(&prompt.screen, 200), before);
+    assert_eq!(prompt.exited(), None);
+    press(&mut prompt, &["GET /b"]);
+    assert_eq!(entered(&mut prompt, &server), ["GET /b"]);
+}
+
+/// ctrl+c in the body editor closes the editor and nothing more: nothing is
+/// sent, the session stays, and it is not counted as the first of the two
+/// that end it.
+#[cfg(unix)]
+#[test]
+fn ctrl_c_in_the_body_editor_closes_only_the_editor() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = open_prompt(&server, dir.path(), &[]);
+    press(&mut prompt, &["PUT /x"]);
+    server.take();
+    prompt.send(b"\r");
+    prompt.wait_for("Enter body", Duration::from_secs(3));
+    prompt.send(b"{\"a\":1}");
+    prompt.pump(Duration::from_millis(200));
+    let mark = prompt.screen.len();
+    prompt.send(b"\x03");
+    prompt.pump(Duration::from_millis(500));
+    assert_eq!(prompt.exited(), None);
+    assert_eq!(server.seen(), 0);
+    assert!(!pty::plain(&prompt.screen[mark..]).contains("ctrl+c again"), "{}", screen_tail(&prompt));
+    let rows = command_area(&prompt, 200, "after ctrl+c");
+    assert_eq!(rows[1], "PUT /x", "{}", rows.join("\n"));
+    // One more is the first of two, not the second.
+    prompt.send(b"\x03");
+    prompt.pump(Duration::from_millis(400));
+    assert_eq!(prompt.exited(), None, "the session ended on the first ctrl+c");
+    assert!(screen_tail(&prompt).contains("ctrl+c again to exit"), "{}", screen_tail(&prompt));
+    prompt.send(b" \x7f");
+    prompt.pump(Duration::from_millis(200));
+    assert_eq!(entered(&mut prompt, &server), Vec::<String>::new());
+    prompt.wait_for("Enter body", Duration::from_secs(3));
+}
+
+/// An `assert` or a `sleep while` at the prompt whose request gets a status
+/// that is no answer (5xx, 401) says that it could not be evaluated, and the
+/// block it is in stops there.
+#[cfg(unix)]
+#[test]
+fn a_check_that_gets_no_answer_at_the_prompt_stops_the_block() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = open_prompt(&server, dir.path(), &[]);
+
+    for (check, sent, status) in [
+        ("assert GET /boom", "GET /boom", "500"),
+        ("assert not GET /denied", "GET /denied", "401"),
+        ("sleep 1s while GET /boom", "GET /boom", "500"),
+        ("sleep 1s while not GET /denied", "GET /denied", "401"),
+    ] {
+        let (requests, shown) = run_pasted(&mut prompt, &server, &format!("GET /first\r{check}\rGET /never"));
+        assert_eq!(requests, ["GET /first", sent], "{check}: {shown}");
+        assert!(shown.contains(&format!("{check} — could not be evaluated")), "{check}: {shown}");
+        assert!(shown.contains(&format!("HTTP/1.1 {status}")), "{check}: {shown}");
+        prompt.pump(Duration::from_millis(300));
+    }
+    press(&mut prompt, &["GET /after"]);
+    assert_eq!(entered(&mut prompt, &server), ["GET /after"]);
 }

@@ -275,14 +275,26 @@ const STREAMING_HELP_MAX_COLS: usize = 68;
 /// Returns false when the handler could not be run or reported failure.
 fn open_external(target: &str) -> bool {
     use std::process::Stdio;
-    Command::new("open")
-        .arg(target)
+    let (program, args) = open_command(std::env::consts::OS, target);
+    Command::new(program)
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .map(|st| st.success())
         .unwrap_or(false)
+}
+
+/// The command that opens a file or a URL with whatever the system `os`
+/// opens it with. On Windows `start` is a builtin of `cmd`, and takes its
+/// first quoted argument for a window title: hence the empty one.
+fn open_command(os: &str, target: &str) -> (&'static str, Vec<String>) {
+    match os {
+        "macos" => ("open", vec![target.to_string()]),
+        "windows" => ("cmd", vec!["/c".to_string(), "start".to_string(), String::new(), target.to_string()]),
+        _ => ("xdg-open", vec![target.to_string()]),
+    }
 }
 
 fn api_docs_url(base_uri: &str) -> String {
@@ -1215,6 +1227,8 @@ struct AppState {
     subtypes: HashMap<String, Vec<String>>,  // base schema → subtype @type values
     parent_types: HashMap<String, String>,  // schema → parent schema (from x-parent-type)
     mapped_types: Vec<String>,  // mapped type names for ~map() completion
+    /// Where the list arrives that is being read again after a write to `/mapped-types`.
+    mapped_types_rx: Option<std::sync::mpsc::Receiver<Option<Vec<String>>>>,
     completions: Vec<String>,
     completion_idx: usize,
     last_tab_input: String,
@@ -1303,6 +1317,7 @@ impl AppState {
             subtypes: HashMap::new(),
             parent_types: HashMap::new(),
             mapped_types: Vec::new(),
+            mapped_types_rx: None,
             completions: Vec::new(),
             completion_idx: 0,
             last_tab_input: String::new(),
@@ -1584,8 +1599,17 @@ fn highlight_json(s: &str) -> String {
             c_key
         }
     };
+    // A string may run over several lines (a raw newline in it is allowed):
+    // each line carries its own colour, so a row is coloured whichever rows
+    // are drawn above it.
     let paint = |color: &str, text: &str| {
-        if color.is_empty() { text.to_string() } else { format!("{}{}{}", color, text, r) }
+        if color.is_empty() {
+            return text.to_string();
+        }
+        text.split('\n')
+            .map(|line| if line.is_empty() { String::new() } else { format!("{}{}{}", color, line, r) })
+            .collect::<Vec<_>>()
+            .join("\n")
     };
 
     while i < len {
@@ -1600,15 +1624,6 @@ fn highlight_json(s: &str) -> String {
         if in_string {
             if ch == '\\' {
                 escape = true;
-                i += 1;
-                continue;
-            }
-            if ch == '\n' {
-                // JSON strings are single-line — terminate unterminated string at newline
-                let string_content: String = chars[string_start..i].iter().collect();
-                out.push_str(&paint(string_color(is_key, !open.is_empty(), &string_content), &string_content));
-                out.push('\n');
-                in_string = false;
                 i += 1;
                 continue;
             }
@@ -1732,9 +1747,13 @@ fn cursor_line_down(input: &str, cursor_pos: usize) -> usize {
 }
 
 /// Whether a key typed this character, as opposed to a shortcut that happens
-/// to carry a letter (`ctrl+a`, `alt+b`). Shift is part of typing.
+/// to carry a letter (`ctrl+a`, `alt+b`). Shift is part of typing, and so are
+/// ctrl and alt held together: that is how Windows reports AltGr, which on
+/// many layouts is the only way to `{`, `[`, `@` or `~`. No shortcut of the
+/// client is on ctrl+alt.
 fn types_a_character(modifiers: KeyModifiers) -> bool {
-    (modifiers - KeyModifiers::SHIFT).is_empty()
+    let held = modifiers - KeyModifiers::SHIFT;
+    held.is_empty() || held == KeyModifiers::CONTROL | KeyModifiers::ALT
 }
 
 /// A "word character" for readline-style word navigation: alphanumeric + underscore.
@@ -1947,10 +1966,15 @@ fn visual_line_count(rendered: &str, width: usize) -> u16 {
 /// windowed) text and its visual line count. Clipped content above/below is shown
 /// as a dimmed `⋯` marker line.
 ///
+/// A cursor line that is taller than the viewport on its own (a compact body
+/// pasted as one line) is shown by its visual rows around `cursor_col`, the
+/// cursor's column in that line, with the same markers for the rows left out.
+///
 /// This keeps the printed input block from ever exceeding the screen, which would
 /// otherwise scroll the terminal and desync `render()`'s relative cursor math —
-/// the cause of the input area jumping upward after a multi-line paste.
-fn clamp_input_viewport(rendered: &str, width: usize, max_lines: u16, cursor_line: usize) -> (String, u16) {
+/// the cause of the input area jumping upward after a multi-line paste. It holds
+/// for a `max_lines` of 3 or more (a row and both markers), which every caller gives.
+fn clamp_input_viewport(rendered: &str, width: usize, max_lines: u16, cursor_line: usize, cursor_col: usize) -> (String, u16) {
     let total = visual_line_count(rendered, width);
     if total <= max_lines {
         return (rendered.to_string(), total);
@@ -1966,12 +1990,52 @@ fn clamp_input_viewport(rendered: &str, width: usize, max_lines: u16, cursor_lin
     };
 
     let cursor_line = cursor_line.min(n - 1);
+    let marker = "\x1b[38;5;240m⋯\x1b[0m";
+
+    // The cursor's line does not fit with the markers it needs: a window of
+    // its rows, grown from the cursor's row like the window of lines below.
+    let rows = line_h(logical[cursor_line]);
+    let (lines_above, lines_below) = (cursor_line > 0, cursor_line + 1 < n);
+    if width > 0 && rows + lines_above as u16 + lines_below as u16 > max_lines {
+        let cursor_row = ((cursor_col / width) as u16).min(rows - 1);
+        let fits = |first: u16, end: u16| {
+            (end - first) + (lines_above || first > 0) as u16 + (lines_below || end < rows) as u16 <= max_lines
+        };
+        let (mut first, mut end) = (cursor_row, cursor_row + 1); // end exclusive
+        loop {
+            let before = (first, end);
+            if end < rows && fits(first, end + 1) {
+                end += 1;
+            }
+            if first > 0 && fits(first - 1, end) {
+                first -= 1;
+            }
+            if (first, end) == before {
+                break;
+            }
+        }
+        let mut out = String::new();
+        let mut count = end - first;
+        if lines_above || first > 0 {
+            out.push_str(marker);
+            out.push('\n');
+            count += 1;
+        }
+        out.push_str(&visible_columns(logical[cursor_line], first as usize * width, end as usize * width));
+        if lines_below || end < rows {
+            out.push('\n');
+            out.push_str(marker);
+            count += 1;
+        }
+        return (out, count);
+    }
+
     // Greedy window containing the cursor line. Expand downward first (so a paste
     // with the cursor at the end keeps its most recent lines), then upward,
     // reserving a line for each `⋯` marker that will be shown.
     let mut start = cursor_line;
     let mut end = cursor_line + 1; // exclusive
-    let mut used: u16 = line_h(logical[cursor_line]);
+    let mut used: u16 = rows;
     loop {
         let mut grew = false;
         if end < n {
@@ -1997,7 +2061,6 @@ fn clamp_input_viewport(rendered: &str, width: usize, max_lines: u16, cursor_lin
         }
     }
 
-    let marker = "\x1b[38;5;240m⋯\x1b[0m";
     let mut out = String::new();
     let mut count: u16 = 0;
     if start > 0 {
@@ -2018,6 +2081,30 @@ fn clamp_input_viewport(rendered: &str, width: usize, max_lines: u16, cursor_lin
         count += 1;
     }
     (out, count)
+}
+
+/// The visible columns `from..to` of a line that may hold ANSI colour codes.
+/// Every code is kept, also those of the part left out, so what is shown has
+/// the colours it had in the whole line and ends with them switched off.
+fn visible_columns(line: &str, from: usize, to: usize) -> String {
+    let mut out = String::new();
+    let mut col = 0usize;
+    let mut in_escape = false;
+    for c in line.chars() {
+        if in_escape {
+            out.push(c);
+            in_escape = c != 'm';
+        } else if c == '\x1b' {
+            in_escape = true;
+            out.push(c);
+        } else {
+            if col >= from && col < to {
+                out.push(c);
+            }
+            col += 1;
+        }
+    }
+    out
 }
 
 /// Hard-wrap a possibly-ANSI string to `width` visible columns, inserting `\r\n`
@@ -2049,6 +2136,12 @@ fn hard_wrap_ansi(s: &str, width: usize) -> String {
         if c == '\n' {
             out.push(c);
             col = 0;
+            continue;
+        }
+        // The `\r` of a `\r\n` takes no column: counted as one, a line
+        // exactly as wide as the terminal got a blank row after it.
+        if c == '\r' {
+            out.push(c);
             continue;
         }
         if col == width {
@@ -2248,6 +2341,13 @@ impl PickerState {
         false
     }
 
+    /// Whether row `i` is the one that adds a connection: the slot that holds
+    /// no saved connection. Told by the slot and not by the text of the row,
+    /// since a saved connection may be named `+ anything`.
+    fn is_add_row(&self, i: usize) -> bool {
+        matches!(self.saved_connections.get(i), Some(None))
+    }
+
     fn update_filter(&mut self) {
         self.filtered_indices.clear();
         for (i, env_opt) in self.saved_connections.iter().enumerate() {
@@ -2415,6 +2515,10 @@ struct ConnectionFlow {
 
     // Track rendered lines for accurate cursor positioning
     last_rendered_lines: u16,
+
+    /// The size of the terminal after a resize that arrived while the flow
+    /// was open, for the session that opened it to take over.
+    resized: Option<(u16, u16)>,
 }
 
 impl ConnectionFlow {
@@ -2448,6 +2552,7 @@ impl ConnectionFlow {
             width,
             delete_confirming: None,
             last_rendered_lines,
+            resized: None,
         }
     }
 
@@ -2474,6 +2579,7 @@ impl ConnectionFlow {
             width,
             delete_confirming: None,
             last_rendered_lines,
+            resized: None,
         }
     }
 
@@ -2493,7 +2599,7 @@ impl ConnectionFlow {
 
             // Count env items (excluding "+ Add new")
             let env_count = self.picker.filtered_indices.iter()
-                .filter(|&&i| !self.picker.items.get(i).map(|item| item.starts_with("+")).unwrap_or(false))
+                .filter(|&&i| !self.picker.is_add_row(i))
                 .count() as u16;
 
             // Check if we have any envs displayed
@@ -2503,7 +2609,7 @@ impl ConnectionFlow {
 
             // No matches if only "+ Add new" in filtered list or empty
             let no_matches = self.picker.filtered_indices.is_empty() ||
-                self.picker.filtered_indices.iter().all(|&i| self.picker.items.get(i).map(|item| item.starts_with("+")).unwrap_or(false));
+                self.picker.filtered_indices.iter().all(|&i| self.picker.is_add_row(i));
 
             // Separator shows if had envs OR if searching
             let separator_line = if had_env || !self.picker.search_query.is_empty() { 1 } else { 0 };
@@ -2527,11 +2633,18 @@ impl ConnectionFlow {
             execute!(stdout, cursor::MoveUp(self.last_rendered_lines), cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
         }
 
-        if self.in_setup {
-            self.render_setup(stdout, &ruler, first)?;
+        // Drawn with auto-wrap off, as the command area is (see `render`):
+        // every line is one row, which is what `rendered_lines` counts. The
+        // lines are cut to the width where their text is known to be long;
+        // this holds for the rest (a narrow window, a long status).
+        execute!(stdout, Print("\x1b[?7l"))?;
+        let drawn = if self.in_setup {
+            self.render_setup(stdout, &ruler, first)
         } else {
-            self.render_picker(stdout, &ruler, first)?;
-        }
+            self.render_picker(stdout, &ruler, first)
+        };
+        execute!(stdout, Print("\x1b[?7h"))?;
+        drawn?;
 
         // Update tracked line count after rendering
         self.last_rendered_lines = self.rendered_lines();
@@ -2626,8 +2739,8 @@ impl ConnectionFlow {
         let w = self.width as usize;
 
         // Top ruler with embedded title (always "Choose a connection")
-        let title = "  Choose a connection  ";
-        let title_len = title.len();
+        let title = fit_to_width("  Choose a connection  ", w);
+        let title_len = char_len(&title);
         let (left, right) = if w < 37 {
             // Centered for narrow terminals
             let total = w.saturating_sub(title_len);
@@ -2644,6 +2757,11 @@ impl ConnectionFlow {
             "─".repeat(right).dimmed()
         )))?;
 
+        // What a row holds behind its four columns of indent. Every row is
+        // cut to it: a row that wrapped would be two, and the next redraw
+        // would not move up far enough.
+        let row_width = w.saturating_sub(4);
+
         // Calculate separator length based on longest env line in filtered results
         let max_env_len = self.picker.filtered_indices.iter()
             .filter_map(|&i| {
@@ -2655,32 +2773,35 @@ impl ConnectionFlow {
             })
             .max()
             .unwrap_or(30);
-        let separator = "─".repeat(max_env_len);
+        let separator = "─".repeat(max_env_len.min(row_width));
 
         // Render only filtered items (excluding "+ Add new" which we handle separately)
         let mut had_env = false;
         for &i in &self.picker.filtered_indices {
-            let item = &self.picker.items[i];
-            let is_add_new = item.starts_with("+");
-
             // Skip "+ Add new" here - we handle it after the separator
-            if is_add_new {
+            if self.picker.is_add_row(i) {
                 continue;
             }
 
-            let spinner = if self.connecting_idx == Some(i) {
+            let connecting = self.connecting_idx == Some(i);
+            let spinner = if connecting {
                 format!(" {}", SPINNER_FRAMES[self.spinner_frame % SPINNER_FRAMES.len()]).dimmed().to_string()
             } else {
                 String::new()
             };
+            // The spinner keeps its two columns behind a row that is cut.
+            let item = &fit_to_width(&self.picker.items[i], row_width.saturating_sub(if connecting { 2 } else { 0 }));
 
             if self.delete_confirming == Some(i) {
                 // Show delete confirmation - replace URL part with "Delete? y/n", keep name/suffix/padding
                 if let Some(Some(env)) = self.picker.saved_connections.get(i) {
-                    let is_default = item.contains(" ♥");
+                    let is_default = self.picker.default_name.as_deref() == Some(env.name.as_str());
                     let suffix = if is_default { " ♥" } else { "  " };
                     let padding = self.picker.max_alias_len.saturating_sub(char_len(&env.name)) + 3;
-                    execute!(stdout, Print(format!("  › \x1b[1m{}{}{}{}\x1b[0m\r\n", env.name, suffix, " ".repeat(padding), "Delete? y/n")))?;
+                    // The question is kept whole; the name gives way to it.
+                    let question = "Delete? y/n";
+                    let name = fit_to_width(&format!("{}{}{}", env.name, suffix, " ".repeat(padding)), row_width.saturating_sub(question.len()));
+                    execute!(stdout, Print(format!("  › \x1b[1m{}{}\x1b[0m\r\n", name, fit_to_width(question, row_width))))?;
                 } else {
                     execute!(stdout, Print(format!("    {}\r\n", item)))?;
                 }
@@ -2697,11 +2818,11 @@ impl ConnectionFlow {
 
         // Check if there are no matches (only "+ Add new" in filtered list or empty)
         let no_matches = self.picker.filtered_indices.is_empty() ||
-           self.picker.filtered_indices.iter().all(|&i| self.picker.items[i].starts_with("+"));
+           self.picker.filtered_indices.iter().all(|&i| self.picker.is_add_row(i));
 
         // Show "(no matches)" ABOVE the separator when searching with no results
         if no_matches && !self.picker.search_query.is_empty() {
-            execute!(stdout, Print(format!("    {}\r\n", "(no matches)".dimmed())))?;
+            execute!(stdout, Print(format!("    {}\r\n", fit_to_width("(no matches)", row_width).dimmed())))?;
         }
 
         // Separator line - show if we had envs OR if searching (so it's always visible during search)
@@ -2711,12 +2832,15 @@ impl ConnectionFlow {
 
         // Show search line or "+ Add new connection"
         if !self.picker.search_query.is_empty() {
-            execute!(stdout, Print(format!("    {} {}\r\n", "search:".dimmed(), self.picker.search_query)))?;
+            // What is typed last is what is shown of a long search.
+            let label = fit_to_width("search:", row_width);
+            let query = fit_tail_to_width(&self.picker.search_query, row_width.saturating_sub(label.len() + 1));
+            execute!(stdout, Print(format!("    {} {}\r\n", label.dimmed(), query)))?;
         } else {
             // Find and render the "+ Add new" item
             for &i in &self.picker.filtered_indices {
-                let item = &self.picker.items[i];
-                if item.starts_with("+") {
+                let item = &fit_to_width(&self.picker.items[i], row_width);
+                if self.picker.is_add_row(i) {
                     if i == self.picker.selected {
                         execute!(stdout, Print(format!("  › \x1b[1m{}\x1b[0m\r\n", item)))?;
                     } else {
@@ -2731,15 +2855,18 @@ impl ConnectionFlow {
         execute!(stdout, Print(format!("{}\r\n", ruler.dimmed())))?;
 
         // Hint or error line
+        let hint_width = w.saturating_sub(2);
         if let Some(ref msg) = self.picker_error_msg {
             // "deleted" messages are info (gray), others are errors (red)
+            let shown = fit_to_width(msg, hint_width);
             if msg.ends_with("deleted") {
-                execute!(stdout, Print(format!("  {}", msg.dimmed())))?;
+                execute!(stdout, Print(format!("  {}", shown.dimmed())))?;
             } else {
-                execute!(stdout, Print(format!("  {}", msg.red())))?;
+                execute!(stdout, Print(format!("  {}", shown.red())))?;
             }
         } else {
-            execute!(stdout, Print(format!("  {}", "type to search, tab default, del delete, esc cancel".dimmed())))?;
+            let hint = fit_to_width("type to search, tab default, del delete, esc cancel", hint_width);
+            execute!(stdout, Print(format!("  {}", hint.dimmed())))?;
         }
 
         Ok(())
@@ -2750,8 +2877,8 @@ impl ConnectionFlow {
         let w = self.width as usize;
 
         // Top ruler with embedded title
-        let title = "  New connection  ";
-        let title_len = title.len();
+        let title = fit_to_width("  New connection  ", w);
+        let title_len = char_len(&title);
         let (left, right) = if w < 37 {
             // Centered for narrow terminals
             let total = w.saturating_sub(title_len);
@@ -2809,7 +2936,7 @@ impl ConnectionFlow {
                 },
                 SetupField::Done => "",
             };
-            execute!(stdout, Print(format!("  {}", hint.dimmed())))?;
+            execute!(stdout, Print(format!("  {}", fit_to_width(hint, w.saturating_sub(2)).dimmed())))?;
         }
 
         Ok(())
@@ -2818,31 +2945,7 @@ impl ConnectionFlow {
     fn render_url_field(&self, stdout: &mut io::Stdout) -> io::Result<()> {
         let is_active = matches!(self.setup_active_field, SetupField::Url);
         let url = &self.setup_url;
-
-        // Ghost text calculation
-        let localhost_full = "localhost:5000";
-        let suffix = ".app.heads.com";
-        let starts_with_digit = url.chars().next().map_or(false, |c| c.is_ascii_digit());
-
-        let ghost = if !is_active || url.is_empty() || url.starts_with("http://") || url.starts_with("https://") {
-            String::new()
-        } else if localhost_full.starts_with(url) && !starts_with_digit {
-            localhost_full[url.len()..].to_string()
-        } else if !starts_with_digit
-            && !url.starts_with("localhost") && !url.starts_with("127.0.0.1") && !url.starts_with("[::1]")
-            && !url.contains(".app.heads.com")
-        {
-            let mut ghost = suffix.to_string();
-            for i in (1..=suffix.len()).rev() {
-                if url.ends_with(&suffix[..i]) {
-                    ghost = suffix[i..].to_string();
-                    break;
-                }
-            }
-            ghost
-        } else {
-            String::new()
-        };
+        let ghost = if is_active { url_ghost(url) } else { String::new() };
 
         let prefix = if is_active { "  › " } else { "    " };
         // Truncate URL to fit terminal width (prefix=4 + label=14 + cursor/check=2)
@@ -2868,14 +2971,17 @@ impl ConnectionFlow {
         let is_active = matches!(self.setup_active_field, SetupField::Auth);
         let confirmed = matches!(self.setup_active_field, SetupField::ClientId | SetupField::Credential | SetupField::Done);
         let prefix = if is_active { "  › " } else { "    " };
+        // Cut to the width, like the fields around it (prefix=4 + label=14,
+        // and what follows the method: the arrows, or the check mark).
+        let option = fit_to_width(auth_options[self.setup_auth_idx], (self.width as usize).saturating_sub(if is_active { 23 } else { 20 }));
 
         if is_active {
             execute!(stdout, Print(format!("{}{:<14}\x1b[1m{}\x1b[0m  {}\r\n",
-                prefix, "Auth method:".dimmed(), auth_options[self.setup_auth_idx], "← →".dimmed())))?;
+                prefix, "Auth method:".dimmed(), option, "← →".dimmed())))?;
         } else if confirmed {
-            execute!(stdout, Print(format!("{}{:<14}{} ✓\r\n", prefix, "Auth method:".dimmed(), auth_options[self.setup_auth_idx])))?;
+            execute!(stdout, Print(format!("{}{:<14}{} ✓\r\n", prefix, "Auth method:".dimmed(), option)))?;
         } else {
-            execute!(stdout, Print(format!("{}{:<14}{}\r\n", prefix, "Auth method:".dimmed(), auth_options[self.setup_auth_idx])))?;
+            execute!(stdout, Print(format!("{}{:<14}{}\r\n", prefix, "Auth method:".dimmed(), option)))?;
         }
 
         Ok(())
@@ -2937,10 +3043,16 @@ impl ConnectionFlow {
             if let Some(client) = client {
                 let test_url = format!("{}/api/v1", url.trim_end_matches('/'));
                 let mut req = client.get(&test_url);
+                // The header every later request gets, so a key that works
+                // there works here: a key shaped like a JWT is Bearer.
+                let mut tried = Config::default();
                 if auth_idx == 1 {
-                    req = req.header("Authorization", format!("Bearer {}", credential));
+                    tried.token = credential.clone();
                 } else {
-                    req = req.header("Authorization", format!("Basic {}", BASE64.encode(format!(":{}", credential).as_bytes())));
+                    tried.api_key = credential.clone();
+                }
+                if let Some(authorization) = auth_header(&tried) {
+                    req = req.header("Authorization", authorization);
                 }
                 match req.send() {
                     Ok(resp) if resp.status().is_success() => {
@@ -2989,14 +3101,16 @@ impl ConnectionFlow {
         loop {
             // Check for result
             if let Ok(result) = rx.try_recv() {
-                if let Some(err) = &result.error {
-                    let err_text = if err.contains("401") {
-                        "unauthorized"
-                    } else if err.contains("403") {
-                        "forbidden"
-                    } else {
-                        "connection failed"
-                    };
+                // A server that did not answer carries no error of its own:
+                // it is the one that is not connected.
+                let failed = match &result.error {
+                    Some(err) if err.contains("401") => Some("unauthorized"),
+                    Some(err) if err.contains("403") => Some("forbidden"),
+                    Some(_) => Some("connection failed"),
+                    None if !result.connected => Some("connection failed"),
+                    None => None,
+                };
+                if let Some(err_text) = failed {
                     self.picker_error_msg = Some(format!("{}: {}", env_name, err_text));
                     self.picker_error_clear_at = Some(Instant::now() + Duration::from_secs(3));
                     return Ok(None);
@@ -3105,7 +3219,7 @@ impl ConnectionFlow {
                     self.render(stdout, false)?;
                 }
             }
-            (KeyModifiers::NONE, KeyCode::Char(c)) => {
+            (modifiers, KeyCode::Char(c)) if types_a_character(modifiers) => {
                 // Regular characters add to search
                 self.picker.add_search_char(c);
                 self.render(stdout, false)?;
@@ -3155,6 +3269,11 @@ impl ConnectionFlow {
                     // Scheme added, and the API prefix cut: only the base URL
                     // is kept, read the way `-b` reads it.
                     let (base_url, trimmed) = base_url_of(&self.setup_url);
+                    // What names no host (`http://`, a blank, `/`) is not a
+                    // URL to go on with: the field keeps it, to be corrected.
+                    if base_url.is_empty() {
+                        return Ok(None);
+                    }
                     self.setup_url = base_url;
                     if trimmed {
                         self.setup_status = "trimmed to base URL".dimmed().to_string();
@@ -3164,27 +3283,10 @@ impl ConnectionFlow {
                     self.render(stdout, false)?;
                 }
                 KeyCode::Tab if !self.setup_url.is_empty() => {
-                    // Accept ghost text
-                    let localhost_full = "localhost:5000";
-                    let suffix = ".app.heads.com";
-                    if localhost_full.starts_with(&self.setup_url) {
-                        self.setup_url = localhost_full.to_string();
-                    } else if !self.setup_url.starts_with("localhost") && !self.setup_url.starts_with("127.0.0.1") && !self.setup_url.starts_with("[::1]")
-                        && !self.setup_url.starts_with("http://") && !self.setup_url.starts_with("https://")
-                        && !self.setup_url.contains(".app.heads.com")
-                    {
-                        let mut matched = false;
-                        for i in (1..=suffix.len()).rev() {
-                            if self.setup_url.ends_with(&suffix[..i]) {
-                                self.setup_url.push_str(&suffix[i..]);
-                                matched = true;
-                                break;
-                            }
-                        }
-                        if !matched {
-                            self.setup_url.push_str(suffix);
-                        }
-                    }
+                    // Tab writes the ghost that is shown, and nothing where
+                    // there is none.
+                    let ghost = url_ghost(&self.setup_url);
+                    self.setup_url.push_str(&ghost);
                     self.render(stdout, false)?;
                 }
                 KeyCode::Char(c) if types_a_character(key.modifiers) => {
@@ -3228,12 +3330,9 @@ impl ConnectionFlow {
                     self.render(stdout, false)?;
                 }
                 KeyCode::Esc => {
-                    // Strip scheme and go back to URL
-                    if self.setup_url.starts_with("https://") {
-                        self.setup_url = self.setup_url.strip_prefix("https://").unwrap().to_string();
-                    } else if self.setup_url.starts_with("http://") {
-                        self.setup_url = self.setup_url.strip_prefix("http://").unwrap().to_string();
-                    }
+                    // Back to the URL as it was confirmed, scheme included:
+                    // without it, Enter would infer one again, and not
+                    // always the one that was typed.
                     self.setup_active_field = SetupField::Url;
                     self.render(stdout, false)?;
                 }
@@ -3320,7 +3419,39 @@ impl ConnectionFlow {
         Ok(None)
     }
 
+    /// A paste fills the field that is active with its first line: the
+    /// search of the picker, or the URL, the client ID or the credential of
+    /// the form. Where nothing is typed (the auth method, a delete that
+    /// waits for its answer) a paste is nothing.
+    fn handle_paste(&mut self, paste: &str, stdout: &mut io::Stdout) -> io::Result<()> {
+        let line = first_pasted_line(paste);
+        if line.is_empty() {
+            return Ok(());
+        }
+        if !self.in_setup {
+            if self.delete_confirming.is_some() {
+                return Ok(());
+            }
+            self.picker.search_query.push_str(&line);
+            self.picker.update_filter();
+        } else {
+            match self.setup_active_field {
+                SetupField::Url => self.setup_url.push_str(&line),
+                SetupField::ClientId => self.setup_client_id.push_str(&line),
+                SetupField::Credential => self.setup_credential.push_str(&line),
+                SetupField::Auth | SetupField::Done => return Ok(()),
+            }
+        }
+        self.render(stdout, false)
+    }
+
     fn run(&mut self, stdout: &mut io::Stdout) -> io::Result<ConnectionFlowResult> {
+        // A paste arrives as one event, as at the prompt. The form a session
+        // starts with is open before the prompt has switched that on, and
+        // read key by key a pasted line break would be an Enter.
+        let _ = execute!(stdout, EnableBracketedPaste);
+        BRACKETED_PASTE_ON.store(true, Ordering::SeqCst);
+
         // Render splash if showing
         if self.show_splash {
             self.render_splash(stdout)?;
@@ -3357,8 +3488,10 @@ impl ConnectionFlow {
                             return Ok(result);
                         }
                     }
-                    Event::Resize(w, _h) => {
+                    Event::Paste(text) => self.handle_paste(&text, stdout)?,
+                    Event::Resize(w, h) => {
                         self.width = w;
+                        self.resized = Some((w, h));
 
                         // Disable raw mode for redraw
                         terminal::disable_raw_mode()?;
@@ -3384,6 +3517,37 @@ impl ConnectionFlow {
                 }
             }
         }
+    }
+}
+
+/// What Tab would add to a URL being typed in the form for a new
+/// connection, shown behind it as a ghost: the rest of `localhost:5000`, or
+/// of `.app.heads.com` behind a name. Nothing for a URL with a scheme
+/// (written in any case), an address, or a host that has its domain.
+fn url_ghost(url: &str) -> String {
+    let localhost_full = "localhost:5000";
+    let suffix = ".app.heads.com";
+    let lower = url.to_ascii_lowercase();
+    let starts_with_digit = url.chars().next().map_or(false, |c| c.is_ascii_digit());
+
+    if url.is_empty() || lower.starts_with("http://") || lower.starts_with("https://") {
+        String::new()
+    } else if localhost_full.starts_with(url) && !starts_with_digit {
+        localhost_full[url.len()..].to_string()
+    } else if !starts_with_digit
+        && !url.starts_with("localhost") && !url.starts_with("127.0.0.1") && !url.starts_with("[::1]")
+        && !url.contains(".app.heads.com")
+    {
+        let mut ghost = suffix.to_string();
+        for i in (1..=suffix.len()).rev() {
+            if url.ends_with(&suffix[..i]) {
+                ghost = suffix[i..].to_string();
+                break;
+            }
+        }
+        ghost
+    } else {
+        String::new()
     }
 }
 
@@ -3647,7 +3811,6 @@ fn main() {
 
     // Detect whether user explicitly provided auth/connection args
     let has_explicit_auth = args.key.is_some() || args.token.is_some() || args.one_password.is_some();
-    let has_explicit_uri = args.base_uri.is_some();
     let mut from_setup = false;
     let mut loaded_connection_alias = String::new();
     let mut connecting_to: Option<String> = None;
@@ -3764,6 +3927,14 @@ fn main() {
     // line. Only then may a dialog be shown; a batch never opens one.
     let wants_prompt = uri.is_empty() && args.all.is_none() && program_line.is_none();
 
+    // A `-b` that names no host (`-b ""`, `-b http://`) is no `-b` at the
+    // prompt: the session opens as it does without one, not on a form that
+    // has an empty URL confirmed. With a request it stays what was given, so
+    // the request is refused for its missing base URL and not sent to the
+    // default connection, which nobody named.
+    let base_arg = args.base_uri.as_deref().filter(|_| !(wants_prompt && config.base_uri.is_empty()));
+    let has_explicit_uri = base_arg.is_some();
+
     // Handle -c flag: load saved connection by alias or URL
     if let Some(ref connection_selector) = args.connection {
         let envs = list_connections();
@@ -3795,8 +3966,8 @@ fn main() {
         };
         loaded_connection_alias = env.name.clone();
         // `-b`, `-k` and `--token` win over what the connection has stored.
-        let env = override_connection(&env, args.base_uri.as_deref(), args.key.as_deref(), args.token.as_deref());
-        config.connection_overridden = args.base_uri.is_some() || args.key.is_some() || args.token.is_some();
+        let env = override_connection(&env, base_arg, args.key.as_deref(), args.token.as_deref());
+        config.connection_overridden = has_explicit_uri || args.key.is_some() || args.token.is_some();
         config.credential_overridden = args.key.is_some() || args.token.is_some();
         if let Err(e) = apply_connection_to_config(&mut config, &env) {
             errln!("{}", e);
@@ -3837,20 +4008,7 @@ fn main() {
 
                 // Stay on form with animated spinner while loading
                 {
-                    let bg_config = config.clone();
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    thread::spawn(move || { let _ = tx.send(background_load(&bg_config, None)); });
-                    let mut frame = 0usize;
-                    loop {
-                        if let Ok(result) = rx.try_recv() {
-                            startup_preloaded = Some(result);
-                            break;
-                        }
-                        flow.setup_status = format!("{} loading...", SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]).dimmed().to_string();
-                        flow.render(&mut stdout, false).ok();
-                        thread::sleep(Duration::from_millis(80));
-                        frame += 1;
-                    }
+                    startup_preloaded = Some(load_behind_flow(&mut flow, &mut stdout, &config));
                 }
 
                 // Clear the flow UI
@@ -3946,20 +4104,7 @@ fn main() {
                         if let Some(pre) = preloaded {
                             startup_preloaded = Some(pre);
                         } else {
-                            let bg_config = config.clone();
-                            let (tx, rx) = std::sync::mpsc::channel();
-                            thread::spawn(move || { let _ = tx.send(background_load(&bg_config, None)); });
-                            let mut frame = 0usize;
-                            loop {
-                                if let Ok(result) = rx.try_recv() {
-                                    startup_preloaded = Some(result);
-                                    break;
-                                }
-                                flow.setup_status = format!("{} loading...", SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]).dimmed().to_string();
-                                flow.render(&mut stdout, false).ok();
-                                thread::sleep(Duration::from_millis(80));
-                                frame += 1;
-                            }
+                            startup_preloaded = Some(load_behind_flow(&mut flow, &mut stdout, &config));
                         }
 
                         // Clear the flow UI
@@ -4013,20 +4158,7 @@ fn main() {
 
                     // Stay on form with animated spinner while loading
                     {
-                        let bg_config = config.clone();
-                        let (tx, rx) = std::sync::mpsc::channel();
-                        thread::spawn(move || { let _ = tx.send(background_load(&bg_config, None)); });
-                        let mut frame = 0usize;
-                        loop {
-                            if let Ok(result) = rx.try_recv() {
-                                startup_preloaded = Some(result);
-                                break;
-                            }
-                            flow.setup_status = format!("{} loading...", SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]).dimmed().to_string();
-                            flow.render(&mut stdout, false).ok();
-                            thread::sleep(Duration::from_millis(80));
-                            frame += 1;
-                        }
+                        startup_preloaded = Some(load_behind_flow(&mut flow, &mut stdout, &config));
                     }
 
                     from_setup = true;
@@ -5296,6 +5428,10 @@ impl ProgressTicker {
                         SPINNER_FRAMES[frame % SPINNER_FRAMES.len()],
                         progress_text(&shared.progress.snapshot(), shared.started.elapsed(), false)
                     );
+                    // One row, whatever the width: a line that wrapped
+                    // would not be erased whole.
+                    let cols = terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
+                    let line = fit_to_width(&line, cols.saturating_sub(1));
                     let mut stderr = io::stderr();
                     let _ = execute!(
                         stderr,
@@ -10076,19 +10212,7 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
                         let new_result = if let Some(pre) = preloaded {
                             pre
                         } else {
-                            let bg_config = new_config.clone();
-                            let (tx, rx) = std::sync::mpsc::channel();
-                            thread::spawn(move || { let _ = tx.send(background_load(&bg_config, None)); });
-                            let mut frame = 0usize;
-                            loop {
-                                if let Ok(r) = rx.try_recv() {
-                                    break r;
-                                }
-                                flow.setup_status = format!("{} loading...", SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]).dimmed().to_string();
-                                flow.render(&mut stdout, false).ok();
-                                thread::sleep(Duration::from_millis(80));
-                                frame += 1;
-                            }
+                            load_behind_flow(&mut flow, &mut stdout, &new_config)
                         };
                         if let Some(new_err) = &new_result.error {
                             errln!("{}", new_err);
@@ -10381,6 +10505,7 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
             render(&mut stdout, &mut state)?;
         }
         }
+        take_mapped_types(&mut state);
         // Animate loading spinner
         if state.loading {
             state.loading_frame += 1;
@@ -10500,11 +10625,16 @@ fn handle_key_event(
                 let method = state.body_input_method.clone();
                 let uri = state.body_input_uri.clone();
 
-                let input = if body.is_empty() {
+                let mut input = if body.is_empty() {
                     format!("{} {}", method, uri)
                 } else {
                     format!("{} {} {}", method, uri, body)
                 };
+                // The redirect of the line the editor was opened from.
+                if !state.display_outfile.is_empty() {
+                    let marker = if state.config.outfile_append { ">>" } else { ">" };
+                    input.push_str(&format!(" {} {}", marker, state.display_outfile));
+                }
                 // Comments and raw newlines, as a `.api` file would have them.
                 // What the input line refuses is refused here: nothing is
                 // sent, and the editor stays open with the text to correct.
@@ -10526,7 +10656,12 @@ fn handle_key_event(
                 state.history_idx = -1;
                 execute_request(state, stdout)?;
 
+                // The line the editor was opened from, redirect included.
                 state.input = format!("{} {}", state.method, state.uri);
+                if !state.display_outfile.is_empty() {
+                    let marker = if state.config.outfile_append { ">>" } else { ">" };
+                    state.input.push_str(&format!(" {} {}", marker, state.display_outfile));
+                }
                 state.cursor_pos = char_len(&state.input);
                 render(stdout, state)?;
             }
@@ -10549,7 +10684,7 @@ fn handle_key_event(
                 render(stdout, state)?;
             }
             // Regular character input
-            (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(c)) => {
+            (modifiers, KeyCode::Char(c)) if types_a_character(modifiers) => {
                 state.body_input_buffer.push(c);
                 render(stdout, state)?;
             }
@@ -10562,34 +10697,13 @@ fn handle_key_event(
     let dominated_by_completions = key.code == KeyCode::Tab
         || key.code == KeyCode::BackTab
         || key.code == KeyCode::Esc;
-    if !dominated_by_completions {
-        state.completions.clear();
-        state.completion_idx = 0;
-        state.last_tab_input.clear();
-        state.completion_uri_suffix.clear();
-    }
-
     // If help is showing, close it on any key except esc/ctrl+h/ctrl+c, then process the key
-    if state.show_help {
-        let is_help_key = key.code == KeyCode::Esc
-            || (key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('h'))
-            || (key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c'));
-        if !is_help_key {
-            state.show_help = false;
-            render(stdout, state)?;
-        }
-    }
-
+    let is_ctrl_c = key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c');
+    let is_help_key = key.code == KeyCode::Esc
+        || (key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('h'))
+        || is_ctrl_c;
     // Reset ctrl+c pending on any non-ctrl+c key
-    if !(key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c')) {
-        if state.ctrl_c_pending {
-            state.ctrl_c_pending = false;
-            state.ctrl_c_at = None;
-            state.status_msg.clear();
-            state.status_msg_at = None;
-            render(stdout, state)?;
-        }
-    }
+    reset_for_input(state, stdout, !dominated_by_completions, !is_help_key, !is_ctrl_c)?;
 
     match (key.modifiers, key.code) {
         // Quit (ctrl+c double-press)
@@ -10839,6 +10953,8 @@ fn handle_key_event(
                 }
                 state.history_idx += 1;
                 state.stashed_body.clear();
+                // A recalled line has the method it was sent with.
+                state.method_auto_promoted = false;
                 let idx = state.history.len() - 1 - state.history_idx as usize;
                 state.input = state.history[idx].clone();
                 state.cursor_pos = char_len(&state.input);
@@ -10857,6 +10973,7 @@ fn handle_key_event(
             } else if state.history_idx > 0 {
                 state.history_idx -= 1;
                 state.stashed_body.clear();
+                state.method_auto_promoted = false;
                 let idx = state.history.len() - 1 - state.history_idx as usize;
                 state.input = state.history[idx].clone();
                 state.cursor_pos = char_len(&state.input);
@@ -10864,6 +10981,7 @@ fn handle_key_event(
             } else if state.history_idx == 0 {
                 state.history_idx = -1;
                 state.stashed_body.clear();
+                state.method_auto_promoted = false;
                 state.input = state.history_stash.clone();
                 state.cursor_pos = char_len(&state.input);
                 render(stdout, state)?;
@@ -10914,11 +11032,11 @@ fn handle_key_event(
                     parse_input(state, &request);
 
                     // If method expects a body but none provided and no infile, enter body input mode.
+                    // An outfile on the line is kept for when the body is sent.
                     // Never mid-chain: opening the multi-line editor between segments
                     // would strand the rest of the chain.
                     if !is_chain
                         && state.body.is_empty()
-                        && state.config.outfile.is_empty()
                         && ["POST", "PUT", "PATCH"].contains(&state.method.as_str())
                     {
                         state.body_input_mode = true;
@@ -11046,7 +11164,7 @@ fn handle_key_event(
         }
 
         // Regular character input
-        (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(c)) => {
+        (modifiers, KeyCode::Char(c)) if types_a_character(modifiers) => {
             // Smart closing bracket: remove trailing comma and fix indentation
             if (c == '}' || c == ']') && state.config.experimental && cursor_inside_brackets(&state.input, state.cursor_pos) {
                 let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
@@ -11104,6 +11222,37 @@ fn handle_key_event(
     }
 
     Ok((false, None))
+}
+
+/// What input at the prompt puts back before it is taken: the list Tab was
+/// going through, the open shortcuts, and a first ctrl+c that was waiting
+/// for its second. A key says which of them it leaves alone (Tab keeps its
+/// list, ctrl+c its count); a typed character and a paste reset all three.
+fn reset_for_input<W: Write>(
+    state: &mut AppState,
+    stdout: &mut W,
+    completions: bool,
+    help: bool,
+    ctrl_c: bool,
+) -> io::Result<()> {
+    if completions {
+        state.completions.clear();
+        state.completion_idx = 0;
+        state.last_tab_input.clear();
+        state.completion_uri_suffix.clear();
+    }
+    if help && state.show_help {
+        state.show_help = false;
+        render(stdout, state)?;
+    }
+    if ctrl_c && state.ctrl_c_pending {
+        state.ctrl_c_pending = false;
+        state.ctrl_c_at = None;
+        state.status_msg.clear();
+        state.status_msg_at = None;
+        render(stdout, state)?;
+    }
+    Ok(())
 }
 
 /// Cycling window for re-pasting the same JSON to advance through its identifiers.
@@ -11379,6 +11528,9 @@ fn handle_paste<W: Write>(
         state.body_input_buffer.push_str(&normalize_paste_newlines(paste));
         return render(stdout, state);
     }
+
+    // A paste is input, as a typed character is.
+    reset_for_input(state, stdout, true, true, true)?;
 
     let inside_body = cursor_inside_brackets(&state.input, state.cursor_pos);
 
@@ -11984,13 +12136,14 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
         state.status_msg_at = Some(Instant::now());
     }
 
-    // Refresh mapped type names after mutating /mapped-types
-    if state.uri.starts_with("/mapped-types")
-        && matches!(state.method.as_str(), "PUT" | "POST" | "PATCH")
-    {
+    // The mapped types are read again after one was written. On a thread of
+    // its own, as when the session started: the prompt does not wait for it,
+    // and takes the list when it is there (`take_mapped_types`).
+    if wrote_mapped_types(&state.config.api_path, &state.method, &state.uri, state.config.last_status) {
         let config = state.config.clone();
-        let names = fetch_mapped_type_names(&config);
-        state.mapped_types = names;
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || { let _ = tx.send(fetch_mapped_type_names(&config)); });
+        state.mapped_types_rx = Some(rx);
     }
 
     // A `sleep while` poll prints nothing unless it errored — then the block
@@ -12066,8 +12219,15 @@ fn execute_request_chain(
                 RequestOutcome::Truthy | RequestOutcome::Falsy => prev = Some(outcome),
                 // Errored or aborted ends the chain — a following `||` does
                 // NOT catch it. The reason is already on screen.
-                RequestOutcome::Errored | RequestOutcome::Aborted => {
+                RequestOutcome::Errored => {
                     skipped += segments.len() - i - 1;
+                    cut_short = true;
+                    break;
+                }
+                // The abort is what the hint line says: nothing was
+                // skipped that the user did not stop.
+                RequestOutcome::Aborted => {
+                    skipped = 0;
                     cut_short = true;
                     break;
                 }
@@ -12546,7 +12706,7 @@ fn wait_interruptible(
     let mut frame_idx = 0usize;
     let mut showing_spinner = false;
     while start.elapsed() < d {
-        let remaining = d - start.elapsed();
+        let remaining = d.saturating_sub(start.elapsed());
         if event::poll(remaining.min(Duration::from_millis(80)))? {
             let event = event::read()?;
             note_resize(state, &event);
@@ -12641,7 +12801,7 @@ struct BodySpan {
 /// `None` where the cursor is in no request: a directive, an include, a
 /// method with nothing after it.
 fn body_span_at(input: &str, byte_pos: usize) -> Option<BodySpan> {
-    let (seg_start, seg_end) = chain_segment_bounds_at(input, byte_pos);
+    let (seg_start, seg_end) = request_bounds_at(input, byte_pos);
     let segment = &input[seg_start..seg_end];
     let text = segment.trim_start();
     let base = seg_start + (segment.len() - text.len());
@@ -12673,6 +12833,42 @@ fn body_span_at(input: &str, byte_pos: usize) -> Option<BodySpan> {
     }
     let start = uri_end + (body.len() - body.trim_start().len());
     Some(BodySpan { uri_end, start, end: start + body.trim().len() })
+}
+
+/// Byte range `[start, end)` of the request containing `byte_pos`, on an
+/// input line that may hold a block of lines as a `.api` file has them: the
+/// cursor's line, and in it the cursor's chain segment. The other lines are
+/// requests of their own, not this one's body. A line break inside a body's
+/// brackets or inside a string is part of the body.
+fn request_bounds_at(input: &str, byte_pos: usize) -> (usize, usize) {
+    let mut line_start = 0usize;
+    let mut line_end = input.len();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, ch) in input.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_string => escape = true,
+            '"' => in_string = !in_string,
+            '{' | '[' | '(' if !in_string => depth += 1,
+            '}' | ']' | ')' if !in_string => depth -= 1,
+            '\n' if !in_string && depth <= 0 => {
+                if byte_pos <= i {
+                    line_end = i;
+                    break;
+                }
+                line_start = i + 1;
+                depth = 0;
+            }
+            _ => {}
+        }
+    }
+    let (seg_start, seg_end) = chain_segment_bounds_at(&input[line_start..line_end], byte_pos - line_start);
+    (line_start + seg_start, line_start + seg_end)
 }
 
 /// Byte range `[start, end)` of the `&&` chain segment containing `byte_pos` —
@@ -13089,7 +13285,7 @@ fn cycle_method(state: &mut AppState) {
     // would flatten a multi-line JSON body into one line.
     let methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
     let cursor_byte = char_to_byte_idx(&state.input, state.cursor_pos);
-    let (seg_start, seg_end) = chain_segment_bounds_at(&state.input, cursor_byte);
+    let (seg_start, seg_end) = request_bounds_at(&state.input, cursor_byte);
     let segment = &state.input[seg_start..seg_end];
     let trimmed = segment.trim_start();
     if trimmed.trim().is_empty() {
@@ -13512,6 +13708,11 @@ fn handle_save_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io::
     let resized = Resized::new(None);
     let entered = read_inline_input_within(stdout, &prompt, false, &prefill, Some(width), None, Some(&resized))?;
     take_resize(state, &resized);
+    // A name is trimmed, as a pasted one is: blanks alone are no name.
+    let entered = match entered {
+        InlineInput::Entered(n) => InlineInput::Entered(n.trim().to_string()),
+        other => other,
+    };
     let name = match entered {
         InlineInput::Entered(n) if !n.is_empty() => n,
         ended => {
@@ -13618,7 +13819,13 @@ fn handle_switch_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io
     // Use unified connection flow
     let mut flow = ConnectionFlow::for_runtime(&envs, state.width);
 
-    match flow.run(stdout)? {
+    let result = flow.run(stdout)?;
+    // A window resized while the picker was open is the session's window
+    // too: it draws at the new size from here on.
+    if let Some((w, h)) = flow.resized {
+        note_resize(state, &Event::Resize(w, h));
+    }
+    match result {
         ConnectionFlowResult::Connected(env, preloaded, resolved_config) => {
             // Clear the flow UI (use tracked lines from last render)
             execute!(stdout, cursor::MoveUp(flow.last_rendered_lines), cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
@@ -13750,14 +13957,24 @@ fn build_curl(state: &AppState) -> Option<String> {
     }
 
     let url = format!("{}{}", config.base_uri, resolve_request_path(&config.api_path, &state.prev_uri));
-    let mut cmd = format!("curl -gfsSL -X {} {}", state.prev_method, sh_quote(&url));
+    let has_body = is_file_body || !state.prev_body.is_empty();
+    // curl's HEAD is `-I`: after `-X HEAD` it waits for a body that never
+    // comes. (With a body to send it has no HEAD at all; `-X` is the nearest.)
+    let method = if state.prev_method == "HEAD" && !has_body {
+        "-I".to_string()
+    } else {
+        format!("-X {}", state.prev_method)
+    };
+    let mut cmd = format!("curl -gfsSL {} {}", method, sh_quote(&url));
     // The header the request itself carried: Bearer for a token and for a
     // key shaped like a JWT, Basic otherwise.
     if let Some(authorization) = auth_header(config) {
         cmd.push_str(&format!(" -H {}", sh_quote(&format!("Authorization: {}", authorization))));
     }
     cmd.push_str(&format!(" -H {}", sh_quote(&format!("Accept: {}", accept))));
-    if ["PUT", "PATCH", "POST"].contains(&state.prev_method.as_str()) {
+    // A body says what it is whatever the method: without the header curl
+    // would send the body of a GET or a DELETE as a form.
+    if has_body || ["PUT", "PATCH", "POST"].contains(&state.prev_method.as_str()) {
         cmd.push_str(&format!(" -H {}", sh_quote(&format!("Content-Type: {}", content_type))));
     }
     if is_file_body {
@@ -13933,7 +14150,8 @@ fn render_input_content(state: &mut AppState, width: usize) -> (String, u16, Str
     // some output above.
     let cursor_line = state.input[..cursor_byte].matches('\n').count();
     let max_input_lines = state.height.saturating_sub(5).max(3);
-    let (rendered, input_line_count) = clamp_input_viewport(&rendered, width, max_input_lines, cursor_line);
+    let cursor_col = char_len(before_cursor.rsplit('\n').next().unwrap_or(""));
+    let (rendered, input_line_count) = clamp_input_viewport(&rendered, width, max_input_lines, cursor_line, cursor_col);
 
     // Build the final output lines with hints appended to the last line
     let lines: Vec<&str> = rendered.split('\n').collect();
@@ -14094,7 +14312,12 @@ impl StreamPulse {
 /// A transient hint line (spinner, progress, abort notice) with the
 /// `streaming` marker kept in its usual place. `pulse` is how far into a
 /// pulse the marker is; `None` leaves it steady.
+///
+/// It is drawn where the cursor is, with auto-wrap on, so it is cut to stay
+/// clear of the right margin: a line that wrapped would leave a row behind
+/// on every frame of a spinner.
 fn transient_hint_line(state: &AppState, text: &str, pulse: Option<Duration>) -> String {
+    let text = &fit_to_width(text, (state.width as usize).saturating_sub(3));
     let mut line = format!("  {}", text.dimmed());
     if let (Some(pad), Some(label)) = (streaming_indicator_pad(state, text.chars().count()), footer_indicator(state)) {
         line.push_str(&" ".repeat(pad));
@@ -14348,9 +14571,10 @@ fn render<W: Write>(stdout: &mut W, state: &mut AppState) -> io::Result<()> {
         // and every redraw after that would leave a copy above.
         let last_idx = buf_lines.len() - 1;
         let mut shown: Vec<String> = buf_lines.iter().map(|line| line.to_string()).collect();
+        let cursor_col = char_len(&shown[last_idx]);
         shown[last_idx].push_str("\x1b[48;5;247m\x1b[38;5;0m \x1b[0m");
         let budget = state.height.saturating_sub(5 + header_lines + prompt_lines).max(3);
-        let (visible, total_buf_visual_lines) = clamp_input_viewport(&shown.join("\n"), width, budget, last_idx);
+        let (visible, total_buf_visual_lines) = clamp_input_viewport(&shown.join("\n"), width, budget, last_idx, cursor_col);
         queue!(stdout, Print(format!("{}\r\n", hard_wrap_ansi(&visible.replace('\n', "\r\n"), width))))?;
         state.prev_input_lines = header_lines + prompt_lines + total_buf_visual_lines;
     } else {
@@ -14481,6 +14705,40 @@ fn print_splash(config: &Config) {
     print_splash_with_width(config, 80);
 }
 
+/// Load what a session needs from the connection the form just made, with
+/// the form still on screen and its spinner turning.
+///
+/// The terminal is in raw mode, so ctrl+c is a key that has to be read: it
+/// clears the form and ends the client, as it does in the form itself. Any
+/// other key, and a paste, is read away: there is no prompt yet to take it,
+/// and left unread it would be typed into the prompt when it opens.
+fn load_behind_flow(flow: &mut ConnectionFlow, stdout: &mut io::Stdout, config: &Config) -> BackgroundLoadResult {
+    let bg_config = config.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || { let _ = tx.send(background_load(&bg_config, None)); });
+    let mut frame = 0usize;
+    loop {
+        if let Ok(result) = rx.try_recv() {
+            return result;
+        }
+        flow.setup_status = format!("{} loading...", SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]).dimmed().to_string();
+        flow.render(stdout, false).ok();
+        let tick = Instant::now();
+        while event::poll(Duration::from_millis(80).saturating_sub(tick.elapsed())).unwrap_or(false) {
+            let Ok(event) = event::read() else { break };
+            if let Event::Key(key) = event {
+                let pressed = key.kind == event::KeyEventKind::Press;
+                if pressed && key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
+                    let total_lines = flow.last_rendered_lines + if flow.show_splash { ConnectionFlow::splash_lines() } else { 0 };
+                    let _ = execute!(stdout, cursor::MoveUp(total_lines), cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown));
+                    exit_process(0);
+                }
+            }
+        }
+        frame += 1;
+    }
+}
+
 fn print_splash_loading(config: &Config, term_width: u16) {
     let mut loading_config = config.clone();
     loading_config.base_uri = "".to_string();
@@ -14546,14 +14804,17 @@ fn background_load(config: &Config, op_selector: Option<String>) -> BackgroundLo
         load_openapi_spec_into(&config, &mut result);
 
         if let Ok(names) = mapped_types_handle.join() {
-            result.mapped_types = names;
+            result.mapped_types = names.unwrap_or_default();
         }
     }
 
     result
 }
 
-fn fetch_mapped_type_names(config: &Config) -> Vec<String> {
+/// The names of the server's mapped types, for `~map(` to complete from.
+/// `None` when they could not be had: no answer, an error status, or an
+/// answer that is not a list.
+fn fetch_mapped_type_names(config: &Config) -> Option<Vec<String>> {
     let client = client_builder()
         .timeout(Duration::from_secs(10))
         .build()
@@ -14566,26 +14827,47 @@ fn fetch_mapped_type_names(config: &Config) -> Vec<String> {
         request = request.header("Authorization", authorization);
     }
 
-    match request.send() {
-        Ok(resp) if resp.status().is_success() => {
-            if let Ok(items) = resp.json::<Vec<serde_json::Value>>() {
-                let mut names: Vec<String> = items
-                    .iter()
-                    .filter_map(|item| {
-                        item.get("identifiers")
-                            .and_then(|ids| ids.get("mappedTypeName"))
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
-                    })
-                    .collect();
-                names.sort();
-                names
-            } else {
-                Vec::new()
-            }
-        }
-        _ => Vec::new(),
+    let resp = request.send().ok().filter(|resp| resp.status().is_success())?;
+    let items = resp.json::<Vec<serde_json::Value>>().ok()?;
+    let mut names: Vec<String> = items
+        .iter()
+        .filter_map(|item| {
+            item.get("identifiers")
+                .and_then(|ids| ids.get("mappedTypeName"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .collect();
+    names.sort();
+    Some(names)
+}
+
+/// Whether a request that was answered `status` wrote a mapped type, so that
+/// the list `~map(` completes from is to be read again. The path is told
+/// however it is written: `mapped-types`, `/mapped-types`, `v1/mapped-types`,
+/// `/api/v1/mapped-types`, and anything below it.
+fn wrote_mapped_types(api_path: &str, method: &str, uri: &str, status: Option<u16>) -> bool {
+    if !matches!(method, "PUT" | "POST" | "PATCH") || !status.is_some_and(|s| (200..300).contains(&s)) {
+        return false;
     }
+    let uri = uri.split('?').next().unwrap_or(uri);
+    let path = resolve_request_path(api_path, uri);
+    // The collection is the segment behind the version: `/api/v1/…`, `/api/me/v1/…`.
+    let is_version = |s: &str| s.strip_prefix('v').is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+    let mut segments = path.split('/').skip_while(|segment| !is_version(segment)).skip(1);
+    segments.next().is_some_and(|segment| segment.split('~').next() == Some("mapped-types"))
+}
+
+/// Take the mapped types a write to `/mapped-types` asked for, once they
+/// have arrived. A list that could not be had leaves the one there is.
+fn take_mapped_types(state: &mut AppState) {
+    let Some(rx) = &state.mapped_types_rx else { return };
+    match rx.try_recv() {
+        Ok(Some(names)) => state.mapped_types = names,
+        Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+        Err(std::sync::mpsc::TryRecvError::Empty) => return,
+    }
+    state.mapped_types_rx = None;
 }
 
 fn apply_background_result(state: &mut AppState, result: BackgroundLoadResult) {
@@ -17198,6 +17480,24 @@ mod tests {
             let rows = wrapped.split('\n').count() as u16;
             assert_eq!(rows, visual_line_count(&s, 80), "len {} mismatch", len);
         }
+        // The same for an input of several lines, which reaches the wrap with
+        // its lines joined by `\r\n`: the `\r` is no column. A line exactly as
+        // wide as the terminal used to get a blank row that nothing counted.
+        for first in [0usize, 1, 79, 80, 81, 159, 160, 161] {
+            for last in [0usize, 5, 80] {
+                let counted = format!("{}\n{}\n{}", "X".repeat(first), "Y".repeat(80), "Z".repeat(last));
+                let wrapped = hard_wrap_ansi(&counted.replace('\n', "\r\n"), 80);
+                let rows = wrapped.split('\n').count() as u16;
+                assert_eq!(rows, visual_line_count(&counted, 80), "{first} + 80 + {last}:\n{wrapped:?}");
+                assert!(!wrapped.contains("\r\n\r\n") || first == 0 || last == 0, "{first} + 80 + {last}: a blank row\n{wrapped:?}");
+            }
+        }
+        // A line one short of the width with the cursor cell at its end.
+        let cell = "\x1b[48;5;247m\x1b[38;5;0m \x1b[0m";
+        let counted = format!("{}{cell}\nnext", "X".repeat(79));
+        let wrapped = hard_wrap_ansi(&counted.replace('\n', "\r\n"), 80);
+        assert_eq!(wrapped.split('\n').count() as u16, visual_line_count(&counted, 80), "{wrapped:?}");
+        assert_eq!(wrapped.split('\n').count(), 2, "{wrapped:?}");
     }
 
     #[test]
@@ -20671,7 +20971,7 @@ mod tests {
     #[test]
     fn clamp_input_viewport_short_input_unchanged() {
         let input = "GET /people\n[\n  {}\n]";
-        let (out, count) = clamp_input_viewport(input, 80, 20, 0);
+        let (out, count) = clamp_input_viewport(input, 80, 20, 0, 0);
         assert_eq!(out, input);
         assert_eq!(count, 4);
     }
@@ -20681,24 +20981,105 @@ mod tests {
         // 50 short logical lines, cap at 10 visual lines.
         let input: String = (0..50).map(|i| format!("line{}", i)).collect::<Vec<_>>().join("\n");
         for cursor_line in [0usize, 7, 25, 49] {
-            let (out, count) = clamp_input_viewport(&input, 80, 10, cursor_line);
+            let (out, count) = clamp_input_viewport(&input, 80, 10, cursor_line, 0);
             assert!(count <= 10, "count {} exceeded cap for cursor_line {}", count, cursor_line);
+            assert_eq!(count, visual_line_count(&out, 80), "cursor_line {cursor_line}");
             // The cursor's logical line must be present in the window.
             assert!(
-                out.contains(&format!("line{}", cursor_line)),
+                out.split('\n').any(|line| line == format!("line{}", cursor_line)),
                 "cursor line{} not visible (cursor_line {})", cursor_line, cursor_line
             );
         }
+        // Lines that wrap, and a cursor line that is as tall as the cap or a
+        // row short of it: with the markers it would be over.
+        for tall in [1usize, 8, 9, 10, 11, 30] {
+            let mut lines: Vec<String> = (0..12).map(|i| format!("line{i}")).collect();
+            for cursor_line in [0usize, 5, 11] {
+                lines[cursor_line] = "x".repeat(80 * tall - 3);
+                for cursor_col in [0usize, 80 * tall / 2, 80 * tall - 4] {
+                    // The cursor's own character, to find it by.
+                    let mut marked: Vec<char> = lines[cursor_line].chars().collect();
+                    marked[cursor_col] = '@';
+                    let mut all = lines.clone();
+                    all[cursor_line] = marked.into_iter().collect();
+                    let (out, count) = clamp_input_viewport(&all.join("\n"), 80, 10, cursor_line, cursor_col);
+                    let what = format!("{tall} rows at line {cursor_line}, cursor at {cursor_col}");
+                    assert!(count <= 10, "{what}: {count} rows");
+                    assert_eq!(count, visual_line_count(&out, 80), "{what}");
+                    assert!(out.contains('@'), "{what}: the cursor is not shown\n{out}");
+                }
+                lines[cursor_line] = format!("line{cursor_line}");
+            }
+        }
+    }
+
+    /// One line taller than the cap is shown by the rows around the cursor,
+    /// with a marker where rows are left out, and its colours carried into
+    /// the part that is shown.
+    #[test]
+    fn clamp_input_viewport_windows_one_tall_line_by_rows() {
+        // 15 rows of 80 on a cap of 7: `PUT /x ` and a compact body.
+        let line: String = (0..1200).map(|i| char::from(b'a' + (i / 80) as u8)).collect();
+        let shown_rows = |out: &str| -> Vec<String> {
+            out.split('\n').map(|row| visible_text(row)).collect()
+        };
+
+        // At the start: the first rows, and a marker below.
+        let (out, count) = clamp_input_viewport(&line, 80, 7, 0, 0);
+        let rows = shown_rows(&out);
+        assert_eq!(count, 7);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0], line[..480]);
+        assert_eq!(rows[1], "⋯");
+
+        // At the end: the last rows, and a marker above.
+        let (out, count) = clamp_input_viewport(&line, 80, 7, 0, 1199);
+        let rows = shown_rows(&out);
+        assert_eq!(count, 7);
+        assert_eq!(rows, ["⋯", &line[720..]]);
+
+        // In the middle: a marker on both sides, and the cursor's row between.
+        let (out, count) = clamp_input_viewport(&line, 80, 7, 0, 7 * 80 + 40);
+        let rows = shown_rows(&out);
+        assert_eq!(count, 7);
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert_eq!((rows[0].as_str(), rows[2].as_str()), ("⋯", "⋯"));
+        assert_eq!(rows[1].chars().count(), 5 * 80);
+        assert!(rows[1].contains(&"h".repeat(80)), "{rows:?}");
+
+        // Every position of the cursor is in what is shown.
+        for cursor_col in 0..1200 {
+            let mut marked: Vec<char> = line.chars().collect();
+            marked[cursor_col] = '@';
+            let marked: String = marked.into_iter().collect();
+            let (out, count) = clamp_input_viewport(&marked, 80, 7, 0, cursor_col);
+            assert!(out.contains('@'), "cursor at {cursor_col}");
+            assert!(count <= 7 && count == visual_line_count(&out, 80), "cursor at {cursor_col}: {count}");
+        }
+
+        // Other lines around it are left out, and marked as left out.
+        let input = format!("GET /a\n{line}\nGET /c");
+        let (out, count) = clamp_input_viewport(&input, 80, 7, 1, 0);
+        let rows = shown_rows(&out);
+        assert_eq!(count, 7);
+        assert_eq!(rows, ["⋯", &line[..400], "⋯"]);
+
+        // A colour that starts in a row left out still holds in the rows shown.
+        let coloured = format!("\x1b[32m{line}\x1b[0m");
+        let (out, _) = clamp_input_viewport(&coloured, 80, 7, 0, 1199);
+        let shown = out.split('\n').nth(1).unwrap();
+        assert!(shown.starts_with("\x1b[32m"), "{shown:?}");
+        assert_eq!(visible_text(shown), line[720..]);
     }
 
     #[test]
     fn clamp_input_viewport_marks_clipped_regions() {
         let input: String = (0..50).map(|i| format!("line{}", i)).collect::<Vec<_>>().join("\n");
         // Cursor in the middle → both top and bottom should be clipped/marked.
-        let (out, _) = clamp_input_viewport(&input, 80, 10, 25);
+        let (out, _) = clamp_input_viewport(&input, 80, 10, 25, 0);
         assert!(out.contains('⋯'), "expected an ellipsis marker when content is clipped");
         // Cursor at the very end → no bottom marker, last real line stays last.
-        let (out_end, _) = clamp_input_viewport(&input, 80, 10, 49);
+        let (out_end, _) = clamp_input_viewport(&input, 80, 10, 49, 0);
         assert!(out_end.trim_end().ends_with("line49"), "cursor-at-end window must end at the last line");
     }
 
@@ -25450,9 +25831,12 @@ mod tests {
             highlight_json(r#"[7] && PUT /x-2/true ["n"]"#),
             format!("{}{}{} && PUT /x-2/true {}{}{}", b('['), n("7"), b(']'), b('['), v("\"n\""), b(']'))
         );
-        // A string still being typed, and one that a line break ends.
+        // A string still being typed, and one that goes on over a line break.
         assert_eq!(highlight_json(r#"{"na"#), format!("{}{key}\"na{r}", b('{')));
-        assert_eq!(highlight_json("{\"a\": \"b\nc"), format!("{}{}: {string}\"b{r}\nc", b('{'), k("\"a\"")));
+        assert_eq!(
+            highlight_json("{\"a\": \"b\nc"),
+            format!("{}{}: {string}\"b{r}\n{string}c{r}", b('{'), k("\"a\""))
+        );
         assert_eq!(highlight_json("{tru, nul, fals, x"), format!("{}tru, nul, fals, x", b('{')));
 
         // Split at the cursor, the colour the cursor is in goes on after it.
@@ -25603,6 +25987,53 @@ mod tests {
         assert!(!PickerState::fuzzy_matches("lacol", "local"));
         assert!(!PickerState::fuzzy_matches("locals", "local"));
         assert!(!PickerState::fuzzy_matches("x", ""));
+    }
+
+    /// The row that adds a connection is the slot without one, whatever the
+    /// connections are named: one named with a `+` is searched, selected
+    /// and counted like the others.
+    #[test]
+    fn a_connection_named_with_a_plus_is_not_the_row_that_adds_one() {
+        let mut picker = picker_of(&[("+ Add new connection", "http://a.example.com"), ("beta", "http://b.example.com")], None);
+        assert_eq!((0..3).map(|i| picker.is_add_row(i)).collect::<Vec<_>>(), [false, false, true]);
+        assert!(!picker.is_add_row(3));
+        for c in "add".chars() {
+            picker.add_search_char(c);
+        }
+        assert_eq!((picker.filtered_indices.clone(), picker.selected), (vec![0, 2], 0));
+        assert_eq!(picker.selected_env().unwrap().name, "+ Add new connection");
+        // A search that finds nothing leaves the slot, and it is selected.
+        picker.add_search_char('q');
+        assert_eq!((picker.filtered_indices.clone(), picker.selected), (vec![2], 2));
+        assert!(picker.selected_env().is_none());
+    }
+
+    /// The ghost of the URL field, which is also what Tab writes there.
+    #[test]
+    fn the_url_ghost_is_offered_for_a_name_and_for_nothing_else() {
+        let rows = [
+            ("", ""),
+            ("l", "ocalhost:5000"),
+            ("localhost:5", "000"),
+            ("localhost:5000", ""),
+            ("localhost:8080", ""),
+            ("acme", ".app.heads.com"),
+            ("acme.", "app.heads.com"),
+            ("acme.app.h", "eads.com"),
+            ("acme.app.heads.com", ""),
+            // An address is whole as it is.
+            ("10.0.0.5", ""),
+            ("127.0.0.1:5000", ""),
+            ("[::1]:5000", ""),
+            // And so is a URL with a scheme, in any case.
+            ("http://acme", ""),
+            ("https://acme", ""),
+            ("HTTPS://acme", ""),
+            ("Http://acme", ""),
+        ];
+        for (typed, ghost) in rows {
+            assert_eq!(url_ghost(typed), ghost, "{typed:?}");
+        }
     }
 
     #[test]
@@ -26420,5 +26851,277 @@ mod tests {
         let typed = dir.path().canonicalize().unwrap().join("lib?/rows/a.json");
         let both = String::from_utf8(resolve_at_file_body(typed.to_str().unwrap()).unwrap().contents).unwrap();
         assert_eq!(both, r#"[{"a":1},{"z":9}]"#);
+    }
+    #[test]
+    fn a_character_typed_with_altgr_is_typed() {
+        // Windows reports AltGr as ctrl and alt held together.
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        assert!(types_a_character(altgr));
+        assert!(types_a_character(altgr | KeyModifiers::SHIFT));
+        // Either alone is a shortcut, with or without shift.
+        assert!(!types_a_character(KeyModifiers::CONTROL));
+        assert!(!types_a_character(KeyModifiers::ALT));
+        assert!(!types_a_character(KeyModifiers::ALT | KeyModifiers::SHIFT));
+        assert!(!types_a_character(KeyModifiers::CONTROL | KeyModifiers::SHIFT));
+        assert!(!types_a_character(altgr | KeyModifiers::SUPER));
+
+        // The keys as they arrive: `{` on a Swedish layout, and ctrl+c, which
+        // stays what it is.
+        let typed = KeyEvent::new(KeyCode::Char('{'), altgr);
+        assert!(matches!((typed.modifiers, typed.code), (m, KeyCode::Char('{')) if types_a_character(m)));
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(!matches!((ctrl_c.modifiers, ctrl_c.code), (m, KeyCode::Char(_)) if types_a_character(m)));
+    }
+
+    #[test]
+    fn a_paste_resets_what_a_typed_character_resets() {
+        let mut state = test_state();
+        state.input = "GET /pe".to_string();
+        state.cursor_pos = char_len(&state.input);
+        state.completions = vec!["/people".to_string(), "/pets".to_string()];
+        state.completion_idx = 1;
+        state.last_tab_input = "GET /pe".to_string();
+        state.completion_uri_suffix = "~count".to_string();
+        state.show_help = true;
+        state.ctrl_c_pending = true;
+        state.ctrl_c_at = Some(Instant::now());
+        state.status_msg = "ctrl+c again to exit".to_string();
+        handle_paste(&mut state, "ople", &mut sink()).unwrap();
+        assert_eq!(state.input, "GET /people");
+        assert!(state.completions.is_empty() && state.completion_idx == 0);
+        assert!(state.last_tab_input.is_empty() && state.completion_uri_suffix.is_empty());
+        assert!(!state.show_help);
+        assert!(!state.ctrl_c_pending && state.ctrl_c_at.is_none());
+
+        // A key says what it leaves: Tab its list, ctrl+c its count.
+        let mut state = test_state();
+        state.completions = vec!["/people".to_string()];
+        state.ctrl_c_pending = true;
+        state.show_help = true;
+        reset_for_input(&mut state, &mut sink(), false, false, false).unwrap();
+        assert!(!state.completions.is_empty() && state.ctrl_c_pending && state.show_help);
+    }
+
+    #[test]
+    fn a_transient_hint_line_is_cut_to_the_width() {
+        let mut state = AppState::new(Config::default());
+        for text in ["⠙ 200 OK, received 12.4 MB of 100 MB (12%)", "⠙ sleeping 5m...", "request aborted"] {
+            for width in [0u16, 1, 2, 3, 4, 10, 16, 20, 25, 40] {
+                state.width = width;
+                let line = transient_hint_line(&state, text, None);
+                assert!(
+                    visible_len(&line) < (width as usize).max(3),
+                    "{text:?} at {width}: {:?}",
+                    visible_text(&line)
+                );
+                // With a marker to show as well.
+                state.config.streaming = true;
+                let line = transient_hint_line(&state, text, Some(Duration::ZERO));
+                assert!(visible_len(&line) < (width as usize).max(3), "{text:?} at {width}, streaming");
+                state.config.streaming = false;
+            }
+            // Where there is room, all of it.
+            state.width = 80;
+            assert_eq!(visible_text(&transient_hint_line(&state, text, None)), format!("  {text}"));
+        }
+        state.width = 16;
+        assert_eq!(visible_text(&transient_hint_line(&state, "⠙ 200 OK, received 13 B", None)), "  ⠙ 200 OK, re…");
+    }
+
+    #[test]
+    fn clearing_a_body_is_for_the_line_the_cursor_is_on() {
+        let block = "GET /a\nPUT /b {\"x\":1} > b.json\nGET /c && PUT /d {\"y\":2}";
+        let span_of = |cursor: usize| body_span_at(block, cursor).map(|s| block[s.start..s.end].to_string());
+        // Line 1 has no body, wherever the cursor is in it.
+        for cursor in 0..=6 {
+            assert_eq!(span_of(cursor).as_deref(), Some(""), "{cursor}");
+        }
+        // Line 2: its body, without the outfile.
+        for cursor in 7..=block.find("\nGET /c").unwrap() {
+            assert_eq!(span_of(cursor).as_deref(), Some("{\"x\":1}"), "{cursor}");
+        }
+        // Line 3 is a chain: the segment the cursor is in.
+        let line3 = block.find("GET /c").unwrap();
+        assert_eq!(span_of(line3 + 2).as_deref(), Some(""));
+        assert_eq!(span_of(block.len()).as_deref(), Some("{\"y\":2}"));
+
+        // A body of several lines is one request's, and so is a string with
+        // a line break in it.
+        let multi = "PUT /b {\n  \"x\": \"a\nb\"\n}\nGET /c";
+        let body = "{\n  \"x\": \"a\nb\"\n}";
+        for cursor in [0, 9, 14, 20, 23] {
+            let span = body_span_at(multi, cursor).unwrap();
+            assert_eq!(&multi[span.start..span.end], body, "{cursor}");
+        }
+        let span = body_span_at(multi, multi.len()).unwrap();
+        assert_eq!((span.start, span.end), (multi.len(), multi.len()));
+
+        // ctrl+space changes the method of the cursor's line and leaves the
+        // other lines where they are.
+        let mut state = test_state();
+        state.input = "GET /a\nPUT /b {\"x\":1}\nGET /c".to_string();
+        state.cursor_pos = char_len("GET /a\nPUT /b");
+        cycle_method(&mut state);
+        assert_eq!(state.input, "GET /a\nGET /b\nGET /c");
+        assert_eq!(state.stashed_body, "{\"x\":1}");
+        state.cursor_pos = char_len(&state.input);
+        state.stashed_body.clear();
+        cycle_method(&mut state);
+        assert_eq!(state.input, "GET /a\nGET /b\nPUT /c");
+    }
+
+    #[test]
+    fn the_mapped_types_are_read_again_after_a_write_that_was_taken() {
+        let wrote = |method: &str, uri: &str, status: Option<u16>| wrote_mapped_types("/api/v1", method, uri, status);
+        for uri in [
+            "mapped-types",
+            "/mapped-types",
+            "v1/mapped-types",
+            "/v1/mapped-types",
+            "api/v1/mapped-types",
+            "/api/v1/mapped-types",
+            "/mapped-types/",
+            "/mapped-types/mappedTypeName=com.heads.csv",
+            "/mapped-types~with(name)",
+            "/mapped-types?x=1",
+        ] {
+            for method in ["PUT", "POST", "PATCH"] {
+                assert!(wrote(method, uri, Some(200)), "{method} {uri}");
+                assert!(wrote(method, uri, Some(201)), "{method} {uri}");
+                // Not after a write that was refused or got no answer.
+                for status in [Some(400), Some(404), Some(409), Some(500), Some(301), None] {
+                    assert!(!wrote(method, uri, status), "{method} {uri} {status:?}");
+                }
+            }
+            // Reading and deleting change nothing that `~map(` offers… a
+            // delete is not asked for by the fix either.
+            for method in ["GET", "HEAD", "DELETE", "OPTIONS"] {
+                assert!(!wrote(method, uri, Some(200)), "{method} {uri}");
+            }
+        }
+        for uri in ["/mapped-types-x", "/people/mapped-types", "/people", "/x/v1/mapped-typesx", "/"] {
+            assert!(!wrote("PUT", uri, Some(200)), "{uri}");
+        }
+        assert!(wrote_mapped_types("/api/me/v1", "PUT", "/mapped-types", Some(200)));
+
+        // A list that arrived replaces the one there was; one that could not
+        // be had, or a reader that went away, leaves it.
+        let mut state = AppState::new(Config::default());
+        state.mapped_types = vec!["com.heads.csv".to_string()];
+        take_mapped_types(&mut state);
+        assert_eq!(state.mapped_types, ["com.heads.csv"]);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.mapped_types_rx = Some(rx);
+        take_mapped_types(&mut state);
+        assert!(state.mapped_types_rx.is_some(), "still on its way");
+        tx.send(None).unwrap();
+        take_mapped_types(&mut state);
+        assert_eq!(state.mapped_types, ["com.heads.csv"]);
+        assert!(state.mapped_types_rx.is_none());
+
+        let (tx, rx) = std::sync::mpsc::channel::<Option<Vec<String>>>();
+        state.mapped_types_rx = Some(rx);
+        drop(tx);
+        take_mapped_types(&mut state);
+        assert_eq!(state.mapped_types, ["com.heads.csv"]);
+        assert!(state.mapped_types_rx.is_none());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.mapped_types_rx = Some(rx);
+        tx.send(Some(vec!["com.heads.sql".to_string()])).unwrap();
+        take_mapped_types(&mut state);
+        assert_eq!(state.mapped_types, ["com.heads.sql"]);
+
+        // No server there: the names can't be had, which is not "no names".
+        let config = Config { base_uri: "http://127.0.0.1:9".to_string(), ..Config::default() };
+        assert_eq!(fetch_mapped_type_names(&config), None);
+    }
+
+    #[test]
+    fn a_curl_command_is_the_request_that_was_sent() {
+        let mut state = AppState::new(Config {
+            base_uri: "http://localhost:5000".to_string(),
+            api_key: "k".to_string(),
+            ..Config::default()
+        });
+        let after_url = |state: &AppState| {
+            let cmd = build_curl(state).unwrap();
+            let (head, tail) = cmd.split_once(" 'http://localhost:5000/api/v1/x'").unwrap();
+            (head.to_string(), tail.replace(" -H 'Authorization: Basic Oms='", ""))
+        };
+        state.prev_uri = "/x".to_string();
+        let json = " -H 'Accept: application/json' -H 'Content-Type: application/json'";
+        let rows: &[(&str, &str, &str, String)] = &[
+            // HEAD is `-I`: after `-X HEAD` curl waits for a body.
+            ("HEAD", "", "curl -gfsSL -I", " -H 'Accept: application/json'".to_string()),
+            ("GET", "", "curl -gfsSL -X GET", " -H 'Accept: application/json'".to_string()),
+            ("DELETE", "", "curl -gfsSL -X DELETE", " -H 'Accept: application/json'".to_string()),
+            ("OPTIONS", "", "curl -gfsSL -X OPTIONS", " -H 'Accept: application/json'".to_string()),
+            // A body is JSON whatever the method, and says so.
+            ("GET", r#"{"a":1}"#, "curl -gfsSL -X GET", format!(r#"{json} --data-binary '{{"a":1}}'"#)),
+            ("DELETE", r#"{"a":1}"#, "curl -gfsSL -X DELETE", format!(r#"{json} --data-binary '{{"a":1}}'"#)),
+            ("DELETE", "@rows.csv", "curl -gfsSL -X DELETE", " -H 'Accept: application/json' -H 'Content-Type: text/csv' --data-binary '@rows.csv'".to_string()),
+            ("HEAD", r#"{"a":1}"#, "curl -gfsSL -X HEAD", format!(r#"{json} --data-binary '{{"a":1}}'"#)),
+            // A write says what it would send, with or without a body.
+            ("PUT", "", "curl -gfsSL -X PUT", json.to_string()),
+            ("POST", r#"{"a":1}"#, "curl -gfsSL -X POST", format!(r#"{json} --data-binary '{{"a":1}}'"#)),
+        ];
+        for (method, body, head, tail) in rows {
+            state.prev_method = method.to_string();
+            state.prev_body = body.to_string();
+            assert_eq!(after_url(&state), (head.to_string(), tail.clone()), "{method} {body}");
+        }
+    }
+
+    #[test]
+    fn a_string_with_a_line_break_is_coloured_to_its_closing_quote() {
+        let (key, string, number, reset) = ("\x1b[38;5;110m", "\x1b[38;5;114m", "\x1b[38;5;179m", "\x1b[0m");
+        let body = "{\"note\": \"first\nsecond\n\nlast\", \"b\": 1}";
+        let coloured = highlight_json(body);
+        // Every line of the string is a string, and the key after it a key.
+        for line in ["\"first", "second", "last\""] {
+            assert!(coloured.contains(&format!("{string}{line}{reset}")), "{line}: {coloured:?}");
+        }
+        assert!(coloured.contains(&format!("{key}\"b\"{reset}")), "{coloured:?}");
+        assert!(coloured.contains(&format!("{number}1{reset}")), "{coloured:?}");
+        // A colour never runs over a line break, and an empty line has none.
+        for line in coloured.split('\n') {
+            assert_eq!(line.matches("\x1b[38").count(), line.matches(reset).count(), "{line:?}");
+        }
+        assert!(coloured.contains("\n\n"), "{coloured:?}");
+        // What is seen is what was typed.
+        assert_eq!(visible_text(&coloured), body);
+
+        // The cursor is found by the characters that are seen, on any line.
+        for pos in 0..body.chars().count() {
+            let (before, at, after) = highlight_json_split(body, Some(pos));
+            assert_eq!(at, body.chars().nth(pos), "{pos}");
+            assert_eq!(visible_text(&before).chars().count(), pos, "{pos}");
+            assert_eq!(format!("{}{}{}", visible_text(&before), at.unwrap(), visible_text(&after)), body, "{pos}");
+        }
+
+        // A string still being typed is a string to the end of what there is.
+        let open = highlight_json("{\"a\": \"one\ntwo");
+        assert!(open.ends_with(&format!("{string}two{reset}")), "{open:?}");
+        // A key with a line break in it is still a key.
+        let split_key = highlight_json("{\"a\nb\": 1}");
+        assert!(split_key.contains(&format!("{key}\"a{reset}\n{key}b\"{reset}")), "{split_key:?}");
+    }
+
+    #[test]
+    fn a_file_or_a_url_is_opened_with_what_the_system_has() {
+        let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(open_command("macos", "out.json"), ("open", args(&["out.json"])));
+        assert_eq!(open_command("linux", "out.json"), ("xdg-open", args(&["out.json"])));
+        assert_eq!(open_command("freebsd", "https://dev.heads.com/api-docs"), ("xdg-open", args(&["https://dev.heads.com/api-docs"])));
+        // `start` takes its first quoted argument for a window title.
+        assert_eq!(
+            open_command("windows", "C:\\out files\\a.json"),
+            ("cmd", args(&["/c", "start", "", "C:\\out files\\a.json"]))
+        );
+        // The one this build runs is one of them.
+        let (program, _) = open_command(std::env::consts::OS, "x");
+        assert!(["open", "xdg-open", "cmd"].contains(&program));
     }
 }
