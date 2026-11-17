@@ -470,6 +470,11 @@ struct Config {
     /// The run is one request given as arguments (`api GET /x > file`), not
     /// a batch: what it could not write ends it with exit 1.
     one_shot: bool,
+    /// The session runs a saved connection (`-c`) with a `-b`, `-k` or
+    /// `--token` in the place of what is stored for it. What it holds is then
+    /// not that connection: saved under a new name it is a new connection,
+    /// and the stored one stays. Ends with a save and with a `ctrl+q` switch.
+    connection_overridden: bool,
 }
 
 impl Default for Config {
@@ -505,6 +510,7 @@ impl Default for Config {
             oauth2_client_id: String::new(),
             oauth2_client_secret: String::new(),
             one_shot: false,
+            connection_overridden: false,
         }
     }
 }
@@ -3511,6 +3517,7 @@ fn main() {
         loaded_connection_alias = env.name.clone();
         // `-b`, `-k` and `--token` win over what the connection has stored.
         let env = override_connection(&env, args.base_uri.as_deref(), args.key.as_deref(), args.token.as_deref());
+        config.connection_overridden = args.base_uri.is_some() || args.key.is_some() || args.token.is_some();
         if let Err(e) = apply_connection_to_config(&mut config, &env) {
             eprintln!("{}", e);
             // The prompt opens all the same, where another connection can
@@ -6843,13 +6850,40 @@ fn rebase_import_path(
     // in an `import dir`, whose files are used where they are) is refused as
     // an include through such a link is. A file that is not there is left to
     // fail where it is read, and a glob to the files it matches.
-    if let Ok(real) = resolved.canonicalize() {
-        let inside = repo.checkout.canonicalize().map(|root| real.starts_with(root)).unwrap_or(true);
-        if !inside {
-            return Err(outside());
+    let root = repo.checkout.canonicalize().ok();
+    let leads_out = |path: &std::path::Path| match (path.canonicalize(), &root) {
+        (Ok(real), Some(root)) => !real.starts_with(root),
+        _ => false,
+    };
+    if leads_out(&resolved) {
+        return Err(outside());
+    }
+    // A pattern is no file, so it is every file it matches that is checked:
+    // one of them may be a link out, or the directory they are in may be.
+    let pattern = resolved.to_string_lossy().to_string();
+    if pattern.chars().any(|c| c == '*' || c == '?' || c == '[') {
+        if let Ok(matches) = glob::glob_with(&pattern, glob_match_options()) {
+            if matches.filter_map(|m| m.ok()).any(|m| leads_out(&m)) {
+                return Err(outside());
+            }
         }
     }
-    Ok(resolved.to_string_lossy().to_string())
+    Ok(pattern)
+}
+
+/// A step of an imported file with the `@file` body of its request, if it has
+/// one, pointed at the repository the file came from: the request of an
+/// `assert` and of a `sleep while` is a request of that file like any other.
+fn rebase_step(step: BulkStep, file_dir: Option<&std::path::Path>, repo: &ImportedRepo) -> Result<BulkStep, String> {
+    Ok(match step {
+        BulkStep::Assert { negate, request } => {
+            BulkStep::Assert { negate, request: rebase_at_body(&request, file_dir, repo)? }
+        }
+        BulkStep::SleepWhile { interval, negate, request } => {
+            BulkStep::SleepWhile { interval, negate, request: rebase_at_body(&request, file_dir, repo)? }
+        }
+        other => other,
+    })
 }
 
 /// The `@file` bodies of imported files as they were written, by the body
@@ -7495,13 +7529,21 @@ fn split_bulk_requests_inner(
                 // `sleep N` — timing directive.
                 if first_word.eq_ignore_ascii_case("sleep") {
                     let rest = trimmed["sleep".len()..].trim();
-                    program.steps.push(parse_sleep_step(rest)?);
+                    let step = parse_sleep_step(rest)?;
+                    program.steps.push(match within {
+                        Some(repo) => rebase_step(step, base_dir, repo)?,
+                        None => step,
+                    });
                     continue;
                 }
                 // `assert [not] <request>` — pre-check directive.
                 if first_word.eq_ignore_ascii_case("assert") {
                     let rest = trimmed["assert".len()..].trim();
-                    program.steps.push(parse_assert_step(rest)?);
+                    let step = parse_assert_step(rest)?;
+                    program.steps.push(match within {
+                        Some(repo) => rebase_step(step, base_dir, repo)?,
+                        None => step,
+                    });
                     continue;
                 }
                 // `confirm [message]` — ask for user confirmation.
@@ -12271,6 +12313,21 @@ fn ask_export_name(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     Ok(answer)
 }
 
+/// Whether saving as `name` asks first: it would write over a saved
+/// connection that is not the one the session runs.
+fn save_asks_to_overwrite(saved: &[String], name: &str, current: &str) -> bool {
+    saved.iter().any(|s| s == name) && name != current
+}
+
+/// The saved connection that a save as `name` takes the place of. A session
+/// that runs the connection `current` renames it when it saves under a new
+/// name. With a flag in the place of what `current` has stored, the session
+/// does not hold that connection: a new name is then a new connection and
+/// `current` stays as it is, with its secret.
+fn save_replaces(current: &str, name: &str, overridden: bool) -> Option<String> {
+    (!current.is_empty() && (!overridden || current == name)).then(|| current.to_string())
+}
+
 /// Returns `true` when ctrl+c at the name prompt asked to leave the client.
 fn handle_save_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<bool> {
     let width = state.width as usize;
@@ -12320,7 +12377,7 @@ fn handle_save_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io::
 
     // Check if overwriting a different alias
     let envs = list_connections();
-    if envs.contains(&name) && name != state.connection_alias {
+    if save_asks_to_overwrite(&envs, &name, &state.connection_alias) {
         // Move down past bottom ruler, replace hint with confirm prompt
         execute!(stdout, Print("\r\n"), cursor::MoveDown(1), cursor::MoveToColumn(0), Clear(ClearType::CurrentLine))?;
         if !confirm_inline(stdout, &format!("  \"{}\" already exists. Overwrite?", name))? {
@@ -12355,10 +12412,12 @@ fn handle_save_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io::
 
     // Saved under a new name, the connection is renamed: the old entry goes
     // and its default flag moves with it.
-    let replaces = (!state.connection_alias.is_empty()).then(|| state.connection_alias.clone());
+    let replaces = save_replaces(&state.connection_alias, &name, state.config.connection_overridden);
     match save_connection(&env, replaces.as_deref()) {
         Ok(()) => {
             state.connection_alias = name.clone();
+            // From here on the session holds a stored connection.
+            state.config.connection_overridden = false;
             state.status_msg = format!("connection {} saved", name);
             state.status_msg_at = Some(Instant::now());
         }
@@ -12413,7 +12472,9 @@ fn handle_switch_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io
             state.status_msg_at = Some(Instant::now());
 
             // Only the connection changes: the session keeps its flags
-            // (`-i`, `--timeout`, `-f`, `--export`, streaming…).
+            // (`-i`, `--timeout`, `-f`, `--export`, streaming…). What it
+            // holds now is the connection as it is stored.
+            state.config.connection_overridden = false;
             if let Err(e) = connect(&mut state.config, &env, resolved_config) {
                 state.status_msg = e;
                 state.status_msg_at = Some(Instant::now());

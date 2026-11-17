@@ -1325,6 +1325,123 @@ fn switching_connection_at_the_prompt_keeps_the_flags() {
     assert_eq!(server.log.lock().unwrap().clone(), ["GET /missing"]);
 }
 
+/// The saved connections as `name=credential`, and the default.
+#[cfg(unix)]
+fn stored(dir: &Path) -> (Vec<String>, String) {
+    let text = std::fs::read_to_string(dir.join(".api-credentials.json")).unwrap();
+    let data: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let connections = data["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| format!("{}={}", c["name"].as_str().unwrap(), c["credential"].as_str().unwrap()))
+        .collect();
+    (connections, data["default"].as_str().unwrap_or("").to_string())
+}
+
+/// `ctrl+s` at a prompt, answered with `name` in the place of the name the
+/// dialog proposes. Returns what the screen showed from then on.
+#[cfg(unix)]
+fn save_as(prompt: &mut pty::Prompt, name: &str, then: &str) -> String {
+    prompt.pump(Duration::from_millis(300));
+    let mark = prompt.screen.len();
+    prompt.send(b"\x13");
+    prompt.wait_for("Save connection as", Duration::from_secs(5));
+    prompt.pump(Duration::from_millis(150));
+    prompt.send(&[0x7f; 24]);
+    prompt.pump(Duration::from_millis(150));
+    prompt.send(name.as_bytes());
+    prompt.pump(Duration::from_millis(150));
+    prompt.send(b"\r");
+    let start = Instant::now();
+    while !pty::plain(&prompt.screen[mark..]).contains(then) {
+        assert!(start.elapsed() < Duration::from_secs(6), "{then:?} never appeared:\n{}", pty::plain(&prompt.screen[mark..]));
+        prompt.pump(Duration::from_millis(50));
+    }
+    pty::plain(&prompt.screen[mark..])
+}
+
+/// Saved under a new name, the connection a session runs is renamed, and the
+/// default follows. Not when a flag stands in the place of what that
+/// connection has stored: the session then holds something else, which is
+/// saved as a new connection, and the stored one keeps its secret.
+#[cfg(unix)]
+#[test]
+fn saving_under_a_new_name_renames_the_connection_unless_a_flag_overrides_it() {
+    use pty::Prompt;
+
+    let server = RecordingServer::start();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    let open = |d: &Path, args: &[&str]| {
+        let mut cmd = api_bare(d);
+        cmd.args(args);
+        let mut prompt = Prompt::open(cmd);
+        prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+        prompt.pump(Duration::from_millis(500));
+        prompt
+    };
+    let strs = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+    // No override: a rename, and the default moves with it.
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write_credentials(d, &[("a", url.clone(), "key", "SECRET", "")], "a");
+    let mut prompt = open(d, &["-c", "a"]);
+    save_as(&mut prompt, "b", "connection b saved");
+    assert_eq!(stored(d), (strs(&["b=SECRET"]), "b".to_string()));
+    drop(prompt);
+
+    // `-k` over the connection: a new name is a new connection.
+    for flags in [&["-k", "OTHERKEY"][..], &["--token", "OTHERKEY"], &["-b", &url]] {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        write_credentials(d, &[("staging", url.clone(), "key", "SECRET", "")], "staging");
+        let mut args = vec!["-c", "staging"];
+        args.extend_from_slice(flags);
+        let held = if flags[0] == "-b" { "SECRET" } else { "OTHERKEY" };
+        let mut prompt = open(d, &args);
+        save_as(&mut prompt, "mine", "connection mine saved");
+        assert_eq!(stored(d), (strs(&["staging=SECRET", &format!("mine={held}")]), "staging".to_string()), "{flags:?}");
+        // The override ended with the save: the session now runs `mine`,
+        // and saving that under a new name renames it.
+        save_as(&mut prompt, "mine2", "connection mine2 saved");
+        assert_eq!(stored(d), (strs(&["staging=SECRET", &format!("mine2={held}")]), "staging".to_string()), "{flags:?}");
+    }
+
+    // Under the same name the override is what is saved, without a question.
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write_credentials(d, &[("staging", url.clone(), "key", "SECRET", "")], "staging");
+    let mut prompt = open(d, &["-c", "staging", "-k", "OTHERKEY"]);
+    let shown = save_as(&mut prompt, "staging", "connection staging saved");
+    assert!(!shown.contains("already exists"), "{shown}");
+    assert_eq!(stored(d), (strs(&["staging=OTHERKEY"]), "staging".to_string()));
+    drop(prompt);
+
+    // A name another connection has is asked about, with or without a flag.
+    for flags in [&[][..], &["-k", "OTHERKEY"]] {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        write_credentials(d, &[("a", url.clone(), "key", "SECRET", ""), ("x", url.clone(), "key", "XKEY", "")], "a");
+        let mut args = vec!["-c", "a"];
+        args.extend_from_slice(flags);
+        let mut prompt = open(d, &args);
+        save_as(&mut prompt, "x", "\"x\" already exists. Overwrite?");
+        prompt.send(b"n");
+        prompt.wait_for("cancelled", Duration::from_secs(5));
+        assert_eq!(stored(d), (strs(&["a=SECRET", "x=XKEY"]), "a".to_string()), "{flags:?}");
+        save_as(&mut prompt, "x", "\"x\" already exists. Overwrite?");
+        prompt.send(b"y");
+        prompt.wait_for("connection x saved", Duration::from_secs(5));
+        let expected = match flags.is_empty() {
+            // Renamed over `x`: `a` is gone and the default is `x`.
+            true => (strs(&["x=SECRET"]), "x".to_string()),
+            false => (strs(&["a=SECRET", "x=OTHERKEY"]), "a".to_string()),
+        };
+        assert_eq!(stored(d), expected, "{flags:?}");
+    }
+}
+
 /// A batch or a program line never opens the "New connection" form, even at
 /// a terminal with a URL and no credential: it runs, as one request does.
 #[cfg(unix)]
@@ -2230,6 +2347,21 @@ mod pty {
 
     impl Drop for Prompt {
         fn drop(&mut self) {
+            // A killed process writes no coverage profile, so under
+            // `cargo llvm-cov` the session is first asked to leave the way a
+            // user would: esc out of whatever is open, then ctrl+c until it
+            // is gone. The wait is bounded, and the kill below still follows,
+            // so a prompt that does not leave can't hang the suite.
+            if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
+                let start = Instant::now();
+                let mut keys: &[u8] = b"\x1b";
+                while matches!(self.child.try_wait(), Ok(None)) && start.elapsed() < Duration::from_secs(3) {
+                    // Not `send`: it asserts, and a panic in a drop aborts.
+                    unsafe { libc::write(self.master, keys.as_ptr() as *const _, keys.len()) };
+                    keys = b"\x03";
+                    self.pump(Duration::from_millis(150));
+                }
+            }
             let _ = self.child.kill();
             // A process can't finish exiting while its terminal still holds
             // output that nobody read (macOS waits for it to drain). So the

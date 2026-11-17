@@ -604,6 +604,113 @@ fn an_include_that_climbs_out_of_a_directory_import_is_refused() {
     assert_eq!(server.sent(), Vec::<String>::new());
 }
 
+/// A directory import whose files are made by the test: `lib/` in `dir`, and
+/// the batch line that imports it.
+fn own_import(dir: &Path, files: &[(&str, &str)]) -> String {
+    for (name, contents) in files {
+        let path = dir.join("libdir").join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+    "import dir lib { \"path\": \"libdir\" }".to_string()
+}
+
+/// The request of an `assert` and of a `sleep while` is a request of the
+/// imported file like any other: its `@file` is read from the import, and one
+/// that points outside is refused before anything is sent.
+#[test]
+fn the_body_of_an_assert_and_of_a_poll_in_an_imported_file_stays_inside() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", Vec::new());
+    std::fs::write(dir.join("outside.json"), r#"{"secret":"outside"}"#).unwrap();
+    // A file of the same name in the working directory must not be the one sent.
+    std::fs::create_dir_all(dir.join("data")).unwrap();
+    std::fs::write(dir.join("data/a.json"), r#"{"from":"cwd"}"#).unwrap();
+    let import = own_import(
+        &dir,
+        &[
+            ("data/a.json", r#"{"from":"import"}"#),
+            ("inside.api", "assert PUT /as @data/a.json\nsleep 0 while not PUT /sw @data/a.json\n"),
+            ("assert-out.api", "assert PUT /as @../outside.json\n"),
+            ("assert-abs.api", "assert PUT /as @/etc/shells\n"),
+            ("poll-out.api", "sleep 0 while not PUT /sw @../outside.json\n"),
+            ("poll-abs.api", "sleep 0 while not PUT /sw @/etc/shells\n"),
+            ("poll-home.api", "sleep while PUT /sw @~/x.json\n"),
+        ],
+    );
+
+    let ran = run_batch(&dir, server.port, "-sa", &format!("{import}\nlib/inside.api\n"));
+    assert!(ran.ok, "{}", ran.stderr);
+    assert_eq!(server.sent(), [r#"PUT /as {"from":"import"}"#, r#"PUT /sw {"from":"import"}"#]);
+    // Logged as the line has it, not as the path it was resolved to.
+    assert!(ran.stdout.contains("assert PUT /as @data/a.json\n"), "{}", ran.stdout);
+
+    for (file, written) in [
+        ("assert-out", "../outside.json"),
+        ("assert-abs", "/etc/shells"),
+        ("poll-out", "../outside.json"),
+        ("poll-abs", "/etc/shells"),
+        ("poll-home", "~/x.json"),
+    ] {
+        let ran = run_batch(&dir, server.port, "-sa", &format!("{import}\nGET /first\nlib/{file}.api\n"));
+        assert!(!ran.ok, "{file}");
+        let refusal = format!("import lib: `@{written}` must be a relative path inside the import");
+        assert!(ran.stderr.contains(&refusal), "{file}: {}", ran.stderr);
+        assert_eq!(server.sent(), Vec::<String>::new(), "{file}");
+    }
+}
+
+/// In a directory import, whose files are used where they are, a link is
+/// followed only when it stays inside. That holds for every file a glob
+/// matches and for a file reached through a linked directory.
+#[test]
+fn a_glob_body_does_not_follow_a_link_out_of_a_directory_import() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", Vec::new());
+    std::fs::create_dir_all(dir.join("elsewhere")).unwrap();
+    std::fs::write(dir.join("outside.json"), r#"{"secret":"outside"}"#).unwrap();
+    std::fs::write(dir.join("elsewhere/x.json"), r#"{"secret":"elsewhere"}"#).unwrap();
+    let import = own_import(
+        &dir,
+        &[
+            ("data/a.json", r#"{"from":"dir"}"#),
+            ("glob.api", "PUT /glob @data/*.json\n"),
+            ("linked-file.api", "PUT /one @linkdir/x.json\n"),
+            ("linked-glob.api", "PUT /ldg @linkdir/*.json\n"),
+            ("check-glob.api", "assert PUT /as @data/*.json\n"),
+        ],
+    );
+    let run = |file: &str| run_batch(&dir, server.port, "-sa", &format!("{import}\nGET /first\nlib/{file}.api\n"));
+
+    // Nothing links out yet: the glob is the one file.
+    let ran = run("glob");
+    assert!(ran.ok, "{}", ran.stderr);
+    assert_eq!(server.sent(), ["GET /first", r#"PUT /glob [{"from":"dir"}]"#]);
+
+    // A link that stays inside is a file like any other.
+    std::os::unix::fs::symlink(dir.join("libdir/data/a.json"), dir.join("libdir/data/b.json")).unwrap();
+    let ran = run("glob");
+    assert!(ran.ok, "{}", ran.stderr);
+    assert_eq!(server.sent(), ["GET /first", r#"PUT /glob [{"from":"dir"},{"from":"dir"}]"#]);
+
+    // One that leads out stops the batch, whatever kind of line the glob is on.
+    std::fs::remove_file(dir.join("libdir/data/b.json")).unwrap();
+    std::os::unix::fs::symlink(dir.join("outside.json"), dir.join("libdir/data/b.json")).unwrap();
+    std::os::unix::fs::symlink(dir.join("elsewhere"), dir.join("libdir/linkdir")).unwrap();
+    for (file, written) in [
+        ("glob", "data/*.json"),
+        ("check-glob", "data/*.json"),
+        ("linked-file", "linkdir/x.json"),
+        ("linked-glob", "linkdir/*.json"),
+    ] {
+        let ran = run(file);
+        assert!(!ran.ok, "{file}");
+        let refusal = format!("import lib: `@{written}` must be a relative path inside the import");
+        assert!(ran.stderr.contains(&refusal), "{file}: {}", ran.stderr);
+        assert_eq!(server.sent(), Vec::<String>::new(), "{file}");
+    }
+}
+
 #[test]
 fn a_failed_assert_in_an_imported_file_stops_the_batch_there() {
     let (_guard, dir) = temp();
