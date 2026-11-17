@@ -6047,6 +6047,86 @@ fn tab_completes_the_uri_from_the_servers_spec() {
     assert_eq!(entered(&mut prompt, &server), ["GET /people/find"], "{}", screen_tail(&prompt));
 }
 
+/// A ghost is drawn where Tab then writes it: at the cursor, with the rest of
+/// the line left as it is, and on the row it will stand on. Where no ghost
+/// is drawn, Tab writes nothing.
+#[cfg(unix)]
+#[test]
+fn a_ghost_is_drawn_where_tab_writes_it() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = open_completing(&server, dir.path(), &["-x"]);
+    // The rows of the input, between the two rulers.
+    let input_rows = |prompt: &mut pty::Prompt, keys: &[&str]| {
+        press(prompt, keys);
+        prompt.pump(Duration::from_millis(300));
+        let rows = pty::rows(&prompt.screen, 200);
+        let rulers = ruler_rows(&rows);
+        rows[rulers[rulers.len() - 2] + 1..rulers[rulers.len() - 1]].to_vec()
+    };
+
+    // What Enter sends, with the prompt back before the next keys.
+    let sent = |prompt: &mut pty::Prompt| {
+        let sent = entered(prompt, &server);
+        prompt.pump(Duration::from_millis(300));
+        sent
+    };
+
+    // At the end of a segment with more of the line behind it. The ghost
+    // used to be drawn behind the blank: `GET /peo ple&& GET /pets`.
+    let mut keys = vec!["GET /peo && GET /pets"];
+    keys.extend(std::iter::repeat(LEFT).take(13));
+    assert_eq!(input_rows(&mut prompt, &keys), ["GET /people && GET /pets"]);
+    keys.push("\t");
+    let rows = input_rows(&mut prompt, &keys);
+    assert!(rows[0].starts_with("GET /people && GET /pets  ") && rows[0].ends_with("(1/2)"), "{rows:?}");
+    assert_eq!(sent(&mut prompt), ["GET /people", "GET /pets"]);
+    // In the blank behind the segment there is none, and Tab leaves the line.
+    let mut keys = vec!["GET /peo && GET /pets"];
+    keys.extend(std::iter::repeat(LEFT).take(12));
+    assert_eq!(input_rows(&mut prompt, &keys), ["GET /peo && GET /pets"]);
+    keys.push("\t");
+    assert_eq!(input_rows(&mut prompt, &keys), ["GET /peo && GET /pets"]);
+
+    // Behind an operator that was the only one: what is inside it, and the
+    // next Tab writes that. Tab was dead there.
+    assert_eq!(input_rows(&mut prompt, &["GET /people~wh", "\t"]), ["GET /people~where(active"]);
+    press(&mut prompt, &["GET /people~wh", "\t", "\t", ")"]);
+    assert_eq!(sent(&mut prompt), ["GET /people~where(active)"]);
+    // Behind one of several Tab goes on to the next, so nothing is shown.
+    let rows = input_rows(&mut prompt, &["GET /people~wi", "\t"]);
+    assert!(rows[0].starts_with("GET /people~with(  ") && rows[0].ends_with("(1/2)"), "{rows:?}");
+    press(&mut prompt, &["GET /people~wi", "\t", "\t", "name)"]);
+    assert_eq!(sent(&mut prompt), ["GET /people~without(name)"]);
+    // Nothing starts so: nothing is written.
+    assert_eq!(input_rows(&mut prompt, &["GET /people~zz", "\t"]), ["GET /people~zz"]);
+    assert_eq!(input_rows(&mut prompt, &["GET /find", "\t"]), ["GET /find"]);
+
+    // The index hint is that of the request the cursor is in.
+    let rows = input_rows(&mut prompt, &["GET /about && GET /people/"]);
+    assert!(rows[0].ends_with("index: COS database key or common identifiers"), "{rows:?}");
+    assert_eq!(input_rows(&mut prompt, &["GET /people/ && GET /about"]), ["GET /people/ && GET /about"]);
+    assert_eq!(input_rows(&mut prompt, &["GET /people~"])[0].trim_end(), "GET /people~with(");
+
+    // A bracket that closes on a line of its own: the cursor keeps its
+    // cell, and the ghost is on the row Tab writes it on.
+    let body: &[&str] = &["PUT /people [{", "\r", "\"name\": \"x\""];
+    let mark = prompt.screen.len();
+    assert_eq!(input_rows(&mut prompt, body), ["PUT /people [{", "    \"name\": \"x\"", "  }"]);
+    let drawn = &prompt.screen[mark..];
+    assert!(drawn.contains("\x1b[48;5;247m\x1b[38;5;0m \x1b[0m\x1b[38;5;240m\r\n  }\x1b[0m"), "{drawn:?}");
+    let closed = [body, &["\t"]].concat();
+    assert_eq!(input_rows(&mut prompt, &closed), ["PUT /people [{", "    \"name\": \"x\"", "  }", "]"]);
+    press(&mut prompt, &[body, &["\t", "\t"]].concat());
+    assert_eq!(sent(&mut prompt), ["PUT /people [{\n    \"name\": \"x\"\n  }\n]"]);
+    // A literal ends a value as a string does. (The `[` is the prompt's,
+    // for an endpoint that takes a list.)
+    assert_eq!(input_rows(&mut prompt, &["PUT /agents {\"name\": null"]), ["PUT /agents [{\"name\": null}"]);
+    assert_eq!(input_rows(&mut prompt, &["PUT /agents {\"name\": null", "\t"]), ["PUT /agents [{\"name\": null}]"]);
+    press(&mut prompt, &["PUT /agents {\"name\": null", "\t", "\t"]);
+    assert_eq!(sent(&mut prompt), ["PUT /agents [{\"name\": null}]"]);
+}
+
 /// Under `-x` the body completes from the spec too: keys, values, the
 /// subtypes of a type and the brackets that close it.
 #[cfg(unix)]
