@@ -5000,6 +5000,26 @@ fn tab_completes_a_body_from_the_servers_spec_under_x() {
     assert_eq!(sent.len(), 1, "{shown}\n{}", screen_tail(&prompt));
     assert_eq!(body_of(&sent, "PUT /people "), serde_json::json!([{"name": "x", "givenName": "y"}]), "{shown}");
 
+    // A closing bracket typed after a comma takes the comma away, and on a
+    // line of its own takes the indent of what it closes.
+    let shown = press(&mut prompt, &["PUT /people [{\"name\": \"x\",", "\r", "}", "]"]);
+    let sent = entered(&mut prompt, &server);
+    assert_eq!(sent, ["PUT /people [{\n    \"name\": \"x\"\n  }]"], "{shown}");
+    // In a body that has lines, Enter goes to a new one: indented after a
+    // comma, between a pair of brackets, and out again after a closing one.
+    let shown = press(&mut prompt, &["PUT /people ", "\t", "\"name\": \"x\",", "\r", "\"givenName\": \"y\"", END]);
+    let sent = entered(&mut prompt, &server);
+    assert_eq!(sent.len(), 1, "{shown}\n{}", screen_tail(&prompt));
+    assert_eq!(body_of(&sent, "PUT /people "), serde_json::json!([{"name": "x", "givenName": "y"}]), "{shown}");
+    let shown = press(&mut prompt, &["PUT /people ", "\t", "\"identifiers\": {}", LEFT, "\r", "\"com.mi6.id\": \"7\"", END]);
+    let sent = entered(&mut prompt, &server);
+    assert_eq!(sent.len(), 1, "{shown}\n{}", screen_tail(&prompt));
+    assert_eq!(body_of(&sent, "PUT /people "), serde_json::json!([{"identifiers": {"com.mi6.id": "7"}}]), "{shown}");
+    let shown = press(&mut prompt, &["PUT /people ", "\t", "\"identifiers\": {}", "\r", END]);
+    let sent = entered(&mut prompt, &server);
+    assert_eq!(sent.len(), 1, "{shown}\n{}", screen_tail(&prompt));
+    assert_eq!(body_of(&sent, "PUT /people "), serde_json::json!([{"identifiers": {}}]), "{shown}");
+
     // Keys are coloured as keys and strings in a list as values.
     prompt.send(b"\x15");
     prompt.pump(Duration::from_millis(60));
@@ -5084,6 +5104,39 @@ fn the_prompt_edits_its_line_with_the_usual_keys() {
     let shown = press(&mut prompt, &["\x1b[A", "\x1b[A", "\x1b[A", "\x1b[B", "\x1b[B", "\x1b[B", "\x1b[B", "\x1b[B", "GET /last"]);
     assert_eq!(entered(&mut prompt, &server), ["GET /last"], "{shown}");
 
+    // The body editor a body-less PUT opens: Enter starts a line, backspace
+    // takes a character, and ctrl+d sends. With nothing typed, no body is sent.
+    press(&mut prompt, &["PUT /ed"]);
+    keys_then(&mut prompt, "\r", "Enter body, ctrl+d when done");
+    for key in ["{\"a\":", "\r", "12", "\x7f", "}", "\x1b[A"] {
+        prompt.send(key.as_bytes());
+        prompt.pump(Duration::from_millis(90));
+    }
+    server.take();
+    prompt.send(b"\x04");
+    pump_until(&mut prompt, Duration::from_secs(4), |_| server.seen() > 0);
+    assert_eq!(server.take(), ["PUT /ed {\"a\":\n1}"], "{}", screen_tail(&prompt));
+    prompt.pump(Duration::from_millis(300));
+    press(&mut prompt, &["PUT /empty"]);
+    keys_then(&mut prompt, "\r", "Enter body, ctrl+d when done");
+    prompt.send(b"\x04");
+    pump_until(&mut prompt, Duration::from_secs(4), |_| server.seen() > 0);
+    assert_eq!(server.take(), ["PUT /empty"], "{}", screen_tail(&prompt));
+    prompt.pump(Duration::from_millis(300));
+
+    // ctrl+h shows the shortcuts and takes them away again, as Esc does,
+    // and any other key does while doing what it does.
+    keys_then(&mut prompt, "\x15\x08", "ctrl+space");
+    prompt.send(b"\x08");
+    prompt.pump(Duration::from_millis(200));
+    keys_then(&mut prompt, "\x08", "ctrl+space");
+    prompt.send(b"\x1b");
+    prompt.pump(Duration::from_millis(300));
+    keys_then(&mut prompt, "\x08", "ctrl+space");
+    prompt.send(b"GET /helped");
+    prompt.pump(Duration::from_millis(200));
+    assert_eq!(entered(&mut prompt, &server), ["GET /helped"], "{}", screen_tail(&prompt));
+
     // ctrl+t on a server that can't stream says so.
     let shown = press(&mut prompt, &["\x14"]);
     assert!(shown.contains("streaming not available on this server"), "{shown}");
@@ -5115,6 +5168,17 @@ fn the_prompt_edits_its_line_with_the_usual_keys() {
     prompt.pump(Duration::from_millis(200));
     press(&mut prompt, &["GET /after"]);
     assert_eq!(entered(&mut prompt, &server), ["GET /after"]);
+}
+
+/// Wait for the client to end. Returns whether it ended well, or `None`
+/// when it is still running after five seconds.
+#[cfg(unix)]
+fn ended(prompt: &mut pty::Prompt) -> Option<bool> {
+    let start = Instant::now();
+    while prompt.exited().is_none() && start.elapsed() < Duration::from_secs(5) {
+        prompt.pump(Duration::from_millis(50));
+    }
+    prompt.exited()
 }
 
 /// The row of the picker that is selected, as the screen has it now.
@@ -5231,9 +5295,21 @@ fn the_startup_picker_is_left_with_esc_and_empties_into_the_form() {
     prompt.wait_for("+ Add new connection", Duration::from_secs(15));
     prompt.pump(Duration::from_millis(400));
     prompt.send(b"\x1b");
-    assert!(pump_until(&mut prompt, Duration::from_secs(5), |_| false) || prompt.exited() == Some(true), "the client did not end");
+    assert_eq!(ended(&mut prompt), Some(true), "the client did not end well");
     assert!(prompt.is_cooked(), "the terminal is left in raw mode");
     assert_eq!(server.seen(), 0);
+
+    // In a narrow terminal the splash above the list is a narrow one.
+    let mut prompt = pty::Prompt::open_sized(api_bare(d), 36);
+    prompt.wait_for("+ Add new connection", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(400));
+    let rows = pty::rows(&prompt.screen, 36);
+    assert!(rows.iter().any(|row| row.contains("CommerceOS API") && !row.contains("Client")), "{rows:#?}");
+    assert!(rows.iter().any(|row| row.contains("ctrl+b for docs")), "{rows:#?}");
+    assert!(rows.iter().any(|row| row.contains("only") && row.contains(&url)), "{rows:#?}");
+    assert!(rows.iter().all(|row| row.chars().count() <= 36), "{rows:#?}");
+    prompt.send(b"\x03");
+    assert_eq!(ended(&mut prompt), Some(true), "the client did not end well");
 
     let mut prompt = pty::Prompt::open(api_bare(d));
     prompt.wait_for("+ Add new connection", Duration::from_secs(15));
@@ -5243,7 +5319,7 @@ fn the_startup_picker_is_left_with_esc_and_empties_into_the_form() {
     assert_eq!(stored(d).0, Vec::<String>::new());
     // With no connection to go back to, Esc in the form ends the client too.
     prompt.send(b"\x1b");
-    assert!(pump_until(&mut prompt, Duration::from_secs(5), |_| false) || prompt.exited() == Some(true), "the client did not end");
+    assert_eq!(ended(&mut prompt), Some(true), "the client did not end well");
     assert!(prompt.is_cooked(), "the terminal is left in raw mode");
 }
 
@@ -5336,4 +5412,157 @@ fn the_connection_form_takes_a_key_a_token_or_a_client() {
     keys_then(&mut prompt, "\x1b[D\r", "Type your OAuth2 client ID");
     keys_then(&mut prompt, "c\r", "Type your client secret");
     keys_then(&mut prompt, "s\r", "connection could not be established");
+}
+
+/// Run the client in a terminal until it ends. Returns what it printed and
+/// whether it ended well.
+#[cfg(unix)]
+fn ends_in_a_terminal(cmd: std::process::Command) -> (String, Option<bool>) {
+    batch_in_a_terminal(cmd, "", b"")
+}
+
+/// A session that can't be opened says why and ends; one opened on a saved
+/// connection that fails stays open and says which one failed.
+#[cfg(unix)]
+#[test]
+fn a_session_that_cannot_connect_says_why() {
+    let server = RecordingServer::start();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let with = |args: &[&str]| {
+        let mut cmd = api_bare(d);
+        cmd.args(args);
+        cmd
+    };
+
+    // A key and nowhere to send it.
+    let (shown, ended) = ends_in_a_terminal(with(&["-k", "k"]));
+    assert!(shown.contains("Error: no base URL specified. Use -b <url> or -c <connection>."), "{shown}");
+    assert_eq!(ended, Some(false));
+    // A key the server refuses, and a server that is not there.
+    let (shown, ended) = ends_in_a_terminal(with(&["-b", &url, "-k", "nokey"]));
+    assert!(shown.contains("HTTP/1.1 401 Unauthorized"), "{shown}");
+    assert_eq!(ended, Some(false));
+    let (shown, ended) = ends_in_a_terminal(with(&["-b", "http://127.0.0.1:1", "-k", "k"]));
+    assert!(shown.contains("Could not connect to 127.0.0.1:1"), "{shown}");
+    assert_eq!(ended, Some(false));
+    assert_eq!(server.seen(), 0);
+
+    // The same two as saved connections: the default one ends the session
+    // before it starts, and one asked for with -c opens it and says so there.
+    write_credentials(
+        d,
+        &[
+            ("down", "http://127.0.0.1:1".to_string(), "key", "k", ""),
+            ("refused", url.clone(), "key", "nokey", ""),
+            ("good", url.clone(), "key", "k", ""),
+        ],
+        "down",
+    );
+    let (shown, ended) = ends_in_a_terminal(with(&[]));
+    assert!(shown.contains("Could not connect to 127.0.0.1:1"), "{shown}");
+    assert_eq!(ended, Some(false));
+    for (name, said) in [("down", "down: connection failed"), ("refused", "refused: unauthorized"), ("good", "connected to: good")] {
+        let mut prompt = pty::Prompt::open(with(&["-c", name]));
+        prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+        let seen = pump_until(&mut prompt, Duration::from_secs(8), |p| pty::plain(&p.screen).contains(said));
+        assert!(seen, "{name}: {}", pty::plain(&prompt.screen));
+        assert_eq!(prompt.exited(), None, "{name}");
+        // From there another one can be picked.
+        if name == "down" {
+            prompt.pump(Duration::from_millis(300));
+            keys_then(&mut prompt, "\x11", "good");
+            keys_then(&mut prompt, "\x1b[B\x1b[B\r", "connected to: good");
+            prompt.pump(Duration::from_millis(400));
+            press(&mut prompt, &["GET /switched"]);
+            assert_eq!(entered(&mut prompt, &server), ["GET /switched"]);
+        }
+    }
+}
+
+/// A saved connection whose key a server elsewhere refuses opens the form
+/// on that server, to take another key. (Against a local server, as with a
+/// key given on the command line, the session just ends: see above.)
+#[cfg(unix)]
+#[test]
+fn a_refused_default_connection_asks_for_another_key() {
+    let server = RecordingServer::start();
+    // The loopback address, written so that it does not read as local.
+    let url = format!("http://127.1:{}", server.port);
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write_credentials(d, &[("far", url.clone(), "key", "nokey", "")], "far");
+
+    let mut prompt = pty::Prompt::open(api_bare(d));
+    prompt.wait_for("Use ← → to choose auth method", Duration::from_secs(15));
+    assert!(pty::plain(&prompt.screen).contains(&url), "{}", pty::plain(&prompt.screen));
+    keys_then(&mut prompt, "\r", "Type your API key");
+    keys_then(&mut prompt, "k\r", "ctrl+h for shortcuts");
+    prompt.pump(Duration::from_millis(500));
+    press(&mut prompt, &["GET /let-in"]);
+    assert_eq!(entered(&mut prompt, &server), ["GET /let-in"], "{}", screen_tail(&prompt));
+    assert!(server.heads()[0].contains("authorization=Basic Oms=;"), "{:?}", server.heads());
+    // The stored connection is as it was: nothing was saved over it.
+    assert_eq!(stored(d), (vec!["far=nokey".to_string()], "far".to_string()));
+
+    // ctrl+c there ends the client.
+    let mut prompt = pty::Prompt::open(api_bare(d));
+    prompt.wait_for("Use ← → to choose auth method", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(300));
+    prompt.send(b"\x03");
+    assert_eq!(ended(&mut prompt), Some(true), "the client did not end well");
+    assert!(prompt.is_cooked(), "the terminal is left in raw mode");
+}
+
+/// `--me` sends to the API of the signed-in user, a bearer token after `-t`
+/// is told where it goes now, an option that is none is named, and a
+/// body-less PUT at a terminal reads its body from there.
+#[cfg(unix)]
+#[test]
+fn one_shot_corners_of_the_command_line() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+
+    let ran = run_in(&server, d, &["--me", "GET", "/x"]);
+    assert_eq!(ran.sent, ["GET /api/me/v1/x"], "{}", ran.stderr);
+
+    let token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJl";
+    let ran = run_in(&server, d, &["-t", token, "GET", "/x"]);
+    assert_eq!(ran.code, Some(1));
+    assert!(ran.stderr.contains("error: -t is now --stream. Use --token <TOKEN> for a bearer token."), "{}", ran.stderr);
+    assert!(ran.sent.is_empty());
+
+    let ran = run_in(&server, d, &["--no-such-option", "GET", "/x"]);
+    assert_eq!(ran.code, Some(1));
+    assert_eq!(ran.stderr.trim(), "error: unexpected option --no-such-option");
+    assert!(ran.sent.is_empty());
+
+    let mut cmd = api(server.port, d);
+    cmd.args(["PUT", "/typed"]);
+    let (shown, ended) = batch_in_a_terminal(cmd, "Reading body from stdin (ctrl+d to finish):", b"{\"a\":1}\n\x04");
+    assert_eq!(ended, Some(true), "{shown}");
+    assert_eq!(server.take(), ["PUT /typed {\"a\":1}"], "{shown}");
+}
+
+/// ctrl+t turns streaming off and on again on a server that can stream.
+#[cfg(unix)]
+#[test]
+fn ctrl_t_toggles_streaming_on_a_server_that_streams() {
+    let server = RecordingServer::start();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    let dir = tempfile::tempdir().unwrap();
+    let mut cmd = api_bare(dir.path());
+    cmd.args(["-b", &url, "-k", "streamer", "--stream"]);
+    let mut prompt = pty::Prompt::open(cmd);
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    let on = |prompt: &pty::Prompt| pty::rows(&prompt.screen, 200).last().is_some_and(|row| row.trim_end().ends_with("streaming"));
+    assert!(pump_until(&mut prompt, Duration::from_secs(5), |p| on(p)), "{}", screen_tail(&prompt));
+    prompt.send(b"\x14");
+    prompt.pump(Duration::from_millis(400));
+    assert!(!on(&prompt), "{}", screen_tail(&prompt));
+    prompt.send(b"\x14");
+    prompt.pump(Duration::from_millis(400));
+    assert!(on(&prompt), "{}", screen_tail(&prompt));
 }

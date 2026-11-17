@@ -22878,7 +22878,8 @@ mod tests {
             "city": { "$ref": "#/components/schemas/strict string" },
             "line1": { "$ref": "#/components/schemas/strict string" } } },
         "assigned labels": { "type": "array",
-          "x-indexer": { "indexType": "label identifiers", "returnType": "label?" } },
+          "x-indexer": { "indexType": "label identifiers", "returnType": "label?" },
+          "x-array-members": { "count": { "$ref": "#/components/schemas/number" } } },
         "label": { "type": "object",
           "properties": {
             "identifiers": { "$ref": "#/components/schemas/common identifiers" },
@@ -23221,6 +23222,12 @@ mod tests {
         assert_eq!(complete("/people~with(name/"), strings(&["/people~with(name/chars", "/people~with(name/length", "/people~with(name/upper"]));
         assert_eq!(complete("/people~with(active/"), strings(&[]));
         assert_eq!(complete("/people~with(nothing/"), strings(&[]));
+        // Into a collection: what can be asked of it. Into a scalar, and on
+        // from what that gives.
+        assert_eq!(complete("/people~with(labels/"), strings(&["/people~with(labels/count"]));
+        assert_eq!(complete("/people~with(labels/count/"), strings(&[]));
+        assert_eq!(complete("/people~with(name/upper/l"), strings(&["/people~with(name/upper/length"]));
+        assert_eq!(complete("/people~with(name//upper/c"), strings(&["/people~with(name//upper/chars"]));
 
         // After an operator that came before it.
         assert_eq!(complete("/people~take(5)~with(na"), strings(&["/people~take(5)~with(name"]));
@@ -23443,6 +23450,16 @@ mod tests {
         ]);
         backtab_pressed(&mut state);
         assert_eq!(shown(&state), "PUT /people @data.csv~map(ärende)^");
+        backtab_pressed(&mut state);
+        assert_eq!(shown(&state), "PUT /people @data.csv~map(com.heads.sql)^");
+        // Shift+Tab has nothing to go back through before Tab was pressed.
+        let mut untouched = completing("PUT /people @data.csv~map(");
+        handle_file_tab_completion_reverse(&mut untouched);
+        assert_eq!(shown(&untouched), "PUT /people @data.csv~map(^");
+        untouched.completions = strings(&["x"]);
+        untouched.input = "GET /people".to_string();
+        handle_file_tab_completion_reverse(&mut untouched);
+        assert_eq!(untouched.input, "GET /people");
         assert_eq!(tabbed("PUT /people @data.csv~map(COM.HEADS.S"), "PUT /people @data.csv~map(com.heads.sql)^");
         // An outfile takes no operator, whatever its name has in it.
         assert_eq!(get_completion_ghost(&completing("GET /people > nothing-here~")), "");
@@ -23999,5 +24016,15 @@ mod tests {
         assert!(!PickerState::fuzzy_matches("lacol", "local"));
         assert!(!PickerState::fuzzy_matches("locals", "local"));
         assert!(!PickerState::fuzzy_matches("x", ""));
+    }
+
+    #[test]
+    fn raw_line_breaks_in_a_string_are_escaped_and_outside_one_kept() {
+        assert_eq!(escape_newlines_in_strings("{\n\t\"a\": \"b\nc\rd\te\"\r\n}"), "{\n\t\"a\": \"b\\nc\\rd\\te\"\r\n}");
+        // An escaped quote does not end the string, and what is escaped
+        // already stays as it is.
+        assert_eq!(escape_newlines_in_strings("\"a\\\"\nb\\n\\\\\"\n"), "\"a\\\"\\nb\\n\\\\\"\n");
+        assert_eq!(escape_newlines_in_strings("å\n"), "å\n");
+        assert_eq!(escape_newlines_in_strings(""), "");
     }
 }
