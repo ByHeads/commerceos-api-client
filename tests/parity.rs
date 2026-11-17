@@ -200,6 +200,20 @@ fn answer(
     } else if path.contains("/keyed") {
         // A record with only a database key and a masked value, for `--export`.
         ("200 OK", r#"{"name":"Ann","identifiers":{"key":"k1"},"secret":"********"}"#.to_string())
+    } else if header("authorization") == Some("Basic Om5va2V5") {
+        // The key `nokey` is no key here.
+        ("401 Unauthorized", r#"{"error":"no such key"}"#.to_string())
+    } else if path.contains("/about") && header("authorization") == Some("Basic OnNwZWM=") {
+        // For a session with the key `spec`: a server with a spec to complete from.
+        ("200 OK", r#"{"feature-flags":[],"openapi-metadata-version":"1.2"}"#.to_string())
+    } else if path.contains("/openapi") && header("authorization") == Some("Basic OnNwZWM=") {
+        ("200 OK", PROMPT_SPEC.to_string())
+    } else if path.contains("/mapped-types") && header("authorization") == Some("Basic OnNwZWM=") {
+        (
+            "200 OK",
+            r#"[{"identifiers":{"mappedTypeName":"com.heads.sql"}},{"name":"unnamed"},{"identifiers":{"mappedTypeName":"com.heads.csv"}}]"#
+                .to_string(),
+        )
     } else if path.contains("/openapi") && header("authorization") == Some("Basic OmJhZHNwZWM=") {
         // For a session with the key `badspec`: an answer that is no spec.
         ("200 OK", r#""not a spec""#.to_string())
@@ -224,6 +238,48 @@ fn answer(
     );
     let _ = stream.flush();
 }
+
+/// The spec the server has for a session with the key `spec`, in the shape
+/// the real one has: properties by `$ref`, collections with an `x-indexer`.
+const PROMPT_SPEC: &str = r##"{
+  "tags": [{ "name": "People", "x-type": "people" }, { "name": "Agents", "x-type": "agents" }],
+  "paths": {
+    "/about": { "get": { "responses": {} } },
+    "/agents": { "get": { "tags": ["Agents"], "responses": { "200": { "content": { "application/json": {
+      "schema": { "type": "array", "items": { "$ref": "#/components/schemas/agent" } } } } } } } },
+    "/people": { "get": { "tags": ["People"], "responses": { "200": { "content": { "application/json": {
+      "schema": { "type": "array", "items": { "$ref": "#/components/schemas/person" } } } } } } } },
+    "/people/find": { "get": { "responses": {} } },
+    "/people/{index}": { "get": { "responses": { "200": { "content": { "application/json": {
+      "schema": { "$ref": "#/components/schemas/person" } } } } } } },
+    "/pets": { "get": { "responses": {} } }
+  },
+  "components": { "schemas": {
+    "people": { "type": "array",
+      "x-indexer": { "indexType": "COS database key or common identifiers", "returnType": "person?" },
+      "x-array-members": { "count": { "$ref": "#/components/schemas/number" } } },
+    "agents": { "type": "array",
+      "x-indexer": { "indexType": "COS database key or common identifiers", "returnType": "agent?" } },
+    "agent": { "type": "object", "x-child-types": ["person", "company"],
+      "properties": {
+        "@type": { "type": "string" },
+        "identifiers": { "$ref": "#/components/schemas/common identifiers" },
+        "name": { "$ref": "#/components/schemas/strict string" } } },
+    "person": { "type": "object",
+      "properties": {
+        "@type": { "type": "string" },
+        "identifiers": { "$ref": "#/components/schemas/common identifiers" },
+        "name": { "$ref": "#/components/schemas/strict string" },
+        "givenName": { "$ref": "#/components/schemas/strict string" },
+        "active": { "$ref": "#/components/schemas/boolean" } } },
+    "common identifiers": { "type": "object",
+      "properties": { "key?": {}, "com.mi6.id": { "$ref": "#/components/schemas/strict string" } },
+      "additionalProperties": { "x-additionalPropertiesName": "[namespaced key]" } },
+    "strict string": { "type": "string" },
+    "boolean": { "type": "boolean" },
+    "number": { "type": "number" }
+  } }
+}"##;
 
 /// One line and what it must do. `argv` is the line as a user would split it
 /// on the command line; `None` when there is no natural split (several lines).
@@ -4767,4 +4823,517 @@ fn closing_a_used_prompt_keeps_its_history() {
 
     quit(&mut prompt);
     assert_eq!(last_move_up(&prompt.screen), Some(3), "exit clear:\n{}", pty::plain(&prompt.screen));
+}
+
+/// The prompt of a session with the key `spec`, once it has read the spec
+/// the server has for it: Tab completes from then on.
+#[cfg(unix)]
+fn open_completing(server: &RecordingServer, dir: &Path, flags: &[&str]) -> pty::Prompt {
+    let url = format!("http://127.0.0.1:{}", server.port);
+    let mut cmd = api_bare(dir);
+    cmd.args(["-b", &url, "-k", "spec"]).args(flags);
+    let mut prompt = pty::Prompt::open(cmd);
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    let start = Instant::now();
+    loop {
+        let mark = prompt.screen.len();
+        prompt.send(b"\x15GET /pe\t");
+        prompt.pump(Duration::from_millis(250));
+        if pty::plain(&prompt.screen[mark..]).contains("GET /people") {
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(15), "the spec was never read:\n{}", screen_tail(&prompt));
+    }
+    server.take();
+    prompt
+}
+
+/// Clear the line and press `keys`, one after the other. Returns what the
+/// screen showed meanwhile.
+#[cfg(unix)]
+fn press(prompt: &mut pty::Prompt, keys: &[&str]) -> String {
+    prompt.send(b"\x15");
+    prompt.pump(Duration::from_millis(60));
+    let mark = prompt.screen.len();
+    for key in keys {
+        prompt.send(key.as_bytes());
+        prompt.pump(Duration::from_millis(90));
+    }
+    pty::plain(&prompt.screen[mark..])
+}
+
+/// Press Enter and return what the server was sent for it.
+#[cfg(unix)]
+fn entered(prompt: &mut pty::Prompt, server: &RecordingServer) -> Vec<String> {
+    server.take();
+    prompt.send(b"\r");
+    pump_until(prompt, Duration::from_secs(4), |_| server.seen() > 0);
+    prompt.pump(Duration::from_millis(250));
+    let sent = server.log.lock().unwrap().clone();
+    sent
+}
+
+const LEFT: &str = "\x1b[D";
+const HOME: &str = "\x1b[H";
+const END: &str = "\x1b[F";
+const SHIFT_TAB: &str = "\x1b[Z";
+
+/// Tab at the prompt completes the URI from the spec the server has, and
+/// Shift+Tab goes back through what Tab offered.
+#[cfg(unix)]
+#[test]
+fn tab_completes_the_uri_from_the_servers_spec() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::write(d.join("data.csv"), "a,b\n1,2\n").unwrap();
+    let mut prompt = open_completing(&server, d, &[]);
+
+    let lines: &[(&[&str], &str)] = &[
+        (&["GET /pe", "\t"], "GET /people"),
+        (&["GET /pe", "\t", "\t"], "GET /people/find"),
+        (&["GET /pe", "\t", "\t", "\t", "\t"], "GET /people"),
+        (&["GET /pe", "\t", "\t", SHIFT_TAB], "GET /people"),
+        (&["GET /pe", "\t", SHIFT_TAB], "GET /pets"),
+        (&["/pet", "\t"], "GET /pets"),
+        (&["GET /people~wi", "\t", "na", "\t", ")"], "GET /people~with(name)"),
+        // In an operator that follows another, and in one inside another.
+        (&["GET /people~take(5)~with(gi", "\t", ")"], "GET /people~take(5)~with(givenName)"),
+        (&["GET /people~with(name,identifiers~just(com", "\t", "))"], "GET /people~with(name,identifiers~just(com.mi6.id))"),
+        (&["GET /people~with(n:na", "\t", ")"], "GET /people~with(n:name)"),
+        (&["GET /people/", "\t", "007/gi", "\t"], "GET /people/com.mi6.id=007/givenName"),
+        // In front of the URI Tab does nothing; at its end it completes.
+        (&["GET /pe", HOME, "\t", END, "\t"], "GET /people"),
+        (&["GET /pe", LEFT, LEFT, LEFT, "\t", END, "\t"], "GET /people"),
+    ];
+    for (keys, sent) in lines {
+        let shown = press(&mut prompt, keys);
+        assert_eq!(entered(&mut prompt, &server), [*sent], "{keys:?}: {shown}");
+        prompt.pump(Duration::from_millis(150));
+    }
+
+    // With an outfile on the line, Tab and Shift+Tab in the URI leave it.
+    let mut keys = vec!["GET /pe > out.json"];
+    keys.extend(std::iter::repeat(LEFT).take(11));
+    keys.extend(["\t", SHIFT_TAB]);
+    let shown = press(&mut prompt, &keys);
+    assert_eq!(entered(&mut prompt, &server), ["GET /pets"], "{shown}");
+    assert!(d.join("out.json").is_file(), "{shown}");
+    assert_eq!(std::fs::read_dir(d).unwrap().count(), 3, "data.csv, out.json and the history file");
+
+    // A body file takes `~map(`, with the mapped types the server lists.
+    let shown = press(&mut prompt, &["PUT /people @data.csv~", "\t", "\t"]);
+    let sent = entered(&mut prompt, &server);
+    assert_eq!(sent, ["PUT /people a,b\n1,2\n"], "{shown}");
+    assert!(server.heads()[0].ends_with("x-request-map=com.heads.csv"), "{:?}", server.heads());
+    // And `~` after `>` is the home directory.
+    let shown = press(&mut prompt, &["GET /people > ~", "\t"]);
+    assert!(shown.contains("GET /people > ~/"), "{shown}");
+
+    // What Tab would add is shown ahead of the cursor, with the count of
+    // what it can be once it has been pressed, and the index a collection takes.
+    let shown = press(&mut prompt, &["GET /pe"]);
+    assert!(shown.contains("GET /people"), "{shown}");
+    let shown = press(&mut prompt, &["GET /pe", "\t"]);
+    assert!(shown.contains("(1/3)"), "{shown}");
+    let shown = press(&mut prompt, &["GET /people/"]);
+    assert!(shown.contains("index: COS database key or common identifiers"), "{shown}");
+    // Esc ends the cycling: Tab then starts from what the line has.
+    press(&mut prompt, &["GET /pe", "\t", "\t", "\x1b"]);
+    prompt.pump(Duration::from_millis(200));
+    prompt.send(b"\t");
+    prompt.pump(Duration::from_millis(100));
+    assert_eq!(entered(&mut prompt, &server), ["GET /people/find"], "{}", screen_tail(&prompt));
+}
+
+/// Under `-x` the body completes from the spec too: keys, values, the
+/// subtypes of a type and the brackets that close it.
+#[cfg(unix)]
+#[test]
+fn tab_completes_a_body_from_the_servers_spec_under_x() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = open_completing(&server, dir.path(), &["-x"]);
+    // The body the server was sent, as the JSON it is.
+    let body_of = |sent: &[String], line: &str| -> serde_json::Value {
+        assert_eq!(sent.len(), 1, "{line}: {sent:?}");
+        let body = sent[0].strip_prefix(line).unwrap_or_else(|| panic!("{sent:?} does not start with {line}"));
+        serde_json::from_str(body).unwrap_or_else(|e| panic!("{body:?} is not JSON: {e}"))
+    };
+
+    // A key by its start, a closing bracket after each complete value.
+    let shown = press(&mut prompt, &["PUT /people [{\"gi", "\t", " \"Ann\"", "\t", "\t"]);
+    let sent = entered(&mut prompt, &server);
+    assert_eq!(sent, ["PUT /people [{\"givenName\": \"Ann\"}]"], "{shown}");
+    // The ghost showed the rest of the key before Tab wrote it.
+    let shown = press(&mut prompt, &["PUT /people [{\"gi"]);
+    assert!(shown.contains("[{\"givenName\":"), "{shown}");
+
+    // A value after its colon, and the other one on the next Tab.
+    let shown = press(&mut prompt, &["PUT /people [{\"active\":", "\t", "\t", "}]"]);
+    assert_eq!(entered(&mut prompt, &server), ["PUT /people [{\"active\": false}]"], "{shown}");
+    let shown = press(&mut prompt, &["PUT /people [{\"name\": \"x\", ac", "\t", "\t", "}]"]);
+    assert_eq!(entered(&mut prompt, &server), ["PUT /people [{\"name\": \"x\", \"active\": true}]"], "{shown}");
+
+    // The subtypes of a type, forward and back.
+    let shown = press(&mut prompt, &["POST /agents {", "\t", "\t", SHIFT_TAB, "}"]);
+    assert_eq!(entered(&mut prompt, &server), ["POST /agents { \"@type\": \"person\"}"], "{shown}");
+    let shown = press(&mut prompt, &["POST /agents {", "\t", "\t", ",", "\"na", "\t", "\"Acme\"", "\t"]);
+    let sent = entered(&mut prompt, &server);
+    assert_eq!(sent.len(), 1, "{shown}\n{}", screen_tail(&prompt));
+    assert_eq!(body_of(&sent, "POST /agents "), serde_json::json!({"@type": "company", "name": "Acme"}), "{shown}");
+
+    // Tab before a body opens the brackets the endpoint takes, on lines of
+    // their own; the object's first key is its identifiers.
+    let shown = press(&mut prompt, &["PUT /people ", "\t", "\t", "\t", " \"007\"", END]);
+    let sent = entered(&mut prompt, &server);
+    assert_eq!(sent.len(), 1, "{shown}\n{}", screen_tail(&prompt));
+    assert_eq!(
+        body_of(&sent, "PUT /people "),
+        serde_json::json!([{"identifiers": {"com.mi6.id": "007"}}]),
+        "{shown}"
+    );
+
+    // Enter inside the brackets lays the body out on lines and goes on.
+    let shown = press(&mut prompt, &["PUT /people [{\"name\": \"x\",", "\r", "\"gi", "\t", " \"y\"", "\t", "\t"]);
+    let sent = entered(&mut prompt, &server);
+    assert_eq!(sent.len(), 1, "{shown}\n{}", screen_tail(&prompt));
+    assert_eq!(body_of(&sent, "PUT /people "), serde_json::json!([{"name": "x", "givenName": "y"}]), "{shown}");
+
+    // Keys are coloured as keys and strings in a list as values.
+    prompt.send(b"\x15");
+    prompt.pump(Duration::from_millis(60));
+    let mark = prompt.screen.len();
+    prompt.send(b"PUT /pets [\"a\", \"b\", {\"k\": 1}] > out-1.json");
+    prompt.pump(Duration::from_millis(300));
+    let drawn = &prompt.screen[mark..];
+    assert!(drawn.contains("\x1b[38;5;114m\"b\"\x1b[0m"), "{drawn:?}");
+    assert!(drawn.contains("\x1b[38;5;110m\"k\"\x1b[0m"), "{drawn:?}");
+    assert!(!drawn.contains("\x1b[38;5;110m\"b\""), "{drawn:?}");
+    assert!(drawn.contains("> out-1.json"), "{drawn:?}");
+}
+
+/// Send `keys` and wait until the screen has shown `text` since then.
+#[cfg(unix)]
+fn keys_then(prompt: &mut pty::Prompt, keys: &str, text: &str) -> String {
+    prompt.pump(Duration::from_millis(150));
+    let mark = prompt.screen.len();
+    prompt.send(keys.as_bytes());
+    let seen = pump_until(prompt, Duration::from_secs(8), |p| pty::plain(&p.screen[mark..]).contains(text));
+    let shown = pty::plain(&prompt.screen[mark..]);
+    assert!(seen, "{text:?} never appeared after {keys:?}:\n{shown}");
+    shown
+}
+
+/// The keys that move in the line and take text out of it do so where the
+/// cursor is, and history comes back with Up and Down.
+#[cfg(unix)]
+#[test]
+fn the_prompt_edits_its_line_with_the_usual_keys() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = open_prompt(&server, dir.path(), &[]);
+    const DELETE: &str = "\x1b[3~";
+
+    let lines: &[(&[&str], &str)] = &[
+        // ← ←, backspace, delete.
+        (&["GET /abcd", LEFT, LEFT, "\x7f", DELETE], "GET /ad"),
+        (&["GET /abc", LEFT, "\x1b[C", "\x1b[C", "d"], "GET /abcd"),
+        // Home and End, and ctrl+a and ctrl+e.
+        (&["ET /x", HOME, "G", END, "y"], "GET /xy"),
+        (&["ET /x", "\x01", "G", "\x05", "z"], "GET /xz"),
+        // At either end there is nothing more to take.
+        (&["GET /edge", HOME, "\x7f", LEFT, END, DELETE, "\x0b", "\x1bd", "\x1b[C", "s"], "GET /edges"),
+        // ctrl+k takes the rest of the line.
+        (&["GET /keep/drop", LEFT, LEFT, LEFT, LEFT, LEFT, "\x0b"], "GET /keep"),
+        // ctrl+w and alt+backspace take the word before the cursor, alt+d the one after.
+        (&["GET /one two", "\x17"], "GET /one"),
+        (&["GET /one three", "\x1b\x7f"], "GET /one"),
+        (&["GET /aaa~bbb", HOME, "\x1bf", "\x1bd"], "GET /bbb"),
+        // alt+b and alt+f, and ctrl+← and ctrl+→, go by words.
+        (&["GET /aaa~bbb", "\x1bb", "\x1bb", "X", "\x1bf", "Y"], "GET /Xaaa~Ybbb"),
+        (&["GET /aaa~bbb", "\x1b[1;5D", "Q", HOME, "\x1b[1;5C", "\x1b[1;5C", "R"], "GET /aaa~RQbbb"),
+        // ctrl+x takes the body, ctrl+f the whole request.
+        (&["PUT /x {\"a\":1}", "\x18", " {\"c\":3}"], "PUT /x {\"c\":3}"),
+        (&["PUT /junk {\"a\":1}", "\x06", "full"], "GET /full"),
+        // ctrl+space goes round the methods: first back to GET, which puts
+        // the body aside, then on to PUT and PATCH with the body again.
+        (&["PUT /m {\"a\":1}", "\x00", "\x00", "\x00"], "PATCH /m {\"a\":1}"),
+        (&["/m", "\x00", "\x00", "\x00", "\x00"], "GET /m"),
+        // ctrl+n starts a new line in the body.
+        (&["PUT /n {\"a\":", "\x0e", "1}"], "PUT /n {\"a\":\n1}"),
+        // Non-ASCII text is edited by the character.
+        (&["GET /åäö", LEFT, "\x7f", "x", END, "\x7f", "y"], "GET /%C3%A5xy"),
+    ];
+    for (keys, sent) in lines {
+        let shown = press(&mut prompt, keys);
+        assert_eq!(entered(&mut prompt, &server), [*sent], "{keys:?}: {shown}");
+        prompt.pump(Duration::from_millis(120));
+    }
+
+    // Up goes back through what was sent, Down forward again and at last
+    // to what was being typed.
+    for line in ["GET /h1", "GET /h2"] {
+        press(&mut prompt, &[line]);
+        entered(&mut prompt, &server);
+    }
+    let shown = press(&mut prompt, &["GET /dra", "\x1b[A", "\x1b[A", "\x1b[B", "\x1b[B", "ft"]);
+    assert_eq!(entered(&mut prompt, &server), ["GET /draft"], "{shown}");
+    let shown = press(&mut prompt, &["\x1b[A", "\x1b[A", "\x1b[A"]);
+    assert_eq!(entered(&mut prompt, &server), ["GET /h1"], "{shown}");
+    let shown = press(&mut prompt, &["\x1b[A", "\x1b[A", "\x1b[A", "\x1b[B", "\x1b[B", "\x1b[B", "\x1b[B", "\x1b[B", "GET /last"]);
+    assert_eq!(entered(&mut prompt, &server), ["GET /last"], "{shown}");
+
+    // ctrl+t on a server that can't stream says so.
+    let shown = press(&mut prompt, &["\x14"]);
+    assert!(shown.contains("streaming not available on this server"), "{shown}");
+    // One ctrl+c asks for another, and any other key takes the question back.
+    let shown = press(&mut prompt, &["\x03"]);
+    assert!(shown.contains("ctrl+c again to exit"), "{shown}");
+    press(&mut prompt, &["GET /still-here"]);
+    assert_eq!(entered(&mut prompt, &server), ["GET /still-here"]);
+    assert_eq!(prompt.exited(), None);
+
+    // ctrl+j takes the last response's body off the screen and keeps its
+    // request and status; ctrl+l takes everything but the splash.
+    prompt.pump(Duration::from_millis(300));
+    let mark = prompt.screen.len();
+    prompt.send(b"\x0a");
+    prompt.pump(Duration::from_millis(500));
+    let redrawn = pty::plain(&prompt.screen[mark..]);
+    assert!(redrawn.contains("GET /still-here") && redrawn.contains("200 OK"), "{redrawn}");
+    assert!(!redrawn.contains("\"ok\": \"/api/v1/still-here\""), "{redrawn}");
+    assert!(redrawn.contains("\"ok\": \"/api/v1/last\""), "{redrawn}");
+    let mark = prompt.screen.len();
+    prompt.send(b"\x0c");
+    prompt.pump(Duration::from_millis(500));
+    let redrawn = pty::plain(&prompt.screen[mark..]);
+    assert!(redrawn.contains("CommerceOS API"), "{redrawn}");
+    assert!(!redrawn.contains("200 OK") && !redrawn.contains("/api/v1/last"), "{redrawn}");
+    // With nothing to take they do nothing, and the session goes on.
+    prompt.send(b"\x0c\x0a");
+    prompt.pump(Duration::from_millis(200));
+    press(&mut prompt, &["GET /after"]);
+    assert_eq!(entered(&mut prompt, &server), ["GET /after"]);
+}
+
+/// The row of the picker that is selected, as the screen has it now.
+#[cfg(unix)]
+fn selected_row(prompt: &pty::Prompt) -> String {
+    pty::rows(&prompt.screen, 200).into_iter().rev().find(|row| row.contains('›')).unwrap_or_default()
+}
+
+/// The picker a session starts with when connections are saved and none is
+/// the default: it filters as one types, marks a default, deletes, says
+/// when a connection is refused, and connects.
+#[cfg(unix)]
+#[test]
+fn the_startup_picker_filters_marks_deletes_and_connects() {
+    let server = RecordingServer::start();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write_credentials(
+        d,
+        &[
+            ("alpha", url.clone(), "key", "k1", ""),
+            ("beta", url.clone(), "key", "nokey", ""),
+            ("gamma", url.clone(), "key", "k3", ""),
+            ("zeta", url.clone(), "key", "k4", ""),
+        ],
+        "",
+    );
+    let mut prompt = pty::Prompt::open(api_bare(d));
+    prompt.wait_for("+ Add new connection", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(400));
+    assert!(selected_row(&prompt).contains("alpha"), "{}", selected_row(&prompt));
+
+    // Down and Up move, and stop at the ends.
+    prompt.send(b"\x1b[A\x1b[B");
+    prompt.pump(Duration::from_millis(250));
+    assert!(selected_row(&prompt).contains("beta"), "{}", selected_row(&prompt));
+    // A connection the server refuses is said to be that, and the picker stays.
+    keys_then(&mut prompt, "\r", "beta: unauthorized");
+
+    // Typing filters: the first match is selected, and the others are gone.
+    prompt.send(b"zt");
+    prompt.pump(Duration::from_millis(300));
+    let rows = pty::rows(&prompt.screen, 200);
+    let listed: Vec<&String> = rows.iter().rev().take(8).collect();
+    assert!(selected_row(&prompt).contains("zeta"), "{listed:?}");
+    assert!(listed.iter().any(|row| row.contains("search: zt")), "{listed:?}");
+    assert!(!listed.iter().any(|row| row.contains("alpha") || row.contains("gamma")), "{listed:?}");
+    // Nothing matches: only the search is left.
+    prompt.send(b"q");
+    prompt.pump(Duration::from_millis(300));
+    let rows = pty::rows(&prompt.screen, 200);
+    assert!(rows.iter().rev().take(6).any(|row| row.contains("(no matches)")), "{rows:?}");
+    prompt.send(b"\x7f\x7f\x7f\x7f");
+    prompt.pump(Duration::from_millis(300));
+    assert!(selected_row(&prompt).contains("alpha"), "{}", selected_row(&prompt));
+
+    // Tab makes the selected one the default, and Tab again none.
+    prompt.send(b"\x1b[B\x1b[B\t");
+    prompt.pump(Duration::from_millis(300));
+    assert_eq!(stored(d).1, "gamma");
+    assert!(selected_row(&prompt).contains("gamma ♥"), "{}", selected_row(&prompt));
+    prompt.send(b"\t");
+    prompt.pump(Duration::from_millis(300));
+    assert_eq!(stored(d).1, "");
+    assert!(!selected_row(&prompt).contains('♥'), "{}", selected_row(&prompt));
+
+    // Delete asks first, and any answer but y keeps the connection.
+    prompt.send(b"\x1b[A");
+    prompt.pump(Duration::from_millis(200));
+    keys_then(&mut prompt, "\x1b[3~", "Delete? y/n");
+    prompt.send(b"n");
+    prompt.pump(Duration::from_millis(300));
+    assert_eq!(stored(d).0.len(), 4);
+    keys_then(&mut prompt, "\x1b[3~", "Delete? y/n");
+    keys_then(&mut prompt, "y", "beta deleted");
+    assert_eq!(stored(d).0, ["alpha=k1", "gamma=k3", "zeta=k4"]);
+    // The selection stays where the deleted one was, on the one after it.
+    // It used to jump to the first.
+    prompt.pump(Duration::from_millis(200));
+    assert!(selected_row(&prompt).contains("gamma"), "{}", selected_row(&prompt));
+
+    // The last line opens the form for a new connection, and Esc there
+    // comes back to the list.
+    prompt.send(b"\x1b[B\x1b[B\x1b[B");
+    prompt.pump(Duration::from_millis(200));
+    keys_then(&mut prompt, "\r", "Type the API base URL");
+    prompt.send(b"\x1b");
+    prompt.pump(Duration::from_millis(400));
+    assert!(selected_row(&prompt).contains("Add new connection"), "{}", selected_row(&prompt));
+
+    // Enter on a connection opens the prompt on it.
+    prompt.send(b"\x1b[A");
+    prompt.pump(Duration::from_millis(200));
+    keys_then(&mut prompt, "\r", "connected to: zeta");
+    prompt.pump(Duration::from_millis(400));
+    press(&mut prompt, &["GET /picked"]);
+    assert_eq!(entered(&mut prompt, &server), ["GET /picked"]);
+    assert!(server.heads()[0].contains("authorization=Basic Oms0;"), "{:?}", server.heads());
+}
+
+/// Esc in the startup picker ends the client, with the terminal as a shell
+/// expects it; deleting the last connection there opens the form.
+#[cfg(unix)]
+#[test]
+fn the_startup_picker_is_left_with_esc_and_empties_into_the_form() {
+    let server = RecordingServer::start();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write_credentials(d, &[("only", url.clone(), "key", "k1", "")], "");
+
+    let mut prompt = pty::Prompt::open(api_bare(d));
+    prompt.wait_for("+ Add new connection", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(400));
+    prompt.send(b"\x1b");
+    assert!(pump_until(&mut prompt, Duration::from_secs(5), |_| false) || prompt.exited() == Some(true), "the client did not end");
+    assert!(prompt.is_cooked(), "the terminal is left in raw mode");
+    assert_eq!(server.seen(), 0);
+
+    let mut prompt = pty::Prompt::open(api_bare(d));
+    prompt.wait_for("+ Add new connection", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(400));
+    keys_then(&mut prompt, "\x1b[3~", "Delete? y/n");
+    keys_then(&mut prompt, "y", "Type the API base URL");
+    assert_eq!(stored(d).0, Vec::<String>::new());
+    // With no connection to go back to, Esc in the form ends the client too.
+    prompt.send(b"\x1b");
+    assert!(pump_until(&mut prompt, Duration::from_secs(5), |_| false) || prompt.exited() == Some(true), "the client did not end");
+    assert!(prompt.is_cooked(), "the terminal is left in raw mode");
+}
+
+/// The form for a new connection takes a URL and an API key, a bearer token
+/// or OAuth2 client credentials, goes back a field with Esc, and says what
+/// went wrong when the server refuses or does not answer.
+#[cfg(unix)]
+#[test]
+fn the_connection_form_takes_a_key_a_token_or_a_client() {
+    let server = RecordingServer::start();
+    let host = format!("127.0.0.1:{}", server.port);
+    let url = format!("http://{host}");
+    let get = |prompt: &mut pty::Prompt, line: &str| -> String {
+        prompt.pump(Duration::from_millis(400));
+        press(prompt, &[line]);
+        let sent = entered(prompt, &server);
+        assert_eq!(sent, [line]);
+        server.heads()[0].split("authorization=").nth(1).unwrap().split(';').next().unwrap().to_string()
+    };
+
+    // An API key. Tab in the URL completes what is typed to a known host.
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = pty::Prompt::open(api_bare(dir.path()));
+    prompt.wait_for("Type the API base URL", Duration::from_secs(15));
+    keys_then(&mut prompt, "loc\t", "localhost:5000");
+    prompt.send(&[0x7f; 14]);
+    keys_then(&mut prompt, "acme\t", "acme.app.heads.com");
+    keys_then(&mut prompt, "\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\t", "acme.app.heads.com");
+    prompt.send(&[0x7f; 18]);
+    // An empty URL is not one: Enter and Tab wait for it.
+    prompt.send(b"\r\t");
+    prompt.pump(Duration::from_millis(200));
+    keys_then(&mut prompt, &format!("{host}\r"), "Use ← → to choose auth method");
+    // ← and → go round the three methods.
+    keys_then(&mut prompt, "\x1b[C", "Bearer token");
+    keys_then(&mut prompt, "\x1b[C", "OAuth2 Client Credentials");
+    keys_then(&mut prompt, "\x1b[C", "API key");
+    keys_then(&mut prompt, "\x1b[D", "OAuth2 Client Credentials");
+    keys_then(&mut prompt, "\x1b[C\r", "Type your API key");
+    // Esc goes back a field, and from the method to the URL as it was typed.
+    keys_then(&mut prompt, "wrong\x7f\x7f\x1b", "Use ← → to choose auth method");
+    let shown = keys_then(&mut prompt, "\x1b", "Type the API base URL");
+    assert!(!shown.contains("http://"), "{shown}");
+    keys_then(&mut prompt, "\r\r", "Type your API key");
+    // What was typed of the key is still there. A key the server refuses
+    // is said to be that, and is typed again from nothing.
+    keys_then(&mut prompt, "\x7f\x7f\x7fnokey\r", "authentication failed, try again");
+    keys_then(&mut prompt, "k9\r", "ctrl+s to save this connection");
+    assert_eq!(get(&mut prompt, "GET /with-key"), "Basic Oms5");
+
+    // A bearer token.
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = pty::Prompt::open(api_bare(dir.path()));
+    prompt.wait_for("Type the API base URL", Duration::from_secs(15));
+    keys_then(&mut prompt, &format!("{host}\r"), "Use ← → to choose auth method");
+    keys_then(&mut prompt, "\x1b[C\r", "Type your bearer token");
+    keys_then(&mut prompt, "tok\r", "ctrl+s to save this connection");
+    assert_eq!(get(&mut prompt, "GET /with-token"), "Bearer tok");
+
+    // OAuth2 client credentials, with `-b` given: the form starts at the method.
+    let dir = tempfile::tempdir().unwrap();
+    let mut cmd = api_bare(dir.path());
+    cmd.args(["-b", &url]);
+    let mut prompt = pty::Prompt::open(cmd);
+    prompt.wait_for("Use ← → to choose auth method", Duration::from_secs(15));
+    keys_then(&mut prompt, "\x1b[D\r", "Type your OAuth2 client ID");
+    // An empty client ID is not one; Esc goes back to the method and on again.
+    prompt.send(b"\r");
+    keys_then(&mut prompt, "\x1b", "Use ← → to choose auth method");
+    keys_then(&mut prompt, "\r", "Type your OAuth2 client ID");
+    keys_then(&mut prompt, "cidx\x7f\r", "Type your client secret");
+    keys_then(&mut prompt, "\x1b", "Type your OAuth2 client ID");
+    keys_then(&mut prompt, "\r", "Type your client secret");
+    keys_then(&mut prompt, "secret\r", "ctrl+s to save this connection");
+    let authorization = get(&mut prompt, "GET /with-client");
+    assert!(authorization.starts_with("Bearer "), "{authorization}");
+
+    // A server that does not answer: said so, and after three tries the
+    // URL is what to look at.
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = pty::Prompt::open(api_bare(dir.path()));
+    prompt.wait_for("Type the API base URL", Duration::from_secs(15));
+    keys_then(&mut prompt, "127.0.0.1:1\r", "Use ← → to choose auth method");
+    keys_then(&mut prompt, "\r", "Type your API key");
+    keys_then(&mut prompt, "k\r", "connection could not be established, try again");
+    keys_then(&mut prompt, "\r", "connection could not be established, try again");
+    keys_then(&mut prompt, "\r", "connection could not be established, check URL");
+    // The same for a client whose token the server does not give.
+    keys_then(&mut prompt, "\x1b", "Use ← → to choose auth method");
+    keys_then(&mut prompt, "\x1b[D\r", "Type your OAuth2 client ID");
+    keys_then(&mut prompt, "c\r", "Type your client secret");
+    keys_then(&mut prompt, "s\r", "connection could not be established");
 }
