@@ -533,6 +533,71 @@ fn every_kind_of_body_in_an_imported_file_is_read_from_the_import() {
     }
 }
 
+/// The path of an import is the client's own and is read as it is: only what
+/// a line of the imported file wrote is a pattern. A directory, or a cache,
+/// whose name holds `?`, `*` or `[` (as every canonical path on Windows
+/// does) sends the same bodies as any other.
+#[test]
+fn a_file_body_of_an_import_is_not_a_pattern_for_what_the_imports_own_path_holds() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", fixture_archive());
+    let kinds = each_kind(&dir, &server);
+
+    for odd in ["lib?", "a[1]", "st*r", "[?]"] {
+        // The fixture as a directory of that name, with a directory beside it
+        // that the name would match as a pattern.
+        let lib = dir.join(odd);
+        for (name, contents) in fixture_files() {
+            let path = lib.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+        // The body of an `assert` and of a poll is a file body like any other.
+        std::fs::write(
+            lib.join("check.api"),
+            "assert PUT /check/assert @data/body.json\nsleep 0 while not PUT /check/poll @data/body.json\n",
+        )
+        .unwrap();
+        for decoy in ["libX", "a1", "star", "x"] {
+            let people = dir.join(decoy).join("data/people");
+            std::fs::create_dir_all(&people).unwrap();
+            std::fs::write(people.join("zed.json"), r#"{"name":"decoy"}"#).unwrap();
+            std::fs::write(dir.join(decoy).join("data/body.json"), r#"{"from":"decoy"}"#).unwrap();
+        }
+        let as_dir = ("dir", format!("import dir lib {{ \"path\": \"{}\" }}", lib.display()));
+        // And a repository and an archive, kept in a cache of that name.
+        for (kind, import) in std::iter::once(&as_dir).chain(kinds.iter().filter(|(kind, _)| *kind != "dir")) {
+            let checks = if *kind == "dir" { "lib/check.api\n" } else { "" };
+            let batch = format!("{import}\n{RUN_THE_FIXTURE}lib/bodies.api\n{checks}");
+            std::fs::write(dir.join("batch.api"), batch).unwrap();
+            let mut cmd = api(&dir, server.port);
+            cmd.env("API_IMPORT_CACHE", dir.join("cache").join(odd)).args(["-sa", "batch.api"]);
+            let ran = finish(cmd, "");
+            assert!(ran.ok, "{odd} {kind}: {}", ran.stderr);
+            let sent = server.api_requests();
+            let checked = if *kind == "dir" { 2 } else { 0 };
+            assert_eq!(sent.len(), fixture_requests().len() + 4 + checked, "{odd} {kind}: {sent:?}");
+            // One file is sent as the file it is, not as a list of one.
+            assert_eq!(sent[..fixture_requests().len()], fixture_requests(), "{odd} {kind}");
+            let bodies = &sent[fixture_requests().len()..];
+            // A pattern the line wrote still is one, below a path that is not.
+            assert!(bodies[1].starts_with("PUT /bodies/people "), "{odd} {kind}: {}", bodies[1]);
+            assert_eq!(
+                json_body(&bodies[1]),
+                serde_json::json!([{ "name": "Ann" }, { "name": "Bob" }, { "name": "Cy" }, { "name": "Di" }]),
+                "{odd} {kind}"
+            );
+            assert_eq!(bodies[2], "PUT /bodies/events {\"event\":1}\n{\"event\":2}", "{odd} {kind}");
+            assert_eq!(bodies[3], "PUT /bodies/rows id,name\n1,Ann\n2,Bob", "{odd} {kind}");
+            if *kind == "dir" {
+                assert_eq!(bodies[4..], [format!("PUT /check/assert {BODY}"), format!("PUT /check/poll {BODY}")], "{odd}");
+            }
+            // Logged as the line has it.
+            assert!(ran.stdout.contains("PUT /bodies/rows @data/rows.csv~map(com.heads.test-rows)\n"), "{odd} {kind}: {}", ran.stdout);
+        }
+    }
+}
+
 #[test]
 fn includes_of_an_imported_file_resolve_next_to_it_at_any_depth() {
     let (_guard, dir) = temp();

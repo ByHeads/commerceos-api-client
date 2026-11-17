@@ -193,8 +193,17 @@ fn answer(
         ("401 Unauthorized", r#"{"error":"token expired"}"#.to_string())
     } else if path.contains("/missing") {
         ("404 Not Found", "{}".to_string())
+    } else if let Some((_, zero)) = path.split_once("/zero/") {
+        // A zero as the path spells it: `/zero/0e0` answers `0e0`.
+        ("200 OK", zero.to_string())
     } else if path.contains("/zero") {
         ("200 OK", "0".to_string())
+    } else if path.contains("/gone") {
+        // An error whose body has lines of its own, and is not laid out the
+        // way the client lays JSON out.
+        ("404 Not Found", GONE.to_string())
+    } else if path.contains("/numbers") {
+        ("200 OK", format!("[{NUMBERS}]"))
     } else if path.contains("/boom") {
         ("500 Internal Server Error", "{}".to_string())
     } else if path.contains("/keyed") {
@@ -243,6 +252,15 @@ fn answer(
     );
     let _ = stream.flush();
 }
+
+/// What `/gone` answers, with its 404.
+const GONE: &str = "{\"error\":\n\"gone\",\n\"n\":1}";
+/// `GONE` as the client writes a buffered JSON body to a file.
+const GONE_INDENTED: &str = "{\n  \"error\": \"gone\",\n  \"n\": 1\n}";
+
+/// The one record `/numbers` answers with, in a list: numbers that no `f64`
+/// holds as they are written.
+const NUMBERS: &str = r#"{"big":12345678901234567890123,"frac":0.3333333333333333333333,"exp":1e+2,"neg":-0.10}"#;
 
 /// The spec the server has for a session with the key `spec`, in the shape
 /// the real one has: properties by `$ref`, collections with an `x-indexer`.
@@ -299,8 +317,9 @@ struct Case {
     exit_ok: bool,
     /// A phrase that must be shown to the user (stderr, or the screen).
     says: Option<&'static str>,
-    /// A file the line must have written.
-    writes: Option<PathBuf>,
+    /// A file the line must have written, and the path of the request whose
+    /// answer it must hold.
+    writes: Option<(PathBuf, &'static str)>,
 }
 
 fn case(label: &'static str, line: &str, argv: Option<&[&str]>, sent: &[&'static str]) -> Case {
@@ -326,8 +345,8 @@ impl Case {
         self.says = Some(says);
         self
     }
-    fn writes(mut self, path: PathBuf) -> Self {
-        self.writes = Some(path);
+    fn writes(mut self, path: PathBuf, answer_of: &'static str) -> Self {
+        self.writes = Some((path, answer_of));
         self
     }
     fn at_the_prompt(mut self, sent: &[&'static str]) -> Self {
@@ -401,6 +420,10 @@ fn cases(dir: &Path) -> Vec<Case> {
     let out7 = out("out7.json").display().to_string();
     let commented_redirect = format!("GET /a > {out6}   # as the server answers");
     let implied_redirect = format!("/a > {out7}");
+    let out8 = out("out8.json").display().to_string();
+    let tab_redirect8 = format!("\t> {out8}");
+    let tab_append8 = format!("\t>> {out8}");
+    let chain_out_b = out("chain-b.json").display().to_string();
     let uri_with_redirect1 = format!("/a > {out1}");
     let uri_with_append2 = format!("/a >> {out2}");
     let import_json = format!(r#"{{"url":"{}","ref":"1.0"}}"#, repo_url(dir));
@@ -466,17 +489,17 @@ fn cases(dir: &Path) -> Vec<Case> {
         // send the request as written.
         case("body-less PUT", "PUT /a", Some(&["PUT", "/a"]), &["PUT /a"]).at_the_prompt(&[]),
         // Outfiles
-        case("> outfile", &format!("GET /a > {out1}"), Some(&["GET", "/a", ">", &out1]), &["GET /a"]).writes(out("out1.json")),
+        case("> outfile", &format!("GET /a > {out1}"), Some(&["GET", "/a", ">", &out1]), &["GET /a"]).writes(out("out1.json"), "/a"),
         case("> outfile as one argument", &format!("GET /a > {out2}"), Some(&["GET", "/a", &redirect2]), &["GET /a"])
-            .writes(out("out2.json")),
+            .writes(out("out2.json"), "/a"),
         case(
             "body then > outfile",
             &format!(r#"PUT /a {{"x":1}} > {out3}"#),
             Some(&["PUT", "/a", r#"{"x":1}"#, &redirect3]),
             &[r#"PUT /a {"x":1}"#],
         )
-        .writes(out("out3.json")),
-        case(">> append", &format!("GET /a >> {out4}"), Some(&["GET", "/a", &append4]), &["GET /a"]).writes(out("out4.json")),
+        .writes(out("out3.json"), "/a"),
+        case(">> append", &format!("GET /a >> {out4}"), Some(&["GET", "/a", &append4]), &["GET /a"]).writes(out("out4.json"), "/a"),
         // The redirect in the URI argument and the body after it — the shape
         // the one-shot form has always taken.
         case(
@@ -485,14 +508,36 @@ fn cases(dir: &Path) -> Vec<Case> {
             Some(&["PUT", &uri_with_redirect1, r#"{"x":1}"#]),
             &[r#"PUT /a {"x":1}"#],
         )
-        .writes(out("out1.json")),
+        .writes(out("out1.json"), "/a"),
         case(
             ">> append in the URI argument, body after",
             &format!(r#"PUT /a {{"x":1}} >> {out2}"#),
             Some(&["PUT", &uri_with_append2, r#"{"x":1}"#]),
             &[r#"PUT /a {"x":1}"#],
         )
-        .writes(out("out2.json")),
+        .writes(out("out2.json"), "/a"),
+        // A tab is a blank before `>` too
+        case("a tab before > outfile", &format!("GET /a\t> {out8}"), Some(&["GET", "/a", &tab_redirect8]), &["GET /a"])
+            .writes(out("out8.json"), "/a"),
+        case("a tab before >> append", &format!("GET /a\t>> {out8}"), Some(&["GET", "/a", &tab_append8]), &["GET /a"])
+            .writes(out("out8.json"), "/a"),
+        // A redirect that names no file is a mistake, not a body of `>`
+        case("> with no path", "GET /c >", Some(&["GET", "/c", ">"]), &[]).fails("needs a path"),
+        case(">> with no path", "GET /c >>", Some(&["GET", "/c", ">>"]), &[]).fails("needs a path"),
+        case("> with no path behind a body", r#"PUT /c {"x":1} >"#, Some(&["PUT", "/c", r#"{"x":1}"#, ">"]), &[])
+            .fails("needs a path"),
+        case("> with no path in a chain", "GET /a && GET /c >", Some(&["GET", "/a", "&&", "GET", "/c", ">"]), &[])
+            .fails("needs a path"),
+        case("> with no path in the first of a chain", "GET /c >> || GET /a", Some(&["GET", "/c", ">>", "||", "GET", "/a"]), &[])
+            .fails("needs a path"),
+        case("assert with a > and no path", "assert GET /c >", Some(&["assert", "GET", "/c", ">"]), &[]).fails("needs a path"),
+        case(
+            "sleep while with a >> and no path",
+            "sleep 100ms while not GET /c >>",
+            Some(&["sleep", "100ms", "while", "not", "GET", "/c", ">>"]),
+            &[],
+        )
+        .fails("needs a path"),
         // Chains
         case("&& chain", "GET /a && GET /b", Some(&["GET", "/a", "&&", "GET", "/b"]), &["GET /a", "GET /b"]),
         case("|| chain", "GET /missing || GET /b", Some(&["GET", "/missing", "||", "GET", "/b"]), &["GET /missing", "GET /b"]),
@@ -516,7 +561,28 @@ fn cases(dir: &Path) -> Vec<Case> {
             Some(&["GET", "/a", ">", &out1, "&&", "GET", "/b"]),
             &["GET /a", "GET /b"],
         )
-        .writes(out("out1.json")),
+        .writes(out("out1.json"), "/a"),
+        // The outfile of a segment holds that segment's answer
+        case(
+            "chain with an outfile on the last segment",
+            &format!("GET /a && GET /b > {chain_out_b}"),
+            Some(&["GET", "/a", "&&", "GET", "/b", ">", &chain_out_b]),
+            &["GET /a", "GET /b"],
+        )
+        .writes(out("chain-b.json"), "/b"),
+        // A body may span lines in any segment, not only the last
+        case(
+            "chain with a multi-line body in its first segment",
+            "PUT /a {\n  \"x\": 1 // one\n} && GET /b",
+            Some(&["PUT", "/a", "{\n  \"x\": 1 // one\n}", "&&", "GET", "/b"]),
+            &["PUT /a {\n  \"x\": 1 \n}", "GET /b"],
+        ),
+        case(
+            "chain with multi-line bodies in the middle",
+            "GET /zero || PUT /b [\n  1,\n  2\n] && PUT /c {\n  \"y\": \"a\nb\"\n} && GET /d",
+            Some(&["GET", "/zero", "||", "PUT", "/b", "[\n  1,\n  2\n]", "&&", "PUT", "/c", "{\n  \"y\": \"a\nb\"\n}", "&&", "GET", "/d"]),
+            &["GET /zero", "PUT /b [\n  1,\n  2\n]", "PUT /c {\n  \"y\": \"a\\nb\"\n}", "GET /d"],
+        ),
         case("directive in a chain", "GET /a && sleep 100ms", Some(&["GET", "/a", "&&", "sleep", "100ms"]), &[])
             .fails("chain segment is not a request: `sleep 100ms`"),
         case("typo in a chain", "GET /a && peple", Some(&["GET", "/a", "&&", "peple"]), &[])
@@ -534,6 +600,18 @@ fn cases(dir: &Path) -> Vec<Case> {
         case("assert not fails", "assert not /a", Some(&["assert", "not", "/a"]), &["GET /a"]).fails("assertion failed"),
         case("assert on a chain", "assert GET /a && GET /b", Some(&["assert", "GET", "/a", "&&", "GET", "/b"]), &[])
             .fails("assert condition can't be a `&&`/`||` chain"),
+        // A condition that breaks off at a separator is refused like a plain line
+        case("assert that breaks off at ||", "assert GET /a ||", Some(&["assert", "GET", "/a", "||"]), &[])
+            .fails("needs a request on both sides"),
+        case("assert not that breaks off at &&", "assert not GET /c &&", Some(&["assert", "not", "GET", "/c", "&&"]), &[])
+            .fails("needs a request on both sides"),
+        case(
+            "sleep while that breaks off at &&",
+            "sleep 100ms while GET /a &&",
+            Some(&["sleep", "100ms", "while", "GET", "/a", "&&"]),
+            &[],
+        )
+        .fails("needs a request on both sides"),
         case("sleep while", "sleep 100ms while GET /zero", Some(&["sleep", "100ms", "while", "GET", "/zero"]), &["GET /zero"]),
         case("sleep while not", "sleep 100ms while not /a", Some(&["sleep", "100ms", "while", "not", "/a"]), &["GET /a"]),
         case("url gate passes", "url has 127.0.0.1\nGET /a", None, &["GET /a"]),
@@ -593,7 +671,7 @@ fn cases(dir: &Path) -> Vec<Case> {
             Some(&["PUT", "/a", r#"{"x":"b > c"}"#, ">", &out5]),
             &[r#"PUT /a {"x":"b > c"}"#],
         )
-        .writes(out("out5.json")),
+        .writes(out("out5.json"), "/a"),
         case(
             "> inside a URI operator",
             r#"GET /a~where(n="x > y")"#,
@@ -635,7 +713,7 @@ fn cases(dir: &Path) -> Vec<Case> {
             &[r#"PUT /a {"x":"a # b"}"#],
         ),
         case("comment behind an outfile", &commented_redirect, Some(&["GET", "/a", ">", &out6, "#", "as the server answers"]), &["GET /a"])
-            .writes(out("out6.json")),
+            .writes(out("out6.json"), "/a"),
         case(
             "comment behind directives and an include",
             "url has 127.0.0.1 # here\nsleep 100ms # wait\nseed.api # the seeds\nassert not GET /missing # gone",
@@ -644,7 +722,7 @@ fn cases(dir: &Path) -> Vec<Case> {
         ),
         case("comment behind a chain", "GET /a && GET /b # both", Some(&["GET", "/a", "&&", "GET", "/b", "#", "both"]), &["GET /a", "GET /b"]),
         // Without a method, the arguments after the URI are still the line's
-        case("implied GET to an outfile", &implied_redirect, Some(&["/a", ">", &out7]), &["GET /a"]).writes(out("out7.json")),
+        case("implied GET to an outfile", &implied_redirect, Some(&["/a", ">", &out7]), &["GET /a"]).writes(out("out7.json"), "/a"),
         // A separator with nothing behind it is a mistake, not a body
         case("a chain that breaks off", "GET /a ||\nPUT /b {\"x\":1}", None, &[])
             .fails("needs a request on both sides"),
@@ -693,8 +771,19 @@ fn check(case: &Case, how: &str, got: &Outcome, shown: &str, expected_sent: &[&s
     if let Some(phrase) = case.says {
         assert!(shown.contains(phrase), "[{}] {how}: expected {phrase:?} to be shown, got:\n{shown}", case.label);
     }
-    if let Some(path) = &case.writes {
+    if let Some((path, answer_of)) = &case.writes {
         assert!(path.is_file(), "[{}] {how}: {} was not written", case.label, path.display());
+        // The file is removed after every run, so what it holds is this
+        // run's: the answer of the request the redirect belongs to, once.
+        let written = std::fs::read_to_string(path).unwrap();
+        let holds: Option<serde_json::Value> = serde_json::from_str(&written).ok();
+        assert_eq!(
+            holds,
+            Some(serde_json::json!({ "ok": format!("/api/v1{answer_of}") })),
+            "[{}] {how}: {} holds:\n{written}",
+            case.label,
+            path.display()
+        );
         std::fs::remove_file(path).unwrap();
     }
 }
@@ -783,6 +872,13 @@ fn header_rows() -> Vec<HeaderRow> {
         (&[], "PUT /h @data.csv~map(com.heads.t) > {d}/o.csv", "text/csv", "text/csv", "com.heads.t"),
         (&[], "PUT /h @rows.ndjson", NDJSON, NDJSON, "-"),
         (&["-i"], "PUT /h @rows.ndjson", "application/x-ndjson;skipNulls=false", NDJSON, "-"),
+        // The extension of a file body is read in any case, like an outfile's.
+        (&[], "PUT /h @more.njson", NDJSON, NDJSON, "-"),
+        (&[], "PUT /h @LOUD.NDJSON", NDJSON, NDJSON, "-"),
+        (&[], "PUT /h @Mixed.NJson", NDJSON, NDJSON, "-"),
+        (&[], "PUT /h @UP.CSV", JSON, "text/csv", "-"),
+        (&[], "PUT /h @UP.CSV~map(com.heads.t)", JSON, "text/csv", "com.heads.t"),
+        (&[], "PUT /h @streams/*", NDJSON, NDJSON, "-"),
         (&[], r#"PUT /h {"x":1}"#, JSON, JSON, "-"),
     ]
 }
@@ -791,6 +887,13 @@ fn header_rows() -> Vec<HeaderRow> {
 fn header_fixtures(dir: &Path) {
     std::fs::write(dir.join("data.csv"), "a,b\n1,2\n").unwrap();
     std::fs::write(dir.join("rows.ndjson"), "{\"a\":1}\n{\"a\":2}\n").unwrap();
+    for name in ["more.njson", "LOUD.NDJSON", "Mixed.NJson"] {
+        std::fs::write(dir.join(name), "{\"a\":1}\n{\"a\":2}\n").unwrap();
+    }
+    std::fs::write(dir.join("UP.CSV"), "a,b\n1,2\n").unwrap();
+    std::fs::create_dir_all(dir.join("streams")).unwrap();
+    std::fs::write(dir.join("streams/a.NDJSON"), "{\"a\":1}\n").unwrap();
+    std::fs::write(dir.join("streams/b.njson"), "{\"a\":2}\n").unwrap();
 }
 
 #[cfg(unix)]
@@ -1117,6 +1220,315 @@ fn an_outfile_that_cannot_be_written_is_a_failure() {
         file("wc.api", "GET /a > no-such-dir/x.json && GET /never\n");
         let chain = run_in(&server, d, &with(&["-sa", "wc.api"]));
         assert_eq!((chain.code, &chain.sent[..]), (Some(1), &["GET /a".to_string()][..]), "stream={stream}: {}", chain.stderr);
+
+        // A file that is there and may not be written is not replaced.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file("ro.json", "old");
+            std::fs::set_permissions(d.join("ro.json"), std::fs::Permissions::from_mode(0o444)).unwrap();
+            // Whoever may write anything (root) is not told no.
+            if std::fs::OpenOptions::new().write(true).open(d.join("ro.json")).is_err() {
+                let one = run_in(&server, d, &with(&["GET", "/a", ">", "ro.json"]));
+                assert_eq!(one.code, Some(1), "stream={stream}: {}", one.stderr);
+                assert!(one.stderr.contains("Error writing to ro.json"), "stream={stream}: {}", one.stderr);
+                assert_eq!(std::fs::read_to_string(d.join("ro.json")).unwrap(), "old", "stream={stream}");
+            }
+            std::fs::remove_file(d.join("ro.json")).unwrap();
+        }
+    }
+}
+
+/// A number is written with the digits it came with, wherever a body is read
+/// as JSON on its way: `> file.json`, `> file.ndjson`, what `>>` adds,
+/// `--export`, and a glob body. None of them is an `f64` on the way.
+#[test]
+fn a_number_is_written_with_the_digits_it_came_with() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let read = |name: &str| std::fs::read_to_string(d.join(name)).unwrap();
+    let compact = |text: &str| text.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    let list = format!("[{NUMBERS}]");
+
+    // Stdout has them as they came, and always had.
+    let shown = run_in(&server, d, &["GET", "/numbers"]);
+    assert_eq!(shown.stdout.trim(), list, "{}", shown.stderr);
+
+    for flags in [&[][..], &["-r"]] {
+        let with = |args: &[&'static str]| [flags, args].concat();
+        let one = run_in(&server, d, &with(&["GET", "/numbers", ">", "n.json"]));
+        assert_eq!(one.code, Some(0), "{}", one.stderr);
+        assert_eq!(compact(&read("n.json")), list, "{flags:?}");
+
+        run_in(&server, d, &with(&["GET", "/numbers", ">", "n.ndjson"]));
+        assert_eq!(read("n.ndjson"), format!("{NUMBERS}\n"), "{flags:?}");
+
+        // What `>>` adds: to a file that is not there, and to one that is.
+        for name in ["a.json", "a.ndjson"] {
+            let _ = std::fs::remove_file(d.join(name));
+            run_in(&server, d, &with(&["GET", "/numbers", ">>", name]));
+            run_in(&server, d, &with(&["GET", "/numbers", ">>", name]));
+        }
+        assert_eq!(compact(&read("a.json")), format!("[{NUMBERS},{NUMBERS}]"), "{flags:?}");
+        assert_eq!(read("a.ndjson"), format!("{NUMBERS}\n{NUMBERS}\n"), "{flags:?}");
+
+        // `--export`: to stdout, a file and an NDJSON file.
+        let export = |args: &[&'static str]| with(&[&["--export", "com.heads.seedID"], args].concat());
+        let exported = run_in(&server, d, &export(&["GET", "/numbers"]));
+        assert_eq!(compact(&exported.stdout), list, "{flags:?}: {}", exported.stderr);
+        run_in(&server, d, &export(&["GET", "/numbers", ">", "e.json"]));
+        assert_eq!(compact(&read("e.json")), list, "{flags:?}");
+        run_in(&server, d, &export(&["GET", "/numbers", ">", "e.ndjson"]));
+        assert_eq!(read("e.ndjson").trim_end(), NUMBERS, "{flags:?}");
+    }
+
+    // A glob body is the files as one array: a single record and a list.
+    std::fs::create_dir(d.join("g")).unwrap();
+    std::fs::write(d.join("g/a.json"), NUMBERS).unwrap();
+    std::fs::write(d.join("g/b.json"), &list).unwrap();
+    let put = run_in(&server, d, &["PUT", "/x", "@g/*.json"]);
+    assert_eq!(put.sent, [format!("PUT /x [{NUMBERS},{NUMBERS}]")], "{}", put.stderr);
+    // And one file is sent as it is.
+    let put = run_in(&server, d, &["PUT", "/x", "@g/a.json"]);
+    assert_eq!(put.sent, [format!("PUT /x {NUMBERS}")], "{}", put.stderr);
+}
+
+/// Zero is falsy however the server spells it, to a chain, an `assert` and a
+/// `sleep while`; a number that only rounds to zero is not zero.
+#[test]
+fn zero_is_falsy_however_it_is_spelled() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    for zero in ["0", "-0", "0.0", "0e0", "0E0", "0.00e-3", "-0.0"] {
+        let chain = run_in(&server, d, &[&format!("GET /zero/{zero} && GET /never")]);
+        assert_eq!((chain.code, &chain.sent[..]), (Some(0), &[format!("GET /zero/{zero}")][..]), "{zero}: {}", chain.stderr);
+        let or = run_in(&server, d, &[&format!("GET /zero/{zero} || GET /then")]);
+        assert_eq!(or.sent, [format!("GET /zero/{zero}"), "GET /then".to_string()], "{zero}: {}", or.stderr);
+        let asserted = run_in(&server, d, &[&format!("assert GET /zero/{zero}")]);
+        assert_eq!(asserted.code, Some(1), "{zero}: {}", asserted.stderr);
+        assert!(asserted.stderr.contains(&format!("assertion failed: assert GET /zero/{zero} ({zero})")), "{zero}: {}", asserted.stderr);
+        let not = run_in(&server, d, &[&format!("assert not GET /zero/{zero}")]);
+        assert_eq!(not.code, Some(0), "{zero}: {}", not.stderr);
+        // The poll ends at once: there is nothing to wait for.
+        let polled = run_in(&server, d, &[&format!("sleep 100ms while GET /zero/{zero}\nGET /after")]);
+        assert_eq!(polled.sent, [format!("GET /zero/{zero}"), "GET /after".to_string()], "{zero}: {}", polled.stderr);
+    }
+    for other in ["1", "0.1", "1e-9", "0.0000000000000000000001", "12345678901234567890123"] {
+        let chain = run_in(&server, d, &[&format!("GET /zero/{other} && GET /then")]);
+        assert_eq!(chain.sent, [format!("GET /zero/{other}"), "GET /then".to_string()], "{other}: {}", chain.stderr);
+    }
+}
+
+/// Without `-f` a `> file` takes whatever was answered, an error too. A
+/// `>> file` collects answers, and an error is not one: it is shown where it
+/// would have been without the redirect, and the file is left as it was,
+/// whatever it holds.
+#[test]
+fn an_error_replaces_an_outfile_and_is_never_appended_to_one() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let read = |name: &str| std::fs::read_to_string(d.join(name)).unwrap();
+
+    for stream in [false, true] {
+        let with = |args: &[&'static str]| -> Vec<&'static str> {
+            let mut all = if stream { vec!["--stream"] } else { Vec::new() };
+            all.extend_from_slice(args);
+            all
+        };
+        // `>`: the error is what the file holds, buffered even under
+        // `--stream` (so indented, where a streamed 200 is as it came).
+        let replaced = run_in(&server, d, &with(&["GET", "/gone", ">", "e.json"]));
+        assert_eq!(replaced.code, Some(0), "stream={stream}: {}", replaced.stderr);
+        assert_eq!(read("e.json"), GONE_INDENTED, "stream={stream}");
+        assert_eq!(replaced.stdout, "", "stream={stream}");
+
+        // `>>`: every kind of target is left as it was.
+        let targets = [
+            ("list.json", "[{\"a\":1}]"),
+            ("one.json", "{\"a\":1}\n"),
+            ("rows.ndjson", "{\"a\":1}\n"),
+            ("table.csv", "a,b\n1,2\n"),
+            ("notes.txt", "a note\n"),
+            ("empty.json", ""),
+        ];
+        for (name, held) in targets {
+            std::fs::write(d.join(name), held).unwrap();
+            let appended = run_in(&server, d, &with(&["GET", "/gone", ">>", name]));
+            assert_eq!(appended.code, Some(0), "stream={stream} {name}: {}", appended.stderr);
+            assert_eq!(read(name), held, "stream={stream}: the error was appended to {name}");
+            // The body goes where it would have gone, and a line says why
+            // the file did not get it.
+            assert_eq!(appended.stdout.trim_end(), GONE, "stream={stream} {name}");
+            assert!(appended.stderr.contains("404 Not Found"), "stream={stream} {name}: {}", appended.stderr);
+            assert!(appended.stderr.contains(&format!(">> {name} (not appended)")), "stream={stream} {name}: {}", appended.stderr);
+        }
+        // A file that is not there is not made for it.
+        let fresh = run_in(&server, d, &with(&["GET", "/gone", ">>", "fresh.json"]));
+        assert_eq!(fresh.code, Some(0), "stream={stream}: {}", fresh.stderr);
+        assert!(!d.join("fresh.json").exists(), "stream={stream}: an error made the file");
+        // `-s` leaves the line out, as it leaves the size line out.
+        let silent = run_in(&server, d, &with(&["-s", "GET", "/gone", ">>", "fresh.json"]));
+        assert_eq!((silent.stderr.as_str(), silent.stdout.trim_end()), ("", GONE), "stream={stream}");
+
+        // In a batch the next line runs, and an answer is still appended:
+        // under `--stream` too, where `>>` splices as it does buffered.
+        std::fs::write(d.join("list.json"), "[{\"a\":1}]").unwrap();
+        std::fs::write(d.join("b.api"), "GET /gone >> list.json\nGET /a >> list.json\nGET /b >> list.json\n").unwrap();
+        let batch = run_in(&server, d, &with(&["-sa", "b.api"]));
+        assert_eq!((batch.code, batch.sent.len()), (Some(0), 3), "stream={stream}: {}", batch.stderr);
+        // `-sa` shows no body, with or without a redirect.
+        assert!(!batch.stdout.contains("\"error\""), "stream={stream}: {}", batch.stdout);
+        let list: serde_json::Value = serde_json::from_str(&read("list.json")).unwrap();
+        assert_eq!(
+            list,
+            serde_json::json!([{ "a": 1 }, { "ok": "/api/v1/a" }, { "ok": "/api/v1/b" }]),
+            "stream={stream}"
+        );
+
+        // A chain's condition answered "no" leaves its `>>` target alone and
+        // goes on to the other half.
+        std::fs::write(d.join("list.json"), "[{\"a\":1}]").unwrap();
+        let chain = run_in(&server, d, &with(&["GET /gone >> list.json || GET /a >> list.json"]));
+        assert_eq!((chain.code, chain.sent.len()), (Some(0), 2), "stream={stream}: {}", chain.stderr);
+        let list: serde_json::Value = serde_json::from_str(&read("list.json")).unwrap();
+        assert_eq!(list, serde_json::json!([{ "a": 1 }, { "ok": "/api/v1/a" }]), "stream={stream}");
+
+        // Under `-f` neither redirect gets the error, as before.
+        std::fs::remove_file(d.join("e.json")).unwrap();
+        for redirect in [">", ">>"] {
+            let stopped = run_in(&server, d, &with(&["-f", "GET", "/gone", redirect, "e.json"]));
+            assert_eq!((stopped.code, stopped.stdout.trim_end()), (Some(1), GONE), "stream={stream} {redirect}");
+            assert!(!d.join("e.json").exists(), "stream={stream} {redirect}");
+        }
+    }
+
+    // A streamed `> file` holds the server's bytes; a streamed `>>` is
+    // buffered, and laid out as a buffered one is.
+    run_in(&server, d, &["--stream", "GET", "/a", ">", "s.json"]);
+    assert_eq!(read("s.json"), r#"{"ok":"/api/v1/a"}"#);
+    run_in(&server, d, &["--stream", "GET", "/a", ">>", "s2.json"]);
+    run_in(&server, d, &["GET", "/a", ">>", "b2.json"]);
+    assert_eq!(read("s2.json"), "{\n  \"ok\": \"/api/v1/a\"\n}");
+    assert_eq!(read("s2.json"), read("b2.json"));
+}
+
+/// The prompt does with an error and a `>>` what a batch does.
+#[cfg(unix)]
+#[test]
+fn the_prompt_does_not_append_an_error_either() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let read = |name: &str| std::fs::read_to_string(d.join(name)).unwrap();
+    std::fs::write(d.join("list.json"), "[{\"a\":1}]").unwrap();
+
+    let mut prompt = open_prompt(&server, d, &[]);
+    let shown = enter_line(&mut prompt, "GET /gone >> list.json", "404");
+    assert_eq!(read("list.json"), "[{\"a\":1}]", "{shown}");
+    assert!(shown.contains(">> list.json (not appended)"), "{shown}");
+    assert!(shown.contains("\"error\": \"gone\""), "{shown}");
+    let shown = enter_line(&mut prompt, "GET /gone >> fresh.json", "404");
+    assert!(!d.join("fresh.json").exists(), "{shown}");
+    // A `>` takes it, and an answer is appended as ever.
+    enter_line(&mut prompt, "GET /gone > e.json", "404");
+    assert_eq!(read("e.json"), GONE_INDENTED);
+    enter_line(&mut prompt, "GET /a >> list.json", "200 OK");
+    let list: serde_json::Value = serde_json::from_str(&read("list.json")).unwrap();
+    assert_eq!(list, serde_json::json!([{ "a": 1 }, { "ok": "/api/v1/a" }]));
+}
+
+/// The outfile of a chain's segment holds the answer of that segment, and a
+/// segment that did not run writes nothing.
+#[test]
+fn an_outfile_in_a_chain_holds_the_answer_of_its_own_segment() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let holds = |name: &str| -> Option<serde_json::Value> {
+        std::fs::read_to_string(d.join(name)).ok().map(|text| serde_json::from_str(&text).unwrap())
+    };
+    let answer = |path: &str| Some(serde_json::json!({ "ok": format!("/api/v1{path}") }));
+    let line = "GET /a > a.json && GET /b > b.json || GET /c > c.json";
+    std::fs::write(d.join("chain.api"), format!("{line}\n")).unwrap();
+
+    let runs: [&[&str]; 3] = [
+        &["-sa", "chain.api"],
+        &[line],
+        &["GET", "/a", ">", "a.json", "&&", "GET", "/b", ">", "b.json", "||", "GET", "/c", ">", "c.json"],
+    ];
+    for args in runs {
+        for name in ["a.json", "b.json", "c.json"] {
+            let _ = std::fs::remove_file(d.join(name));
+        }
+        let chain = run_in(&server, d, args);
+        assert_eq!((chain.code, &chain.sent[..]), (Some(0), &["GET /a".to_string(), "GET /b".to_string()][..]), "{args:?}: {}", chain.stderr);
+        assert_eq!((holds("a.json"), holds("b.json"), holds("c.json")), (answer("/a"), answer("/b"), None), "{args:?}");
+    }
+
+    // The condition's own "no" is what its file holds, and the other half's
+    // answer is in the other half's file.
+    let or = run_in(&server, d, &["GET /zero > zero.json || GET /b >> or.json"]);
+    assert_eq!(or.code, Some(0), "{}", or.stderr);
+    assert_eq!((holds("zero.json"), holds("or.json")), (Some(serde_json::json!(0)), answer("/b")));
+}
+
+/// `PUT /x @dir/*.json` with one file that is not JSON: the file is named,
+/// the run fails, and nothing is sent, not that request and not a later one.
+#[test]
+fn a_glob_body_with_a_malformed_file_names_it_and_sends_nothing() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::create_dir(d.join("rows")).unwrap();
+    std::fs::write(d.join("rows/a.json"), r#"{"a":1}"#).unwrap();
+    std::fs::write(d.join("rows/b.json"), r#"{"b":2,}"#).unwrap();
+    std::fs::write(d.join("rows/c.json"), r#"{"c":3}"#).unwrap();
+    std::fs::write(d.join("glob.api"), "PUT /x @rows/*.json\nGET /never\n").unwrap();
+
+    let runs: [&[&str]; 4] = [&["PUT", "/x", "@rows/*.json"], &["PUT /x @rows/*.json"], &["-sa", "glob.api"], &["-sfa", "glob.api"]];
+    for args in runs {
+        let bad = run_in(&server, d, args);
+        assert_eq!((bad.code, bad.sent.len()), (Some(1), 0), "{args:?}: {}", bad.stderr);
+        assert!(bad.stderr.contains("invalid JSON in rows/b.json: "), "{args:?}: {}", bad.stderr);
+        assert!(bad.stderr.contains("line 1 column 8"), "{args:?}: {}", bad.stderr);
+    }
+    // With the file mended the three are one array, in sorted order.
+    std::fs::write(d.join("rows/b.json"), r#"[{"b":2}]"#).unwrap();
+    let good = run_in(&server, d, &["-sa", "glob.api"]);
+    assert_eq!(good.sent, [r#"PUT /x [{"a":1},{"b":2},{"c":3}]"#, "GET /never"], "{}", good.stderr);
+}
+
+/// A file body that is NDJSON is sent as it is, as NDJSON, whichever of the
+/// two extensions it has; a glob of them is one stream, in sorted order, with
+/// a line break between two files where the first had none.
+#[test]
+fn an_ndjson_file_body_is_sent_as_ndjson_and_a_glob_of_them_as_one_stream() {
+    const HEAD: &str = "accept=application/x-ndjson; content-type=application/x-ndjson; authorization=Basic Oms=; x-request-map=-";
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::write(d.join("rows.njson"), "{\"a\":1}\n{\"a\":2}\n").unwrap();
+    std::fs::create_dir(d.join("ev")).unwrap();
+    std::fs::write(d.join("ev/b.ndjson"), "{\"b\":1}\n{\"b\":2}").unwrap();
+    std::fs::write(d.join("ev/a.ndjson"), "{\"a\":1}\n").unwrap();
+    std::fs::write(d.join("ev/c.njson"), "{\"c\":1}\n").unwrap();
+    std::fs::write(d.join(".DS_Store"), "junk").unwrap();
+    std::fs::write(d.join("nd.api"), "PUT /rows @rows.njson\nPUT /events @ev/*\n").unwrap();
+
+    let sent = ["PUT /rows {\"a\":1}\n{\"a\":2}\n", "PUT /events {\"a\":1}\n{\"b\":1}\n{\"b\":2}\n{\"c\":1}\n"];
+    let batch = api(server.port, d).args(["-sa", "nd.api"]).output().expect("spawn api");
+    server.settle(Duration::from_millis(150), Duration::from_secs(3));
+    assert_eq!(server.heads(), [HEAD, HEAD], "{}", String::from_utf8_lossy(&batch.stderr));
+    assert_eq!(server.take(), sent);
+
+    for (line, sent) in [(&["PUT", "/rows", "@rows.njson"], sent[0]), (&["PUT", "/events", "@ev/*"], sent[1])] {
+        api(server.port, d).args(line).output().expect("spawn api");
+        server.settle(Duration::from_millis(150), Duration::from_secs(3));
+        assert_eq!(server.heads(), [HEAD], "{line:?}");
+        assert_eq!(server.take(), [sent], "{line:?}");
     }
 }
 
@@ -2324,6 +2736,137 @@ fn a_one_shot_reads_stdin_only_as_a_body_it_needs() {
     // With the body as an argument, the pipe is the answer.
     let split = ask(&server, dir.path(), &["-p", "PUT", "/a", r#"{"x":1}"#], Some("y\n"));
     assert_eq!((split.code, &split.sent[..]), (Some(0), &[r#"PUT /a {"x":1}"#.to_string()][..]), "{}", split.stderr);
+}
+
+/// One plain request is the same single request whether the shell split it
+/// (`api GET /x`) or it came in one quoted argument (`api "GET /x"`): the
+/// same stdout, the same stderr, the same exit code and the same request,
+/// under no flags, `-s`, `-sf` and `-f`, and with the body piped in.
+#[cfg(unix)]
+#[test]
+fn one_request_is_the_same_single_request_quoted_or_split() {
+    use std::process::Stdio;
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+
+    // The time a request took is the one thing that differs between two runs.
+    fn timeless(text: &str) -> String {
+        text.lines()
+            .map(|l| match l.rsplit_once(' ') {
+                Some((head, took)) if l.contains("HTTP/1.1") && took.ends_with('s') => format!("{head} <time>"),
+                _ => l.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    let run = |flags: &[&str], request: &[&str], stdin: Option<&str>| {
+        let mut cmd = api(server.port, dir.path());
+        cmd.args(flags).args(request).stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() });
+        server.take();
+        let mut child = cmd.spawn().expect("spawn api");
+        if let Some(text) = stdin {
+            child.stdin.take().unwrap().write_all(text.as_bytes()).unwrap();
+        }
+        let out = child.wait_with_output().expect("api runs");
+        server.settle(Duration::from_millis(150), Duration::from_secs(3));
+        (
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            timeless(&String::from_utf8_lossy(&out.stderr)),
+            out.status.code(),
+            server.take(),
+        )
+    };
+
+    let rows: [(&[&str], &str, Option<&str>); 9] = [
+        (&["GET", "/a"], "GET /a", None),
+        (&["/a"], "/a", None),
+        (&["GET", "/gone"], "GET /gone", None),
+        (&["PUT", "/a", r#"{"x":1}"#], r#"PUT /a {"x":1}"#, None),
+        (&["PUT", "/a", "{\"x\": 1, // one\n}"], "PUT /a {\"x\": 1, // one\n}", None),
+        (&["GET", "/a", ">", "out.json"], "GET /a > out.json", None),
+        (&["PUT", "/a"], "PUT /a", Some(r#"{"x":1}"#)),
+        (&["POST", "/gone"], "POST /gone", Some(r#"{"x":1}"#)),
+        (&["GET", "/a"], "GET /a", Some("not a body")),
+    ];
+    let flag_sets: [&[&str]; 4] = [&[], &["-s"], &["-sf"], &["-f"]];
+    for (split, quoted, stdin) in rows {
+        for flags in flag_sets {
+            let as_split = run(flags, split, stdin);
+            let as_quoted = run(flags, &[quoted], stdin);
+            assert_eq!(as_quoted, as_split, "{flags:?} {quoted:?} (left: quoted, right: split)");
+        }
+    }
+
+    // What the split form is known to do, so the two are not alike in being wrong.
+    let (stdout, stderr, code, sent) = run(&["-s"], &["GET /a"], None);
+    assert_eq!((stdout.as_str(), stderr.as_str(), code), ("{\"ok\":\"/api/v1/a\"}\n", "", Some(0)));
+    assert_eq!(sent, ["GET /a"]);
+    let (stdout, stderr, code, _) = run(&["-sf"], &["GET /gone"], None);
+    assert_eq!((stdout.trim_end(), code), (GONE, Some(1)), "{stderr}");
+    let (stdout, stderr, code, _) = run(&["-f"], &["GET /gone"], None);
+    assert_eq!((stdout.trim_end(), code), (GONE, Some(1)), "{stderr}");
+    assert!(stderr.contains("HTTP/1.1 404"), "{stderr}");
+    let (_, stderr, code, sent) = run(&[], &["PUT /a"], Some(r#"{"x":1}"#));
+    assert_eq!((code, &sent[..]), (Some(0), &[r#"PUT /a {"x":1}"#.to_string()][..]), "{stderr}");
+
+    // What is not one plain request still runs as a batch, and logs like one.
+    for line in ["GET /a && GET /b", "GET /a\nGET /b", "assert GET /a"] {
+        let (stdout, stderr, code, _) = run(&["-s"], &[line], None);
+        assert!(stdout.starts_with("[http://127.0.0.1:"), "{line:?}: {stdout}\n{stderr}");
+        assert_eq!(code, Some(0), "{line:?}: {stderr}");
+    }
+    std::fs::write(dir.path().join("one.api"), "GET /a\n").unwrap();
+    let (stdout, stderr, _, sent) = run(&["-s"], &["one.api"], None);
+    assert!(stdout.starts_with("[http://127.0.0.1:"), "{stdout}\n{stderr}");
+    assert_eq!(sent, ["GET /a"]);
+}
+
+/// At a terminal a quoted `PUT /x` with no body asks for one, as the split
+/// form does, and sends what is typed.
+#[cfg(unix)]
+#[test]
+fn a_quoted_request_without_a_body_reads_one_at_a_terminal() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    for request in [&["PUT", "/a"][..], &["PUT /a"][..]] {
+        server.take();
+        let mut cmd = api(server.port, dir.path());
+        cmd.args(request);
+        let (shown, ended) = batch_in_a_terminal(cmd, "Reading body from stdin", b"{\"x\":1}\r\x04");
+        server.settle(Duration::from_millis(150), Duration::from_secs(3));
+        assert_eq!(server.take(), [r#"PUT /a {"x":1}"#], "{request:?}\n{shown}");
+        assert_eq!(ended, Some(true), "{request:?}\n{shown}");
+    }
+}
+
+/// A file whose last body is never closed is not run in part: the error names
+/// the unclosed body, the exit code is 1, and the requests above it are not
+/// sent either.
+#[test]
+fn a_file_that_ends_in_an_unclosed_body_sends_nothing() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    for (name, text) in [
+        ("object.api", "GET /a\nPUT /x {\n"),
+        ("deep.api", "GET /a\nPUT /x {\n  \"a\": [1,\n"),
+        ("array.api", "PUT /a {\"x\":1}\nPOST /x ["),
+    ] {
+        std::fs::write(dir.path().join(name), text).unwrap();
+        for flags in ["-a", "-sa", "-sfa"] {
+            let ran = run_in(&server, dir.path(), &[flags, name]);
+            assert_eq!((ran.code, ran.sent.len()), (Some(1), 0), "{flags} {name}: {}", ran.stderr);
+            assert!(ran.stderr.contains("error: unclosed body at end of bulk file"), "{flags} {name}: {}", ran.stderr);
+            assert_eq!(ran.stdout, "", "{flags} {name}");
+        }
+        // From stdin it is the same file.
+        let mut cmd = api(server.port, dir.path());
+        cmd.args(["-sa", "-"]).stdin(std::fs::File::open(dir.path().join(name)).unwrap());
+        let ran = ran(&server, cmd);
+        assert_eq!((ran.code, ran.sent.len()), (Some(1), 0), "stdin {name}: {}", ran.stderr);
+        assert!(ran.stderr.contains("unclosed body at end of bulk file"), "stdin {name}: {}", ran.stderr);
+    }
 }
 
 /// A GET does not wait for a stdin that stays open, and leaves it for
@@ -3896,6 +4439,58 @@ fn the_body_editor_sends_what_was_typed_or_pasted() {
     assert!(edit(&mut prompt, "PUT /never", &[b"\x1b[200~{\"a\":1}\x1b[201~"], b"\x1b").is_empty());
 }
 
+/// A body that is not closed is refused by the body editor as the input line
+/// refuses it: nothing is sent and nothing written, the reason is in the hint
+/// line, and the editor stays open with the text there to finish. A ` > `
+/// inside a string of a body that is closed is the body's own.
+#[cfg(unix)]
+#[test]
+fn the_body_editor_refuses_an_unclosed_body_and_stays_open() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = open_prompt(&server, dir.path(), &[]);
+    let files = |dir: &Path| -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|name| name != ".api_history")
+            .collect();
+        names.sort();
+        names
+    };
+    let before = files(dir.path());
+
+    prompt.send(b"\x15");
+    prompt.pump(Duration::from_millis(60));
+    prompt.send(b"PUT /note");
+    prompt.pump(Duration::from_millis(100));
+    prompt.send(b"\r");
+    prompt.wait_for("Enter body, ctrl+d when done", Duration::from_secs(5));
+    server.take();
+    prompt.send(br#"{"note": "a > b""#);
+    let shown = keys_then(&mut prompt, "\x04", "unclosed body");
+    prompt.pump(Duration::from_millis(300));
+    assert_eq!(server.take(), Vec::<String>::new(), "{shown}");
+    assert_eq!(files(dir.path()), before, "a file was written");
+    // Still the editor, with what was typed: the reason is under its ruler.
+    let rows = pty::rows(&prompt.screen, 200);
+    let tail = rows[rows.len().saturating_sub(6)..].join("\n");
+    let at = |text: &str| rows.iter().rposition(|row| row.contains(text)).unwrap_or_else(|| panic!("{text:?}:\n{tail}"));
+    assert_eq!(at("PUT /note") + 1, at("Enter body, ctrl+d when done"), "{tail}");
+    assert_eq!(at("Enter body, ctrl+d when done") + 1, at(r#"{"note": "a > b""#), "{tail}");
+    assert_eq!(at(r#"{"note": "a > b""#) + 2, at("unclosed body"), "{tail}");
+    assert_eq!(ruler_rows(&rows).len(), 2, "{tail}");
+
+    // Closed, it is sent whole, and the ` > ` in its string names no file.
+    prompt.send(b"}");
+    prompt.pump(Duration::from_millis(100));
+    prompt.send(b"\x04");
+    pump_until(&mut prompt, Duration::from_secs(4), |_| server.seen() > 0);
+    prompt.pump(Duration::from_millis(200));
+    assert_eq!(server.take(), [r#"PUT /note {"note": "a > b"}"#], "{}", screen_tail(&prompt));
+    assert_eq!(files(dir.path()), before, "a file was written");
+}
+
 /// ctrl+g GETs the URI on the line, whatever was sent before and whatever
 /// method, body or outfile the line has, and leaves the line as it was.
 #[cfg(unix)]
@@ -4009,6 +4604,41 @@ fn pump_until(prompt: &mut pty::Prompt, timeout: Duration, mut done: impl FnMut(
 fn screen_tail(prompt: &pty::Prompt) -> String {
     let rows = pty::rows(&prompt.screen, 200);
     rows[rows.len().saturating_sub(14)..].join("\n")
+}
+
+/// An identifier pasted onto a URI is one segment of it, whatever its value
+/// holds: a blank, `/`, `?`, `#` and `%` arrive percent-encoded, once, and
+/// nothing of the value is sent as a body or read as a query.
+#[cfg(unix)]
+#[test]
+fn a_pasted_identifier_is_one_segment_of_the_uri() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = open_prompt(&server, dir.path(), &[]);
+    let mut paste_on = |line: &str, pasted: &str| -> (Vec<String>, String) {
+        prompt.send(b"\x15");
+        prompt.pump(Duration::from_millis(60));
+        prompt.send(line.as_bytes());
+        prompt.pump(Duration::from_millis(150));
+        server.take();
+        prompt.paste(pasted);
+        prompt.pump(Duration::from_millis(200));
+        let rows = pty::rows(&prompt.screen, 200);
+        let line = rows[rows.len().saturating_sub(3)].clone();
+        prompt.send(b"\r");
+        pump_until(&mut prompt, Duration::from_secs(4), |_| server.seen() > 0);
+        prompt.pump(Duration::from_millis(200));
+        (server.take(), line)
+    };
+
+    let (sent, line) = paste_on("GET /people", r#"{"identifiers":{"com.x.name":"A B"}}"#);
+    assert_eq!(sent, ["GET /people/com.x.name=A%20B"], "{line}");
+    assert_eq!(line.trim_end(), "GET /people/com.x.name=A%20B");
+    let (sent, line) = paste_on("DELETE /people/", r#"{"com.x.name":"a/b?c#d 50%"}"#);
+    assert_eq!(sent, ["DELETE /people/com.x.name=a%2Fb%3Fc%23d%2050%25"], "{line}");
+    // A value with nothing of the kind is pasted as it is.
+    let (sent, line) = paste_on("GET /people", r#"{"identifiers":{"com.x.id":"007-a_b.c"}}"#);
+    assert_eq!(sent, ["GET /people/com.x.id=007-a_b.c"], "{line}");
 }
 
 /// A paste of several lines into a dialog that takes one fills it with the
@@ -4652,6 +5282,57 @@ fn fail_fast_at_the_prompt_stops_a_pasted_block_and_keeps_the_session() {
     assert!(shown.contains("stopped at 500 (--fail-fast)"), "{shown}");
     let (sent, _) = run("GET /a");
     assert_eq!(sent, ["GET /a"]);
+}
+
+/// A plain line whose outfile can't be written is said to be so and the next
+/// line runs, in a pasted block and in a file run from the prompt, as in a
+/// batch. A chain stops there, a request that got no answer stops the
+/// program, and so does a failed write under `-f`.
+#[cfg(unix)]
+#[test]
+fn an_outfile_that_cannot_be_written_does_not_stop_a_block_at_the_prompt() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = open_prompt(&server, dir.path(), &[]);
+
+    let (sent, shown) = run_pasted(&mut prompt, &server, "GET /a > nodir/x.json\rGET /b\r");
+    assert_eq!(sent, ["GET /a", "GET /b"], "{shown}");
+    assert!(shown.contains("Error writing to nodir/x.json"), "{shown}");
+
+    std::fs::write(dir.path().join("unwritable.api"), "GET /a > nodir/x.json\nGET /b\n").unwrap();
+    let (sent, shown) = run_pasted(&mut prompt, &server, "unwritable.api");
+    assert_eq!(sent, ["GET /a", "GET /b"], "{shown}");
+    assert!(shown.contains("Error writing to nodir/x.json"), "{shown}");
+
+    // A chain stops where its write failed, and the block with it, as a batch does.
+    let (sent, shown) = run_pasted(&mut prompt, &server, "GET /a > nodir/x.json && GET /never\rGET /b\r");
+    assert_eq!(sent, ["GET /a"], "{shown}");
+    assert!(shown.contains("Error writing to nodir/x.json"), "{shown}");
+
+    // A response that stops before its end is no answer: the program stops.
+    let (sent, shown) = run_pasted(&mut prompt, &server, "GET /trunc\rGET /b\r");
+    assert_eq!(sent, ["GET /trunc"], "{shown}");
+    let (sent, shown) = run_pasted(&mut prompt, &server, "GET /trunc > t.json\rGET /b\r");
+    assert_eq!(sent, ["GET /trunc"], "{shown}");
+    assert!(!dir.path().join("t.json").exists());
+    drop(prompt);
+
+    // Streamed, the two are told apart the same way.
+    let mut prompt = open_prompt(&server, dir.path(), &["--stream"]);
+    let (sent, shown) = run_pasted(&mut prompt, &server, "GET /a > nodir/x.json\rGET /b\r");
+    assert_eq!(sent, ["GET /a", "GET /b"], "{shown}");
+    assert!(shown.contains("Error writing to nodir/x.json"), "{shown}");
+    let (sent, shown) = run_pasted(&mut prompt, &server, "GET /trunc > t.json\rGET /b\r");
+    assert_eq!(sent, ["GET /trunc"], "{shown}");
+    drop(prompt);
+
+    // Under `-f` a write that failed ends the program, as it ends a batch.
+    let mut prompt = open_prompt(&server, dir.path(), &["-f"]);
+    let (sent, shown) = run_pasted(&mut prompt, &server, "GET /a > nodir/x.json\rGET /b\r");
+    assert_eq!(sent, ["GET /a"], "{shown}");
+    assert!(shown.contains("Error writing to nodir/x.json"), "{shown}");
+    let (sent, _) = run_pasted(&mut prompt, &server, "GET /b");
+    assert_eq!(sent, ["GET /b"]);
 }
 
 /// A terminal sends a pasted newline as `\r`. Pasted over the `GET /` the
@@ -6041,11 +6722,11 @@ fn esc_ends_a_wait_at_the_prompt_and_what_follows_it() {
     assert_eq!(entered(&mut prompt, &server), ["GET /after"]);
 }
 
-/// Without `-f` an error status is an answer like any other, and its body is
-/// what the outfile gets: `>` replaces the file with it and `>>` appends it.
-/// (Under `-f` the file is left alone, which other tests pin.)
+/// Without `-f` an error's body is what a `>` outfile gets: the file is
+/// replaced with it. A `>>` target is left as it was, and the batch goes on.
+/// (Under `-f` neither file is touched, which other tests pin too.)
 #[test]
-fn without_fail_fast_an_error_body_goes_to_the_outfile() {
+fn without_fail_fast_an_error_body_replaces_an_outfile_and_is_not_appended() {
     let server = RecordingServer::start();
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
@@ -6058,7 +6739,7 @@ fn without_fail_fast_an_error_body_goes_to_the_outfile() {
     assert_eq!(got.sent, ["GET /missing", "GET /boom", "GET /after"]);
     let json = |name: &str| serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(d.join(name)).unwrap()).unwrap();
     assert_eq!(json("out.json"), serde_json::json!({}));
-    assert_eq!(json("log.json"), serde_json::json!([{ "kept": 1 }, {}]));
+    assert_eq!(std::fs::read_to_string(d.join("log.json")).unwrap(), "[{\"kept\":1}]\n");
 
     // Under `-f` neither file is touched, and the run stops at the first.
     std::fs::write(d.join("out.json"), "[{\"kept\":1}]\n").unwrap();

@@ -30,7 +30,10 @@ encoding_rs = "0.8"
 
 # JSON handling
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+# `arbitrary_precision`: a number is kept as the digits it was written with, so
+# a body that is read and written again (`> file`, `--export`, a glob body)
+# holds the values it came with, not the nearest `f64`.
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
 
 # Terminal handling
 crossterm = "0.27"

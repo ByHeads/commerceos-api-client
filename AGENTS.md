@@ -14,6 +14,7 @@ METHOD URI [BODY] [> OUTFILE]
 - If the first token starts with `/`, `GET` is implied — `/people` is the same as `GET /people`.
 - `URI` may be written **with or without its leading slash**, and with or without the `/api/v1` prefix — `GET api/v1/people`, `GET /api/v1/people`, `GET v1/people`, and `GET /people` all request the same thing. That makes a path copied out of a browser URL or a log usable as-is. In a `.api` file this needs an explicit method, because a bare line that doesn't start with `/` is an [include](#6-includes).
 - `BODY` and `OUTFILE` are optional. If both are present, `BODY` comes first; the `> path` suffix is parsed off the end. A ` >` inside a JSON string, inside brackets or inside the parentheses of a URI operator is not an outfile: `PUT /x {"a":"b > c"}` and `GET /x~where(name="a > b")` are sent as written.
+- The `>` needs a blank in front of it, a space or a tab, and a path behind it. A `>` or `>>` that names no file (`GET /x >`) stops the batch before anything is sent: ``a `>` or `>>` needs a path to write to``. That holds for a plain line, a chain segment, an `assert` and a `sleep while`.
 - A body starts on the request line. A `{` that starts a line of its own is a [describe block](#describe-block), which belongs at the top of the file.
 - A line may hold several requests joined by `&&` / `||`, see [chaining](#5-chaining).
 
@@ -144,8 +145,13 @@ PUT /sync-webhooks @data.csv~map(com.heads.csv-product)
 ```
 
 Globs are processed in **sorted order** and skip OS junk (`.DS_Store`,
-`Thumbs.db`, `desktop.ini`, `._*`). `.njson` counts as NDJSON too. Empty match
-sets and invalid JSON are hard errors (the run exits non-zero).
+`Thumbs.db`, `desktop.ini`, `._*`). `.njson` counts as NDJSON too, and the
+extension is read in any case, as an outfile's is: `@ROWS.CSV` is sent as
+`text/csv`. Empty match sets and invalid JSON (`invalid JSON in <file>: …`)
+are hard errors: the run exits non-zero and the request is not sent.
+
+A number in a combined glob body is sent with the digits its file has
+(`12345678901234567890123`, `0.10`), as a single `@file` is sent byte for byte.
 
 ## 4. Output to file (`> path`)
 
@@ -163,8 +169,9 @@ GET /people > clipboard                  # system clipboard, case-insensitive
 
 - The extension drives the `Accept` header as above; anything else asks for JSON.
   It is read in any case (`out.CSV` is a CSV file), and `.njson` is NDJSON too.
-- An outfile that can't be written (a directory that doesn't exist, a full
-  disk) is reported as `Error writing to <path>: …`. For a single request and
+- An outfile that can't be written (a directory that doesn't exist, a file
+  that is read-only, a full disk) is reported as `Error writing to <path>: …`,
+  with `--stream` as without. For a single request and
   under `-f` that is exit 1; a chain stops there; a plain batch line is
   reported and the next line runs, as after a failed request.
 - `~/` expands to the home directory (on Windows `~\` does too).
@@ -172,6 +179,24 @@ GET /people > clipboard                  # system clipboard, case-insensitive
   targets get one compact object per line, `.csv` appends drop the duplicate
   header row, anything else is text-appended. `>> clipboard` is rejected
   when the line is read, before anything is sent.
+- **An error is written by `>` and never appended by `>>`.** Without `-f`, a
+  `> file` holds whatever was answered, a 404's body too, so check the status
+  (or run with `-f`) before trusting the file. A `>> file` collects answers,
+  and a non-2xx body is not one: the file is left as it was, whatever its
+  format, and one that is not there is not created. The body goes where it
+  would have gone without the redirect (stdout; nowhere in `-sa` mode, where
+  the status line says what happened), and `>> people.json (not appended)`
+  stands on stderr in the place of the size line. The batch carries on as
+  after any failed request. Under `-f` neither `>` nor `>>` gets an error:
+  see [fail-fast](#stopping-at-the-first-failure--f---fail-fast). The one
+  error `-f` lets through is a "no" that was asked for, the 404 of a chain
+  segment with another after it (`GET /x > f.json || …`): that is written by
+  `>` as without `-f`, and not appended by `>>`.
+- **Numbers are written as they came.** A JSON body that is indented, turned
+  into NDJSON lines or rewritten by `--export` keeps every number's digits:
+  `12345678901234567890123` and `0.10` are not rounded to what a double holds.
+  Only an exponent's spelling is made uniform (`1E2` and `1e2` are written
+  `1e+2`).
 - A `.ndjson`/`.njson` target always holds one compact JSON value per line,
   after `>` and after any number of `>>`: a single record is one line, and a
   list is one line per element. Other JSON targets are indented.
@@ -244,7 +269,9 @@ GET /people~where(givenName=Test)~count && DELETE /people~where(givenName=Test)
   (`GET /a && sleep 2`) is an error, not a step that is quietly dropped.
 - A chain is one line. A `&&` or `||` with nothing behind it (`GET /a ||`,
   with the write on the next line) stops the batch before anything is sent:
-  ``a `&&` or `||` needs a request on both sides, on one line``.
+  ``a `&&` or `||` needs a request on both sides, on one line``. An `assert`
+  or a `sleep while` whose request ends in one (`assert GET /a ||`) is
+  refused the same way.
 
 The same truthiness rule drives `sleep while` and `assert` below.
 
@@ -757,7 +784,9 @@ segment that isn't a request is an error everywhere. `tests/parity.rs` runs one
 table of lines through all three and compares what reached the server.
 
 **Interactive prompt.** The line is read as `.api` syntax. One request is sent
-as typed (a body-less `PUT` opens the body editor, which is the prompt's own);
+as typed (a body-less `PUT` opens the body editor, which is the prompt's own;
+ctrl+d there sends the body, and a body that is not closed is refused as on the
+line: nothing is sent and the editor stays open);
 anything else runs in the session: `confirm` asks in the hint line (`y`/enter or
 `n`/esc), `sleep` and `sleep while` show a spinner and stop on esc, `assert`
 logs the line as typed (`assert GET /x`) with its status but not the body and
@@ -769,20 +798,24 @@ request line, a directive or a block replaces whatever is on the line, so a
 paste over the starting `GET /` is just the paste. Tab on a
 line that is a path (`se`, `shared/`, `~/seeds/`) completes it to a directory
 or a `.api` file; a path starting with `/` completes as a URI. A block or a
-file carries on past a plain line that is answered with an error status, as a
-batch does. A stopped program (failed assert, declined confirm, a request
+file carries on past a plain line that is answered with an error status, and
+past one whose outfile could not be written (`Error writing to …`), as a
+batch does; a chain stops there, and so does the program under `-f`. A stopped program (failed assert, declined confirm, a request
 that got no answer, esc) leaves the session open, in the export mode it had
 before a file that stopped set one of its own.
 
 **One-shot arguments.** The positional arguments are joined into one line. A
-directive, an include, a `&&`/`||` chain, or a whole line in a single quoted
-argument runs through the batch runner exactly like a one-line `-a` file, so
+directive, an include, a `&&`/`||` chain, or several lines in one quoted
+argument run through the batch runner exactly like a `-a` file, so
 `api assert /companies/x` exits 1 on failure and `api seed.api` is `api -a
 seed.api`. Quote the `&&` or the whole line so the shell doesn't take it. A plain
 `METHOD URI [BODY]` is sent directly, after the same reading: a `> file` may sit
 in any argument (`api GET /people ">" out.json`, `api GET /people "> out.json"`,
 `api "GET /people > out.json"` are the same), and a body may carry comments or
-raw newlines just as in a file.
+raw newlines just as in a file. One plain request is that single request
+however it is quoted: `api -s "GET /people"` prints what `api -s GET /people`
+prints (the body alone, not a `-sa` log), and `echo '{…}' | api "PUT /x"`
+sends the piped body.
 
 In both places a mistyped request reports `not a request or .api file`, where
 it used to be sent as a GET to a nonsense path or silently re-send the previous
@@ -1223,6 +1256,8 @@ Run it: `api -sa workshop.api`.
 - **An `export` line under `--export`** → the command line wins: the name on the line is not used and `export off` does not turn export off. The `-sa` log notes `↳ ignored: --export … is set`.
 - **Expecting secrets in an export** → the API masks them (`********`) and `--export` turns that into `null`, and says where (`Response had masked data, now null at …`). A password, an API key or a client secret has to be set separately.
 - **`-p` or `confirm` without a terminal** → up to 3.3.1, end of input was read as Enter, so an unattended `api -spa file.api` or a `confirm` gate sent everything. From 3.3.2 it sends nothing and exits 1 with `aborted (could not read confirmation)`. Pipe the answer (`yes | …`, `echo n | …`); a program read from stdin (`api -a -`) has no stdin left to answer with.
+- **Collecting with `>>` and expecting the errors in the file** → a non-2xx body is not appended: the file keeps what it had, and `>> file (not appended)` is printed under the status line. A `> file` does take an error's body when the run has no `-f`.
+- **A `>` with nothing behind it** → `GET /x >` is an error (``a `>` or `>>` needs a path to write to``), not a request with the body `>`.
 - **Expecting a failed request to stop a batch** → it doesn't, unless the line is an `assert`, a chain or a poll, or the run has `-f`. A plain `PUT /assert {…}` that answers 409 is logged and the next line runs. Run with `-f`.
 - **Chaining on `PUT /assert`** → a passing `/assert` answers `200` with `null`, which is falsy, so `PUT /assert {…} && …` skips what follows and `assert PUT /assert {…}` fails on a pass. Write it on its own line and run with `-f`.
 - **`assert` on a list endpoint** → `[]` is truthy, so `assert GET /people~where(x)` passes even when nothing matches. Assert a `~count` or a single item by identifier instead.

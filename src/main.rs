@@ -1142,6 +1142,9 @@ struct AppState {
     /// Printed before the next request's log line (`assert `), see
     /// `OutputBlock::prefix`. Taken by `execute_request`.
     log_prefix: String,
+    /// The last request was answered, and what it was to leave behind (an
+    /// outfile, the clipboard) could not be written.
+    write_failed: bool,
     // Tab completion
     spec: Option<ApiSpec>,
     endpoints: Vec<String>,
@@ -1230,6 +1233,7 @@ impl AppState {
             prev_width: 80,
             output_history: Vec::new(),
             log_prefix: String::new(),
+            write_failed: false,
             spec: None,
             endpoints: Vec::new(),
             schema_props: HashMap::new(),
@@ -3599,7 +3603,14 @@ fn main() {
 
     // A directive, chain, include, or whole line in one argument runs through
     // the batch runner — same syntax as a `.api` file and the interactive prompt.
-    let program_line = one_shot_program_line(&args.method, &args.uri, &args.body);
+    let mut program_line = one_shot_program_line(&args.method, &args.uri, &args.body);
+    // One plain request in a quoted argument (`api "GET /x"`) is the single
+    // request it is when the shell splits it: its body alone on stdout, a
+    // piped stdin as its body. Only what is more than that is a batch.
+    let quoted_request = program_line.as_deref().and_then(one_typed_request);
+    if quoted_request.is_some() {
+        program_line = None;
+    }
 
     // Parse positional args like bash client
     let body_arg = if args.body.is_empty() { None } else { Some(args.body.join(" ")) };
@@ -3619,7 +3630,10 @@ fn main() {
     // The arguments as one line, read the way a `.api` file reads it: a body
     // comment, a raw newline in a string, or a `> file` in an argument of its
     // own means the same thing here as there.
-    let (method, uri, mut body) = if program_line.is_none() && !method.is_empty() {
+    let (method, uri, mut body) = if let Some(parts) = quoted_request {
+        // Read by the batch parser already, which is the same reading.
+        parts
+    } else if program_line.is_none() && !method.is_empty() {
         // A `> file` given in the URI argument with the body after it
         // (`api PUT "/x > out.json" '{…}'`) goes last, where a line keeps it.
         let (uri, redirect) = match outfile_marker_at(&uri) {
@@ -3627,7 +3641,10 @@ fn main() {
             None => (uri, String::new()),
         };
         let joined = format!("{} {} {}{}", method, uri, body, redirect);
-        match normalize_request_text(&joined).map(|t| parse_request_line(&t)) {
+        // A request that can't be sent is refused before anything else
+        // happens (`>> clipboard`, a `>` with no path), as a line of a file is.
+        let read = normalize_request_text(&joined).and_then(|t| refuse_request(&t).map(|()| parse_request_line(&t)));
+        match read {
             Ok(Some(parts)) => parts,
             Ok(None) => (method, uri, body),
             Err(e) => {
@@ -3638,15 +3655,6 @@ fn main() {
     } else {
         (method, uri, body)
     };
-
-    // A one-shot request that can't be sent is refused before anything else
-    // happens (`>> clipboard`), as a line of a file is.
-    if program_line.is_none() && !method.is_empty() {
-        if let Err(e) = refuse_request(&format!("{} {}", method, uri)) {
-            errln!("error: {}", e);
-            exit_process(1);
-        }
-    }
 
     // A piped stdin is the body of a request that takes one and was given
     // none. A GET or a DELETE never reads it: it would wait for a pipe that
@@ -4103,6 +4111,8 @@ fn looks_like_bearer_token(method: &str) -> bool {
 /// (`api assert /x`, `api seed.api`), a `&&`/`||` chain (`api GET /a "&&" PUT
 /// /b`), or a whole line in one argument (`api "GET /about"`). A plain
 /// `METHOD URI [BODY]` returns `None` and takes the one-shot path unchanged.
+/// A whole line that turns out to be one plain request is taken back by
+/// `one_typed_request` and sent as that single request.
 ///
 /// Rejoining with single spaces loses the shell's original spacing, which
 /// matters only inside a body — and a body that cares is a quoted argument
@@ -4131,6 +4141,25 @@ fn one_shot_program_line(method: &Option<String>, uri: &Option<String>, body: &[
 /// it holds (`api one.api` is `api -a one.api`).
 fn is_one_typed_request(line: &str, program: &BulkProgram) -> bool {
     !is_program_line(line) && matches!(&program.steps[..], [BulkStep::Request(_)])
+}
+
+/// The method, URI and body of a line that is one plain request and nothing
+/// else. `None` for anything the batch runner has to run or to refuse: a
+/// directive, an include, a chain, several requests, a line that can't be
+/// read.
+fn one_typed_request(line: &str) -> Option<(String, String, String)> {
+    // A program line may name a file or an import: not read here.
+    if is_program_line(line) {
+        return None;
+    }
+    let program = split_bulk_requests(line, None).ok()?;
+    if !is_one_typed_request(line, &program) || program.describe.is_some() || !program.url_conditions.is_empty() {
+        return None;
+    }
+    match &program.steps[..] {
+        [BulkStep::Request(request)] => parse_request_line(request),
+        _ => None,
+    }
 }
 
 fn parse_positional_args(
@@ -4464,6 +4493,7 @@ fn normalize_request_text(text: &str) -> Result<String, String> {
 
 /// Where the ` > outfile` (or ` >> outfile`) of a request starts: the last
 /// ` >` that is outside a JSON string and outside brackets and parentheses.
+/// The blank in front of it may be a tab, as for a ` #` comment.
 /// A `>` in a body (`{"a":"b > c"}`) or in a URI operator
 /// (`~where(name="a > b")`) is the request's own, as `&&` there is.
 ///
@@ -4472,7 +4502,7 @@ fn normalize_request_text(text: &str) -> Result<String, String> {
 fn outfile_marker_at(text: &str) -> Option<usize> {
     match balanced_outfile_marker(text) {
         Ok(found) => found,
-        Err(()) => text.rfind(" >"),
+        Err(()) => text.rfind(" >").max(text.rfind("\t>")),
     }
 }
 
@@ -4499,7 +4529,7 @@ fn balanced_outfile_marker(text: &str) -> Result<Option<usize>, ()> {
             '"' => in_string = true,
             '{' | '[' | '(' => depth += 1,
             '}' | ']' | ')' => depth -= 1,
-            ' ' if depth <= 0 && bytes.get(i + 1) == Some(&b'>') => found = Some(i),
+            ' ' | '\t' if depth <= 0 && bytes.get(i + 1) == Some(&b'>') => found = Some(i),
             _ => {}
         }
     }
@@ -4552,9 +4582,21 @@ fn uri_end(text: &str) -> usize {
     text.len()
 }
 
+/// Whether the text ends in a ` >` or ` >>` that names no file. That is a
+/// redirect someone did not finish, not a body of `>`.
+fn redirect_lacks_path(text: &str) -> bool {
+    outfile_marker_at(text).is_some_and(|at| {
+        let rest = &text[at + 2..];
+        rest.strip_prefix('>').unwrap_or(rest).trim().is_empty()
+    })
+}
+
 /// A request that could be parsed but must not be sent, and why. Checked
 /// while a file or a line is read, so nothing has been sent when it is said.
 fn refuse_request(request: &str) -> Result<(), String> {
+    if redirect_lacks_path(request) {
+        return Err(format!("a `>` or `>>` needs a path to write to: `{}`", request.trim()));
+    }
     let Some((_, uri, _)) = parse_request_line(request) else {
         return Ok(());
     };
@@ -4844,6 +4886,8 @@ enum BodyDelivery {
     Streamed {
         overflowed: bool,
         error: Option<String>,
+        /// The error is the outfile's: the response itself arrived whole.
+        unwritten: bool,
         /// Bytes written to the outfile.
         bytes: u64,
     },
@@ -6117,9 +6161,18 @@ fn parse_condition(condition: &str, what: &str, usage: &str) -> Result<(bool, St
     if depth != 0 {
         return Err(format!("{} condition must fit on one line: `{}`", what, request));
     }
+    // A separator with nothing on one side is the mistake it is on a plain
+    // line, and is not sent as a body.
+    if chain_is_incomplete(request) {
+        return Err(format!(
+            "a `&&` or `||` needs a request on both sides, on one line: `{}`",
+            request
+        ));
+    }
     if split_request_chain(request).len() > 1 {
         return Err(format!("{} condition can't be a `&&`/`||` chain: `{}`", what, request));
     }
+    refuse_request(request)?;
     let (_, uri, _) = parse_request_line(request)
         .ok_or_else(|| format!("{} condition is not a request: `{}` — {}", what, request, usage))?;
     if outfile_marker_at(&uri).is_some() {
@@ -6473,7 +6526,7 @@ fn parse_import_directive(
             return Err(format!("an import reads one JSON file, not `@{}`", raw));
         }
         let path = match within {
-            Some(repo) => rebase_import_path(raw, file_dir, repo)?,
+            Some(repo) => rebase_import_body(raw, file_dir, repo)?,
             None => raw.to_string(),
         };
         let contents = resolve_at_file_body(&path)?.contents;
@@ -7208,15 +7261,73 @@ fn rebase_import_path(
     }
     // A pattern is no file, so it is every file it matches that is checked:
     // one of them may be a link out, or the directory they are in may be.
-    let pattern = resolved.to_string_lossy().to_string();
-    if pattern.chars().any(|c| c == '*' || c == '?' || c == '[') {
+    if is_glob_pattern(raw) {
+        let pattern = import_glob_pattern(raw, file_dir.unwrap_or(&repo.root));
         if let Ok(matches) = glob::glob_with(&pattern, glob_match_options()) {
             if matches.filter_map(|m| m.ok()).any(|m| leads_out(&m)) {
                 return Err(outside());
             }
         }
     }
-    Ok(pattern)
+    Ok(resolved.to_string_lossy().to_string())
+}
+
+/// Whether a path as a line wrote it is a pattern for several files.
+fn is_glob_pattern(path: &str) -> bool {
+    path.contains(['*', '?', '['])
+}
+
+/// The pattern `raw` of an imported file in `base`, the directory it is
+/// relative to. Only what the line wrote is a pattern: a `?`, `*` or `[` in
+/// the path of the import itself (a cache directory, or every canonical path
+/// on Windows, which starts with `\\?\`) is that character.
+fn import_glob_pattern(raw: &str, base: &std::path::Path) -> String {
+    normalize_path_lexically(&pattern_below(base, raw)).to_string_lossy().to_string()
+}
+
+/// The pattern `raw`, as a line wrote it, below the directory `base`, whose
+/// own name is no part of the pattern whatever characters it holds.
+fn pattern_below(base: &std::path::Path, raw: &str) -> PathBuf {
+    let base = base.to_string_lossy();
+    // The glob crate matches nothing under a verbatim path.
+    let base = if cfg!(windows) { without_verbatim_prefix(&base) } else { base.into_owned() };
+    PathBuf::from(glob::Pattern::escape(&base)).join(raw)
+}
+
+/// A Windows path without the `\\?\` that `canonicalize` puts in front of
+/// it: `\\?\C:\x` is `C:\x`, and `\\?\UNC\host\share` is `\\host\share`.
+fn without_verbatim_prefix(path: &str) -> String {
+    match path.strip_prefix(r"\\?\UNC\") {
+        Some(share) => format!(r"\\{}", share),
+        None => path.strip_prefix(r"\\?\").unwrap_or(path).to_string(),
+    }
+}
+
+/// The `@file` paths that are read as the one file they name, whatever
+/// characters they hold: the ones the client built for an imported file from
+/// a line that wrote no pattern.
+static LITERAL_BODIES: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+
+/// Whether `path` is one the client built, to be read as it is.
+fn is_literal_body(path: &str) -> bool {
+    LITERAL_BODIES.lock().ok().is_some_and(|built| built.as_ref().is_some_and(|set| set.contains(path)))
+}
+
+/// The `@file` body of an imported file as it is to be read: the one file in
+/// its repository, or the pattern the line wrote below a path that is not one.
+fn rebase_import_body(
+    raw: &str,
+    file_dir: Option<&std::path::Path>,
+    repo: &ImportedRepo,
+) -> Result<String, String> {
+    let path = rebase_import_path(raw, file_dir, repo)?;
+    if is_glob_pattern(raw) {
+        return Ok(import_glob_pattern(raw, file_dir.unwrap_or(&repo.root)));
+    }
+    if let Ok(mut built) = LITERAL_BODIES.lock() {
+        built.get_or_insert_with(Default::default).insert(path.clone());
+    }
+    Ok(path)
 }
 
 /// A step of an imported file with the `@file` body of its request, if it has
@@ -7277,7 +7388,7 @@ fn rebase_at_body(
     let (file_body, _) = parse_body_functions(&body);
     let functions = &body[file_body.len()..];
     let raw = file_body.trim_start_matches('@').trim();
-    let path = rebase_import_path(raw, file_dir, repo)?;
+    let path = rebase_import_body(raw, file_dir, repo)?;
     let rebased = format!("@{}{}", path, functions);
     let (uri, outfile) = split_uri_outfile(&uri_and_outfile);
     if let Ok(mut written) = WRITTEN_BODIES.lock() {
@@ -7843,9 +7954,13 @@ fn resolve_include_paths_as(
         path_buf
     };
 
-    let is_glob = expanded.chars().any(|c| c == '*' || c == '?' || c == '[');
-    if is_glob {
-        let pattern = resolved.to_string_lossy().to_string();
+    if is_glob_pattern(&expanded) {
+        // The directory of the including file is not what the line wrote.
+        let pattern = match base_dir {
+            Some(base) if std::path::Path::new(&expanded).is_relative() => pattern_below(base, &expanded),
+            _ => resolved,
+        };
+        let pattern = pattern.to_string_lossy().to_string();
         let mut matches: Vec<std::path::PathBuf> = glob::glob_with(&pattern, glob_match_options())
             .map_err(|e| format!("invalid include glob '{}': {}", include_spec, e))?
             .filter_map(|r| r.ok())
@@ -8801,8 +8916,9 @@ struct RequestParts {
     streaming: bool,
 }
 
-/// What an outfile's extension says the file holds. Read in any case, so
-/// `out.CSV` is a CSV file to `Accept` as it is to `>>`.
+/// What a file's extension says the file holds: an outfile's, and an `@file`
+/// body's. Read in any case, so `out.CSV` is a CSV file to `Accept` as it is
+/// to `>>`, and `@rows.CSV` is sent as one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutFormat {
     Json,
@@ -9041,6 +9157,11 @@ fn stream_to_outfile_with(
     if existing.as_ref().is_some_and(|meta| !meta.is_file()) {
         return stream_in_place(resp, &target);
     }
+    // A file that may not be written is not replaced by one that was: its
+    // mode says no here as it does to a buffered write.
+    if existing.is_some() {
+        fs::OpenOptions::new().write(true).open(&target).map_err(StreamFailure::Write)?;
+    }
     let Ok((part, file)) = create_part(&target) else {
         // No file can be made beside it. Whether the target itself can be
         // written is for the write to say.
@@ -9122,6 +9243,20 @@ impl OutTarget<'_> {
     fn marker(&self, bytes: u64) -> String {
         let name = if self.is_clipboard() { "clipboard" } else { self.display };
         outfile_marker(name, bytes, self.append)
+    }
+
+    /// Whether a response with `status` is kept from this target. A `>> file`
+    /// collects answers, and an error is not one: spliced into a list or
+    /// under a CSV header it would pass for a record. The file is left as it
+    /// was and the body is shown, as if there were no redirect. A `> file`
+    /// holds whatever was answered.
+    fn refuses(&self, status: reqwest::StatusCode) -> bool {
+        self.append && !status.is_success()
+    }
+
+    /// The line that stands where `marker` would, for a refused response.
+    fn refusal(&self) -> String {
+        format!(">> {} (not appended)", self.display)
     }
 }
 
@@ -9391,6 +9526,18 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
             exported.text
         }
         _ => body_text,
+    };
+
+    // An error is not appended to a `>> file`: it goes where it would have
+    // gone without the redirect.
+    let target = match target {
+        Some(target) if target.refuses(status) => {
+            if !config.silent && !config.bulk_silent {
+                errln!("{}", target.refusal().dimmed());
+            }
+            None
+        }
+        other => other,
     };
 
     if let Some(target) = &target {
@@ -9905,10 +10052,6 @@ fn handle_key_event(
                 let body = state.body_input_buffer.trim().to_string();
                 let method = state.body_input_method.clone();
                 let uri = state.body_input_uri.clone();
-                state.body_input_mode = false;
-                state.body_input_buffer.clear();
-                state.body_input_method.clear();
-                state.body_input_uri.clear();
 
                 let input = if body.is_empty() {
                     format!("{} {}", method, uri)
@@ -9916,7 +10059,20 @@ fn handle_key_event(
                     format!("{} {} {}", method, uri, body)
                 };
                 // Comments and raw newlines, as a `.api` file would have them.
-                let input = normalize_request_text(&input).unwrap_or(input);
+                // What the input line refuses is refused here: nothing is
+                // sent, and the editor stays open with the text to correct.
+                let read = normalize_request_text(&input).and_then(|text| refuse_request(&text).map(|()| text));
+                let input = match read {
+                    Ok(text) => text,
+                    Err(e) => {
+                        show_program_status(state, stdout, e)?;
+                        return Ok((false, None));
+                    }
+                };
+                state.body_input_mode = false;
+                state.body_input_buffer.clear();
+                state.body_input_method.clear();
+                state.body_input_uri.clear();
                 parse_input(state, &input);
                 state.history.push(input.clone());
                 append_history(&input);
@@ -10608,6 +10764,26 @@ fn extract_identifier_pairs(s: &str) -> Vec<(String, String)> {
     Vec::new()
 }
 
+/// An identifier as the URI segment that names its record: `key=value`, with
+/// what would end the segment or the URI percent-encoded in the value. A
+/// blank would start a body, a `/` another segment, a `?` or `#` the query
+/// or the fragment; `%` is encoded so the server reads back what was there.
+/// The request is sent with these as they are: a `%XX` is not encoded again.
+fn identifier_segment(key: &str, value: &str) -> String {
+    let mut out = format!("{}=", key);
+    for ch in value.chars() {
+        if ch.is_whitespace() || ch.is_control() || matches!(ch, '/' | '?' | '#' | '%') {
+            let mut buf = [0u8; 4];
+            for byte in ch.encode_utf8(&mut buf).bytes() {
+                out.push_str(&format!("%{:02X}", byte));
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// Place an expanded `identifier=value` (`kv`) into the URI's index slot — the
 /// last path segment of `before` (the text up to the cursor) — replacing or
 /// appending so repeated identifier pastes never accumulate:
@@ -10813,7 +10989,7 @@ fn handle_paste<W: Write>(
             };
 
             let (k, v) = &pairs[idx];
-            let kv = format!("{}={}", k, v);
+            let kv = identifier_segment(k, v);
             let note = if pairs.len() > 1 {
                 format!("paste: {} ({}/{})", kv, idx + 1, pairs.len())
             } else {
@@ -10998,6 +11174,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     // No status yet: one left from the request before would otherwise be
     // read as this one's if it is aborted or never sent.
     state.config.last_status = None;
+    state.write_failed = false;
 
     record_last_request(state);
 
@@ -11076,6 +11253,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
                             BodyDelivery::Streamed {
                                 overflowed: body.overflowed,
                                 error: None,
+                                unwritten: false,
                                 bytes: body.bytes,
                             },
                         ),
@@ -11084,6 +11262,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
                             String::new(),
                             BodyDelivery::Streamed {
                                 overflowed: false,
+                                unwritten: matches!(failure, StreamFailure::Write(_)),
                                 error: Some(match failure {
                                     StreamFailure::Write(e) => format!("Error writing to {}: {}", outfile_written, e),
                                     StreamFailure::Body(e) => describe_body_failure(&e, thread_config.timeout_secs),
@@ -11244,15 +11423,20 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
             // To a file or the clipboard. Under `-f` an error is not what
             // the outfile was meant to hold: the file is left alone and the
             // body is shown, as a batch does it.
-            let to_target = !state.config.outfile.is_empty() && !fail_fast_trips(&state.config, status.as_u16());
-            if to_target {
-                let target = OutTarget {
-                    path: &state.config.outfile,
-                    display: &state.display_outfile,
-                    append: state.config.outfile_append,
-                };
+            // Nor is an error appended to a `>> file`, with or without `-f`.
+            let target = (!state.config.outfile.is_empty()).then(|| OutTarget {
+                path: &state.config.outfile,
+                display: &state.display_outfile,
+                append: state.config.outfile_append,
+            });
+            let refused = target.as_ref().filter(|t| t.refuses(status)).map(|t| t.refusal());
+            let target = target.filter(|_| refused.is_none() && !fail_fast_trips(&state.config, status.as_u16()));
+            if let Some(target) = target {
                 // A streamed body is already on disk — only its failure, if
                 // any, is still to be reported.
+                // A body that stopped short while streaming is not a write
+                // that failed: it is a request that got no answer.
+                let unwritten = !matches!(delivery, BodyDelivery::Streamed { unwritten: false, .. });
                 let delivered: Result<u64, String> = match delivery {
                     BodyDelivery::Streamed { error: Some(ref e), .. } => Err(e.clone()),
                     BodyDelivery::Streamed { bytes, .. } => Ok(bytes),
@@ -11266,6 +11450,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
                         // What the request was to leave behind is not there:
                         // a chain stops here.
                         outcome = RequestOutcome::Errored;
+                        state.write_failed = unwritten;
                     }
                     Ok(written) => {
                         if !state.config.silent {
@@ -11294,6 +11479,9 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
                         status_str,
                         format_latency(elapsed).dimmed()
                     );
+                    if let Some(refusal) = &refused {
+                        block.head.push_str(&format!("{}\n", refusal.dimmed()));
+                    }
                 }
 
                 // Build body. The trailing blank line belongs to the head when
@@ -11701,11 +11889,16 @@ fn run_program_steps(
             BulkStep::Request(request) => {
                 parse_input(state, request);
                 // A plain line that is answered with an error status is
-                // logged and the next one runs, as in a batch. What got no
-                // answer at all (esc, no connection) stops the program.
+                // logged and the next one runs, as in a batch, and so is one
+                // whose outfile could not be written (which `-f` stops at).
+                // What got no answer at all (esc, no connection) stops the
+                // program.
                 let answered = match execute_request(state, stdout)? {
                     RequestOutcome::Truthy | RequestOutcome::Falsy => true,
-                    RequestOutcome::Errored => state.config.last_status.is_some_and(status_is_error),
+                    RequestOutcome::Errored => {
+                        (state.write_failed && !state.config.fail_fast)
+                            || state.config.last_status.is_some_and(status_is_error)
+                    }
                     RequestOutcome::Aborted => false,
                 };
                 // `-f` at the prompt stops the program, not the session.
@@ -15922,28 +16115,26 @@ struct AtFileResult {
 
 /// Resolve an `@<path>` body argument into request bytes.
 /// Supports single files and glob patterns (`*`, `?`, `[`). Multiple matched files
-/// are combined: `.ndjson`/`.njson` files concatenate as a single NDJSON stream;
-/// everything else parses as JSON and combines into a flat JSON array.
+/// are combined: `.ndjson`/`.njson` files (any case) concatenate as a single
+/// NDJSON stream; everything else parses as JSON and combines into a flat JSON array.
 fn resolve_at_file_body(path_raw: &str) -> Result<AtFileResult, String> {
     let expanded = expand_home(path_raw);
 
-    let is_glob = expanded.chars().any(|c| c == '*' || c == '?' || c == '[');
+    // A path the client built for an imported file is that file.
+    let is_glob = is_glob_pattern(&expanded) && !is_literal_body(path_raw);
 
     if !is_glob {
         // Single file — preserve existing behavior
         match fs::read(&expanded) {
             Ok(contents) => {
-                let (content_type, accept_type) =
-                    if expanded.ends_with(".ndjson") || expanded.ends_with(".njson") {
-                        (
-                            Some("application/x-ndjson".to_string()),
-                            Some("application/x-ndjson".to_string()),
-                        )
-                    } else if expanded.ends_with(".csv") {
-                        (Some("text/csv".to_string()), None)
-                    } else {
-                        (None, None)
-                    };
+                let (content_type, accept_type) = match outfile_format(&expanded) {
+                    OutFormat::Ndjson => (
+                        Some("application/x-ndjson".to_string()),
+                        Some("application/x-ndjson".to_string()),
+                    ),
+                    OutFormat::Csv => (Some("text/csv".to_string()), None),
+                    _ => (None, None),
+                };
                 Ok(AtFileResult {
                     contents,
                     content_type,
@@ -15964,10 +16155,7 @@ fn resolve_at_file_body(path_raw: &str) -> Result<AtFileResult, String> {
         }
         paths.sort();
 
-        let all_ndjson = paths.iter().all(|p| {
-            let s = p.to_string_lossy();
-            s.ends_with(".ndjson") || s.ends_with(".njson")
-        });
+        let all_ndjson = paths.iter().all(|p| is_ndjson_path(&p.to_string_lossy()));
 
         if all_ndjson {
             // NDJSON: concatenate file contents (ensure trailing newline between files)
@@ -18628,8 +18816,8 @@ mod tests {
             ("/x >out.json", Some(" >out.json")),
             ("/x", None),
             ("/x>out.json", None),
-            // A tab before `>` is not the marker: it takes a blank.
-            ("/x\t> out.json", None),
+            // A tab before `>` is a blank too.
+            ("/x\t> out.json", Some("\t> out.json")),
             ("/x {\"a\":\"b > c\"}", None),
             ("/x {\"a\":\"b > c\"} > out.json", Some(" > out.json")),
             ("/x {\"a\":\"\\\" > c\"} > out.json", Some(" > out.json")),
@@ -19785,6 +19973,44 @@ mod tests {
         assert!(r.iter().any(|c| c.ends_with("clipboard/")), "missing real dir: {:?}", r);
         // No bare virtual entry injected mid-path.
         assert!(!r.iter().any(|c| c == "clipboard"), "virtual clipboard wrongly added mid-path: {:?}", r);
+    }
+
+    #[test]
+    fn an_identifier_value_is_encoded_to_stay_one_uri_segment() {
+        let rows = [
+            ("007", "com.x.id=007"),
+            ("a-b_c.d~e", "com.x.id=a-b_c.d~e"),
+            ("A B", "com.x.id=A%20B"),
+            ("a/b", "com.x.id=a%2Fb"),
+            ("a?b", "com.x.id=a%3Fb"),
+            ("a#b", "com.x.id=a%23b"),
+            ("50%", "com.x.id=50%25"),
+            // Already encoded text is a value like any other.
+            ("a%20b", "com.x.id=a%2520b"),
+            ("a\tb\nc", "com.x.id=a%09b%0Ac"),
+            ("a\u{a0}b", "com.x.id=a%C2%A0b"),
+            ("Åsa", "com.x.id=Åsa"),
+            ("a=b&c", "com.x.id=a=b&c"),
+            ("", "com.x.id="),
+        ];
+        for (value, segment) in rows {
+            assert_eq!(identifier_segment("com.x.id", value), segment, "{value:?}");
+        }
+        // The segment is the whole of what the line gains: no body, no outfile.
+        let line = apply_identifier_index("PUT /people", &identifier_segment("com.x.name", "A B > c"));
+        assert_eq!(line, "PUT /people/com.x.name=A%20B%20>%20c");
+        assert_eq!(
+            parse_request_line(&line),
+            Some(("PUT".to_string(), "/people/com.x.name=A%20B%20>%20c".to_string(), String::new()))
+        );
+        // And the URL it is sent as keeps the encoding as it is.
+        let url = reqwest::Url::parse(&format!(
+            "http://h{}",
+            resolve_request_path("/api/v1", &format!("/people/{}", identifier_segment("com.x.name", "a/b?c#d 50%")))
+        ))
+        .unwrap();
+        assert_eq!(url.path(), "/api/v1/people/com.x.name=a%2Fb%3Fc%23d%2050%25");
+        assert_eq!((url.query(), url.fragment()), (None, None));
     }
 
     #[test]
@@ -20992,6 +21218,34 @@ mod tests {
                 "GET /people/123".to_string(),
                 "PUT /people/123 {\n  \"name\": \"Joe\"\n}".to_string(),
             ],
+        );
+        // In a segment that is not the last, and in more than one.
+        let input = "PUT /a {\n  \"x\": \"a && b\"\n} && GET /b || PUT /c [\n  1,\n  2\n] > out.json && GET /d";
+        assert_eq!(
+            split_request_chain(input),
+            vec![
+                (ChainOp::And, "PUT /a {\n  \"x\": \"a && b\"\n}".to_string()),
+                (ChainOp::And, "GET /b".to_string()),
+                (ChainOp::Or, "PUT /c [\n  1,\n  2\n] > out.json".to_string()),
+                (ChainOp::And, "GET /d".to_string()),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_file_reads_a_multi_line_body_in_a_chain_segment_that_is_not_the_last() {
+        let file = "GET /first\nPUT /a {\n  \"x\": 1, // one\n  \"y\": \"l1\nl2\"\n} && GET /b\nGET /last\n";
+        let program = split_bulk_requests(file, None).unwrap();
+        assert_eq!(
+            program.steps,
+            [
+                BulkStep::Request("GET /first".to_string()),
+                BulkStep::Chain(vec![
+                    (ChainOp::And, "PUT /a {\n  \"x\": 1, \n  \"y\": \"l1\\nl2\"\n}".to_string()),
+                    (ChainOp::And, "GET /b".to_string()),
+                ]),
+                BulkStep::Request("GET /last".to_string()),
+            ]
         );
     }
 
@@ -24939,5 +25193,231 @@ mod tests {
         // Neither as a link nor as a file holding the link's target.
         assert!(fs::symlink_metadata(dest.join("passwd")).is_err());
         assert!(fs::symlink_metadata(dest.join("up")).is_err());
+    }
+
+    /// Numbers no `f64` holds as they are written.
+    const EXACT_NUMBERS: &str = r#"{"big":12345678901234567890123,"frac":0.3333333333333333333333,"exp":1e+2,"neg":-0.10}"#;
+
+    fn holds_the_exact_numbers(text: &str, where_: &str) {
+        for digits in ["12345678901234567890123", "0.3333333333333333333333", "1e+2", "-0.10"] {
+            assert!(text.contains(digits), "{where_}: {digits} was rewritten in {text}");
+        }
+    }
+
+    #[test]
+    fn a_number_keeps_its_digits_wherever_a_body_is_read_as_json() {
+        let config = Config::default();
+        let list = format!("[{EXACT_NUMBERS}]");
+        // `> file.json`: indented, the digits as they came.
+        holds_the_exact_numbers(&outfile_text(&config, EXACT_NUMBERS), "> file.json");
+        // `> file.ndjson`: one compact line per element.
+        assert_eq!(ndjson_lines(&list).unwrap(), format!("{EXACT_NUMBERS}\n"));
+        // An exponent stays one. Its sign is written out, which is the one
+        // thing about a number that is not kept as it came.
+        assert_eq!(ndjson_lines("[1e2,1E2,1.50e-3,1E+2]").unwrap(), "1e+2\n1e+2\n1.50e-3\n1e+2\n");
+        // `--export`, indented, compact and by line.
+        for (ndjson, compact) in [(false, false), (false, true), (true, true)] {
+            holds_the_exact_numbers(&export_body(EXACT_NUMBERS, "com.heads.seedID", ndjson, compact).text, "--export");
+        }
+        // What `>>` adds, to a JSON file and to an NDJSON file.
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["out.json", "out.ndjson"] {
+            let path = dir.path().join(name);
+            let path = path.to_str().unwrap();
+            fs::write(path, "{\"a\":1}\n").unwrap();
+            append_to_outfile(path, &outfile_text(&config, &list)).unwrap();
+            holds_the_exact_numbers(&fs::read_to_string(path).unwrap(), name);
+        }
+        // A glob body: the files as one array.
+        fs::create_dir(dir.path().join("g")).unwrap();
+        fs::write(dir.path().join("g/a.json"), EXACT_NUMBERS).unwrap();
+        fs::write(dir.path().join("g/b.json"), &list).unwrap();
+        let body = resolve_at_file_body(&format!("{}/g/*.json", dir.path().display())).unwrap().contents;
+        assert_eq!(String::from_utf8(body).unwrap(), format!("[{EXACT_NUMBERS},{EXACT_NUMBERS}]"));
+    }
+
+    #[test]
+    fn every_spelling_of_zero_is_falsy_and_no_other_number_is() {
+        use RequestOutcome::*;
+        for zero in ["0", "-0", "0.0", "-0.0", "0.000", "0e0", "0E0", "0e10", "0.0e-5", "-0e+3"] {
+            assert_eq!(classify_response(200, zero), Falsy, "{zero}");
+            assert_eq!(classify_streamed(200, zero, false), Falsy, "{zero}");
+        }
+        for other in ["1", "-1", "0.1", "1e2", "1e-9", "0.0000000000000000000001", "12345678901234567890123", "1e999"] {
+            assert_eq!(classify_response(200, other), Truthy, "{other}");
+        }
+        // A number in a string or a list is not a number.
+        assert_eq!(classify_response(200, "\"0\""), Truthy);
+        assert_eq!(classify_response(200, "[0]"), Truthy);
+    }
+
+    #[test]
+    fn a_tab_before_the_marker_is_a_blank_like_any_other() {
+        fn marker(text: &str) -> Option<&str> {
+            outfile_marker_at(text).map(|at| &text[at..])
+        }
+        assert_eq!(marker("/x\t> out.json"), Some("\t> out.json"));
+        assert_eq!(marker("/x\t>> out.json"), Some("\t>> out.json"));
+        assert_eq!(marker("/x {\"a\":\"b\t> c\"}"), None);
+        // Unbalanced: the last one, whichever blank it has.
+        assert_eq!(marker("/x {\"a\": 1 > a\t> out.json"), Some("\t> out.json"));
+        for (line, uri) in [("GET /a\t> out.json", "/a > out.json"), ("GET /a\t>> out.json", "/a >> out.json")] {
+            let (_, parsed, body) = parse_request_line(line).unwrap();
+            assert_eq!((parsed.as_str(), body.as_str()), (uri, ""), "{line:?}");
+        }
+        let steps = split_bulk_requests("GET /a\t> out.json && GET /b\t>> b.json", None).unwrap().steps;
+        assert_eq!(
+            steps,
+            [BulkStep::Chain(vec![
+                (ChainOp::And, "GET /a\t> out.json".to_string()),
+                (ChainOp::And, "GET /b\t>> b.json".to_string())
+            ])]
+        );
+    }
+
+    #[test]
+    fn a_redirect_with_no_path_is_refused_wherever_it_is_written() {
+        const NEEDS: &str = "needs a path";
+        for line in [
+            "GET /c >",
+            "GET /c >>",
+            "GET /c\t>",
+            "/c >",
+            "PUT /c {\"x\":1} >",
+            "PUT /c {\"x\":1} >>  ",
+            "GET /a && GET /c >",
+            "GET /c > && GET /a",
+            "GET /c >> || GET /a",
+            "assert GET /x >",
+            "assert not GET /x >>",
+            "sleep while GET /x >",
+            "sleep 1 while not /x >>",
+        ] {
+            let err = split_bulk_requests(line, None).unwrap_err();
+            assert!(err.contains(NEEDS), "{line:?}: {err}");
+        }
+        // A `>` that is the request's own is not a redirect at all.
+        for line in ["PUT /c {\"x\":\"a >\"}", "GET /c~where(a >)", "GET /c>"] {
+            assert!(split_bulk_requests(line, None).is_ok(), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_condition_that_breaks_off_at_a_separator_is_refused_like_a_plain_line() {
+        const BOTH_SIDES: &str = "a `&&` or `||` needs a request on both sides";
+        for line in [
+            "assert GET /a ||",
+            "assert not GET /x &&",
+            "sleep while GET /a &&",
+            "sleep 2 while not GET /a ||",
+            "assert && GET /a",
+        ] {
+            let err = split_bulk_requests(line, None).unwrap_err();
+            assert!(err.contains(BOTH_SIDES), "{line:?}: {err}");
+        }
+        // A separator that is the request's own is no chain.
+        for line in ["assert GET /a~where(x=1||y=2)", "sleep while PUT /a {\"x\":\"a && b\"}"] {
+            assert!(split_bulk_requests(line, None).is_ok(), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_body_that_is_not_json_ends_at_a_trailing_comment() {
+        let steps = split_bulk_requests("PUT /x a # b", None).unwrap().steps;
+        assert_eq!(steps, [BulkStep::Request("PUT /x a".to_string())]);
+        assert_eq!(
+            parse_request_line("PUT /x a"),
+            Some(("PUT".to_string(), "/x".to_string(), "a".to_string()))
+        );
+        assert_eq!(normalize_request_text("PUT /x a # b").unwrap(), "PUT /x a");
+    }
+
+    #[test]
+    fn the_extension_of_a_file_body_is_read_in_any_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let at = |name: &str| resolve_at_file_body(&format!("{}/{}", d.display(), name)).unwrap();
+        let kinds = |file: &AtFileResult| (file.content_type.clone(), file.accept_type.clone());
+        let ndjson = (Some("application/x-ndjson".to_string()), Some("application/x-ndjson".to_string()));
+
+        for name in ["d.csv", "D.CSV", "d.Csv"] {
+            fs::write(d.join(name), "a,b\n1,2\n").unwrap();
+            assert_eq!(kinds(&at(name)), (Some("text/csv".to_string()), None), "{name}");
+        }
+        for name in ["e.ndjson", "E.NDJSON", "f.njson", "F.NJSON", "g.NdJson"] {
+            fs::write(d.join(name), "{\"a\":1}\n").unwrap();
+            assert_eq!(kinds(&at(name)), ndjson, "{name}");
+        }
+        fs::write(d.join("h.json"), "{}").unwrap();
+        assert_eq!(kinds(&at("h.json")), (None, None));
+
+        // A glob of them is one NDJSON stream, in sorted order, not JSON.
+        fs::create_dir(d.join("g")).unwrap();
+        fs::write(d.join("g/b.NDJSON"), "{\"b\":2}\n{\"b\":3}").unwrap();
+        fs::write(d.join("g/a.NJSON"), "{\"a\":1}\n").unwrap();
+        fs::write(d.join("g/c.ndjson"), "{\"c\":4}\n").unwrap();
+        let stream = at("g/*");
+        assert_eq!(kinds(&stream), ndjson);
+        assert_eq!(String::from_utf8(stream.contents).unwrap(), "{\"a\":1}\n{\"b\":2}\n{\"b\":3}\n{\"c\":4}\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stream_to_a_file_that_cannot_be_written_is_a_write_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("ro.json");
+        fs::write(&target, "old").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o444)).unwrap();
+        // Whoever may write anything (root) is not told no.
+        if fs::OpenOptions::new().write(true).open(&target).is_ok() {
+            return;
+        }
+        let streamed = stream_to_outfile(&b"[1,2]"[..], target.to_str().unwrap());
+        assert!(matches!(streamed, Err(StreamFailure::Write(_))));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "old");
+        assert_eq!(fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o444);
+        assert_eq!(names_in(dir.path()), ["ro.json"]);
+        // Through a link too: the file it names is the target.
+        std::os::unix::fs::symlink("ro.json", dir.path().join("link.json")).unwrap();
+        let streamed = stream_to_outfile(&b"[1,2]"[..], dir.path().join("link.json").to_str().unwrap());
+        assert!(matches!(streamed, Err(StreamFailure::Write(_))));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "old");
+    }
+
+    #[test]
+    fn the_path_of_an_import_is_no_part_of_a_pattern() {
+        let base = std::path::Path::new("/cache/lib?/a[1]/st*r");
+        assert_eq!(import_glob_pattern("data/*.json", base), "/cache/lib[?]/a[[]1[]]/st[*]r/data/*.json");
+        assert_eq!(import_glob_pattern("../x?.json", base), "/cache/lib[?]/a[[]1[]]/x?.json");
+        assert_eq!(import_glob_pattern("./[ab].json", std::path::Path::new("/plain")), "/plain/[ab].json");
+        // What `canonicalize` puts in front of a path on Windows.
+        assert_eq!(without_verbatim_prefix(r"\\?\C:\Users\me\cache"), r"C:\Users\me\cache");
+        assert_eq!(without_verbatim_prefix(r"\\?\UNC\host\share\cache"), r"\\host\share\cache");
+        assert_eq!(without_verbatim_prefix(r"C:\Users\me"), r"C:\Users\me");
+        assert_eq!(without_verbatim_prefix("/tmp/x"), "/tmp/x");
+
+        // A path the client built is the file it names; the same characters
+        // written on a line are a pattern.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("lib?");
+        fs::create_dir_all(root.join("rows")).unwrap();
+        fs::create_dir_all(dir.path().join("libX/rows")).unwrap();
+        fs::write(root.join("body.json"), r#"{"name":"Ann"}"#).unwrap();
+        fs::write(root.join("rows/a.json"), r#"{"a":1}"#).unwrap();
+        fs::write(dir.path().join("libX/body.json"), r#"{"name":"decoy"}"#).unwrap();
+        fs::write(dir.path().join("libX/rows/a.json"), r#"{"z":9}"#).unwrap();
+        let repo = ImportedRepo { alias: "lib".to_string(), checkout: root.clone(), root: root.clone(), host: None };
+        let sent = |raw: &str| {
+            let path = rebase_import_body(raw, None, &repo).unwrap();
+            String::from_utf8(resolve_at_file_body(&path).unwrap().contents).unwrap()
+        };
+        assert_eq!(sent("body.json"), r#"{"name":"Ann"}"#);
+        assert_eq!(sent("rows/*.json"), r#"[{"a":1}]"#);
+        assert_eq!(sent("rows/?.json"), r#"[{"a":1}]"#);
+        // The same path from a line of the batch's own is a pattern, as ever.
+        let typed = dir.path().canonicalize().unwrap().join("lib?/rows/a.json");
+        let both = String::from_utf8(resolve_at_file_body(typed.to_str().unwrap()).unwrap().contents).unwrap();
+        assert_eq!(both, r#"[{"a":1},{"z":9}]"#);
     }
 }

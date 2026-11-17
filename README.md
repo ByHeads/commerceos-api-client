@@ -89,7 +89,7 @@ raw newlines inside strings escaped, and a `> file` may sit in any argument.
 
 ### Bodies
 
-- `@file` reads the body from a file. Content type follows the extension (`.json`, `.csv`, `.ndjson`).
+- `@file` reads the body from a file. Content type follows the extension (`.json`, `.csv`, `.ndjson`), read in any case.
 - `@dir/*.json` combines matching files into one JSON array; `@dir/*.ndjson` concatenates them.
 - `@file~map(typeName)` sends the type as an `X-Request-Map` header for streamed transformations:
 
@@ -110,7 +110,7 @@ api GET /products > products.json          # handled by the shell: plain stdout 
 | Target | Effect |
 |---|---|
 | `> file` | write the body to `file` (`~/` is expanded) |
-| `>> file` | append: JSON merges into one array, NDJSON gets one object per line, CSV drops the duplicate header, other text appends |
+| `>> file` | append: JSON merges into one array, NDJSON gets one object per line, CSV drops the duplicate header, other text appends. A non-2xx body is not appended: it is shown, and the file is left as it was |
 | `> clipboard` | copy the body to the system clipboard (case-insensitive) |
 
 The extension of the target sets the `Accept` header: `.csv` → `text/csv`,
@@ -119,6 +119,9 @@ So `GET "/products~map(com.heads.sql-product) > products.sql"` asks for SQL.
 
 After the status line the client prints the target and the size written, e.g.
 `> products.json (47.1 KB)` or `>> products.json (+1.2 KB)`.
+
+The `>` takes a blank in front of it (a space or a tab) and a path behind it; a `>` with
+no path is an error. Numbers in a body written to a file keep the digits the server sent.
 
 ### Chaining
 
@@ -266,7 +269,8 @@ Paste JSON onto the URI and the client turns it into an index segment. Any of th
 
 Pasting the first one onto `GET /people` gives `GET /people/com.heads.seedID=joe`. Paste it
 again within 10 seconds to cycle to `com.erp.id=42`. An existing `key=value` segment is
-replaced, so repeated pastes never pile up. Trailing commas from a copied fragment are fine,
+replaced, so repeated pastes never pile up. A value stays one segment: a blank, `/`, `?`, `#`
+and `%` in it are percent-encoded (`"A B"` becomes `com.x.name=A%20B`). Trailing commas from a copied fragment are fine,
 and `@type`/`@id` are never used as identifiers.
 
 Pasting a whole request line (`GET /people/...`) replaces the input. Pasting a JSON body after
