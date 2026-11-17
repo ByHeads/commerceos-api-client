@@ -1432,6 +1432,38 @@ fn a_malformed_credentials_file_is_reported_and_left_alone() {
     assert!(got.stderr.contains(".api-credentials.json"), "{}", got.stderr);
     assert!(got.stderr.contains("no base URL specified"), "{}", got.stderr);
 
+    // A connection asked for by name is not found in it, and the reason is
+    // said first.
+    let named = run_bare(&server, d, &["-c", "keep", "GET", "/a"]);
+    assert_eq!((named.code, named.sent.len()), (Some(1), 0));
+    assert!(named.stderr.contains("WARNING: could not read"), "{}", named.stderr);
+    assert!(named.stderr.contains("Connection \"keep\" not found. Saved connections: none"), "{}", named.stderr);
+
+    // A file that may not be read is reported the same way, and one with
+    // nothing in it is a store with nothing saved: no warning.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let locked = tempfile::tempdir().unwrap();
+        let path = locked.path().join(".api-credentials.json");
+        write_credentials(locked.path(), &[("keep", format!("http://127.0.0.1:{}", server.port), "key", "k", "")], "keep");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let got = run_bare(&server, locked.path(), &["GET", "/a"]);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!((got.code, got.sent.len()), (Some(1), 0), "{}", got.stderr);
+        assert!(got.stderr.contains("WARNING: could not read"), "{}", got.stderr);
+        assert!(got.stderr.contains("no base URL specified"), "{}", got.stderr);
+
+        std::fs::write(&path, "").unwrap();
+        let got = run_bare(&server, locked.path(), &["GET", "/a"]);
+        assert_eq!((got.code, got.sent.len()), (Some(1), 0), "{}", got.stderr);
+        assert!(!got.stderr.contains("WARNING"), "{}", got.stderr);
+        assert!(got.stderr.contains("no base URL specified"), "{}", got.stderr);
+        // And it can be written to.
+        let url = format!("http://127.0.0.1:{}", server.port);
+        let got = run_bare(&server, locked.path(), &["-b", &url, "-k", "k", "GET", "/a"]);
+        assert_eq!((got.code, got.sent.len()), (Some(0), 1), "{}", got.stderr);
+    }
+
     // At the prompt, saving the connection in use does not replace the file.
     let mut prompt = Prompt::open(api(server.port, d));
     prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
@@ -3568,6 +3600,34 @@ fn a_spec_that_cannot_be_read_is_said_with_b_and_with_c() {
         let seen = pump_until(&mut prompt, Duration::from_secs(4), |p| pty::plain(&p.screen).contains(notice));
         assert_eq!(seen, said, "{args:?}: {}", pty::plain(&prompt.screen));
     }
+}
+
+/// A save reads the store afresh: a connection another session saved since
+/// this one started is still there afterwards.
+#[cfg(unix)]
+#[test]
+fn a_save_keeps_what_was_saved_from_outside_in_the_meantime() {
+    let server = RecordingServer::start();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write_credentials(d, &[("a", url.clone(), "key", "AKEY", ""), ("b", url.clone(), "key", "BKEY", "")], "a");
+    let mut cmd = api_bare(d);
+    cmd.args(["-c", "a"]);
+    let mut prompt = pty::Prompt::open(cmd);
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(500));
+
+    write_credentials(
+        d,
+        &[("a", url.clone(), "key", "AKEY", ""), ("b", url.clone(), "key", "BKEY", ""), ("third", url.clone(), "key", "CKEY", "")],
+        "b",
+    );
+    save_as(&mut prompt, "a", "connection a saved");
+    assert_eq!(
+        stored(d),
+        (vec!["a=AKEY".to_string(), "b=BKEY".to_string(), "third=CKEY".to_string()], "b".to_string())
+    );
 }
 
 /// `ctrl+q` shows what is saved now. A file that was broken when the session

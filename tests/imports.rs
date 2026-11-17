@@ -604,6 +604,50 @@ fn an_include_that_climbs_out_of_a_directory_import_is_refused() {
     assert_eq!(server.sent(), Vec::<String>::new());
 }
 
+/// A request from an imported file is logged, and previewed, with its
+/// `@file` body as the line has it, whatever the import is and wherever the
+/// file really is: never the path in the import cache.
+#[test]
+fn a_file_body_of_an_import_is_logged_as_written_for_every_kind() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", fixture_archive());
+    let written = [
+        "PUT /seed/body @data/body.json\n",
+        "PUT /bodies/people @data/people/*.json\n",
+        "PUT /bodies/events @data/events.ndjson\n",
+        // A body function stays on the path it follows.
+        "PUT /bodies/rows @data/rows.csv~map(com.heads.test-rows)\n",
+        // And so does a body in a segment of a chain.
+        "PUT /chain/second @data/body.json~map(com.heads.test)\n",
+    ];
+    for (kind, import) in each_kind(&dir, &server) {
+        let batch = format!("{import}\nlib/seed.api\nlib/bodies.api\nlib/chain.api\n");
+        let ran = run_batch(&dir, server.port, "-sa", &batch);
+        assert!(ran.ok, "{kind}: {}", ran.stderr);
+        for line in written {
+            assert!(ran.stdout.contains(line), "{kind}: {line:?} is not in\n{}", ran.stdout);
+        }
+        // Only the directory import's own log line names where it is.
+        let requests: String = ran.stdout.lines().filter(|l| !l.starts_with("import ")).collect::<Vec<_>>().join("\n");
+        assert!(!requests.contains(".import-cache"), "{kind}: {requests}");
+        assert!(!requests.contains(&fixture().display().to_string()), "{kind}: {requests}");
+        server.sent();
+
+        // The preview lists them the same way, and sends nothing when declined.
+        std::fs::write(dir.join("batch.api"), &batch).unwrap();
+        let mut cmd = api(&dir, server.port);
+        cmd.args(["-spa", "batch.api"]);
+        let preview = finish(cmd, "n\n");
+        for line in written {
+            // A chain's later segment is listed behind its `&&`.
+            assert!(preview.stderr.contains(&format!(" {line}")), "{kind}: {line:?} is not in\n{}", preview.stderr);
+        }
+        let listed: String = preview.stderr.lines().filter(|l| !l.trim_start().starts_with("import ")).collect::<Vec<_>>().join("\n");
+        assert!(!listed.contains(".import-cache"), "{kind}: {listed}");
+        assert_eq!(server.api_requests(), Vec::<String>::new(), "{kind}");
+    }
+}
+
 /// A directory import whose files are made by the test: `lib/` in `dir`, and
 /// the batch line that imports it.
 fn own_import(dir: &Path, files: &[(&str, &str)]) -> String {

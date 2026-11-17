@@ -7062,21 +7062,29 @@ fn rebase_step(step: BulkStep, file_dir: Option<&std::path::Path>, repo: &Import
     })
 }
 
-/// The `@file` bodies of imported files as they were written, by the body
-/// they were rebased to. A request from an import is sent with the path its
+/// The `@file` bodies of imported files as they were written, by the request
+/// they were rebased in. A request from an import is sent with the path its
 /// file really has, and logged with the one its line has.
+///
+/// By the request and not by the body alone: two files of an import may name
+/// the same file each in its own way (`@data/a.json`, `@../data/a.json`).
 static WRITTEN_BODIES: std::sync::Mutex<Option<HashMap<String, String>>> = std::sync::Mutex::new(None);
+
+/// What a request's `@file` body is kept under in `WRITTEN_BODIES`.
+fn written_body_key(method: &str, uri: &str, body: &str) -> String {
+    format!("{} {} {}", method.to_uppercase(), split_uri_outfile(uri).0.trim(), body)
+}
 
 /// A body as its line wrote it: for the `@file` body of an imported file,
 /// the path in the file, not the one in the cache it was resolved to.
-fn body_as_written(body: &str) -> String {
+fn body_as_written(method: &str, uri: &str, body: &str) -> String {
     if !body.starts_with('@') {
         return body.to_string();
     }
     WRITTEN_BODIES
         .lock()
         .ok()
-        .and_then(|written| written.as_ref().and_then(|map| map.get(body).cloned()))
+        .and_then(|written| written.as_ref().and_then(|map| map.get(&written_body_key(method, uri, body)).cloned()))
         .unwrap_or_else(|| body.to_string())
 }
 
@@ -7099,10 +7107,10 @@ fn rebase_at_body(
     let raw = file_body.trim_start_matches('@').trim();
     let path = rebase_import_path(raw, file_dir, repo)?;
     let rebased = format!("@{}{}", path, functions);
-    if let Ok(mut written) = WRITTEN_BODIES.lock() {
-        written.get_or_insert_with(HashMap::new).insert(rebased.clone(), body.clone());
-    }
     let (uri, outfile) = split_uri_outfile(&uri_and_outfile);
+    if let Ok(mut written) = WRITTEN_BODIES.lock() {
+        written.get_or_insert_with(HashMap::new).insert(written_body_key(&method, uri, &rebased), body.clone());
+    }
     Ok(format!("{} {} {}{}", method, uri, rebased, outfile))
 }
 
@@ -7931,7 +7939,7 @@ fn split_bulk_requests_in_session(contents: &str, export: Option<String>) -> Res
 /// The body is compacted (JSON re-serialized without whitespace) when possible,
 /// matching the bulk-silent status-line format.
 fn format_request_preview(method: &str, uri: &str, body: &str) -> String {
-    let display_body = compact_body_for_display(&body_as_written(body));
+    let display_body = compact_body_for_display(&body_as_written(method, uri, body));
     if display_body.is_empty() {
         return format!("{} {}", method, uri);
     }
@@ -10963,7 +10971,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     let mut block = OutputBlock {
         method: state.method.clone(),
         uri: state.uri.clone(),
-        body: body_as_written(&state.body),
+        body: body_as_written(&state.method, &state.uri, &state.body),
         display_outfile: state.display_outfile.clone(),
         outfile_append: state.config.outfile_append,
         prefix: std::mem::take(&mut state.log_prefix),

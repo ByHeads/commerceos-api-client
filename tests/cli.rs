@@ -3794,3 +3794,140 @@ fn assert_flag_lists_every_put_assert_body_in_one_array() {
         .stdout("")
         .stderr("error: --describe and --assert each print a document of their own: use one\n");
 }
+
+#[test]
+fn describe_reads_a_file_however_it_is_named_or_encoded() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    // A byte order mark and CRLF line ends, as Windows Notepad writes them.
+    std::fs::write(d.join("bom.api"), "\u{feff}{ \"title\": { \"en\": \"Bom\" } }\r\nGET /a\r\n").unwrap();
+    bare_api(d).args(["-r", "--describe", "bom.api"]).assert().success().stdout("{\"title\":{\"en\":\"Bom\"}}\n").stderr("");
+    // `~/` is the home directory.
+    bare_api(d)
+        .env("HOME", d)
+        .args(["-r", "--describe", "~/bom.api"])
+        .assert()
+        .success()
+        .stdout("{\"title\":{\"en\":\"Bom\"}}\n");
+
+    // What would stop a run stops this too, with nothing on stdout.
+    for (text, says) in [
+        ("{ \"title\": {} }\n{ \"title\": {} }\nGET /a\n", "error: a file has one describe block, and this is a second\n"),
+        ("[ { \"title\": {} } ]\nGET /a\n", "error: a describe block is a JSON object, not an array\n"),
+        ("{ \"title\": {\nGET /a\n", "error: unclosed describe block (depth 2)\n"),
+        // A directive is one line, whatever brackets it holds.
+        ("confirm Send [x?\n{ \"title\": {} }\n", "error: a describe block must come before the first request\n"),
+    ] {
+        std::fs::write(d.join("stop.api"), text).unwrap();
+        bare_api(d).args(["--describe", "stop.api"]).assert().failure().stdout("").stderr(says);
+    }
+    // A `url` line may stand above the block, with a bracket it never closes.
+    std::fs::write(d.join("gated.api"), "url has [x\n{ \"title\": { \"en\": \"T\" } }\nGET /a\n").unwrap();
+    bare_api(d).args(["-r", "--describe", "gated.api"]).assert().success().stdout("{\"title\":{\"en\":\"T\"}}\n");
+}
+
+#[test]
+fn describe_first_follows_the_locale_and_prints_only_the_file_that_is_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::write(d.join("cat.api"), DESCRIBED).unwrap();
+    std::fs::write(d.join("only.api"), "{ \"title\": { \"en\": \"Only\" } }\n").unwrap();
+    std::fs::write(d.join("inc.api"), "{ \"title\": { \"en\": \"Included\" } }\nGET /inc\n").unwrap();
+    std::fs::write(d.join("main.api"), "{ \"title\": { \"en\": \"Main\" } }\ninc.api\n").unwrap();
+    let connected = |d: &std::path::Path| {
+        let mut cmd = bare_api(d);
+        cmd.args(["--no-keychain", "-b", "http://localhost:1", "-k", "x"]);
+        cmd
+    };
+    let declined = |env: &[(&str, &str)], args: &[&str]| {
+        let mut cmd = connected(d);
+        cmd.env("LANG", "en_GB.UTF-8");
+        for (name, value) in env {
+            cmd.env(name, value);
+        }
+        let out = cmd.args(args).write_stdin("n\n").output().unwrap();
+        assert!(out.status.success(), "{args:?}");
+        String::from_utf8(out.stderr).unwrap()
+    };
+
+    // `LC_MESSAGES` is asked before `LANG`, and `LC_ALL` before both.
+    assert!(declined(&[], &["-spma", "cat.api"]).starts_with("Catalog\n"));
+    assert!(declined(&[("LC_MESSAGES", "sv_SE.UTF-8")], &["-spma", "cat.api"]).starts_with("Katalog\n"));
+    assert!(declined(&[("LC_MESSAGES", "sv_SE.UTF-8"), ("LC_ALL", "en_GB.UTF-8")], &["-spma", "cat.api"]).starts_with("Catalog\n"));
+    assert!(declined(&[("LC_ALL", "sv_SE.UTF-8")], &["-spma", "cat.api"]).starts_with("Katalog\n"));
+
+    // The block of an included file is that file's: it is not printed.
+    let shown = declined(&[], &["-spma", "main.api"]);
+    assert!(shown.starts_with("Main\n\nPreview — 1 request"), "{shown}");
+    assert!(!shown.contains("Included"), "{shown}");
+    // A file named with `~/`.
+    let mut home = connected(d);
+    let out = home.env("HOME", d).env("LANG", "en_GB.UTF-8").args(["-spm", "~/cat.api"]).write_stdin("n\n").output().unwrap();
+    assert!(String::from_utf8(out.stderr).unwrap().starts_with("Catalog\n"));
+
+    // Without `-p`, and for a file that only describes: the block is
+    // printed, nothing is sent, and that is no failure.
+    for args in [&["-sma", "only.api"][..], &["-ma", "only.api"]] {
+        let out = connected(d).env("LANG", "en_GB.UTF-8").args(args).output().unwrap();
+        assert!(out.status.success(), "{args:?}");
+        assert!(String::from_utf8(out.stderr).unwrap().starts_with("Only\n"), "{args:?}");
+    }
+    // The same file read from stdin.
+    let out = connected(d)
+        .env("LANG", "en_GB.UTF-8")
+        .args(["-sma", "-"])
+        .write_stdin("{ \"title\": { \"en\": \"Piped\" } }\n")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8(out.stderr).unwrap().starts_with("Piped\n"));
+}
+
+#[test]
+fn assert_flag_reads_every_kind_of_body_and_says_what_it_cannot_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let file = |name: &str, text: &[u8]| std::fs::write(d.join(name), text).unwrap();
+    std::fs::create_dir(d.join("people")).unwrap();
+    file("asserts.csv", b"{\"api/v1/m\":{\"is\":1}}");
+    file("people/a.json", b"{\"api/v1/p1\":{\"is\":1}}");
+    file("people/b.json", b"[{\"api/v1/p2\":{\"is\":2}}]");
+    // A body function on the file, and a glob, which is the one array the
+    // request would send.
+    file("files.api", b"PUT /assert @asserts.csv~map(com.heads.x)\nPUT /assert @people/*.json\nPUT /assert?x=1 {\"q\":{\"is\":1}}\n");
+    bare_api(d)
+        .args(["-r", "--assert", "files.api"])
+        .assert()
+        .success()
+        .stdout("[{\"api/v1/m\":{\"is\":1}},[{\"api/v1/p1\":{\"is\":1}},{\"api/v1/p2\":{\"is\":2}}],{\"q\":{\"is\":1}}]\n");
+
+    // Indented unless `-r`, from a file and from stdin.
+    let indented = "[\n  {\n    \"a\": {\n      \"is\": 1\n    }\n  }\n]\n";
+    file("one.api", b"PUT /assert {\"a\":{\"is\":1}}\n");
+    bare_api(d).args(["--assert", "one.api"]).assert().success().stdout(indented);
+    bare_api(d).args(["--assert", "-"]).write_stdin("PUT /assert {\"a\":{\"is\":1}}\n").assert().success().stdout(indented);
+
+    // A byte order mark and CRLF, and the endpoint under `--me`.
+    file("bom.api", "\u{feff}{ \"title\": {} }\r\nPUT /assert { \"a\": { \"is\": 1 } }\r\n".as_bytes());
+    bare_api(d).args(["-r", "--assert", "bom.api"]).assert().success().stdout("[{\"a\":{\"is\":1}}]\n");
+    file("me.api", b"PUT /assert { \"x\": { \"is\": 1 } }\nPUT /api/me/v1/assert { \"y\": { \"is\": 2 } }\nPUT /people/assert { \"z\": 1 }\n");
+    for flags in [&["-r", "--assert", "me.api"][..], &["--me", "-r", "--assert", "me.api"]] {
+        bare_api(d).args(flags).assert().success().stdout("[{\"x\":{\"is\":1}},{\"y\":{\"is\":2}}]\n");
+    }
+
+    // What can't be read is an error, with nothing on stdout.
+    file("nobody.api", b"PUT /assert\nGET /a\n");
+    file("bin.json", b"\xff\xfe{}");
+    file("bin.api", b"PUT /assert @bin.json\n");
+    file("inc.api", b"nope/missing.api\n");
+    file("nofile.api", b"PUT /assert @gone.json\n");
+    for (name, says) in [
+        ("nobody.api", "error: the body of `PUT /assert` is not JSON: "),
+        ("bin.api", "error: not UTF-8 text: @bin.json"),
+        ("inc.api", "error: include not found: nope/missing.api"),
+        ("nofile.api", "error: "),
+        ("missing.api", "error: could not read missing.api"),
+    ] {
+        bare_api(d).args(["--assert", name]).assert().failure().stdout("").stderr(predicate::str::starts_with(says));
+    }
+}
