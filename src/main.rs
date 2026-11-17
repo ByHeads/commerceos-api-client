@@ -10097,8 +10097,10 @@ fn handle_key_event(
                         let cursor_in_body = state.cursor_pos.saturating_sub(char_len(&state.input[..bs]));
                         let (formatted, new_body_cursor) = reformat_json_multiline(body, cursor_in_body);
                         let prefix_char_len = char_len(prefix);
-                        state.input = format!("{}\n{}", prefix, formatted);
-                        // +1 for the newline between prefix and body
+                        // The body stays on the request line, where a body
+                        // starts: on the line under it, it is not one.
+                        state.input = format!("{} {}", prefix, formatted);
+                        // +1 for the space between prefix and body
                         state.cursor_pos = prefix_char_len + 1 + new_body_cursor;
 
                         // The reformat already placed the cursor on a new indented line
