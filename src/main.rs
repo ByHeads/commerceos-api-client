@@ -3642,9 +3642,14 @@ fn main() {
             );
             exit_process(1);
         }
+        // A body that can't be read is not an empty one: nothing is sent.
         let mut stdin_content = String::new();
-        if io::stdin().read_to_string(&mut stdin_content).is_ok() {
-            body = stdin_content.trim().to_string();
+        match io::stdin().read_to_string(&mut stdin_content) {
+            Ok(_) => body = stdin_content.trim().to_string(),
+            Err(e) => {
+                errln!("error: could not read the body from stdin: {}", e);
+                exit_process(1);
+            }
         }
     }
 
@@ -4126,8 +4131,13 @@ fn parse_positional_args(
         }
     }
 
+    // With the method left out, the "URI" argument is the first of the rest.
     if let Some(b) = body {
-        result_body = b;
+        if result_body.is_empty() {
+            result_body = b;
+        } else if !b.is_empty() {
+            result_body = format!("{} {}", result_body, b);
+        }
     }
 
     (result_method, result_uri, result_body)
@@ -4665,6 +4675,8 @@ fn strip_body_comments_and_count(s: &str) -> (String, i32) {
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
     let mut depth: i32 = 0;
+    // Parentheses of a URI operator, which hold no comment either.
+    let mut parens: i32 = 0;
     let mut in_string = false;
     let mut escape = false;
 
@@ -4684,7 +4696,18 @@ fn strip_body_comments_and_count(s: &str) -> (String, i32) {
             continue;
         }
 
-        // Strip comments only inside JSON bodies (depth > 0)
+        // Behind the request, a ` # …` runs to the end of the line. It needs
+        // the blank in front, so `/people#x` and `id=#5` are left alone.
+        if depth <= 0 && parens <= 0 && ch == '#' && (i == 0 || chars[i - 1].is_whitespace()) {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            let kept = out.trim_end_matches([' ', '\t']).len();
+            out.truncate(kept);
+            continue;
+        }
+
+        // The other comment styles only inside JSON bodies (depth > 0)
         if depth > 0 {
             // `// ...` line comment
             if ch == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
@@ -4728,12 +4751,51 @@ fn strip_body_comments_and_count(s: &str) -> (String, i32) {
                 depth -= 1;
                 out.push(ch);
             }
+            '(' => {
+                parens += 1;
+                out.push(ch);
+            }
+            ')' => {
+                parens -= 1;
+                out.push(ch);
+            }
             _ => out.push(ch),
         }
         i += 1;
     }
 
     (out, depth)
+}
+
+/// A directive or include line without its trailing ` # comment`: the first
+/// `#` that follows a blank and is outside quotes, brackets and parentheses,
+/// the rule `strip_body_comments_and_count` has for a request.
+fn without_trailing_comment(line: &str) -> &str {
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    let mut after_blank = false;
+    for (i, ch) in line.char_indices() {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' | '[' | '(' => depth += 1,
+            '}' | ']' | ')' => depth -= 1,
+            '#' if depth <= 0 && after_blank => return line[..i].trim_end(),
+            _ => {}
+        }
+        after_blank = ch.is_whitespace();
+    }
+    line
 }
 
 /// Special `> outfile` sentinel: when the outfile is the bare token "clipboard"
@@ -5515,6 +5577,10 @@ fn export_identifiers(object: &mut Map<String, Value>, id_key: &str) {
             // An answer never carries one. If it did, the key read beside it
             // is the one to go by, and the two may not stand together.
             "key?" => {}
+            // Listed as one the record doesn't have: the key takes the name.
+            _ if only_key && name == id_key => {
+                identifiers.entry(name).or_insert(value);
+            }
             _ => {
                 identifiers.insert(name, value);
             }
@@ -5787,6 +5853,21 @@ fn chain_segment_should_run(prev: Option<RequestOutcome>, op: ChainOp) -> bool {
 /// every line as a chain. Empty segments (from a stray or trailing separator)
 /// are dropped; the following segment keeps its own operator.
 fn split_request_chain(input: &str) -> Vec<(ChainOp, String)> {
+    let mut segments = chain_parts(input);
+    segments.retain(|(_, s)| !s.is_empty());
+    segments
+}
+
+/// Whether a `&&` or `||` of the line has no request on one of its sides
+/// (`GET /a ||`). In a file that is a mistake, and the line under it would
+/// run whatever the first one answered.
+fn chain_is_incomplete(input: &str) -> bool {
+    let parts = chain_parts(input);
+    parts.len() > 1 && parts.iter().any(|(_, s)| s.is_empty())
+}
+
+/// The line cut at its top-level `&&` / `||`, empty segments included.
+fn chain_parts(input: &str) -> Vec<(ChainOp, String)> {
     let mut segments: Vec<(ChainOp, String)> = Vec::new();
     let mut current = String::new();
     // Operator that introduced the segment being accumulated.
@@ -5831,7 +5912,6 @@ fn split_request_chain(input: &str) -> Vec<(ChainOp, String)> {
         current.push(ch);
     }
     segments.push((op, current.trim().to_string()));
-    segments.retain(|(_, s)| !s.is_empty());
     segments
 }
 
@@ -5876,6 +5956,11 @@ struct BulkProgram {
     /// What the describe blocks read hold that a describe block should not,
     /// one line each. A warning: the batch runs all the same.
     describe_warnings: Vec<String>,
+    /// The steps that came from a file named in the text itself, as a range
+    /// of `steps`, with the export mode the text is in around that file. A
+    /// prompt session outlives a program that stops inside one, and goes on
+    /// in that mode, not in the file's.
+    file_spans: Vec<(std::ops::Range<usize>, Option<String>)>,
 }
 
 impl BulkProgram {
@@ -7742,6 +7827,12 @@ fn split_bulk_requests_inner(
             let first_word = trimmed.split_whitespace().next().unwrap_or("");
             importing = first_word.eq_ignore_ascii_case("import");
             if is_one_line_step(trimmed) {
+                // A `confirm` keeps its whole line: all of it is the question.
+                let trimmed = if first_word.eq_ignore_ascii_case("confirm") {
+                    trimmed
+                } else {
+                    without_trailing_comment(trimmed)
+                };
                 // `sleep N` — timing directive.
                 if first_word.eq_ignore_ascii_case("sleep") {
                     let rest = trimmed["sleep".len()..].trim();
@@ -7812,6 +7903,7 @@ fn split_bulk_requests_inner(
                         .map_err(|e| format!("could not read include {}: {}", path.display(), e))?;
                     chain.insert(canonical.clone());
                     let new_base = canonical.parent().map(|p| p.to_path_buf());
+                    let first_step = program.steps.len();
                     // This file's export mode is not the included file's:
                     // that one starts without, and what it sets ends with it.
                     if export.is_some() {
@@ -7829,6 +7921,9 @@ fn split_bulk_requests_inner(
                     )?;
                     if export.is_some() || left_in.is_some() {
                         program.steps.push(BulkStep::Export { name: export.clone(), written: false });
+                    }
+                    if included_as.is_none() {
+                        program.file_spans.push((first_step..program.steps.len(), export.clone()));
                     }
                     chain.remove(&canonical);
                 }
@@ -7865,6 +7960,12 @@ fn split_bulk_requests_inner(
                 current.clear();
                 declare_import(&assembled, base_dir, within, aliases, &mut declared, program)?;
                 continue;
+            }
+            if chain_is_incomplete(&assembled) {
+                return Err(format!(
+                    "a `&&` or `||` needs a request on both sides, on one line: `{}`",
+                    assembled.trim()
+                ));
             }
             let mut segments = split_request_chain(&assembled);
             // A file body in an imported file is a file in its repository.
@@ -11419,7 +11520,8 @@ fn looks_like_a_path(word: &str) -> bool {
 /// parser (so includes expand), gate on `url`, then execute every step in
 /// order with the interactive sender. The typed line stays on the input line
 /// throughout and is restored afterwards, like a `&&` chain. A failed assert,
-/// a declined confirm, an errored request, or esc stops the remaining steps.
+/// a declined confirm, a request that got no answer, or esc stops the
+/// remaining steps; a plain line answered with an error status does not.
 fn run_program_line(state: &mut AppState, stdout: &mut io::Stdout, line: &str) -> io::Result<()> {
     // A fetch can take a moment; say what the prompt is busy with.
     if matches!(classify_prompt_line(line, None), PromptLine::Program) && line.to_ascii_lowercase().contains("import") {
@@ -11445,6 +11547,12 @@ fn run_program_line(state: &mut AppState, stdout: &mut io::Stdout, line: &str) -
     // Published so every per-request input restore shows the typed line.
     state.chain_input = Some(line.to_string());
     let result = run_program_steps(state, stdout, &program.steps);
+    // Stopped inside a file: the export mode there was the file's own.
+    if let Ok(Some(stopped)) = &result {
+        if let Some((_, around)) = program.file_spans.iter().find(|(span, _)| span.contains(stopped)) {
+            apply_export_step(&mut state.config, around);
+        }
+    }
     state.chain_input = None;
     state.config.quiet = false;
     state.config.check_only = false;
@@ -11476,16 +11584,25 @@ fn show_program_status(state: &mut AppState, stdout: &mut io::Stdout, msg: Strin
     render(stdout, state)
 }
 
-/// The step loop of `run_program_line`. Returns as soon as a step says stop.
-fn run_program_steps(state: &mut AppState, stdout: &mut io::Stdout, steps: &[BulkStep]) -> io::Result<()> {
-    for step in steps {
+/// The step loop of `run_program_line`. Returns as soon as a step says stop,
+/// with the place of that step.
+fn run_program_steps(
+    state: &mut AppState,
+    stdout: &mut io::Stdout,
+    steps: &[BulkStep],
+) -> io::Result<Option<usize>> {
+    for (at, step) in steps.iter().enumerate() {
         let keep_going = match step {
             BulkStep::Request(request) => {
                 parse_input(state, request);
-                let answered = matches!(
-                    execute_request(state, stdout)?,
-                    RequestOutcome::Truthy | RequestOutcome::Falsy
-                );
+                // A plain line that is answered with an error status is
+                // logged and the next one runs, as in a batch. What got no
+                // answer at all (esc, no connection) stops the program.
+                let answered = match execute_request(state, stdout)? {
+                    RequestOutcome::Truthy | RequestOutcome::Falsy => true,
+                    RequestOutcome::Errored => state.config.last_status.is_some_and(status_is_error),
+                    RequestOutcome::Aborted => false,
+                };
                 // `-f` at the prompt stops the program, not the session.
                 let tripped = fail_fast_tripped_at_prompt(&state.config);
                 if tripped {
@@ -11545,10 +11662,10 @@ fn run_program_steps(state: &mut AppState, stdout: &mut io::Stdout, steps: &[Bul
             }
         };
         if !keep_going {
-            break;
+            return Ok(Some(at));
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// The question a `confirm [message]` asks, without the `[Y/n]` marker — the
@@ -24026,5 +24143,150 @@ mod tests {
         assert_eq!(escape_newlines_in_strings("\"a\\\"\nb\\n\\\\\"\n"), "\"a\\\"\\nb\\n\\\\\"\n");
         assert_eq!(escape_newlines_in_strings("å\n"), "å\n");
         assert_eq!(escape_newlines_in_strings(""), "");
+    }
+
+    #[test]
+    fn export_gives_the_key_to_a_name_the_record_lists_as_null() {
+        let exported = |body: &str| export_body(body, SEED, false, true).text;
+        // With `-i` the name asked for may be listed already, as null: the
+        // record doesn't have it, and gets it. Wherever the member stands.
+        assert_eq!(
+            exported(r#"{"identifiers":{"key":"k1","com.heads.seedID":null}}"#),
+            r#"{"identifiers":{"key?":"k1","com.heads.seedID":"k1"}}"#
+        );
+        assert_eq!(
+            exported(r#"{"identifiers":{"com.heads.seedID":null,"key":"k1"}}"#),
+            r#"{"identifiers":{"com.heads.seedID":"k1","key?":"k1"}}"#
+        );
+        // A record that has the name keeps what it has.
+        assert_eq!(
+            exported(r#"{"identifiers":{"key":"k1","com.heads.seedID":"ours"}}"#),
+            r#"{"identifiers":{"com.heads.seedID":"ours"}}"#
+        );
+    }
+
+    #[test]
+    fn a_trailing_comment_ends_a_directive_line() {
+        let cut = without_trailing_comment;
+        assert_eq!(cut("sleep 2 # wait"), "sleep 2");
+        assert_eq!(cut("shared/checks.api   # another file"), "shared/checks.api");
+        assert_eq!(cut("export off\t# done"), "export off");
+        assert_eq!(cut("url has localhost:5000 # here"), "url has localhost:5000");
+        // Not a comment: no blank in front, or inside quotes or brackets.
+        assert_eq!(cut("assert GET /a#b"), "assert GET /a#b");
+        assert_eq!(cut("assert GET /a~where(n=x #y)"), "assert GET /a~where(n=x #y)");
+        assert_eq!(cut(r#"assert PUT /a {"x":"a # b"} # c"#), r#"assert PUT /a {"x":"a # b"}"#);
+        assert_eq!(cut(r#"assert GET /a~where(n="\" # ") # c"#), r#"assert GET /a~where(n="\" # ")"#);
+        assert_eq!(cut("seeds/å.api # ö"), "seeds/å.api");
+        assert_eq!(cut(""), "");
+    }
+
+    #[test]
+    fn a_trailing_comment_is_not_part_of_a_request_or_a_directive() {
+        let steps = |text: &str| split_bulk_requests(text, None).unwrap().steps;
+        let request = |text: &str| match &steps(text)[..] {
+            [BulkStep::Request(r)] => r.clone(),
+            other => panic!("{text}: {other:?}"),
+        };
+        assert_eq!(request("GET /about > /tmp/about.json   # as the server answers"), "GET /about > /tmp/about.json");
+        assert_eq!(request("GET /people~count # note"), "GET /people~count");
+        assert_eq!(request("GET /people >> people.json\t# append"), "GET /people >> people.json");
+        assert_eq!(request("PUT /a @body.json~map(com.heads.csv) # mapped"), "PUT /a @body.json~map(com.heads.csv)");
+        assert_eq!(request("PUT /a {\"x\": 1} # one\n"), "PUT /a {\"x\": 1}");
+        // Behind a body that spans lines, and inside it as before.
+        assert_eq!(request("PUT /a {\n  \"x\": 1 # in\n} # out\n"), "PUT /a {\n  \"x\": 1 \n}");
+        // What only looks like one is sent as written.
+        assert_eq!(request("GET /a#b"), "GET /a#b");
+        assert_eq!(request("GET /a~where(n=x #y)"), "GET /a~where(n=x #y)");
+        assert_eq!(request(r#"PUT /a {"x":"a # b"}"#), r#"PUT /a {"x":"a # b"}"#);
+        assert_eq!(request(r#"PUT /a "a # b""#), r#"PUT /a "a # b""#);
+        // The outfile is the path, so its `Accept` is the extension's.
+        let (_, uri, _) = parse_request_line(&request("GET /events > out.csv  # csv")).unwrap();
+        assert_eq!(split_uri_outfile(&uri), ("/events", " > out.csv"));
+
+        // In a chain the comment ends the line, not a segment.
+        assert_eq!(
+            steps("GET /a && GET /b # both"),
+            [BulkStep::Chain(vec![(ChainOp::And, "GET /a".to_string()), (ChainOp::And, "GET /b".to_string())])]
+        );
+        // Directives.
+        assert_eq!(steps("sleep 2 # wait"), [BulkStep::Sleep(Duration::from_secs(2))]);
+        assert_eq!(steps("export off # done"), [BulkStep::Export { name: None, written: true }]);
+        assert_eq!(
+            steps("assert not GET /a~count # none left"),
+            [BulkStep::Assert { negate: true, request: "GET /a~count".to_string() }]
+        );
+        let gated = split_bulk_requests("url has localhost # here\nGET /a", None).unwrap();
+        assert!(evaluate_program_gates(&gated, "http://localhost:5000").is_ok());
+        // All of a `confirm` line is its question.
+        assert_eq!(steps("confirm Is #5 done? # really"), [BulkStep::Confirm(Some("Is #5 done? # really".to_string()))]);
+        // The prompt and the arguments read a request the same way.
+        assert_eq!(normalize_request_text("GET /a > out.json # note").unwrap(), "GET /a > out.json");
+    }
+
+    #[test]
+    fn a_trailing_comment_ends_an_include_line() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("checks.api"), "GET /c # the check\n").unwrap();
+        let program = split_bulk_requests("checks.api   # another file\n", Some(dir.path())).unwrap();
+        assert_eq!(program.steps, [BulkStep::Request("GET /c".to_string())]);
+    }
+
+    #[test]
+    fn a_chain_with_nothing_on_one_side_is_refused_in_a_file() {
+        for text in ["GET /a ||\nPUT /a {\"x\":1}\n", "GET /a &&", "GET /a && && GET /b", "GET /a || # then\nGET /b"] {
+            let err = split_bulk_requests(text, None).unwrap_err();
+            assert!(err.contains("needs a request on both sides"), "{text}: {err}");
+        }
+        // A separator inside a body, a string or an operator is no chain.
+        for text in ["PUT /a {\"x\":\"&&\"}", "GET /a~where(x=1||)", "PUT /a \"||\""] {
+            assert_eq!(split_bulk_requests(text, None).unwrap().steps.len(), 1, "{text}");
+        }
+        assert!(!chain_is_incomplete("GET /a"));
+        assert!(!chain_is_incomplete(""));
+    }
+
+    #[test]
+    fn arguments_without_a_method_keep_every_argument() {
+        let args = |a: &[&str]| {
+            let mut it = a.iter().map(|s| s.to_string());
+            let (method, uri) = (it.next(), it.next());
+            let rest: Vec<String> = it.collect();
+            parse_positional_args(method, uri, (!rest.is_empty()).then(|| rest.join(" ")))
+        };
+        let got = |m: &str, u: &str, b: &str| (m.to_string(), u.to_string(), b.to_string());
+        assert_eq!(args(&["/people", ">", "out.json"]), got("GET", "/people", "> out.json"));
+        assert_eq!(args(&["/x", "{\"a\":1}", "{\"b\":2}"]), got("GET", "/x", "{\"a\":1} {\"b\":2}"));
+        assert_eq!(args(&["/people", "> out.json"]), got("GET", "/people", "> out.json"));
+        assert_eq!(args(&["/people"]), got("GET", "/people", ""));
+        // With a method nothing changes.
+        assert_eq!(args(&["put", "/x", "{\"a\":1}", "{\"b\":2}"]), got("PUT", "/x", "{\"a\":1} {\"b\":2}"));
+        assert_eq!(args(&["GET", "/people", ">", "out.json"]), got("GET", "/people", "> out.json"));
+    }
+
+    #[test]
+    fn a_program_knows_which_steps_a_named_file_gave_it() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("own.api"), "export other.name.id\nGET /o\ninner.api\n").unwrap();
+        fs::write(dir.path().join("inner.api"), "GET /i\n").unwrap();
+        fs::write(dir.path().join("plain.api"), "GET /p\n").unwrap();
+        let spans = |text: &str, export: Option<&str>| {
+            let program =
+                split_bulk_requests_with(text, Some(dir.path()), &mut ImportAliases::new(), export.map(String::from))
+                    .unwrap();
+            (program.steps.len(), program.file_spans)
+        };
+        // The file's steps, its closing step included; a file it includes
+        // is part of it and has no span of its own.
+        let (count, found) = spans("GET /a\nown.api\nGET /b", None);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].1, None);
+        assert_eq!(found[0].0.start, 1);
+        assert_eq!(found[0].0.end, count - 1);
+        // Around each file is the mode the text was in when it named it.
+        let (_, found) = spans("plain.api\nexport a.b.c\nplain.api\nown.api", Some("x.y.z"));
+        let around: Vec<Option<&str>> = found.iter().map(|(_, e)| e.as_deref()).collect();
+        assert_eq!(around, [Some("x.y.z"), Some("a.b.c"), Some("a.b.c")]);
+        assert!(spans("GET /a", Some("x.y.z")).1.is_empty());
     }
 }

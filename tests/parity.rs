@@ -392,6 +392,10 @@ fn cases(dir: &Path) -> Vec<Case> {
     let redirect3 = format!("> {out3}");
     let append4 = format!(">> {out4}");
     let out5 = out("out5.json").display().to_string();
+    let out6 = out("out6.json").display().to_string();
+    let out7 = out("out7.json").display().to_string();
+    let commented_redirect = format!("GET /a > {out6}   # as the server answers");
+    let implied_redirect = format!("/a > {out7}");
     let uri_with_redirect1 = format!("/a > {out1}");
     let uri_with_append2 = format!("/a >> {out2}");
     let import_json = format!(r#"{{"url":"{}","ref":"1.0"}}"#, repo_url(dir));
@@ -617,6 +621,28 @@ fn cases(dir: &Path) -> Vec<Case> {
         case("comment then request", "# note\nGET /a", None, &["GET /a"]),
         case("unknown word", "peple", Some(&["peple"]), &[]).fails("not a request or .api file: peple"),
         case("unknown word with more", "peple /a", Some(&["peple", "/a"]), &[]).fails("not a request or .api file: peple"),
+        // A ` # …` behind a line is a comment, as the documentation writes them
+        case("comment behind a request", "GET /a # note", Some(&["GET", "/a", "#", "note"]), &["GET /a"]),
+        case(
+            "comment behind a body",
+            r#"PUT /a {"x":"a # b"} # note"#,
+            Some(&["PUT", "/a", r#"{"x":"a # b"}"#, "#", "note"]),
+            &[r#"PUT /a {"x":"a # b"}"#],
+        ),
+        case("comment behind an outfile", &commented_redirect, Some(&["GET", "/a", ">", &out6, "#", "as the server answers"]), &["GET /a"])
+            .writes(out("out6.json")),
+        case(
+            "comment behind directives and an include",
+            "url has 127.0.0.1 # here\nsleep 100ms # wait\nseed.api # the seeds\nassert not GET /missing # gone",
+            None,
+            &["GET /inc1", "GET /inc2", "GET /missing"],
+        ),
+        case("comment behind a chain", "GET /a && GET /b # both", Some(&["GET", "/a", "&&", "GET", "/b", "#", "both"]), &["GET /a", "GET /b"]),
+        // Without a method, the arguments after the URI are still the line's
+        case("implied GET to an outfile", &implied_redirect, Some(&["/a", ">", &out7]), &["GET /a"]).writes(out("out7.json")),
+        // A separator with nothing behind it is a mistake, not a body
+        case("a chain that breaks off", "GET /a ||\nPUT /b {\"x\":1}", None, &[])
+            .fails("needs a request on both sides"),
         case("stops after a failed assert", "assert /missing\nGET /never", None, &["GET /missing"]).fails("assertion failed"),
         case("stops after an error status", "GET /a && GET /boom && GET /never", None, &["GET /a", "GET /boom"])
             .fails("500 Internal Server Error"),
@@ -5565,4 +5591,115 @@ fn ctrl_t_toggles_streaming_on_a_server_that_streams() {
     prompt.send(b"\x14");
     prompt.pump(Duration::from_millis(400));
     assert!(on(&prompt), "{}", screen_tail(&prompt));
+}
+
+/// A body on stdin that can't be read is not an empty body: nothing is sent.
+#[cfg(unix)]
+#[test]
+fn a_piped_body_that_cannot_be_read_sends_nothing() {
+    use std::process::Stdio;
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    server.take();
+    let mut child = api(server.port, dir.path())
+        .args(["PUT", "/a"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn api");
+    // Latin-1, which is not UTF-8.
+    child.stdin.take().unwrap().write_all(b"{\"name\":\"Bj\xf6rn\"}").unwrap();
+    let out = child.wait_with_output().expect("api runs");
+    server.settle(Duration::from_millis(150), Duration::from_secs(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("could not read the body from stdin"), "{stderr}");
+    assert_eq!(server.take(), Vec::<String>::new());
+}
+
+/// Paste a line or a block at the prompt, press Enter, and wait until the
+/// server has been quiet: what was sent, and what the screen showed.
+#[cfg(unix)]
+fn run_pasted(prompt: &mut pty::Prompt, server: &RecordingServer, paste: &str) -> (Vec<String>, String) {
+    prompt.send(b"\x15");
+    prompt.pump(Duration::from_millis(60));
+    server.take();
+    prompt.paste(paste);
+    prompt.pump(Duration::from_millis(80));
+    let mark = prompt.screen.len();
+    prompt.send(b"\r");
+    let start = Instant::now();
+    let mut quiet = 0;
+    while quiet < 2 && start.elapsed() < Duration::from_secs(4) {
+        let before = server.seen();
+        prompt.pump(Duration::from_millis(120));
+        quiet = if server.seen() == before { quiet + 1 } else { 0 };
+    }
+    (server.take(), pty::plain(&prompt.screen[mark..]))
+}
+
+/// A file that stops midway (a failed assert) is still only a file: the
+/// export mode it set, or was kept out of, is not the session's afterwards.
+#[cfg(unix)]
+#[test]
+fn a_file_that_stops_at_the_prompt_leaves_the_export_mode_as_it_was() {
+    use pty::Prompt;
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("own.api"), "export other.name.id\nassert GET /missing\nGET /never\n").unwrap();
+    std::fs::write(dir.path().join("plain.api"), "assert GET /missing\nGET /never\n").unwrap();
+    let mut prompt = Prompt::open(api(server.port, dir.path()));
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+
+    let exported = |file: &str| -> Option<String> {
+        let text = std::fs::read_to_string(dir.path().join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        value["identifiers"].as_object().unwrap().keys().find(|k| *k != "key?" && *k != "key").cloned()
+    };
+
+    // The file turned export on and stopped: the session has it off.
+    let (sent, shown) = run_pasted(&mut prompt, &server, "own.api");
+    assert_eq!(sent, ["GET /missing"], "{shown}");
+    run_pasted(&mut prompt, &server, "GET /keyed > after-own.json");
+    assert_eq!(exported("after-own.json"), None);
+
+    // The session has it on, and a file that is kept out of it stops: on.
+    run_pasted(&mut prompt, &server, "export com.heads.seedID");
+    let (sent, shown) = run_pasted(&mut prompt, &server, "plain.api");
+    assert_eq!(sent, ["GET /missing"], "{shown}");
+    run_pasted(&mut prompt, &server, "GET /keyed > after-plain.json");
+    assert_eq!(exported("after-plain.json"), Some("com.heads.seedID".to_string()));
+    // And after a file with a mode of its own.
+    run_pasted(&mut prompt, &server, "own.api");
+    run_pasted(&mut prompt, &server, "GET /keyed > after-both.json");
+    assert_eq!(exported("after-both.json"), Some("com.heads.seedID".to_string()));
+}
+
+/// Without `-f` a block at the prompt runs on past a line that was answered
+/// with an error status, as a batch does. What got no answer stops it.
+#[cfg(unix)]
+#[test]
+fn a_block_at_the_prompt_runs_on_past_an_error_status() {
+    use pty::Prompt;
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("failing.api"), "GET /boom\nGET /b\n").unwrap();
+    let mut prompt = Prompt::open(api(server.port, dir.path()));
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+
+    let (sent, shown) = run_pasted(&mut prompt, &server, "GET /boom\rGET /denied\rGET /missing\rGET /b\r");
+    assert_eq!(sent, ["GET /boom", "GET /denied", "GET /missing", "GET /b"], "{shown}");
+    let (sent, shown) = run_pasted(&mut prompt, &server, "failing.api");
+    assert_eq!(sent, ["GET /boom", "GET /b"], "{shown}");
+
+    // A body file that isn't there is no request at all, and ends the block.
+    let (sent, shown) = run_pasted(&mut prompt, &server, "PUT /a @nowhere.json\rGET /b\r");
+    assert_eq!(sent, Vec::<String>::new(), "{shown}");
+    // In a chain an error status is still no answer to go on from.
+    let (sent, _) = run_pasted(&mut prompt, &server, "GET /boom || GET /never\rGET /b\r");
+    assert_eq!(sent, ["GET /boom"]);
 }

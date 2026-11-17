@@ -33,6 +33,22 @@ GET /about
 GET /people~take(5)
 ```
 
+### Behind a line
+
+A ` # …` behind a request, a directive or an include is a comment to the end
+of the line. The `#` needs a blank in front of it and counts only outside a
+JSON string, brackets and the parentheses of a URI operator, like ` >`:
+
+```
+GET /people > /tmp/people.json   # a comment
+shared/checks.api                # a comment
+sleep 2                          # a comment
+GET /people#x                    # the `#x` is sent: no blank in front
+PUT /x {"note":"a # b"}          # the string is sent whole
+```
+
+A `confirm` line has none: all of it is the question.
+
 ### Inside JSON bodies
 
 Three comment styles are supported inside `{}` / `[]` bodies and stripped before
@@ -226,6 +242,9 @@ GET /people~where(givenName=Test)~count && DELETE /people~where(givenName=Test)
   belongs to the segment it follows.
 - Every segment must be a request. A directive or an include in a chain
   (`GET /a && sleep 2`) is an error, not a step that is quietly dropped.
+- A chain is one line. A `&&` or `||` with nothing behind it (`GET /a ||`,
+  with the write on the next line) stops the batch before anything is sent:
+  ``a `&&` or `||` needs a request on both sides, on one line``.
 
 The same truthiness rule drives `sleep while` and `assert` below.
 
@@ -739,9 +758,11 @@ A pasted block of several lines runs line by line, as a file would; pasting a
 request line, a directive or a block replaces whatever is on the line, so a
 paste over the starting `GET /` is just the paste. Tab on a
 line that is a path (`se`, `shared/`, `~/seeds/`) completes it to a directory
-or a `.api` file; a path starting with `/` completes as a URI. A stopped
-program (failed assert, declined confirm, errored request, esc) leaves the
-session open.
+or a `.api` file; a path starting with `/` completes as a URI. A block or a
+file carries on past a plain line that is answered with an error status, as a
+batch does. A stopped program (failed assert, declined confirm, a request
+that got no answer, esc) leaves the session open, in the export mode it had
+before a file that stopped set one of its own.
 
 **One-shot arguments.** The positional arguments are joined into one line. A
 directive, an include, a `&&`/`||` chain, or a whole line in a single quoted
@@ -1158,6 +1179,9 @@ Run it: `api -sa workshop.api`.
 - **Expecting `--describe` or `-m` to show an included file's block** → both show the block of the file named on the command line only.
 - **Expecting `--assert` to list `assert` lines** → it lists `PUT /assert` bodies. The `assert` keyword is a request judged by truthiness and is not part of the list.
 - **Trailing comma in JSON** → server returns 500 with a parse error. JSON is strict; don't trail commas in objects/arrays.
+- **A `#` with a blank in front, outside a string** → a comment from there to the end of the line (`GET /x # note`). A body that is not JSON and holds ` #` (`PUT /x a # b`) loses what follows; quote it (`"a # b"`) or send it as an `@file`.
+- **A chain broken over two lines** → `GET /x ||` with the `PUT` on the next line is an error. Write the chain on one line; a body may still span lines.
+- **Piping a body that is not UTF-8** → `error: could not read the body from stdin`, exit 1, nothing sent. Send it as an `@file`.
 - **Piping a body to a `GET`** → it is not sent. Stdin is read as a body only for `POST`, `PUT` and `PATCH` without a body argument. And `echo '{…}' | api -p PUT /x` with no terminal is an error: stdin can't be the body and the answer to `-p`. Give the body as an argument or an `@file`.
 - **A response that stops before its end** → a body cut short by the server or the network, or one that takes longer than `--timeout`, is no answer: `The response was cut short: …` or `Timed out after …`, exit 1, with or without `-f`. Nothing is written to the outfile, a chain or an `assert` does not take it for a "no", and nothing after it is sent.
 - **Unclosed brackets** → the whole run fails with `"unclosed body at end of bulk file"`. If a body looks wrong, check that `{}` and `[]` balance.
