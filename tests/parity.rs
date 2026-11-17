@@ -1225,6 +1225,8 @@ fn flags_win_over_the_connection_chosen_with_c() {
             ("local", url.clone(), "key", "STOREDKEY", ""),
             ("tok", url.clone(), "token", "STOREDTOKEN", ""),
             ("oauth", url.clone(), "oauth2", "secret", "id"),
+            // As a file written by hand may have it.
+            ("shout", format!("HTTP://127.0.0.1:{}/api/v1/", other.port), "key", "STOREDKEY", ""),
         ],
         "local",
     );
@@ -1247,10 +1249,41 @@ fn flags_win_over_the_connection_chosen_with_c() {
         (&["-c", "tok", "-k", "CLIKEY", "GET", "/a"][..], cli),
         (&["-c", "tok", "--token", "T", "GET", "/a"][..], "Bearer T"),
         (&["-c", "oauth", "-k", "CLIKEY", "GET", "/a"][..], cli),
+        // A token over an OAuth2 connection: used as it is, nothing exchanged.
+        (&["-c", "oauth", "--token", "T", "GET", "/a"][..], "Bearer T"),
+        // Both given: the token wins.
+        (&["-k", "CLIKEY", "--token", "T", "GET", "/a"][..], "Bearer T"),
+        (&["-c", "oauth", "-k", "CLIKEY", "--token", "T", "GET", "/a"][..], "Bearer T"),
     ] {
         let got = run_bare(&server, d, args);
         assert_eq!((got.code, &got.sent[..]), (Some(0), &["GET /a".to_string()][..]), "{args:?}: {}", got.stderr);
         assert_eq!(authorization(&server), authorization_sent, "{args:?}");
+    }
+
+    // The same in a batch.
+    std::fs::write(d.join("one.api"), "GET /from-file\n").unwrap();
+    let got = run_bare(&server, d, &["-c", "local", "-k", "CLIKEY", "-sa", "one.api"]);
+    assert_eq!((got.code, &got.sent[..]), (Some(0), &["GET /from-file".to_string()][..]), "{}", got.stderr);
+    assert_eq!(authorization(&server), cli);
+
+    // `-b` over an OAuth2 connection: the exchange goes to the other host too.
+    other.take();
+    let got = run_bare(&server, d, &["-c", "oauth", "-b", &other_url, "GET", "/a"]);
+    assert_eq!((got.code, got.sent.len()), (Some(0), 0), "{}", got.stderr);
+    let there = other.log.lock().unwrap().clone();
+    assert_eq!(there.len(), 2, "{there:?}");
+    assert!(there[0].starts_with("POST /oauth2/v1/token"), "{there:?}");
+    assert_eq!(there[1], "GET /a");
+
+    // A stored URL is read as `-b` is: its scheme in any case, its API path
+    // dropped. And the connection is chosen by that URL in any spelling.
+    let bare_other = other_url.trim_start_matches("http://").to_string();
+    for selector in ["shout", &other_url, &bare_other, &format!("{other_url}/api/v1")] {
+        other.take();
+        let got = run_bare(&server, d, &["-c", selector, "GET", "/a"]);
+        assert_eq!((got.code, got.sent.len()), (Some(0), 0), "{selector}: {}", got.stderr);
+        assert_eq!(other.log.lock().unwrap().clone(), ["GET /a"], "{selector}");
+        assert_eq!(authorization(&other), stored, "{selector}");
     }
 
     // `-b` sends the stored credential to another host.
@@ -1263,7 +1296,7 @@ fn flags_win_over_the_connection_chosen_with_c() {
     // A connection that is not saved.
     let missing = run_bare(&server, d, &["-c", "nope", "GET", "/a"]);
     assert_eq!((missing.code, missing.sent.len()), (Some(1), 0));
-    assert!(missing.stderr.contains("Connection \"nope\" not found. Saved connections: local, tok, oauth"), "{}", missing.stderr);
+    assert!(missing.stderr.contains("Connection \"nope\" not found. Saved connections: local, tok, oauth, shout"), "{}", missing.stderr);
 
     // An entry without `client_id` is a whole entry.
     std::fs::write(
@@ -1931,6 +1964,19 @@ fn a_bad_option_value_names_its_option() {
     assert!(got.sent.is_empty());
     assert!(shown.contains("error: invalid value for --timeout: abc"), "{shown}");
     assert!(!shown.contains("unexpected option"), "{shown}");
+
+    // A negative number is a value too, and not one the option takes.
+    let args: Vec<String> = ["--timeout", "-1", "GET", "/a"].iter().map(|s| s.to_string()).collect();
+    let (got, shown) = run_cli(&server, dir.path(), &args);
+    assert!(!got.exit_ok && got.sent.is_empty());
+    assert!(shown.contains("error: invalid value for --timeout: -1"), "{shown}");
+    assert!(!shown.contains("unexpected option"), "{shown}");
+
+    // An empty `-b` is no base URL, not a host that does not answer.
+    let empty = run_bare(&server, dir.path(), &["-b", "", "-k", "k", "GET", "/a"]);
+    assert_eq!((empty.code, empty.sent.len()), (Some(1), 0), "{}", empty.stderr);
+    assert!(empty.stderr.contains("no base URL specified"), "{}", empty.stderr);
+    assert!(!empty.stderr.contains("Is COS running"), "{}", empty.stderr);
 }
 
 /// What a confirmation run did: what the server received, the exit code, stderr.

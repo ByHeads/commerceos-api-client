@@ -445,7 +445,7 @@ struct Args {
     no_streaming: bool,
 
     /// Request timeout in seconds; 0 disables it (default: 600 = 10 minutes)
-    #[arg(long = "timeout", value_name = "SECONDS")]
+    #[arg(long = "timeout", value_name = "SECONDS", allow_negative_numbers = true)]
     timeout: Option<u64>,
 }
 
@@ -3306,6 +3306,10 @@ fn base_url_of(text: &str) -> (String, bool) {
         Some(at) => rest.split_at(at),
         None => (rest, ""),
     };
+    // No host is no base URL (`-b ""`), not `https://`.
+    if host.is_empty() {
+        return (String::new(), false);
+    }
     // The first `/api` that is a whole path component, and all after it.
     let mut kept = path;
     let mut from = 0;
@@ -3335,6 +3339,23 @@ fn host_is_local(host: &str) -> bool {
 
 /// The base URL for what was given as one, on the command line or in a saved
 /// connection. See `base_url_of`.
+/// Whether `-c <selector>` names the saved connection with the URL `stored`
+/// by that URL: with its scheme or without, and in any spelling the URL is
+/// read in (`HTTP://host/api/v1` is chosen by `host`).
+fn url_selects(stored: &str, selector: &str) -> bool {
+    let bare = |url: &str| url.trim_start_matches("https://").trim_start_matches("http://").to_string();
+    let stored = normalize_base_uri(stored);
+    let asked = normalize_base_uri(selector);
+    if stored.is_empty() || asked.is_empty() {
+        return false;
+    }
+    let has_scheme = ["http://", "https://"].iter().any(|s| selector.trim().to_ascii_lowercase().starts_with(s));
+    match has_scheme {
+        true => stored == asked,
+        false => bare(&stored) == bare(&asked),
+    }
+}
+
 fn normalize_base_uri(uri: &str) -> String {
     base_url_of(uri).0
 }
@@ -3636,10 +3657,7 @@ fn main() {
         // An exact alias first, then a URL, with or without its scheme.
         let by_alias = envs.iter().find(|name| *name == connection_selector).and_then(|name| load_connection(name));
         let found = by_alias.or_else(|| {
-            envs.iter().filter_map(|name| load_connection(name)).find(|env| {
-                let url_bare = env.url.trim_start_matches("https://").trim_start_matches("http://");
-                env.url == *connection_selector || url_bare == *connection_selector
-            })
+            envs.iter().filter_map(|name| load_connection(name)).find(|env| url_selects(&env.url, connection_selector))
         });
         let Some(env) = found else {
             errln!("Connection \"{}\" not found. Saved connections: {}", connection_selector,
@@ -7528,6 +7546,8 @@ fn print_describe_first(block: &DescribeBlock) {
 /// Whether a request URI is the `/assert` endpoint of an API version.
 fn is_assert_uri(api_path: &str, uri: &str) -> bool {
     let uri = split_uri_outfile(uri).0.trim();
+    // A query string is not part of the path: `PUT /assert?x=1` asserts too.
+    let uri = uri.split('?').next().unwrap_or(uri);
     let path = resolve_request_path(api_path, uri);
     let Some(prefix) = path.trim_end_matches('/').strip_suffix("/assert") else {
         return false;
@@ -8880,7 +8900,7 @@ impl OutTarget<'_> {
         if self.is_clipboard() {
             format!("clipboard unavailable: {}", e)
         } else {
-            format!("Error writing to {}: {}", self.path, e)
+            format!("Error writing to {}: {}", self.display, e)
         }
     }
 
@@ -9987,14 +10007,14 @@ fn handle_key_event(
 
         // Copy curl
         (KeyModifiers::CONTROL, KeyCode::Char('y')) => {
-            if copy_curl(state) {
-                state.status_msg = "curl command copied to clipboard".to_string();
+            let said = match curl_refusal(state) {
+                Some(why) => Some(why),
+                None => copy_curl(state).then_some("curl command copied to clipboard"),
+            };
+            if let Some(said) = said {
+                state.status_msg = said.to_string();
                 state.status_msg_at = Some(std::time::Instant::now());
                 render(stdout, state)?;
-                // Clear status after delay (status will clear on next action)
-                std::thread::spawn(|| {
-                    std::thread::sleep(Duration::from_secs(3));
-                });
             }
         }
 
@@ -11010,6 +11030,8 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     let renewed_token: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
     let thread_renewed = Arc::clone(&renewed_token);
     let thread_config = state.config.clone();
+    // The outfile as it was written, for a message about it.
+    let outfile_written = state.display_outfile.clone();
     let request_handle = thread::spawn(move || {
         let sent = send_request(&thread_config, &parts, built).map_err(|e| RequestFailure::of(e, &failure_base_uri));
         let result = sent.and_then(|sent| {
@@ -11038,7 +11060,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
                             BodyDelivery::Streamed {
                                 overflowed: false,
                                 error: Some(match failure {
-                                    StreamFailure::Write(e) => format!("Error writing to {}: {}", path, e),
+                                    StreamFailure::Write(e) => format!("Error writing to {}: {}", outfile_written, e),
                                     StreamFailure::Body(e) => describe_body_failure(&e, thread_config.timeout_secs),
                                 }),
                                 bytes: 0,
@@ -12825,7 +12847,7 @@ fn sh_quote(word: &str) -> String {
 /// The command holds the credential: that is what a command that can be run
 /// as it is takes.
 fn build_curl(state: &AppState) -> Option<String> {
-    if state.prev_uri.is_empty() {
+    if state.prev_uri.is_empty() || curl_refusal(state).is_some() {
         return None;
     }
     let config = &state.config;
@@ -12860,7 +12882,8 @@ fn build_curl(state: &AppState) -> Option<String> {
     if let Some(asked) = to_file.then(|| accept_for_outfile(&state.prev_outfile)).flatten() {
         accept = asked.to_string();
     }
-    if config.streaming {
+    // As the request itself: export needs the whole body, so it is not streamed.
+    if config.streaming && config.export_id.is_none() {
         content_type.push_str(";stream=true");
         accept.push_str(";stream=true");
     }
@@ -12895,6 +12918,15 @@ fn build_curl(state: &AppState) -> Option<String> {
         cmd.push_str(&format!(" -o {}", sh_quote(&state.prev_outfile)));
     }
     Some(cmd)
+}
+
+/// Why the last request can't be written as a curl command, when it can't.
+/// A glob body is several files that the client combined into one array (or
+/// one NDJSON stream); curl would send the pattern's name as a file.
+fn curl_refusal(state: &AppState) -> Option<&'static str> {
+    let (file_body, _) = parse_body_functions(&state.prev_body);
+    let is_glob = file_body.starts_with('@') && file_body.chars().any(|c| c == '*' || c == '?' || c == '[');
+    is_glob.then_some("a glob body can't be written as a curl command")
 }
 
 fn copy_curl(state: &AppState) -> bool {
@@ -15285,9 +15317,17 @@ fn extract_file_path_context(input: &str, cursor_pos: usize) -> Option<FilePathC
 /// Get file/directory completions for a partial path.
 /// Returns full paths (from the partial's perspective) suitable for replacing the partial.
 fn get_file_completions(partial: &str) -> Vec<String> {
-    let expanded = if partial.starts_with("~/") || (cfg!(windows) && partial.starts_with("~\\")) {
-        expand_home(partial)
-    } else if partial.starts_with('~') && !partial.contains('/') {
+    get_file_completions_with(partial, cfg!(windows))
+}
+
+/// `get_file_completions`, told whether `\` separates a path as `/` does
+/// (Windows). A completion keeps the directory part as it was typed, with
+/// the separators it has.
+fn get_file_completions_with(partial: &str, backslash_separates: bool) -> Vec<String> {
+    let separates = |c: char| c == '/' || (backslash_separates && c == '\\');
+    let expanded = if let (Some(rest), Some(home)) = (home_relative(partial, backslash_separates), dirs::home_dir()) {
+        home.join(rest).to_string_lossy().into_owned()
+    } else if partial.starts_with('~') && !partial.contains(separates) {
         // Just "~" with no slash yet
         if let Some(home) = dirs::home_dir() {
             format!("{}", home.display())
@@ -15297,10 +15337,15 @@ fn get_file_completions(partial: &str) -> Vec<String> {
     } else {
         partial.to_string()
     };
+    // Read with the separator this machine has, whichever was typed.
+    let expanded = match backslash_separates {
+        true => expanded.replace('\\', std::path::MAIN_SEPARATOR_STR),
+        false => expanded,
+    };
 
     // Split into directory and file prefix
     let path = std::path::Path::new(&expanded);
-    let (dir, file_prefix) = if expanded.ends_with('/') {
+    let (dir, file_prefix) = if partial.ends_with(separates) {
         (std::path::PathBuf::from(&expanded), String::new())
     } else if let Some(parent) = path.parent() {
         let file_part = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
@@ -15332,12 +15377,9 @@ fn get_file_completions(partial: &str) -> Vec<String> {
         }
         let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
         // Build the completion using the original partial's directory prefix (preserving ~)
-        let dir_prefix = if partial.ends_with('/') {
-            partial.to_string()
-        } else if let Some(last_slash) = partial.rfind('/') {
-            partial[..=last_slash].to_string()
-        } else {
-            String::new()
+        let dir_prefix = match partial.rfind(separates) {
+            Some(last_separator) => partial[..=last_separator].to_string(),
+            None => String::new(),
         };
         let suffix = if is_dir { "/" } else { "" };
         results.push(format!("{}{}{}", dir_prefix, name, suffix));
@@ -18379,6 +18421,80 @@ mod tests {
     }
 
     #[test]
+    fn a_saved_connection_is_chosen_by_its_url_in_any_spelling() {
+        for (stored, selector, chosen) in [
+            ("http://host:5000", "http://host:5000", true),
+            ("http://host:5000", "host:5000", true),
+            ("https://cos.example.com", "cos.example.com", true),
+            // As stored by hand, and as read: the scheme in any case, the
+            // API path and a trailing slash dropped.
+            ("HTTP://host/api/v1", "host", true),
+            ("HTTP://host/api/v1/", "http://host", true),
+            ("http://host", "HOST".to_lowercase().as_str(), true),
+            ("https://cos.example.com", "cos.example.com/api/v1", true),
+            ("https://cos.example.com", "https://cos.example.com/", true),
+            // A scheme that is given has to be the one stored.
+            ("http://host", "https://host", false),
+            ("http://host:5000", "host:5001", false),
+            ("http://host", "", false),
+            ("", "", false),
+        ] {
+            assert_eq!(url_selects(stored, selector), chosen, "{stored:?} by {selector:?}");
+        }
+    }
+
+    #[test]
+    fn no_host_is_no_base_url() {
+        assert_eq!(base_url_of(""), (String::new(), false));
+        assert_eq!(base_url_of("   "), (String::new(), false));
+        assert_eq!(base_url_of("http://"), (String::new(), false));
+        assert_eq!(normalize_base_uri("/api/v1"), "");
+        assert_eq!(normalize_base_uri("localhost:5000"), "http://localhost:5000");
+    }
+
+    #[test]
+    fn a_write_failure_names_the_path_as_it_was_written() {
+        let e = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        let file = OutTarget { path: "/Users/me/x/y.json", display: "~/x/y.json", append: false };
+        assert_eq!(file.failure(&e), "Error writing to ~/x/y.json: denied");
+        assert_eq!(file.marker(1200), outfile_marker("~/x/y.json", 1200, false));
+        let appended = OutTarget { path: "/Users/me/x/y.json", display: "~/x/y.json", append: true };
+        assert_eq!(appended.failure(&e), "Error writing to ~/x/y.json: denied");
+        assert_eq!(appended.marker(1200), outfile_marker("~/x/y.json", 1200, true));
+        for name in ["clipboard", "Clipboard"] {
+            let clipboard = OutTarget { path: name, display: name, append: false };
+            assert_eq!(clipboard.failure(&e), "clipboard unavailable: denied");
+            assert_eq!(clipboard.marker(10), outfile_marker("clipboard", 10, false));
+        }
+    }
+
+    #[test]
+    fn a_completion_keeps_the_directory_as_typed_with_either_separator() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("seeds/more")).unwrap();
+        fs::write(dir.path().join("seeds/a.api"), "").unwrap();
+        fs::write(dir.path().join("seeds/b.json"), "").unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+
+        let slash = |rest: &str| format!("{root}/{rest}");
+        assert_eq!(get_file_completions_with(&slash("seeds/a"), false), [slash("seeds/a.api")]);
+        assert_eq!(
+            get_file_completions_with(&slash("seeds/"), false),
+            [slash("seeds/more/"), slash("seeds/a.api"), slash("seeds/b.json")]
+        );
+        // Where `\` separates too, the whole path stays, not just the name.
+        let back = |rest: &str| format!("{root}\\{rest}");
+        assert_eq!(get_file_completions_with(&back("seeds\\a"), true), [back("seeds\\a.api")]);
+        assert_eq!(
+            get_file_completions_with(&back("seeds\\"), true),
+            [back("seeds\\more/"), back("seeds\\a.api"), back("seeds\\b.json")]
+        );
+        assert_eq!(get_file_completions_with(&slash("seeds\\a"), true), [slash("seeds\\a.api")]);
+        // Elsewhere a `\` is a character of a name like any other.
+        assert!(get_file_completions_with(&back("seeds\\a"), false).is_empty());
+    }
+
+    #[test]
     fn a_save_under_an_override_leaves_the_stored_connection() {
         // No override: a new name renames the session's connection.
         assert_eq!(save_replaces("staging", "mine", false), Some("staging".to_string()));
@@ -18677,6 +18793,39 @@ mod tests {
             tail(&state),
             r#"application/json' -H 'Content-Type: text/csv' -H 'X-Request-Map: com.heads.t' --data-binary '@data'\''s.csv'"#
         );
+        // An NDJSON file body, and one under the home directory.
+        state.prev_body = "@events.NDJSON".to_string();
+        assert_eq!(
+            tail(&state),
+            "application/x-ndjson' -H 'Content-Type: application/x-ndjson' --data-binary '@events.NDJSON'"
+        );
+        state.prev_body = "@~/seeds/a.json".to_string();
+        assert!(tail(&state).ends_with(&format!(" --data-binary '@{}'", expand_home("~/seeds/a.json"))), "{}", tail(&state));
+
+        // A glob body is several files combined: no curl command sends that.
+        for glob in ["@people/*.json", "@people/a?.json~map(com.heads.t)", "@events/[ab].ndjson"] {
+            state.prev_body = glob.to_string();
+            assert_eq!(curl_refusal(&state), Some("a glob body can't be written as a curl command"), "{glob}");
+            assert_eq!(build_curl(&state), None, "{glob}");
+        }
+        state.prev_body = r#"{"pattern":"@a/*.json"}"#.to_string();
+        assert_eq!(curl_refusal(&state), None);
+
+        // Streaming is in the headers when the request was streamed, which
+        // it is not under export. `-i` and `--ndjson` are there as sent.
+        state.prev_method = "GET".to_string();
+        state.prev_body.clear();
+        state.config.streaming = true;
+        assert_eq!(tail(&state), "application/json;stream=true'");
+        state.config.export_id = Some("com.heads.seedID".to_string());
+        assert_eq!(tail(&state), "application/json'");
+        state.config.export_id = None;
+        state.config.streaming = false;
+        state.config.include_nulls = true;
+        assert_eq!(tail(&state), "application/json;skipNulls=false'");
+        state.config.include_nulls = false;
+        state.config.ndjson = true;
+        assert_eq!(tail(&state), "application/x-ndjson'");
     }
 
     #[test]
@@ -22782,11 +22931,11 @@ mod tests {
 
     #[test]
     fn is_assert_uri_knows_the_endpoint_however_it_is_written() {
-        for uri in ["/assert", "assert", "/v1/assert", "v1/assert", "/api/v1/assert", "api/v2/assert", "/assert/", "/assert > /tmp/out.json"] {
+        for uri in ["/assert", "assert", "/v1/assert", "v1/assert", "/api/v1/assert", "api/v2/assert", "/assert/", "/assert > /tmp/out.json", "/assert?x=1", "v1/assert/?a=b&c=/people"] {
             assert!(is_assert_uri("/api/v1", uri), "{uri}");
         }
         assert!(is_assert_uri("/api/me/v1", "/assert"));
-        for uri in ["/asserts", "/people/assert", "/assert/x", "/assert~count", "/api/assert", "/", ""] {
+        for uri in ["/asserts", "/people/assert", "/assert/x", "/assert~count", "/api/assert", "/", "", "/people?x=/assert"] {
             assert!(!is_assert_uri("/api/v1", uri), "{uri}");
         }
     }
