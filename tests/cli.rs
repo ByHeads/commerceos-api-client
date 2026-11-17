@@ -3564,9 +3564,11 @@ fn a_download_that_is_no_archive_fails_cleanly() {
     // Nothing half-unpacked is left in the cache.
     let archives = dir.join(".import-cache/archives");
     let left: Vec<String> = std::fs::read_dir(&archives)
-        .map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect())
-        .unwrap_or_default();
-    assert!(left.iter().all(|name| name == "refs"), "{left:?}");
+        .expect("the archive cache was made")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(left, Vec::<String>::new());
 }
 
 #[test]

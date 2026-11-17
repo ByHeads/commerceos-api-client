@@ -316,6 +316,7 @@ two can't be told apart: set the terminal to send DEL (`0x7f`) for Backspace.
 - `-b URL -k KEY` sends the key as Basic auth. `--token TOKEN` sends a Bearer token (long form only; `-t` is `--stream`).
 - With neither, the client prompts for credentials; `ctrl+s` saves the connection, `ctrl+q` switches.
 - `-c alias` (or `-c url`) picks a saved connection: `api -c staging GET /people`.
+  A URL that several saved connections share is an error that lists their aliases.
 - A key or token without `-b` uses the default saved connection's URL.
 - `-k`, `--token` and `-b` win over what a saved connection has stored, with `-c` too:
   `api -c staging -k OTHERKEY GET /people`.

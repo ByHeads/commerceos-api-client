@@ -168,6 +168,19 @@ fn answer(
     } else {
         None
     };
+    if path.contains("/slow") {
+        // A whole body, in pieces over three seconds.
+        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n1\r\n[\r\n");
+        for _ in 0..15 {
+            std::thread::sleep(Duration::from_millis(200));
+            if stream.write_all(b"2\r\n1,\r\n").and_then(|()| stream.flush()).is_err() {
+                return;
+            }
+        }
+        let _ = stream.write_all(b"2\r\n1]\r\n0\r\n\r\n");
+        let _ = stream.flush();
+        return;
+    }
     if let Some((rest, hold)) = broken {
         let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{rest}").as_bytes());
         let _ = stream.flush();
@@ -180,7 +193,10 @@ fn answer(
         // used; every later one is good. The client `once` gets no second.
         let nth = tokens.fetch_add(1, Ordering::SeqCst);
         let token = if nth == 0 { "stale" } else { "fresh" };
-        if nth > 0 && body.contains("client_id=once") {
+        if body.contains("client_id=nokey") {
+            // A client whose token is let in nowhere.
+            ("200 OK", r#"{"access_token":"nokey","expires_in":3600}"#.to_string())
+        } else if nth > 0 && body.contains("client_id=once") {
             ("500 Internal Server Error", "{}".to_string())
         } else {
             ("200 OK", format!(r#"{{"access_token":"{token}","expires_in":3600}}"#))
@@ -209,7 +225,7 @@ fn answer(
     } else if path.contains("/keyed") {
         // A record with only a database key and a masked value, for `--export`.
         ("200 OK", r#"{"name":"Ann","identifiers":{"key":"k1"},"secret":"********"}"#.to_string())
-    } else if header("authorization") == Some("Basic Om5va2V5") {
+    } else if header("authorization") == Some("Basic Om5va2V5") || header("authorization") == Some("Bearer nokey") {
         // The key `nokey` is no key here.
         ("401 Unauthorized", r#"{"error":"no such key"}"#.to_string())
     } else if path.contains("/about") && header("authorization") == Some("Basic OnNwZWM=") {
@@ -1117,6 +1133,102 @@ fn a_stream_that_fails_leaves_no_partial_outfile() {
     assert!(!d.join("good.json.part").exists());
 }
 
+/// What a directory holds, dot-files (the history, the credentials) aside.
+fn left_in(dir: &Path) -> Vec<String> {
+    let mut left: Vec<String> =
+        std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+    left.retain(|name| !name.starts_with('.'));
+    left.sort();
+    left
+}
+
+/// A streamed run that is sent `signal` once its partial file is there: how
+/// it ended. `ignored` starts it the way a shell starts a background job of
+/// a script, with the signal ignored.
+#[cfg(unix)]
+fn interrupted_mid_stream(mut cmd: std::process::Command, dir: &Path, signal: libc::c_int, ignored: bool) -> std::process::ExitStatus {
+    use std::os::unix::process::CommandExt;
+
+    unsafe {
+        cmd.pre_exec(move || {
+            // Not whatever the test run itself was started with.
+            libc::signal(signal, if ignored { libc::SIG_IGN } else { libc::SIG_DFL });
+            Ok(())
+        });
+    }
+    let mut child = cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().expect("spawn api");
+    let start = Instant::now();
+    while !left_in(dir).iter().any(|name| name.ends_with(".part")) {
+        assert!(start.elapsed() < Duration::from_secs(10), "no partial file appeared: {:?}", left_in(dir));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    unsafe { libc::kill(child.id() as libc::pid_t, signal) };
+    child.wait().expect("wait")
+}
+
+/// ctrl+c, or a `kill`, during a streamed `> file` leaves the target as it
+/// was and no partial file, and the run still ends the way an interrupted
+/// program does, so a shell reports 130.
+#[cfg(unix)]
+#[test]
+fn an_interrupted_stream_leaves_no_partial_file() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::write(d.join("kept.json"), "[\"before\"]").unwrap();
+    let streamed = |args: &[&str]| {
+        let mut cmd = api(server.port, d);
+        cmd.arg("--stream").args(args);
+        cmd
+    };
+
+    for signal in [libc::SIGINT, libc::SIGTERM] {
+        let status = interrupted_mid_stream(streamed(&["GET", "/slow", ">", "new.json"]), d, signal, false);
+        assert_eq!(status.signal(), Some(signal), "{status:?}");
+        assert_eq!(left_in(d), ["kept.json"], "signal {signal}");
+
+        let status = interrupted_mid_stream(streamed(&["GET", "/slow", ">", "kept.json"]), d, signal, false);
+        assert_eq!(status.signal(), Some(signal), "{status:?}");
+        assert_eq!(left_in(d), ["kept.json"], "signal {signal}");
+        assert_eq!(std::fs::read_to_string(d.join("kept.json")).unwrap(), "[\"before\"]", "signal {signal}");
+    }
+
+    // In a batch the lines after it are not sent, and an interrupt during a
+    // later line (a `sleep`) still ends the run at once.
+    std::fs::write(d.join("then.api"), "GET /slow > new.json\nGET /never\n").unwrap();
+    server.take();
+    let status = interrupted_mid_stream(streamed(&["-sa", "then.api"]), d, libc::SIGINT, false);
+    assert_eq!(status.signal(), Some(libc::SIGINT), "{status:?}");
+    assert_eq!(left_in(d), ["kept.json", "then.api"]);
+    server.settle(Duration::from_millis(150), Duration::from_secs(2));
+    assert_eq!(server.take(), ["GET /slow"]);
+
+    std::fs::write(d.join("sleeps.api"), "GET /a > first.json\nsleep 30\nGET /never\n").unwrap();
+    let mut child = streamed(&["-sa", "sleeps.api"]).stdout(std::process::Stdio::null()).spawn().expect("spawn api");
+    let start = Instant::now();
+    while !d.join("first.json").exists() && start.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let sent_at = Instant::now();
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) };
+    let status = child.wait().expect("wait");
+    assert_eq!(status.signal(), Some(libc::SIGINT), "{status:?}");
+    assert!(sent_at.elapsed() < Duration::from_secs(5), "the sleep was not interrupted");
+    std::fs::remove_file(d.join("first.json")).unwrap();
+    std::fs::remove_file(d.join("sleeps.api")).unwrap();
+
+    // A run started with the interrupt ignored still ignores it: the
+    // transfer goes on to its end.
+    let status = interrupted_mid_stream(streamed(&["GET", "/slow", ">", "whole.json"]), d, libc::SIGINT, true);
+    assert_eq!(status.code(), Some(0), "{status:?}");
+    assert_eq!(left_in(d), ["kept.json", "then.api", "whole.json"]);
+    assert!(std::fs::read_to_string(d.join("whole.json")).unwrap().ends_with("1]"));
+}
+
 /// A streamed outfile is the file a buffered one would be: `/dev/null` takes
 /// it, a link stays a link, a private file stays private, and a file that
 /// happens to be named `<outfile>.part` is not touched.
@@ -1833,6 +1945,89 @@ fn the_prompt_streams_an_outfile_as_a_batch_does() {
     assert_eq!(left, ["kept.json", "s.json"]);
 }
 
+/// esc during a request says `request aborted` and the session goes on. A
+/// streamed `> file` that is aborted is really given up: the target is as
+/// it was and no partial file is left, then, when the body would have
+/// ended, or after quitting at once.
+#[cfg(unix)]
+#[test]
+fn an_aborted_stream_at_the_prompt_is_given_up() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    std::fs::write(d.join("kept.json"), "[\"before\"]").unwrap();
+    let open = || {
+        let mut cmd = api_bare(d);
+        cmd.args(["-b", &url, "-k", "streamer", "--stream"]);
+        let mut prompt = pty::Prompt::open(cmd);
+        prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+        prompt.pump(Duration::from_millis(500));
+        prompt
+    };
+    // Send `line` and press esc once its partial file is there (or, for a
+    // line with no outfile, once the server has the request).
+    let aborted = |prompt: &mut pty::Prompt, line: &str| -> String {
+        prompt.send(b"\x15");
+        prompt.pump(Duration::from_millis(60));
+        server.take();
+        let mark = prompt.screen.len();
+        prompt.paste(line);
+        prompt.pump(Duration::from_millis(60));
+        prompt.send(b"\r");
+        let to_file = line.contains('>');
+        let under_way = pump_until(prompt, Duration::from_secs(6), |_| match to_file {
+            true => left_in(d).iter().any(|name| name.ends_with(".part")),
+            false => server.seen() > 0,
+        });
+        assert!(under_way, "{line}: {:?}\n{}", left_in(d), screen_tail(prompt));
+        prompt.pump(Duration::from_millis(400));
+        prompt.send(b"\x1b");
+        assert!(
+            pump_until(prompt, Duration::from_secs(3), |p| pty::plain(&p.screen[mark..]).contains("request aborted")),
+            "{line}: {}",
+            screen_tail(prompt)
+        );
+        pty::plain(&prompt.screen[mark..])
+    };
+
+    let mut prompt = open();
+    aborted(&mut prompt, "GET /slow");
+    for target in ["new.json", "kept.json"] {
+        aborted(&mut prompt, &format!("GET /slow > {target}"));
+        assert_eq!(left_in(d), ["kept.json"], "{target}, at once");
+        // The body ends three seconds after it began.
+        prompt.pump(Duration::from_millis(3500));
+        assert_eq!(left_in(d), ["kept.json"], "{target}, when the body has ended");
+        assert_eq!(std::fs::read_to_string(d.join("kept.json")).unwrap(), "[\"before\"]", "{target}");
+    }
+    // The session is still there, and still streams to a file.
+    let shown = enter_line(&mut prompt, "GET /a > s.json", "200 OK");
+    assert!(shown.contains("> s.json"), "{shown}");
+    assert_eq!(left_in(d), ["kept.json", "s.json"]);
+
+    // Quitting right behind an abort.
+    aborted(&mut prompt, "GET /slow > new.json");
+    quit(&mut prompt);
+    assert_eq!(ended(&mut prompt), Some(true));
+    assert_eq!(left_in(d), ["kept.json", "s.json"]);
+
+    // A `kill` while the prompt streams: no partial file, and the terminal
+    // is given back as the shell had it.
+    let mut prompt = open();
+    prompt.paste("GET /slow > new.json");
+    prompt.pump(Duration::from_millis(60));
+    prompt.send(b"\r");
+    assert!(pump_until(&mut prompt, Duration::from_secs(6), |_| left_in(d).iter().any(|name| name.ends_with(".part"))));
+    prompt.pump(Duration::from_millis(300));
+    let mark = prompt.screen.len();
+    prompt.signal(libc::SIGTERM);
+    assert_eq!(ended(&mut prompt), Some(false));
+    assert_eq!(left_in(d), ["kept.json", "s.json"]);
+    assert!(prompt.is_cooked(), "the terminal is left in raw mode");
+    assert!(prompt.screen[mark..].contains("\x1b[?2004l"), "bracketed paste is left on: {:?}", &prompt.screen[mark..]);
+}
+
 /// A request ended with esc has no status. Under `-f` the 404 of the line
 /// before is not reported as what stopped the block, and the rest of the
 /// block is not sent.
@@ -2130,8 +2325,6 @@ fn flags_win_over_the_connection_chosen_with_c() {
         (&["GET", "/a"][..], stored),
         (&["-c", "local", "GET", "/a"][..], stored),
         (&["-c", "tok", "GET", "/a"][..], "Bearer STOREDTOKEN"),
-        (&["-c", &url, "GET", "/a"][..], stored),
-        (&["-c", url.trim_start_matches("http://"), "GET", "/a"][..], stored),
         // Flags over the default connection…
         (&["-k", "CLIKEY", "GET", "/a"][..], cli),
         (&["--token", "T", "GET", "/a"][..], "Bearer T"),
@@ -2203,6 +2396,68 @@ fn flags_win_over_the_connection_chosen_with_c() {
     for base in [url.replace("http://", "HTTP://"), format!("{url}/api/v1"), format!("{url}/")] {
         let got = run_bare(&server, d, &["-b", &base, "-k", "k", "GET", "/a"]);
         assert_eq!((got.code, &got.sent[..]), (Some(0), &["GET /a".to_string()][..]), "{base}: {}", got.stderr);
+    }
+}
+
+/// `-c <url>` names a connection only when one saved connection has that
+/// URL. With several, which credential to send is not guessed: the aliases
+/// are listed and nothing is sent. An alias is still an alias.
+#[test]
+fn a_url_that_fits_several_connections_is_not_guessed() {
+    let server = RecordingServer::start();
+    let other = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    let bare = url.trim_start_matches("http://").to_string();
+    let other_url = format!("http://127.0.0.1:{}", other.port);
+    write_credentials(
+        d,
+        &[
+            ("a1", url.clone(), "key", "STOREDKEY", ""),
+            ("a2", format!("HTTP://{bare}/api/v1"), "token", "STOREDTOKEN", ""),
+            ("alone", other_url.clone(), "key", "STOREDKEY", ""),
+            // A connection named as another one's URL is written.
+            (&bare, other_url.clone(), "token", "NAMED", ""),
+        ],
+        "a2",
+    );
+    std::fs::write(d.join("one.api"), "GET /a\n").unwrap();
+
+    for selector in [url.clone(), format!("{url}/api/v1")] {
+        for args in [&["GET", "/a"][..], &["-sa", "one.api"][..], &["-k", "CLIKEY", "GET", "/a"][..]] {
+            let mut all = vec!["-c", selector.as_str()];
+            all.extend_from_slice(args);
+            let got = run_bare(&server, d, &all);
+            assert_eq!((got.code, got.sent.len(), other.seen()), (Some(1), 0, 0), "{all:?}: {}", got.stderr);
+            assert_eq!(
+                got.stderr.trim(),
+                format!("Connection \"{selector}\" fits several saved connections: a1, a2. Name one of them."),
+                "{all:?}"
+            );
+            assert_eq!(got.stdout, "", "{all:?}");
+        }
+    }
+
+    // An exact alias wins over a URL, and one match is the connection.
+    other.take();
+    let got = run_bare(&server, d, &["-c", &bare, "GET", "/a"]);
+    assert_eq!((got.code, got.sent.len()), (Some(0), 0), "{}", got.stderr);
+    assert_eq!(authorization(&other), "Bearer NAMED");
+    for (selector, sent) in [("a1", "Basic OlNUT1JFREtFWQ=="), ("a2", "Bearer STOREDTOKEN")] {
+        let got = run_bare(&server, d, &["-c", selector, "GET", "/a"]);
+        assert_eq!((got.code, &got.sent[..]), (Some(0), &["GET /a".to_string()][..]), "{selector}: {}", got.stderr);
+        assert_eq!(authorization(&server), sent, "{selector}");
+    }
+    std::fs::write(
+        d.join(".api-credentials.json"),
+        format!(r#"{{"connections":[{{"name":"only","url":"{url}","auth_type":"key","credential":"STOREDKEY"}}],"default":""}}"#),
+    )
+    .unwrap();
+    for selector in [&url, &bare] {
+        let got = run_bare(&server, d, &["-c", selector, "GET", "/a"]);
+        assert_eq!((got.code, &got.sent[..]), (Some(0), &["GET /a".to_string()][..]), "{selector}: {}", got.stderr);
+        assert_eq!(authorization(&server), "Basic OlNUT1JFREtFWQ==", "{selector}");
     }
 }
 
@@ -3065,6 +3320,111 @@ fn a_batch_keeps_running_when_its_stdout_is_closed() {
     assert_eq!(server.take(), ["GET /a", "GET /missing"]);
 }
 
+/// A run whose stdout (or stderr, with `to_stderr`) is a pipe that takes
+/// nothing more once it is full, with a reader that starts late: everything
+/// that came through it, what the other stream said, and the exit code.
+#[cfg(unix)]
+fn run_into_a_slow_pipe(mut cmd: std::process::Command, to_stderr: bool) -> (Vec<u8>, String, Option<i32>) {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::process::Stdio;
+
+    let mut fds = [0 as libc::c_int; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let (mut reader, writer) = unsafe { (std::fs::File::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    // The mode belongs to the pipe, so the client's end has it too.
+    unsafe {
+        let flags = libc::fcntl(fds[1], libc::F_GETFL);
+        assert_eq!(libc::fcntl(fds[1], libc::F_SETFL, flags | libc::O_NONBLOCK), 0);
+    }
+    if to_stderr {
+        cmd.stdout(Stdio::piped()).stderr(Stdio::from(writer));
+    } else {
+        cmd.stdout(Stdio::from(writer)).stderr(Stdio::piped());
+    }
+    let mut child = cmd.spawn().expect("spawn api");
+    // The command holds the other copy of the write end.
+    drop(cmd);
+    let other = std::thread::spawn({
+        let mut out = child.stdout.take();
+        let mut err = child.stderr.take();
+        move || {
+            let mut text = String::new();
+            if let Some(pipe) = out.as_mut() {
+                let _ = pipe.read_to_string(&mut text);
+            }
+            if let Some(pipe) = err.as_mut() {
+                let _ = pipe.read_to_string(&mut text);
+            }
+            text
+        }
+    });
+    std::thread::sleep(Duration::from_millis(400));
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let status = child.wait().expect("wait");
+    (got, other.join().unwrap(), status.code())
+}
+
+/// A pipe that is full for the moment has not lost its reader: what is
+/// printed arrives whole, on stdout and on stderr. And a stdout that fails
+/// for good is an error, not a short output with exit 0.
+#[cfg(unix)]
+#[test]
+fn output_arrives_whole_through_a_pipe_that_is_full_for_a_while() {
+    use std::os::unix::process::CommandExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    // A describe block of some 250 KB, and one with 4,000 members to warn about.
+    let texts: Vec<String> = (0..500usize)
+        .map(|i| format!(r#""{}{}-SE": "{}""#, (b'a' + (i / 26) as u8) as char, (b'a' + (i % 26) as u8) as char, "d".repeat(480)))
+        .collect();
+    std::fs::write(d.join("big.api"), format!("{{\n\"description\": {{\n{}\n}}\n}}\nGET /a\n", texts.join(",\n"))).unwrap();
+    let members: Vec<String> = (0..4000).map(|i| format!(r#""member{i:04}": 1"#)).collect();
+    std::fs::write(d.join("odd.api"), format!("{{\n{}\n}}\nGET /a\n", members.join(",\n"))).unwrap();
+
+    let mut cmd = api_bare(d);
+    cmd.args(["--describe", "big.api"]);
+    let (stdout, stderr, code) = run_into_a_slow_pipe(cmd, false);
+    assert_eq!(code, Some(0), "{stderr}");
+    let block: serde_json::Value = serde_json::from_slice(&stdout)
+        .unwrap_or_else(|e| panic!("{} bytes of stdout are not the block: {e}\n{stderr}", stdout.len()));
+    assert_eq!(block["description"].as_object().unwrap().len(), 500);
+
+    let mut cmd = api_bare(d);
+    cmd.args(["-r", "--describe", "odd.api"]);
+    let (stderr, _, code) = run_into_a_slow_pipe(cmd, true);
+    assert_eq!(code, Some(0));
+    let stderr = String::from_utf8_lossy(&stderr);
+    assert_eq!(stderr.lines().count(), 4000, "{} bytes of stderr", stderr.len());
+    assert!(stderr.lines().last().unwrap().contains("member3999 is not a member"), "{:?}", stderr.lines().last());
+
+    // A file that may hold 1,000 bytes and no more.
+    let mut cmd = api_bare(d);
+    cmd.args(["--describe", "big.api"]).stdout(std::fs::File::create(d.join("full.json")).unwrap()).stderr(std::process::Stdio::piped());
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            let limit = libc::rlimit { rlim_cur: 1000, rlim_max: 1000 };
+            match libc::setrlimit(libc::RLIMIT_FSIZE, &limit) {
+                0 => Ok(()),
+                _ => Err(std::io::Error::last_os_error()),
+            }
+        });
+    }
+    let out = cmd.output().expect("spawn api");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("Error writing to stdout: "), "{stderr}");
+}
+
 /// A value an option can't take is reported with the option it was for.
 #[test]
 fn a_bad_option_value_names_its_option() {
@@ -3713,6 +4073,11 @@ mod pty {
         }
 
         /// Whether the client has ended, and if so whether it ended well.
+        /// Send the client a signal, as `kill` does.
+        pub fn signal(&mut self, signal: libc::c_int) {
+            unsafe { libc::kill(self.child.id() as libc::pid_t, signal) };
+        }
+
         pub fn exited(&mut self) -> Option<bool> {
             self.child.try_wait().expect("wait for api").map(|status| status.success())
         }
@@ -6236,6 +6601,61 @@ fn a_refused_default_connection_asks_for_another_key() {
     assert!(prompt.is_cooked(), "the terminal is left in raw mode");
 }
 
+/// Nothing of a refused default connection is kept by the session that
+/// follows it: not its name, and not its client secret, which would
+/// otherwise answer the next 401 on whatever was connected to instead.
+#[cfg(unix)]
+#[test]
+fn a_refused_default_connection_leaves_nothing_in_the_session() {
+    let server = RecordingServer::start();
+    let url = format!("http://127.1:{}", server.port);
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let connections =
+        [("far", url.clone(), "oauth2", "REFUSEDSECRET", "nokey"), ("good", url.clone(), "key", "k", "")];
+    let refused = |d: &Path| {
+        write_credentials(d, &connections, "far");
+        let mut prompt = pty::Prompt::open(api_bare(d));
+        prompt.wait_for("Use ← → to choose auth method", Duration::from_secs(15));
+        prompt
+    };
+
+    // Another key, typed into the form.
+    let mut prompt = refused(d);
+    keys_then(&mut prompt, "\r", "Type your API key");
+    keys_then(&mut prompt, "k\r", "ctrl+h for shortcuts");
+    prompt.pump(Duration::from_millis(600));
+    assert!(!pty::plain(&prompt.screen).contains("connected to: far"), "{}", screen_tail(&prompt));
+    let (sent, shown) = run_pasted(&mut prompt, &server, "GET /denied");
+    // A 401, and not one that is answered with the refused connection's secret.
+    assert_eq!(sent, ["GET /denied"], "{shown}");
+    // Saved, it is a connection of its own: the refused one is as it was.
+    let shown = save_as(&mut prompt, "mine", "saved");
+    assert!(!shown.contains("far"), "{shown}");
+    let (saved, default) = stored(d);
+    assert_eq!((saved, default.as_str()), (vec!["far=REFUSEDSECRET".to_string(), "good=k".to_string(), "mine=k".to_string()], "far"));
+    drop(prompt);
+
+    // Another saved connection, from the picker behind the form.
+    let mut prompt = refused(d);
+    keys_then(&mut prompt, "\x1b", "Type the API base URL");
+    keys_then(&mut prompt, "\x1b", "good");
+    prompt.pump(Duration::from_millis(200));
+    let down = if selected_row(&prompt).contains("good") { "" } else { "\x1b[B" };
+    keys_then(&mut prompt, &format!("{down}\r"), "connected to: good");
+    assert!(!pty::plain(&prompt.screen).contains("connected to: far"), "{}", screen_tail(&prompt));
+    let (sent, shown) = run_pasted(&mut prompt, &server, "GET /denied");
+    // A 401, and not one that is answered with the refused connection's secret.
+    assert_eq!(sent, ["GET /denied"], "{shown}");
+    // ctrl+s proposes the name of the connection in use.
+    prompt.pump(Duration::from_millis(300));
+    keys_then(&mut prompt, "\x13", "Save connection as");
+    prompt.pump(Duration::from_millis(200));
+    let rows = pty::rows(&prompt.screen, 200);
+    assert!(rows.iter().any(|row| row.contains("Save connection as") && row.contains("good")), "{rows:#?}");
+    assert!(rows.iter().all(|row| !(row.contains("Save connection as") && row.contains("far"))), "{rows:#?}");
+}
+
 /// `--me` sends to the API of the signed-in user, a bearer token after `-t`
 /// is told where it goes now, an option that is none is named, and a
 /// body-less PUT at a terminal reads its body from there.
@@ -6456,6 +6876,9 @@ fn a_key_beside_an_oauth2_connection_is_not_renewed_with_the_stored_secret() {
     cmd.args(["-c", "o", "-k", "CLIKEY"]);
     let mut prompt = pty::Prompt::open(cmd);
     prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    // With `-c` the prompt is drawn while the connection is still being
+    // loaded, and until that has ended it takes no key and no paste.
+    prompt.wait_for("connected to: o", Duration::from_secs(15));
 
     let (sent, shown) = run_pasted(&mut prompt, &server, "GET /denied");
     assert_eq!(sent, ["GET /denied"], "{shown}");

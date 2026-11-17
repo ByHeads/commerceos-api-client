@@ -90,9 +90,11 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "signal-hook",
  "tar",
  "tempfile",
  "webpki-roots",
+ "winapi",
  "zip",
 ]
 

@@ -25,28 +25,66 @@ use crossterm::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-/// Set once a write to stdout has failed: the reader has gone away
+/// Set once a write to stdout has failed because its reader has gone away
 /// (`api -sa seed.api | head -2`). Nothing more is written there.
 static STDOUT_CLOSED: AtomicBool = AtomicBool::new(false);
 
-/// Stdout for everything the client prints. A closed stdout is not a reason
-/// to stop: a batch is run for its requests, and its log is a by-product. So
-/// a failed write is remembered, what follows is dropped, and the run goes
-/// on to exit by how its requests went.
+/// Write all of `buf`, or flush when it is `None`. An error that only says
+/// "not now" is waited out: a pipe that is full for the moment (`WouldBlock`,
+/// when the other end set it non-blocking) or a call that was interrupted.
+/// `write`, not `write_all`: after an error it says how much was taken.
+fn write_through(to: &mut impl Write, buf: Option<&[u8]>) -> io::Result<()> {
+    let mut rest = buf.unwrap_or_default();
+    loop {
+        let step = match buf {
+            Some(_) if rest.is_empty() => return Ok(()),
+            Some(_) => to.write(rest),
+            None => to.flush().map(|()| 0),
+        };
+        match step {
+            Ok(_) if buf.is_none() => return Ok(()),
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => rest = &rest[n..],
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(1)),
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Stdout for everything the client prints. A stdout nobody reads any more
+/// (a broken pipe) is not a reason to stop: a batch is run for its requests,
+/// and its log is a by-product. So that is remembered, what follows is
+/// dropped, and the run goes on to exit by how its requests went.
+///
+/// Any other failure (a full disk under `> log`) is one: it is said on
+/// stderr and the run ends with exit 1, since what was asked for is not
+/// where it was to go.
 struct Out;
+
+impl Out {
+    fn put(buf: Option<&[u8]>) {
+        if STDOUT_CLOSED.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Err(e) = write_through(&mut io::stdout().lock(), buf) {
+            STDOUT_CLOSED.store(true, Ordering::Relaxed);
+            if e.kind() != io::ErrorKind::BrokenPipe {
+                let _ = writeln!(ErrOut, "Error writing to stdout: {}", e);
+                exit_process(1);
+            }
+        }
+    }
+}
 
 impl Write for Out {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if !STDOUT_CLOSED.load(Ordering::Relaxed) && io::stdout().write_all(buf).is_err() {
-            STDOUT_CLOSED.store(true, Ordering::Relaxed);
-        }
+        Out::put(Some(buf));
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        if !STDOUT_CLOSED.load(Ordering::Relaxed) && io::stdout().flush().is_err() {
-            STDOUT_CLOSED.store(true, Ordering::Relaxed);
-        }
+        Out::put(None);
         Ok(())
     }
 }
@@ -74,21 +112,32 @@ static STDERR_CLOSED: AtomicBool = AtomicBool::new(false);
 /// Stderr for everything the client says there: in `-a` mode that is the
 /// status line of every request. Like `Out`, a reader that has gone away
 /// (`api -a seed.api 2>&1 | head -1`) does not stop the batch, where
-/// `eprintln!` would panic on the first line nobody took.
+/// `eprintln!` would panic on the first line nobody took. A stderr that
+/// fails in any other way has nowhere left to say so: the run ends, exit 1.
 struct ErrOut;
+
+impl ErrOut {
+    fn put(buf: Option<&[u8]>) {
+        if STDERR_CLOSED.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Err(e) = write_through(&mut io::stderr().lock(), buf) {
+            STDERR_CLOSED.store(true, Ordering::Relaxed);
+            if e.kind() != io::ErrorKind::BrokenPipe {
+                exit_process(1);
+            }
+        }
+    }
+}
 
 impl Write for ErrOut {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if !STDERR_CLOSED.load(Ordering::Relaxed) && io::stderr().write_all(buf).is_err() {
-            STDERR_CLOSED.store(true, Ordering::Relaxed);
-        }
+        ErrOut::put(Some(buf));
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        if !STDERR_CLOSED.load(Ordering::Relaxed) && io::stderr().flush().is_err() {
-            STDERR_CLOSED.store(true, Ordering::Relaxed);
-        }
+        ErrOut::put(None);
         Ok(())
     }
 }
@@ -160,7 +209,9 @@ impl Drop for TerminalGuard {
 /// leave the shell in raw mode with bracketed paste on.
 fn exit_process(code: i32) -> ! {
     restore_terminal();
-    let _ = io::stdout().flush();
+    // What is still buffered goes out as everything else did. A stdout that
+    // has failed is not tried again (and does not lead back here).
+    let _ = Out.flush();
     std::process::exit(code)
 }
 
@@ -2069,21 +2120,35 @@ fn load_history_from(path: &std::path::Path) -> Vec<String> {
 }
 
 /// Write the last `HISTORY_LIMIT` entries as the whole file, in one step.
+/// The file they are staged in is private from the start, and a history that
+/// is a symlink is written where the link points.
 fn save_history_to(path: &std::path::Path, history: &[String]) {
+    save_history_with(path, history, |from, to| fs::rename(from, to))
+}
+
+fn save_history_with(
+    path: &std::path::Path,
+    history: &[String],
+    rename: impl Fn(&std::path::Path, &std::path::Path) -> io::Result<()>,
+) {
     let kept = &history[history.len().saturating_sub(HISTORY_LIMIT)..];
     let mut text = String::new();
     for entry in kept {
         text.push_str(&history_line(entry));
         text.push('\n');
     }
-    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    let target = resolve_link(path);
+    let mut name = target.file_name().map(|n| n.to_os_string()).unwrap_or_default();
     name.push(format!(".tmp-{}", std::process::id()));
-    let tmp = path.with_file_name(name);
-    if fs::write(&tmp, text).is_ok() {
-        keep_history_private(&tmp);
-        if fs::rename(&tmp, path).is_err() {
-            let _ = fs::remove_file(&tmp);
-        }
+    let tmp = target.with_file_name(name);
+    // Something that has the name already is not this run's to write or remove.
+    let Ok(mut file) = create_private(&tmp) else {
+        return;
+    };
+    let staged = file.write_all(text.as_bytes()).and_then(|()| file.flush());
+    drop(file);
+    if staged.and_then(|()| rename(&tmp, &target)).is_err() {
+        let _ = fs::remove_file(&tmp);
     }
 }
 
@@ -3705,7 +3770,23 @@ fn main() {
         // An exact alias first, then a URL, with or without its scheme.
         let by_alias = envs.iter().find(|name| *name == connection_selector).and_then(|name| load_connection(name));
         let found = by_alias.or_else(|| {
-            envs.iter().filter_map(|name| load_connection(name)).find(|env| url_selects(&env.url, connection_selector))
+            let mut fits: Vec<SavedConnection> = envs
+                .iter()
+                .filter_map(|name| load_connection(name))
+                .filter(|env| url_selects(&env.url, connection_selector))
+                .collect();
+            // Several connections to one host hold different credentials,
+            // and which of them to send is not something to guess.
+            if fits.len() > 1 {
+                let names: Vec<&str> = fits.iter().map(|env| env.name.as_str()).collect();
+                errln!(
+                    "Connection \"{}\" fits several saved connections: {}. Name one of them.",
+                    connection_selector,
+                    names.join(", ")
+                );
+                exit_process(1);
+            }
+            fits.pop()
         });
         let Some(env) = found else {
             errln!("Connection \"{}\" not found. Saved connections: {}", connection_selector,
@@ -6405,7 +6486,16 @@ fn check_nested_import(spec: &ImportSpec, within: &ImportedRepo) -> Result<(), S
         }
         ImportSource::Git { url, .. } | ImportSource::Archive { url, .. } => url,
     };
+    // What stands before an `@` is read one way by this client and maybe
+    // another by git or by a proxy, and the host is what the rule below
+    // compares. `user@host:path` has one reading and stays.
+    let userinfo = reqwest::Url::parse(url)
+        .is_ok_and(|parsed| parsed.has_host() && (!parsed.username().is_empty() || parsed.password().is_some()));
     match &within.host {
+        Some(_) if userinfo => Err(format!(
+            "import {}: an imported file can't name a user or a password in a url: {}",
+            spec.alias, url
+        )),
         Some(host) if import_host(url).as_ref() != Some(host) => Err(format!(
             "import {}: a file imported from {} can import only from {}, not {}",
             spec.alias, host, host, url
@@ -6615,11 +6705,19 @@ fn parse_import_directive(
 /// connections are.
 fn validate_archive_url(url: &str) -> Result<(), String> {
     let unsupported = || format!("unsupported url `{}` (use https:// or file://)", url);
-    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+    // A `\` is a `/` to one URL parser and a character of the host to another.
+    if url.contains('\\') {
         return Err(unsupported());
     }
-    if let Some(path) = url.strip_prefix("file://") {
-        return if path.starts_with('/') { Ok(()) } else { Err(unsupported()) };
+    if url.starts_with("file://") {
+        // A path of this machine may hold a blank.
+        if url.chars().any(|c| c.is_control() || (c.is_whitespace() && c != ' ')) {
+            return Err(unsupported());
+        }
+        return archive_file_path(url).map(|_| ());
+    }
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(unsupported());
     }
     let parsed = reqwest::Url::parse(url).map_err(|_| unsupported())?;
     match parsed.scheme() {
@@ -6627,6 +6725,41 @@ fn validate_archive_url(url: &str) -> Result<(), String> {
         "http" if is_loopback_url(&parsed) => Ok(()),
         _ => Err(unsupported()),
     }
+}
+
+/// The file a `file://` archive URL names: `file:///path` or
+/// `file://localhost/path`, with `%20` and the like decoded. Any other host is
+/// refused, since the file would be read from this machine all the same.
+fn archive_file_path(url: &str) -> Result<PathBuf, String> {
+    let rest = url.strip_prefix("file://").unwrap_or(url);
+    let at = rest.find('/').unwrap_or(rest.len());
+    let (host, path) = rest.split_at(at);
+    if !host.is_empty() && !host.eq_ignore_ascii_case("localhost") {
+        return Err(format!(
+            "unsupported url `{}` (a file:// url reads a file of this machine, not of the host `{}`: write file:///path)",
+            url, host
+        ));
+    }
+    if path.is_empty() {
+        return Err(format!("unsupported url `{}` (use https:// or file://)", url));
+    }
+    let raw = path.as_bytes();
+    let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+    let mut decoded = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        match (raw[i], raw.get(i + 1).copied().and_then(hex), raw.get(i + 2).copied().and_then(hex)) {
+            (b'%', Some(high), Some(low)) => {
+                decoded.push(high * 16 + low);
+                i += 3;
+            }
+            (byte, _, _) => {
+                decoded.push(byte);
+                i += 1;
+            }
+        }
+    }
+    Ok(PathBuf::from(String::from_utf8_lossy(&decoded).into_owned()))
 }
 
 fn is_loopback_url(url: &reqwest::Url) -> bool {
@@ -6645,7 +6778,9 @@ fn validate_import_url(url: &str) -> Result<(), String> {
         };
         plain(user) && plain(host) && !path.is_empty() && !path.starts_with("//")
     };
+    // A `\` is a `/` to one URL parser and a character of the host to another.
     let ok = !url.starts_with('-')
+        && !url.contains('\\')
         && !url.chars().any(|c| c.is_whitespace() || c.is_control())
         && (["https://", "ssh://", "file://"].iter().any(|scheme| url.starts_with(scheme)) || scp_like());
     if ok {
@@ -6684,40 +6819,88 @@ fn import_cache_key(name: &str) -> String {
     format!("{}-{:016x}", readable, hash)
 }
 
-/// A git command that can't stop to ask for anything and can't be steered
-/// onto another transport. Symlinks are checked out as plain files, so a
-/// repository can't point at a file outside itself.
+/// A git command that can't stop to ask for anything, can't be steered onto
+/// another transport and gives up on a remote that has gone quiet. Symlinks
+/// are checked out as plain files, so a repository can't point at a file
+/// outside itself. Its messages are in English whatever the locale, since
+/// `git_remote_did_not_answer` reads them.
 fn git_command(dir: Option<&std::path::Path>) -> Command {
     let mut cmd = Command::new("git");
     if let Some(dir) = dir {
         cmd.arg("-C").arg(dir);
     }
     cmd.args(["-c", "core.symlinks=false", "-c", "advice.detachedHead=false"])
+        // Less than a byte a second for a minute is a remote that is gone.
+        .args(["-c", "http.lowSpeedLimit=1", "-c", "http.lowSpeedTime=60"])
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_LFS_SKIP_SMUDGE", "1")
         .env("GIT_ALLOW_PROTOCOL", "https:ssh:file")
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
         .stdin(std::process::Stdio::null());
     if std::env::var_os("GIT_SSH_COMMAND").is_none() && std::env::var_os("GIT_SSH").is_none() {
-        cmd.env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
+        cmd.env(
+            "GIT_SSH_COMMAND",
+            "ssh -oBatchMode=yes -oConnectTimeout=30 -oServerAliveInterval=15 -oServerAliveCountMax=4",
+        );
     }
     cmd
 }
 
+/// How long one git command may take, as an archive download may: a remote
+/// that accepts the connection and then says nothing must not hang the batch.
+const GIT_DEADLINE: Duration = Duration::from_secs(300);
+
 /// Run a git command, returning its stdout or the reason it failed.
-fn run_git(mut cmd: Command) -> Result<String, String> {
-    let output = cmd.output().map_err(|e| {
-        if e.kind() == io::ErrorKind::NotFound {
-            "an import needs `git` on the PATH".to_string()
-        } else {
-            format!("could not run git: {}", e)
-        }
-    })?;
+fn run_git(cmd: Command) -> Result<String, String> {
+    run_git_within(cmd, GIT_DEADLINE)
+}
+
+/// `run_git` with the time the command may take given.
+fn run_git_within(mut cmd: Command, deadline: Duration) -> Result<String, String> {
+    let output = match output_with_timeout(&mut cmd, deadline) {
+        Ok(Some(output)) => output,
+        Ok(None) => return Err(format!("git timed out after {}", format_elapsed(deadline))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err("an import needs `git` on the PATH".to_string()),
+        Err(e) => return Err(format!("could not run git: {}", e)),
+    };
     if output.status.success() {
         return Ok(String::from_utf8_lossy(&output.stdout).to_string());
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
     let reason = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("; ");
     Err(if reason.is_empty() { format!("git exited with {}", output.status) } else { reason })
+}
+
+/// Whether git failed because the remote gave no answer at all: its name did
+/// not resolve, nothing accepted the connection, or it went quiet. A remote
+/// that answered (a refused login, no such repository) is not this, and
+/// neither is anything this list does not know.
+fn git_remote_did_not_answer(reason: &str) -> bool {
+    const NO_ANSWER: &[&str] = &[
+        "could not resolve host",
+        "name or service not known",
+        "temporary failure in name resolution",
+        "failed to connect to",
+        "couldn't connect to server",
+        "could not connect to server",
+        "connection refused",
+        "timed out",
+        "operation too slow",
+        "not responding",
+        "network is unreachable",
+        "no route to host",
+        "network is down",
+    ];
+    let reason = reason.to_ascii_lowercase();
+    NO_ANSWER.iter().any(|needle| reason.contains(needle))
+}
+
+/// Why an import could not be fetched, and whether that was a remote that
+/// gave no answer at all: the only failure a cached copy may stand in for.
+struct FetchFailure {
+    reason: String,
+    unanswered: bool,
 }
 
 /// From `git ls-remote` output, the commit `git_ref` names and the full ref
@@ -6775,7 +6958,7 @@ fn fetch_into_cache(url: &str, fetch_name: &str, repo_cache: &std::path::Path) -
     let sha = match fetched {
         Ok(sha) => sha,
         Err(e) => {
-            let _ = fs::remove_dir_all(&scratch);
+            discard_scratch(&scratch);
             return Err(e);
         }
     };
@@ -6823,11 +7006,16 @@ fn mark_import_used(checkout: &std::path::Path) {
 /// fetches that never finished. `keep` is the one this run just fetched.
 /// Called only when a fetch has brought something new in, so a run that finds
 /// everything cached never pays for the walk.
+///
+/// Only a directory with a marker beside it is the client's to remove: the
+/// cache may be a directory that holds other things, and a name that looks
+/// like a hash proves nothing. A checkout from before there were markers gets
+/// one the next time it is used, and is otherwise left where it is.
 fn prune_import_cache(cache_dir: &std::path::Path, keep: &std::path::Path, max_age: Duration) {
     let now = std::time::SystemTime::now();
-    let unused_for = |path: &std::path::Path| -> Option<Duration> {
-        let modified = fs::metadata(path).and_then(|m| m.modified()).ok()?;
-        now.duration_since(modified).ok()
+    let unused_for = |marker: &std::path::Path| -> Option<Duration> {
+        let meta = fs::symlink_metadata(marker).ok().filter(|m| m.is_file())?;
+        now.duration_since(meta.modified().ok()?).ok()
     };
     let is_hash = |name: &str| (name.len() == 40 || name.len() == 64) && name.chars().all(|c| c.is_ascii_hexdigit());
     // One directory per repository, and `archives` beside them.
@@ -6835,18 +7023,12 @@ fn prune_import_cache(cache_dir: &std::path::Path, keep: &std::path::Path, max_a
         for entry in fs::read_dir(group.path()).into_iter().flatten().flatten() {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
-            if path == keep || !path.is_dir() {
+            let is_dir = fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir());
+            if path == keep || !is_dir {
                 continue;
             }
             let marker = import_used_marker(&path);
-            // A checkout made before there were markers is as old as it is.
-            let idle = if name.starts_with(".tmp-") {
-                unused_for(&path)
-            } else if is_hash(&name) {
-                unused_for(&marker).or_else(|| unused_for(&path))
-            } else {
-                None
-            };
+            let idle = if name.starts_with(".tmp-") || is_hash(&name) { unused_for(&marker) } else { None };
             if idle.is_some_and(|idle| idle > max_age) {
                 let _ = fs::remove_dir_all(&path);
                 let _ = fs::remove_file(&marker);
@@ -6856,7 +7038,9 @@ fn prune_import_cache(cache_dir: &std::path::Path, keep: &std::path::Path, max_a
 }
 
 /// A path for work in progress under `parent` (created if need be), named so
-/// two runs never share one. The directory itself is not created.
+/// two runs never share one. The directory itself is not created; the marker
+/// beside it is, which is what lets a later run clear out what a fetch that
+/// never finished left there.
 fn cache_scratch_dir(parent: &std::path::Path) -> Result<PathBuf, String> {
     fs::create_dir_all(parent).map_err(|e| format!("could not create {}: {}", parent.display(), e))?;
     let nanos = std::time::SystemTime::now()
@@ -6865,17 +7049,24 @@ fn cache_scratch_dir(parent: &std::path::Path) -> Result<PathBuf, String> {
         .unwrap_or(0);
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    Ok(parent.join(format!(".tmp-{}-{}-{}", std::process::id(), nanos, n)))
+    let scratch = parent.join(format!(".tmp-{}-{}-{}", std::process::id(), nanos, n));
+    mark_import_used(&scratch);
+    Ok(scratch)
+}
+
+/// Remove a scratch directory and its marker.
+fn discard_scratch(scratch: &std::path::Path) {
+    let _ = fs::remove_dir_all(scratch);
+    let _ = fs::remove_file(import_used_marker(scratch));
 }
 
 /// Give finished work in `scratch` its place in the cache. If `dest` is
 /// already there, another run got to it first and its copy is kept.
 fn move_into_cache(scratch: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
-    if dest.is_dir() || fs::rename(scratch, dest).is_err() {
-        let _ = fs::remove_dir_all(scratch);
-        if !dest.is_dir() {
-            return Err(format!("could not move the import into {}", dest.display()));
-        }
+    let moved = !dest.is_dir() && fs::rename(scratch, dest).is_ok();
+    discard_scratch(scratch);
+    if !moved && !dest.is_dir() {
+        return Err(format!("could not move the import into {}", dest.display()));
     }
     Ok(())
 }
@@ -6889,6 +7080,29 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// The most an archive may unpack to. An import holds `.api` files and their
 /// bodies; anything near this is a mistake or an attack.
 const ARCHIVE_UNPACKED_LIMIT: u64 = 1024 * 1024 * 1024;
+
+/// The most files and directories an archive may unpack to. Empty ones weigh
+/// nothing against the limit above and fill a disk's inodes all the same.
+const ARCHIVE_ENTRY_LIMIT: u64 = 100_000;
+
+/// The bounds an archive is unpacked within, and what is left of them.
+struct UnpackBudget {
+    bytes: u64,
+    entries: u64,
+}
+
+impl UnpackBudget {
+    /// Count the entry at `path` and the directories that have to be made
+    /// for it under `dest`, before any of them is.
+    fn entry(&mut self, path: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
+        let new = path.ancestors().take_while(|a| *a != dest && a.starts_with(dest) && !a.exists()).count() as u64;
+        if new > self.entries {
+            return Err("archive holds more than 100,000 files and directories".to_string());
+        }
+        self.entries -= new;
+        Ok(())
+    }
+}
 
 /// Where an archive entry named `name` goes under `dest`, or an error if the
 /// name would put it anywhere else.
@@ -6907,18 +7121,18 @@ fn archive_entry_dest(name: &std::path::Path, dest: &std::path::Path) -> Result<
 fn write_archive_file(
     mut from: impl io::Read,
     path: &std::path::Path,
-    remaining: &mut u64,
+    budget: &mut UnpackBudget,
 ) -> Result<(), String> {
     let failed = |e: io::Error| format!("could not unpack {}: {}", path.display(), e);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(failed)?;
     }
     let mut file = fs::File::create(path).map_err(failed)?;
-    let written = io::copy(&mut (&mut from).take(*remaining + 1), &mut file).map_err(failed)?;
-    if written > *remaining {
+    let written = io::copy(&mut (&mut from).take(budget.bytes.saturating_add(1)), &mut file).map_err(failed)?;
+    if written > budget.bytes {
         return Err("archive unpacks to more than 1 GB".to_string());
     }
-    *remaining -= written;
+    budget.bytes -= written;
     Ok(())
 }
 
@@ -6926,12 +7140,13 @@ fn write_archive_file(
 /// into `dest`. Only files and directories are written: links and device
 /// entries are skipped, and an entry named outside the archive is an error.
 fn unpack_archive(bytes: &[u8], dest: &std::path::Path) -> Result<(), String> {
-    unpack_archive_within(bytes, dest, ARCHIVE_UNPACKED_LIMIT)
+    unpack_archive_within(bytes, dest, ARCHIVE_UNPACKED_LIMIT, ARCHIVE_ENTRY_LIMIT)
 }
 
-/// `unpack_archive` with the size it may unpack to given.
-fn unpack_archive_within(bytes: &[u8], dest: &std::path::Path, limit: u64) -> Result<(), String> {
-    let mut remaining = limit;
+/// `unpack_archive` with the size and the number of files and directories it
+/// may unpack to given.
+fn unpack_archive_within(bytes: &[u8], dest: &std::path::Path, limit: u64, entries: u64) -> Result<(), String> {
+    let mut budget = UnpackBudget { bytes: limit, entries };
     fs::create_dir_all(dest).map_err(|e| format!("could not create {}: {}", dest.display(), e))?;
 
     if bytes.starts_with(b"PK\x03\x04") {
@@ -6944,9 +7159,11 @@ fn unpack_archive_within(bytes: &[u8], dest: &std::path::Path, limit: u64) -> Re
             };
             let path = archive_entry_dest(&name, dest)?;
             if entry.is_dir() {
+                budget.entry(&path, dest)?;
                 fs::create_dir_all(&path).map_err(|e| format!("could not unpack {}: {}", path.display(), e))?;
             } else if entry.is_file() {
-                write_archive_file(entry, &path, &mut remaining)?;
+                budget.entry(&path, dest)?;
+                write_archive_file(entry, &path, &mut budget)?;
             }
         }
         return Ok(());
@@ -6972,10 +7189,11 @@ fn unpack_archive_within(bytes: &[u8], dest: &std::path::Path, limit: u64) -> Re
         }
         let name = entry.path().map_err(unreadable)?.into_owned();
         let path = archive_entry_dest(&name, dest)?;
+        budget.entry(&path, dest)?;
         if kind.is_dir() {
             fs::create_dir_all(&path).map_err(|e| format!("could not unpack {}: {}", path.display(), e))?;
         } else {
-            write_archive_file(entry, &path, &mut remaining)?;
+            write_archive_file(entry, &path, &mut budget)?;
         }
     }
     Ok(())
@@ -6984,9 +7202,59 @@ fn unpack_archive_within(bytes: &[u8], dest: &std::path::Path, limit: u64) -> Re
 /// Download an archive. `token` goes along as a bearer token; the client's
 /// own API credentials never do. A redirect is followed only to `https://`
 /// (or to this machine), so a download can't be steered onto plain http.
-fn download_archive(url: &str, token: Option<&str>) -> Result<Vec<u8>, String> {
-    if let Some(path) = url.strip_prefix("file://") {
-        return fs::read(path).map_err(|e| e.to_string());
+fn download_archive(url: &str, token: Option<&str>) -> Result<Vec<u8>, FetchFailure> {
+    download_archive_within(url, token, ARCHIVE_UNPACKED_LIMIT)
+}
+
+/// What a download is refused with when it is larger than an archive may
+/// unpack to: it is held in memory, and could never be unpacked.
+const ARCHIVE_TOO_LARGE: &str = "the archive is larger than 1 GB";
+
+/// The bytes of a download as they arrive, up to `limit` of them.
+struct CappedDownload {
+    bytes: Vec<u8>,
+    limit: u64,
+    over: bool,
+}
+
+impl io::Write for CappedDownload {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if (self.bytes.len() + buf.len()) as u64 > self.limit {
+            self.over = true;
+            return Err(io::Error::other(ARCHIVE_TOO_LARGE));
+        }
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `download_archive` with the size the download may have given.
+fn download_archive_within(url: &str, token: Option<&str>, limit: u64) -> Result<Vec<u8>, FetchFailure> {
+    let answered = |reason: String| FetchFailure { reason, unanswered: false };
+    // A failure of the request itself: no answer when nothing was reached
+    // or it took too long, an answer otherwise (a refused redirect is one).
+    let failed = |e: reqwest::Error| FetchFailure {
+        reason: describe_download_error(&e),
+        unanswered: e.is_connect() || e.is_timeout(),
+    };
+    let mut download = CappedDownload { bytes: Vec::new(), limit, over: false };
+    if url.starts_with("file://") {
+        // A file that is not there is the remote that did not answer: a
+        // disk that is not mounted, a share that is away.
+        let unread = |e: io::Error| FetchFailure { reason: e.to_string(), unanswered: e.kind() == io::ErrorKind::NotFound };
+        let mut file = fs::File::open(archive_file_path(url).map_err(answered)?).map_err(unread)?;
+        if file.metadata().map_err(unread)?.len() > limit {
+            return Err(answered(ARCHIVE_TOO_LARGE.to_string()));
+        }
+        return match io::copy(&mut file, &mut download) {
+            Ok(_) => Ok(download.bytes),
+            Err(_) if download.over => Err(answered(ARCHIVE_TOO_LARGE.to_string())),
+            Err(e) => Err(answered(e.to_string())),
+        };
     }
     let client = client_builder()
         .timeout(Duration::from_secs(300))
@@ -7001,17 +7269,25 @@ fn download_archive(url: &str, token: Option<&str>) -> Result<Vec<u8>, String> {
             }
         }))
         .build()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| answered(e.to_string()))?;
     let mut request = client.get(url);
     if let Some(token) = token {
         request = request.bearer_auth(token);
     }
-    let response = request.send().map_err(|e| describe_download_error(&e))?;
+    let mut response = request.send().map_err(failed)?;
     let status = response.status();
     if !status.is_success() {
-        return Err(status.to_string());
+        return Err(answered(status.to_string()));
     }
-    response.bytes().map(|b| b.to_vec()).map_err(|e| describe_download_error(&e))
+    // What the server says it will send, and then what it does send.
+    if response.content_length().is_some_and(|length| length > limit) {
+        return Err(answered(ARCHIVE_TOO_LARGE.to_string()));
+    }
+    match response.copy_to(&mut download) {
+        Ok(_) => Ok(download.bytes),
+        Err(_) if download.over => Err(answered(ARCHIVE_TOO_LARGE.to_string())),
+        Err(e) => Err(failed(e)),
+    }
 }
 
 /// A download failure without the URL in it (the caller names the import)
@@ -7033,7 +7309,7 @@ fn describe_download_error(e: &reqwest::Error) -> String {
 /// With a `sha256`, the cache is asked first and a hit needs no network; a
 /// download whose hash differs is an error. Without one the archive is
 /// downloaded on every run, since the URL may serve something new, and if it
-/// can't be reached the copy it last served is used, marked stale.
+/// gives no answer at all the copy it last served is used, marked stale.
 fn fetch_archive_import(
     url: &str,
     sha256: Option<&str>,
@@ -7074,7 +7350,7 @@ fn fetch_archive_import(
                 if !archives.join(&sha).is_dir() {
                     let scratch = cache_scratch_dir(&archives)?;
                     if let Err(e) = unpack_archive(&bytes, &scratch) {
-                        let _ = fs::remove_dir_all(&scratch);
+                        discard_scratch(&scratch);
                         return Err(format!("import archive {}: {}", url, e));
                     }
                     move_into_cache(&scratch, &archives.join(&sha))?;
@@ -7088,13 +7364,16 @@ fn fetch_archive_import(
                 found(sha, false)
             }
             Err(e) => {
+                // Only for a url that gave no answer: one that answers 404
+                // or 401 has said something, and the old files are not it.
                 let cached = fs::read_to_string(&last_served)
                     .ok()
+                    .filter(|_| e.unanswered)
                     .map(|sha| sha.trim().to_string())
                     .filter(|sha| sha256.is_none() && sha.len() == 64 && archives.join(sha).is_dir());
                 match cached {
                     Some(sha) => found(sha, true),
-                    None => return Err(format!("could not reach import {}: {}", url, e)),
+                    None => return Err(format!("could not reach import {}: {}", url, e.reason)),
                 }
             }
         }
@@ -7111,9 +7390,16 @@ fn fetch_archive_import(
 /// The directory an unpacked archive's files start in: the one directory at
 /// its top when that is all there is (`cloddy-2.1.0/…`, the way a release
 /// tarball is packed), otherwise the top itself.
+///
+/// What a file manager leaves beside it does not count: a name that starts
+/// with a dot (`.DS_Store`, `._name`) and the `__MACOSX` of a zip made on a Mac.
 fn archive_top_dir(checkout: &std::path::Path) -> PathBuf {
+    let beside = |path: &PathBuf| {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        name.starts_with('.') || name == "__MACOSX" || is_os_junk(path)
+    };
     let mut entries = match fs::read_dir(checkout) {
-        Ok(entries) => entries.flatten().map(|e| e.path()).filter(|p| !is_os_junk(p)),
+        Ok(entries) => entries.flatten().map(|e| e.path()).filter(|p| !beside(p)),
         Err(_) => return checkout.to_path_buf(),
     };
     match (entries.next(), entries.next()) {
@@ -7156,8 +7442,8 @@ fn resolve_import_dir(
 ///
 /// A commit SHA already in the cache costs nothing. A tag or a branch is
 /// resolved with one `git ls-remote` and fetched only when it points at a
-/// commit the cache doesn't hold. If the remote can't be reached, the commit
-/// the ref last resolved to is used, marked stale.
+/// commit the cache doesn't hold. If the remote gives no answer at all, the
+/// commit the ref last resolved to is used, marked stale.
 fn fetch_git_import(url: &str, git_ref: &str) -> Result<FetchedImport, String> {
     let cache_dir = import_cache_dir()?;
     let memo_key = (cache_dir.clone(), "git", url.to_string(), git_ref.to_string());
@@ -7177,8 +7463,11 @@ fn fetch_git_import(url: &str, git_ref: &str) -> Result<FetchedImport, String> {
             Ok(listing) => pick_remote_ref(&listing, git_ref)
                 .ok_or_else(|| format!("import ref not found: {} in {}", git_ref, url))?,
             Err(e) => {
+                // Only for a remote that gave no answer. One that refused
+                // the login or has no such repository has said something.
                 let cached = fs::read_to_string(&last_resolved)
                     .ok()
+                    .filter(|_| git_remote_did_not_answer(&e) || git_file_remote_is_gone(url))
                     .map(|sha| sha.trim().to_string())
                     .filter(|sha| is_full_sha(sha) && repo_cache.join(sha).is_dir());
                 match cached {
@@ -7214,6 +7503,12 @@ fn fetch_git_import(url: &str, git_ref: &str) -> Result<FetchedImport, String> {
     };
     resolved_imports().lock().unwrap().insert(memo_key, fetched.clone());
     Ok(fetched)
+}
+
+/// Whether `url` is a `file://` repository that is not there: the remote
+/// that did not answer, for a disk that is not mounted or a share that is away.
+fn git_file_remote_is_gone(url: &str) -> bool {
+    url.strip_prefix("file://").is_some_and(|path| !std::path::Path::new(path).exists())
 }
 
 /// `path` with its `.` and `..` components resolved by name alone.
@@ -7411,8 +7706,28 @@ fn split_alias(spec: &str, backslash_separates: bool) -> Option<(&str, &str)> {
     Some((&spec[..at], &spec[at + 1..]))
 }
 
+/// Refuse an include line of an imported file (or an alias path) that names a
+/// place outside its repository, going by the line alone. This comes before
+/// the line is looked up, so nothing outside is walked for a pattern, and a
+/// file that is there is refused exactly as one that is not.
+fn ensure_include_names_inside(
+    raw: &str,
+    base: &std::path::Path,
+    repo: &ImportedRepo,
+    spec: &str,
+) -> Result<(), String> {
+    let inside = !raw.starts_with('~')
+        && !std::path::Path::new(raw).is_absolute()
+        && normalize_path_lexically(&base.join(raw)).starts_with(&repo.checkout);
+    if inside {
+        Ok(())
+    } else {
+        Err(format!("import {}: include leaves the import: {}", repo.alias, spec))
+    }
+}
+
 /// Refuse an include that an imported file (or an alias path) points outside
-/// its repository.
+/// its repository: where the file really is, a link followed.
 fn ensure_inside_import(path: &std::path::Path, repo: &ImportedRepo, spec: &str) -> Result<(), String> {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     if canonical.starts_with(&repo.checkout) {
@@ -8080,11 +8395,16 @@ fn split_bulk_requests_inner(
                 // `alias/…` names a file in an imported repository; anything
                 // else is a path next to this file.
                 let (paths, repo) = match alias_include(trimmed, aliases) {
-                    Some((repo, rest)) => (
-                        resolve_include_paths_as(rest, Some(&repo.root), trimmed)?,
-                        Some(repo.clone()),
-                    ),
-                    None => (resolve_include_paths(trimmed, base_dir)?, within.cloned()),
+                    Some((repo, rest)) => {
+                        ensure_include_names_inside(rest, &repo.root, repo, trimmed)?;
+                        (resolve_include_paths_as(rest, Some(&repo.root), trimmed)?, Some(repo.clone()))
+                    }
+                    None => {
+                        if let Some(repo) = within {
+                            ensure_include_names_inside(trimmed, base_dir.unwrap_or(&repo.root), repo, trimmed)?;
+                        }
+                        (resolve_include_paths(trimmed, base_dir)?, within.cloned())
+                    }
                 };
                 for path in paths {
                     if let Some(repo) = &repo {
@@ -9131,12 +9451,106 @@ fn stream_in_place(resp: impl IoRead, target: &std::path::Path) -> Result<Stream
     stream_to_sink(resp, &mut writer)
 }
 
+/// The partial files of the streamed transfers that are under way, each with
+/// the flag that tells its transfer it has been given up.
+static LIVE_PARTS: std::sync::Mutex<Vec<(PathBuf, Arc<AtomicBool>)>> = std::sync::Mutex::new(Vec::new());
+
+fn live_parts() -> std::sync::MutexGuard<'static, Vec<(PathBuf, Arc<AtomicBool>)>> {
+    LIVE_PARTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Give up every streamed transfer that is under way: its partial file is
+/// removed and it is told so, which keeps it from putting anything in the
+/// target's place. The lock is handed back for a caller that is about to end
+/// the process, so that no transfer starts or finishes behind its back.
+fn give_up_live_parts() -> std::sync::MutexGuard<'static, Vec<(PathBuf, Arc<AtomicBool>)>> {
+    let mut parts = live_parts();
+    for (part, given_up) in parts.drain(..) {
+        given_up.store(true, Ordering::SeqCst);
+        let _ = fs::remove_file(part);
+    }
+    parts
+}
+
+fn transfer_given_up() -> io::Error {
+    io::Error::other("the transfer was aborted")
+}
+
+/// A response body that stops being read once its transfer is given up.
+struct UntilGivenUp<'a, R> {
+    body: R,
+    given_up: &'a AtomicBool,
+}
+
+impl<R: IoRead> IoRead for UntilGivenUp<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.given_up.load(Ordering::SeqCst) {
+            return Err(transfer_given_up());
+        }
+        self.body.read(buf)
+    }
+}
+
+/// From the first partial file on, an interrupt removes what is half
+/// written before it ends the run: ctrl+c, and a `kill`. The run then ends
+/// as it would have without this, killed by that signal, so a shell still
+/// reports 130 for ctrl+c. The terminal is restored first, as on every way
+/// out.
+///
+/// A signal handler may do next to nothing, so the signals are taken on a
+/// thread of their own (`signal-hook`). A signal the run was started to
+/// ignore (a background job of a script) stays ignored.
+#[cfg(unix)]
+fn watch_for_interrupt() {
+    use signal_hook::consts::{SIGINT, SIGTERM};
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let ignored = |signal: i32| unsafe {
+            let mut current: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(signal, std::ptr::null(), &mut current) == 0 && current.sa_sigaction == libc::SIG_IGN
+        };
+        let wanted: Vec<i32> = [SIGINT, SIGTERM].into_iter().filter(|signal| !ignored(*signal)).collect();
+        let Ok(mut signals) = signal_hook::iterator::Signals::new(wanted) else {
+            return;
+        };
+        thread::spawn(move || {
+            if let Some(signal) = signals.forever().next() {
+                let _held = give_up_live_parts();
+                restore_terminal();
+                let _ = signal_hook::low_level::emulate_default_handler(signal);
+                std::process::exit(128 + signal);
+            }
+        });
+    });
+}
+
+/// On Windows the console calls the handler on a thread of its own, for
+/// ctrl+c, ctrl+break and a closed window. Answering "not handled" passes
+/// the event on to the default handler, which ends the process.
+#[cfg(windows)]
+fn watch_for_interrupt() {
+    unsafe extern "system" fn interrupted(_event: u32) -> i32 {
+        std::mem::forget(give_up_live_parts());
+        restore_terminal();
+        0
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        winapi::um::consoleapi::SetConsoleCtrlHandler(Some(interrupted), 1);
+    });
+}
+
+#[cfg(not(any(unix, windows)))]
+fn watch_for_interrupt() {}
+
 /// Stream a response body to `path`.
 ///
 /// The bytes go to a file of their own beside the target, which takes the
 /// target's name only once the body has ended. A transfer that fails then
 /// leaves no file that looks complete: the target is as it was. The new file
-/// has the mode the target had.
+/// has the mode the target had. The same goes for a transfer that is given
+/// up: by an interrupt (`watch_for_interrupt`), or by whoever holds
+/// `given_up` and sets it (esc at the prompt).
 ///
 /// A symlink is followed first, so the file it names is the target. And
 /// where that way is not open the target is written as it stands: one that
@@ -9144,14 +9558,16 @@ fn stream_in_place(resp: impl IoRead, target: &std::path::Path) -> Result<Stream
 /// no file can be created in. Such a target is cut short by a transfer that
 /// fails.
 fn stream_to_outfile(resp: impl IoRead, path: &str) -> Result<StreamedBody, StreamFailure> {
-    stream_to_outfile_with(resp, path, |from, to| fs::rename(from, to))
+    stream_to_outfile_with(resp, path, &Arc::new(AtomicBool::new(false)), |from, to| fs::rename(from, to))
 }
 
 fn stream_to_outfile_with(
     resp: impl IoRead,
     path: &str,
+    given_up: &Arc<AtomicBool>,
     rename: impl Fn(&std::path::Path, &std::path::Path) -> io::Result<()>,
 ) -> Result<StreamedBody, StreamFailure> {
+    let resp = UntilGivenUp { body: resp, given_up };
     let target = resolve_link(std::path::Path::new(path));
     let existing = fs::metadata(&target).ok();
     if existing.as_ref().is_some_and(|meta| !meta.is_file()) {
@@ -9162,7 +9578,20 @@ fn stream_to_outfile_with(
     if existing.is_some() {
         fs::OpenOptions::new().write(true).open(&target).map_err(StreamFailure::Write)?;
     }
-    let Ok((part, file)) = create_part(&target) else {
+    watch_for_interrupt();
+    // Made and listed in one step, so an interrupt finds every file there is.
+    let created = {
+        let mut parts = live_parts();
+        if given_up.load(Ordering::SeqCst) {
+            return Err(StreamFailure::Body(transfer_given_up()));
+        }
+        let created = create_part(&target);
+        if let Ok((part, _)) = &created {
+            parts.push((part.clone(), Arc::clone(given_up)));
+        }
+        created
+    };
+    let Ok((part, file)) = created else {
         // No file can be made beside it. Whether the target itself can be
         // written is for the write to say.
         return stream_in_place(resp, &target);
@@ -9174,6 +9603,18 @@ fn stream_to_outfile_with(
     let mut writer = io::BufWriter::new(file);
     let streamed = stream_to_sink(resp, &mut writer);
     drop(writer);
+    // From here the file is this transfer's to place or remove, unless it
+    // was given up meanwhile: then it is gone, and its name may be another
+    // transfer's by now.
+    let mut parts = live_parts();
+    let Some(listed) = parts.iter().position(|(_, flag)| Arc::ptr_eq(flag, given_up)) else {
+        return Err(StreamFailure::Body(transfer_given_up()));
+    };
+    parts.remove(listed);
+    let streamed = match given_up.load(Ordering::SeqCst) {
+        true => Err(StreamFailure::Body(transfer_given_up())),
+        false => streamed,
+    };
     let result = streamed.and_then(|body| {
         // A target that can't be replaced (a file mounted on its own) is
         // given the finished bytes instead.
@@ -9575,7 +10016,7 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
     outcome
 }
 
-fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool, connection_alias: String, connecting_to: Option<String>, oauth2_creds: Option<(String, String)>, startup_preloaded: Option<BackgroundLoadResult>, from_cli_auth: bool) -> io::Result<()> {
+fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool, mut connection_alias: String, connecting_to: Option<String>, oauth2_creds: Option<(String, String)>, startup_preloaded: Option<BackgroundLoadResult>, from_cli_auth: bool) -> io::Result<()> {
     // Get initial terminal size
     let (width, height) = terminal::size()?;
 
@@ -9625,6 +10066,12 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
                         // A failed token exchange shows when the load below fails.
                         let mut new_config = config.clone();
                         let _ = connect(&mut new_config, &env, resolved_config);
+                        // Nothing of the refused connection is kept: the
+                        // name is that of the one in use now, or none for
+                        // what was typed into the form. With the old name
+                        // its stored client secret would be loaded below
+                        // and sent to the new host on the next 401.
+                        connection_alias = env.name.clone();
                         // Stay on form with animated spinner while loading
                         let new_result = if let Some(pre) = preloaded {
                             pre
@@ -11234,6 +11681,10 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     let thread_config = state.config.clone();
     // The outfile as it was written, for a message about it.
     let outfile_written = state.display_outfile.clone();
+    // Set when the request is aborted, so that a streamed outfile is given
+    // up by the thread that goes on without us.
+    let given_up = Arc::new(AtomicBool::new(false));
+    let thread_given_up = Arc::clone(&given_up);
     let request_handle = thread::spawn(move || {
         let sent = send_request(&thread_config, &parts, built).map_err(|e| RequestFailure::of(e, &failure_base_uri));
         let result = sent.and_then(|sent| {
@@ -11245,7 +11696,12 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
                 if status.is_success() {
                     // Stream straight to the file. A failure here is
                     // reported through BodyDelivery — it isn't a request error.
-                    let streamed = stream_to_outfile(CountingReader::new(resp, &thread_progress), &path);
+                    let streamed = stream_to_outfile_with(
+                        CountingReader::new(resp, &thread_progress),
+                        &path,
+                        &thread_given_up,
+                        |from, to| fs::rename(from, to),
+                    );
                     return Ok(match streamed {
                         Ok(body) => (
                             status,
@@ -11334,6 +11790,11 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     // Handle abort — detach thread and return immediately
     if aborted {
         drop(request_handle);
+        // An outfile that was being streamed is not finished behind the
+        // user's back: its partial file goes now, and the target stays as
+        // it was. Only this request can have one under way.
+        given_up.store(true, Ordering::SeqCst);
+        drop(give_up_live_parts());
         state.status_msg = "request aborted".to_string();
         state.status_msg_at = Some(std::time::Instant::now());
         // Restore hint area with abort message
@@ -18948,9 +19409,53 @@ mod tests {
 
         // A target that can't be renamed over gets the finished bytes.
         let refuse = |_: &std::path::Path, _: &std::path::Path| Err(io::Error::from(io::ErrorKind::ResourceBusy));
-        stream_to_outfile_with(&b"[5]"[..], path, refuse).unwrap();
+        stream_to_outfile_with(&b"[5]"[..], path, &Arc::new(AtomicBool::new(false)), refuse).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "[5]");
         assert_eq!(names_in(d).len(), 3);
+    }
+
+    /// A body whose transfer is given up once its first piece has been read.
+    struct GivenUpMidway<'a> {
+        pieces: Vec<&'static [u8]>,
+        given_up: &'a AtomicBool,
+    }
+
+    impl IoRead for GivenUpMidway<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.pieces.is_empty() {
+                return Ok(0);
+            }
+            let piece = self.pieces.remove(0);
+            buf[..piece.len()].copy_from_slice(piece);
+            self.given_up.store(true, Ordering::SeqCst);
+            Ok(piece.len())
+        }
+    }
+
+    #[test]
+    fn a_transfer_that_is_given_up_leaves_the_target_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let target = d.join("out.json");
+        let path = target.to_str().unwrap();
+        let rename = |from: &std::path::Path, to: &std::path::Path| fs::rename(from, to);
+        fs::write(&target, "before").unwrap();
+
+        // Given up before it began: nothing is made.
+        let given_up = Arc::new(AtomicBool::new(true));
+        assert!(matches!(stream_to_outfile_with(&b"[1]"[..], path, &given_up, rename), Err(StreamFailure::Body(_))));
+        assert_eq!((names_in(d), fs::read_to_string(&target).unwrap()), (vec!["out.json".to_string()], "before".to_string()));
+
+        // Given up partway: the rest is not read, and nothing takes the
+        // target's place, also when the body would have ended there.
+        for pieces in [vec![&b"[1,"[..], &b"2]"[..]], vec![&b"[1,2]"[..]]] {
+            let given_up = Arc::new(AtomicBool::new(false));
+            let body = GivenUpMidway { pieces, given_up: &given_up };
+            assert!(matches!(stream_to_outfile_with(body, path, &given_up, rename), Err(StreamFailure::Body(_))));
+            assert_eq!((names_in(d), fs::read_to_string(&target).unwrap()), (vec!["out.json".to_string()], "before".to_string()));
+        }
+        // Nothing of it is still listed as under way.
+        assert!(live_parts().iter().all(|(part, _)| !part.starts_with(d)));
     }
 
     #[cfg(unix)]
@@ -19107,6 +19612,71 @@ mod tests {
         }
         // Nothing is left beside it.
         assert!(fs::read_dir(dir.path()).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().contains(".tmp-")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_history_trim_writes_through_a_link_and_into_a_file_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let lines: String = (0..HISTORY_LIMIT + 5).map(|i| format!("GET /{i}\n")).collect();
+
+        // A history kept elsewhere (a dotfiles checkout) stays there.
+        fs::create_dir(d.join("dotfiles")).unwrap();
+        let real = d.join("dotfiles/history");
+        let link = d.join(".api_history");
+        fs::write(&real, &lines).unwrap();
+        std::os::unix::fs::symlink("dotfiles/history", &link).unwrap();
+        assert_eq!(load_history_from(&link).len(), HISTORY_LIMIT);
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_to_string(&real).unwrap().lines().count(), HISTORY_LIMIT);
+        assert_eq!(names_in(&d.join("dotfiles")), ["history"]);
+
+        // Something that already has the temporary name is not written to,
+        // and not through: the history is no worse off untrimmed.
+        let plain = d.join("plain");
+        fs::write(&plain, &lines).unwrap();
+        let planted = d.join(format!("plain.tmp-{}", std::process::id()));
+        fs::write(d.join("victim"), "theirs").unwrap();
+        std::os::unix::fs::symlink("victim", &planted).unwrap();
+        load_history_from(&plain);
+        assert_eq!(fs::read_to_string(d.join("victim")).unwrap(), "theirs");
+        assert!(fs::symlink_metadata(&planted).unwrap().file_type().is_symlink());
+        assert!(fs::symlink_metadata(&plain).unwrap().file_type().is_file());
+        fs::remove_file(&planted).unwrap();
+
+        // A trim that can't take the file's place leaves nothing beside it.
+        let refuse = |_: &std::path::Path, _: &std::path::Path| Err(io::Error::from(io::ErrorKind::ResourceBusy));
+        let entries: Vec<String> = lines.lines().map(String::from).collect();
+        save_history_with(&plain, &entries, refuse);
+        assert_eq!(fs::read_to_string(&plain).unwrap(), lines);
+        assert_eq!(names_in(d), [".api_history", "dotfiles", "plain", "victim"]);
+    }
+
+    #[test]
+    fn a_partial_file_gets_a_name_nothing_has() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let target = d.join("out.json");
+        let pid = std::process::id();
+
+        let (first, _) = create_part(&target).unwrap();
+        assert_eq!(first, d.join(format!("out.json.{pid}.part")));
+        // That name is taken now, by a file with something in it.
+        fs::write(&first, "theirs").unwrap();
+        let (second, mut file) = create_part(&target).unwrap();
+        assert_eq!(second, d.join(format!("out.json.{pid}-1.part")));
+        file.write_all(b"mine").unwrap();
+        assert_eq!(fs::read_to_string(&first).unwrap(), "theirs");
+        assert_eq!(fs::read_to_string(&second).unwrap(), "mine");
+
+        // With every name taken there is none to give, and none is written over.
+        for n in 2..8 {
+            fs::write(d.join(format!("out.json.{pid}-{n}.part")), "theirs").unwrap();
+        }
+        assert_eq!(create_part(&target).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&second).unwrap(), "mine");
+        assert_eq!(names_in(d).len(), 8);
     }
 
     #[test]
@@ -22167,7 +22737,8 @@ mod tests {
             ("home.api", "PUT /x @~/.ssh/id_rsa\n"),
             ("up.api", "PUT /x @../../../../etc/hosts\n"),
             ("glob.api", "PUT /x @../*.json\n"),
-            ("include.api", "../../../outside.api\n"),
+            ("include.api", "../../outside.api\n"),
+            ("nothing.api", "../../no-such-file.api\n"),
             ("ok.api", "GET /ok\n"),
         ]);
         let dir = tempfile::tempdir().unwrap();
@@ -22176,8 +22747,21 @@ mod tests {
             let err = split_bulk_requests(&format!("{import}cl/{file}\n"), Some(dir.path())).unwrap_err();
             assert!(err.contains("must be a relative path inside the import"), "{file}: {err}");
         }
-        let err = split_bulk_requests(&format!("{import}cl/include.api\n"), Some(dir.path())).unwrap_err();
-        assert!(err.contains("include not found") || err.contains("leaves the import"), "{err}");
+        // The include climbs from the checkout to a file that is there, two
+        // directories up: `<cache>/outside.api`. One that is not is refused
+        // in the same words, so the answer says nothing about the disk.
+        let checkout = match split_bulk_requests(&format!("{import}cl/ok.api\n"), Some(dir.path())) {
+            Ok(_) => session_free_checkout(&url),
+            Err(e) => panic!("{e}"),
+        };
+        let there = checkout.join("../../outside.api");
+        fs::write(&there, "GET /outside\n").unwrap();
+        assert!(there.is_file());
+        for (file, line) in [("include.api", "../../outside.api"), ("nothing.api", "../../no-such-file.api")] {
+            let err = split_bulk_requests(&format!("{import}cl/{file}\n"), Some(dir.path())).unwrap_err();
+            assert_eq!(err, format!("import cl: include leaves the import: {line}"), "{file}");
+        }
+        fs::remove_file(&there).unwrap();
 
         // Nor can the alias be used to climb out of it.
         fs::write(dir.path().join("outside.api"), "GET /outside\n").unwrap();
@@ -22312,38 +22896,53 @@ mod tests {
         let recent_archive = archives.join(sha('0', 64));
         let dead_fetch = repo.join(".tmp-1-2-3");
         let live_fetch = repo.join(".tmp-4-5-6");
+        // Not the client's: a directory that only looks like a checkout or
+        // like a fetch in progress, in a cache directory that holds more.
+        let foreign = cache.join("my-project").join(sha('9', 40));
+        let foreign_archive = archives.join(sha('8', 64));
+        let foreign_tmp = repo.join(".tmp-build");
         let refs = repo.join("refs");
         for path in [
             &stale, &recent, &unmarked_old, &unmarked_new, &kept, &stale_archive, &recent_archive, &dead_fetch,
-            &live_fetch, &refs,
+            &live_fetch, &foreign, &foreign_archive, &foreign_tmp, &refs,
         ] {
             fs::create_dir_all(path).unwrap();
             fs::write(path.join("file"), "x").unwrap();
         }
-        for (path, days) in [(&stale, 31), (&recent, 29), (&kept, 400), (&stale_archive, 90), (&recent_archive, 1)] {
+        for (path, days) in [
+            (&stale, 31), (&recent, 29), (&kept, 400), (&stale_archive, 90), (&recent_archive, 1), (&dead_fetch, 60),
+            (&live_fetch, 0),
+        ] {
             mark_import_used(path);
             age(&import_used_marker(path), days);
         }
-        // Without a marker the directory's own age stands in.
-        for path in [&unmarked_old, &dead_fetch, &refs] {
-            age(path, 60);
+        // Old as directories, all of them; only the marker is asked.
+        for path in [&unmarked_old, &foreign, &foreign_archive, &foreign_tmp, &refs, &recent] {
+            age(path, 400);
         }
-        // An old directory that was used yesterday is not old.
-        age(&recent, 400);
 
         prune_import_cache(cache, &kept, IMPORT_CACHE_MAX_AGE);
 
-        for gone in [&stale, &unmarked_old, &stale_archive, &dead_fetch] {
+        for gone in [&stale, &stale_archive, &dead_fetch] {
             assert!(!gone.exists(), "{} should have been pruned", gone.display());
+            assert!(!import_used_marker(gone).exists(), "the marker of {} should be gone", gone.display());
         }
-        assert!(!import_used_marker(&stale).exists());
-        assert!(!import_used_marker(&stale_archive).exists());
         // The one this run fetched stays whatever its marker says; `refs` is
-        // not a checkout, however old.
-        for stays in [&recent, &unmarked_new, &kept, &recent_archive, &live_fetch, &refs] {
+        // not a checkout, however old. What has no marker was not made by a
+        // client that prunes, or not by the client at all: it is left alone.
+        for stays in [
+            &recent, &unmarked_old, &unmarked_new, &kept, &recent_archive, &live_fetch, &foreign, &foreign_archive,
+            &foreign_tmp, &refs,
+        ] {
             assert!(stays.join("file").is_file(), "{} should have been kept", stays.display());
         }
         assert!(import_used_marker(&recent).is_file());
+
+        // A directory where the marker should be is no marker.
+        fs::create_dir_all(import_used_marker(&foreign)).unwrap();
+        age(&import_used_marker(&foreign), 400);
+        prune_import_cache(cache, &kept, IMPORT_CACHE_MAX_AGE);
+        assert!(foreign.join("file").is_file());
 
         // A cache that doesn't exist is nothing to prune.
         prune_import_cache(&cache.join("nope"), &kept, IMPORT_CACHE_MAX_AGE);
@@ -23103,14 +23702,384 @@ mod tests {
         for (name, bytes) in [("tar", tar_gz(&files, |_| {})), ("zip", zip_of(&files))] {
             // Exactly what it holds is fine; the limit is on the sum of the
             // files, so the second one is what goes over.
-            unpack_archive_within(&bytes, &dir.path().join(format!("{name}-fits")), total).unwrap();
+            unpack_archive_within(&bytes, &dir.path().join(format!("{name}-fits")), total, 10).unwrap();
             let dest = dir.path().join(format!("{name}-over"));
-            let err = unpack_archive_within(&bytes, &dest, total - 1).unwrap_err();
+            let err = unpack_archive_within(&bytes, &dest, total - 1, 10).unwrap_err();
             assert_eq!(err, "archive unpacks to more than 1 GB", "{name}");
             assert!(dest.join("a.api").is_file(), "{name}");
         }
         // The limit in force is the one the message names.
         assert_eq!(ARCHIVE_UNPACKED_LIMIT, 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn an_archive_may_only_unpack_to_so_many_files_and_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        // Three files and the two directories they need: five in all.
+        let files = [("a.api", ""), ("one/b.api", ""), ("one/two/c.api", "")];
+        for (name, bytes) in [("tar", tar_gz(&files, |_| {})), ("zip", zip_of(&files))] {
+            unpack_archive_within(&bytes, &dir.path().join(format!("{name}-fits")), 0, 5).unwrap();
+            let dest = dir.path().join(format!("{name}-over"));
+            let err = unpack_archive_within(&bytes, &dest, 0, 4).unwrap_err();
+            assert_eq!(err, "archive holds more than 100,000 files and directories", "{name}");
+            // It stopped where the count ran out: the last file and its
+            // directory were never made.
+            assert!(dest.join("one/b.api").is_file(), "{name}");
+            assert!(!dest.join("one/two").exists(), "{name}");
+        }
+        // A directory entry counts as the directory it makes, once.
+        let bytes = tar_gz(&[("d/a.api", "")], |builder| {
+            for _ in 0..3 {
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(tar::EntryType::Directory);
+                header.set_size(0);
+                header.set_mode(0o755);
+                header.set_cksum();
+                builder.append_data(&mut header, "d/", io::empty()).unwrap();
+            }
+        });
+        unpack_archive_within(&bytes, &dir.path().join("dirs"), 0, 2).unwrap();
+        assert_eq!(ARCHIVE_ENTRY_LIMIT, 100_000);
+    }
+
+    #[test]
+    fn an_archive_that_holds_too_much_leaves_nothing_in_the_cache() {
+        // Through the import itself, which is what clears up after it: an
+        // entry that leaves the archive stops the unpacking halfway.
+        let bytes = zip_of(&[("ok.api", "GET /ok\n"), ("../escaped.api", "hi")]);
+        let (_guard, url) = archive_file(&bytes, "half.zip");
+        let dir = tempfile::tempdir().unwrap();
+        let src = format!("import archive h {{ \"url\": \"{url}\" }}\n");
+        let err = split_bulk_requests(&src, Some(dir.path())).unwrap_err();
+        assert_eq!(err, format!("import archive {url}: archive entry leaves the archive: ../escaped.api"));
+        let archives = import_cache_dir().unwrap().join("archives");
+        assert!(!archives.join(sha256_hex(&bytes)).exists());
+        let left: Vec<String> = fs::read_dir(&archives)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with(".tmp-"))
+            .collect();
+        // Another test may be unpacking right now; what is its own is not
+        // this archive's `ok.api`.
+        for name in left.iter().filter(|name| !name.ends_with(".used")) {
+            assert!(!archives.join(name).join("ok.api").exists(), "{name} was left behind");
+        }
+    }
+
+    #[test]
+    fn an_archive_entry_with_an_absolute_name_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().canonicalize().unwrap().join("absolute.api");
+        let name = target.to_string_lossy().to_string();
+
+        let bytes = tar_gz(&[("ok.api", "GET /ok\n")], |builder| {
+            let mut header = tar::Header::new_gnu();
+            header.as_gnu_mut().unwrap().name[..name.len()].copy_from_slice(name.as_bytes());
+            header.set_size(2);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, &b"hi"[..]).unwrap();
+        });
+        let err = unpack_archive(&bytes, &dir.path().join("tar")).unwrap_err();
+        assert_eq!(err, format!("archive entry leaves the archive: {name}"));
+        assert!(!target.exists());
+
+        // A zip's is read as a name below the archive's top, and stays there.
+        let bytes = zip_of(&[("ok.api", "GET /ok\n"), (&name, "hi")]);
+        let dest = dir.path().join("zip");
+        unpack_archive(&bytes, &dest).unwrap();
+        assert!(!target.exists());
+        assert_eq!(fs::read_to_string(dest.join(name.trim_start_matches('/'))).unwrap(), "hi");
+    }
+
+    #[test]
+    fn work_that_another_run_finished_first_is_dropped_for_its_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("a".repeat(40));
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(dest.join("theirs.api"), "GET /theirs\n").unwrap();
+
+        let scratch = cache_scratch_dir(dir.path()).unwrap();
+        assert!(import_used_marker(&scratch).is_file(), "a scratch directory is marked as the client's");
+        fs::create_dir_all(&scratch).unwrap();
+        fs::write(scratch.join("ours.api"), "GET /ours\n").unwrap();
+        move_into_cache(&scratch, &dest).unwrap();
+        assert_eq!(fs::read_to_string(dest.join("theirs.api")).unwrap(), "GET /theirs\n");
+        assert!(!dest.join("ours.api").exists());
+        assert!(!scratch.exists() && !import_used_marker(&scratch).exists());
+
+        // First there: the work becomes the copy, and the marker of the
+        // scratch directory goes with the name.
+        let scratch = cache_scratch_dir(dir.path()).unwrap();
+        fs::create_dir_all(&scratch).unwrap();
+        fs::write(scratch.join("ours.api"), "GET /ours\n").unwrap();
+        let dest = dir.path().join("b".repeat(40));
+        move_into_cache(&scratch, &dest).unwrap();
+        assert!(dest.join("ours.api").is_file());
+        assert!(!scratch.exists() && !import_used_marker(&scratch).exists());
+
+        // Nowhere to move it to is an error, and nothing is left of it.
+        let scratch = cache_scratch_dir(dir.path()).unwrap();
+        fs::create_dir_all(&scratch).unwrap();
+        let err = move_into_cache(&scratch, &dir.path().join("no/such/place")).unwrap_err();
+        assert!(err.starts_with("could not move the import into "), "{err}");
+        assert!(!scratch.exists() && !import_used_marker(&scratch).exists());
+    }
+
+    /// A server on this machine that answers one request with `reply`.
+    fn serve_once(reply: Vec<u8>) -> (String, thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}/lib.tar.gz", listener.local_addr().unwrap().port());
+        let served = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => seen.extend_from_slice(&buf[..n]),
+                }
+            }
+            // The client may hang up before it has all of it.
+            let _ = stream.write_all(&reply);
+        });
+        (url, served)
+    }
+
+    #[test]
+    fn a_download_larger_than_an_archive_may_be_is_refused() {
+        let body = vec![b'x'; 200_000];
+        let head = |length: Option<usize>| match length {
+            Some(length) => format!("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {length}\r\n\r\n"),
+            None => "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_string(),
+        };
+        let reply = |length: Option<usize>| [head(length).as_bytes(), &body[..]].concat();
+
+        // It fits: exactly the limit is allowed.
+        let (url, served) = serve_once(reply(Some(body.len())));
+        let got = download_archive_within(&url, None, body.len() as u64).ok().expect("it fits");
+        assert_eq!(got.len(), body.len());
+        served.join().unwrap();
+
+        // Said to be too large: refused on the header, before the body.
+        let (url, served) = serve_once(reply(Some(body.len())));
+        let err = download_archive_within(&url, None, body.len() as u64 - 1).err().unwrap();
+        assert_eq!(err.reason, "the archive is larger than 1 GB");
+        assert!(!err.unanswered);
+        served.join().unwrap();
+
+        // Not said at all: refused when it has sent more than may be held.
+        let (url, served) = serve_once(reply(None));
+        let err = download_archive_within(&url, None, 50_000).err().unwrap();
+        assert_eq!(err.reason, "the archive is larger than 1 GB");
+        assert!(!err.unanswered);
+        served.join().unwrap();
+
+        // The same for a file of this machine.
+        let (_guard, url) = archive_file(&body, "big.tar.gz");
+        assert_eq!(download_archive_within(&url, None, body.len() as u64).ok().expect("it fits").len(), body.len());
+        let err = download_archive_within(&url, None, body.len() as u64 - 1).err().unwrap();
+        assert_eq!(err.reason, "the archive is larger than 1 GB");
+        assert!(!err.unanswered);
+    }
+
+    #[test]
+    fn only_a_remote_that_gave_no_answer_is_one_a_cached_copy_stands_in_for() {
+        // Nothing listens: no answer.
+        let closed = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://127.0.0.1:{}/lib.tar.gz", listener.local_addr().unwrap().port())
+        };
+        let err = download_archive(&closed, None).err().unwrap();
+        assert!(err.unanswered, "{}", err.reason);
+        // A status is an answer.
+        for status in ["404 Not Found", "401 Unauthorized", "500 Internal Server Error"] {
+            let (url, served) =
+                serve_once(format!("HTTP/1.1 {status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").into_bytes());
+            let err = download_archive(&url, None).err().unwrap();
+            assert_eq!(err.reason, status);
+            assert!(!err.unanswered, "{status}");
+            served.join().unwrap();
+        }
+        // A file that is not there is the disk that is not mounted.
+        let err = download_archive("file:///no/such/dir/lib.tar.gz", None).err().unwrap();
+        assert!(err.unanswered, "{}", err.reason);
+
+        // git, in the words it uses with `LC_ALL=C`.
+        for silent in [
+            "fatal: unable to access 'https://example.invalid/r/': Could not resolve host: example.invalid",
+            "fatal: unable to access 'https://127.0.0.1:9/r/': Failed to connect to 127.0.0.1 port 9 after 0 ms: Couldn't connect to server",
+            "fatal: unable to access 'https://10.255.255.1/r/': Failed to connect to 10.255.255.1 port 443 after 75003 ms: Timeout was reached",
+            "fatal: unable to access 'https://example.com/r/': Operation too slow. Less than 1 bytes/sec transferred the last 60 seconds",
+            "ssh: Could not resolve hostname example.invalid: nodename nor servname provided, or not known; fatal: Could not read from remote repository.",
+            "ssh: connect to host 127.0.0.1 port 22: Connection refused; fatal: Could not read from remote repository.",
+            "ssh: connect to host 10.255.255.1 port 22: Operation timed out; fatal: Could not read from remote repository.",
+            "ssh: connect to host example.com port 22: Network is unreachable",
+            "Timeout, server example.com not responding.; fatal: Could not read from remote repository.",
+            "git timed out after 5m",
+        ] {
+            assert!(git_remote_did_not_answer(silent), "{silent}");
+        }
+        for answered in [
+            "fatal: Authentication failed for 'https://example.com/r/'",
+            "fatal: could not read Username for 'https://example.com': terminal prompts disabled",
+            "remote: Repository not found.; fatal: repository 'https://example.com/r/' not found",
+            "git@example.com: Permission denied (publickey).; fatal: Could not read from remote repository.",
+            "fatal: '/no/such/repo' does not appear to be a git repository; fatal: Could not read from remote repository.",
+            "fatal: unable to access 'https://example.com/r/': The requested URL returned error: 403",
+            "fatal: unable to access 'https://example.com/r/': SSL certificate problem: self signed certificate",
+            "git exited with exit status: 128",
+        ] {
+            assert!(!git_remote_did_not_answer(answered), "{answered}");
+        }
+    }
+
+    #[test]
+    fn a_git_command_that_goes_quiet_is_given_up_on() {
+        let mut quiet = Command::new("sleep");
+        quiet.arg("30");
+        let started = Instant::now();
+        let err = run_git_within(quiet, Duration::from_millis(300)).unwrap_err();
+        assert_eq!(err, "git timed out after 300ms");
+        assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+        // And that is a remote that did not answer.
+        assert!(git_remote_did_not_answer(&err));
+        assert_eq!(GIT_DEADLINE, Duration::from_secs(300));
+
+        // What it prints is read while it runs, more than a pipe holds.
+        let mut loud = Command::new("sh");
+        loud.args(["-c", "head -c 300000 /dev/zero | tr '\\0' 'x'"]);
+        assert_eq!(run_git_within(loud, Duration::from_secs(30)).unwrap().len(), 300_000);
+        let mut failing = Command::new("sh");
+        failing.args(["-c", "echo ' fatal: one ' >&2; echo >&2; echo 'two' >&2; exit 3"]);
+        assert_eq!(run_git_within(failing, Duration::from_secs(30)).unwrap_err(), "fatal: one; two");
+
+        // The commands the client runs carry the bounds git has of its own,
+        // and speak the language their messages are matched in.
+        let cmd = git_command(None);
+        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().to_string()).collect();
+        assert!(args.windows(2).any(|w| w == ["-c", "http.lowSpeedLimit=1"]), "{args:?}");
+        assert!(args.windows(2).any(|w| w == ["-c", "http.lowSpeedTime=60"]), "{args:?}");
+        let env = |name: &str| {
+            cmd.get_envs().find(|(k, _)| *k == name).and_then(|(_, v)| v).map(|v| v.to_string_lossy().to_string())
+        };
+        assert_eq!(env("LC_ALL").as_deref(), Some("C"));
+        assert_eq!(env("LANG").as_deref(), Some("C"));
+    }
+
+    #[test]
+    fn what_a_file_manager_leaves_beside_the_top_directory_does_not_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let top = |name: &str, beside: &[&str]| {
+            let checkout = dir.path().join(name);
+            fs::create_dir_all(checkout.join("lib-1.0")).unwrap();
+            for other in beside {
+                match other.strip_suffix('/') {
+                    Some(d) => fs::create_dir_all(checkout.join(d)).unwrap(),
+                    None => fs::write(checkout.join(other), "x").unwrap(),
+                }
+            }
+            archive_top_dir(&checkout).strip_prefix(&checkout).unwrap().to_string_lossy().to_string()
+        };
+        assert_eq!(top("alone", &[]), "lib-1.0");
+        assert_eq!(top("mac", &[".DS_Store", "._lib-1.0", "__MACOSX/"]), "lib-1.0");
+        assert_eq!(top("windows", &["Thumbs.db", "desktop.ini"]), "lib-1.0");
+        assert_eq!(top("dotdir", &[".github/"]), "lib-1.0");
+        // Anything else beside it is a file of the archive: the top is the top.
+        assert_eq!(top("file", &["README.md"]), "");
+        assert_eq!(top("two", &["other/"]), "");
+        // A dot-name is never the top directory itself.
+        let hidden = dir.path().join("hidden");
+        fs::create_dir_all(hidden.join(".git")).unwrap();
+        assert_eq!(archive_top_dir(&hidden), hidden);
+
+        // Through an import: a zip made on a Mac.
+        let bytes = zip_of(&[("lib-1.0/sv.api", "GET /sv\n"), (".DS_Store", "x"), ("__MACOSX/._lib-1.0", "x")]);
+        let (_guard, url) = archive_file(&bytes, "mac.zip");
+        let src = format!("import archive m {{ \"url\": \"{url}\" }}\nm/sv.api\n");
+        let program = split_bulk_requests(&src, Some(dir.path())).unwrap();
+        assert_eq!(requests_of(&program), vec!["GET /sv".to_string()]);
+    }
+
+    #[test]
+    fn a_file_url_names_a_file_of_this_machine_with_its_path_decoded() {
+        let path = |url: &str| archive_file_path(url).map(|p| p.to_string_lossy().to_string());
+        assert_eq!(path("file:///tmp/a.tar.gz").unwrap(), "/tmp/a.tar.gz");
+        assert_eq!(path("file://localhost/tmp/a.tar.gz").unwrap(), "/tmp/a.tar.gz");
+        assert_eq!(path("file://LocalHost/tmp/a.tar.gz").unwrap(), "/tmp/a.tar.gz");
+        assert_eq!(path("file:///tmp/my%20dir/a.tar.gz").unwrap(), "/tmp/my dir/a.tar.gz");
+        assert_eq!(path("file:///tmp/my dir/a.tar.gz").unwrap(), "/tmp/my dir/a.tar.gz");
+        assert_eq!(path("file:///tmp/r%C3%A4ksm%c3%b6rg%C3%A5s.zip").unwrap(), "/tmp/räksmörgås.zip");
+        // A `%` that starts no escape is a `%`.
+        assert_eq!(path("file:///tmp/100%/a%2.zip%").unwrap(), "/tmp/100%/a%2.zip%");
+        for url in ["file://example.com/tmp/a.tar.gz", "file://relative/a.tar.gz", "file://tmp"] {
+            let err = path(url).unwrap_err();
+            let host = url.trim_start_matches("file://").split('/').next().unwrap();
+            assert_eq!(
+                err,
+                format!("unsupported url `{url}` (a file:// url reads a file of this machine, not of the host `{host}`: write file:///path)")
+            );
+            assert_eq!(validate_archive_url(url).unwrap_err(), err);
+        }
+        assert!(path("file://").unwrap_err().starts_with("unsupported url"));
+        assert!(path("file://localhost").unwrap_err().starts_with("unsupported url"));
+
+        for url in ["file:///tmp/my dir/a.tar.gz", "file:///tmp/my%20dir/a.tar.gz", "file://localhost/tmp/a.zip"] {
+            assert!(validate_archive_url(url).is_ok(), "{url}");
+        }
+        // A blank is for a file's path only, and only a blank.
+        for url in ["https://example.com/my dir/a.zip", "file:///tmp/a\tb.zip", "file:///tmp/a\nb.zip"] {
+            assert!(validate_archive_url(url).unwrap_err().starts_with("unsupported url"), "{url:?}");
+        }
+
+        // And it is read from there, written either way.
+        let bytes = zip_of(&[("sv.api", "GET /spaced\n")]);
+        let (guard, _) = archive_file(&bytes, "plain.zip");
+        let spaced = guard.path().canonicalize().unwrap().join("my dir");
+        fs::create_dir_all(&spaced).unwrap();
+        fs::write(spaced.join("lib 1.zip"), &bytes).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        for written in ["my dir/lib 1.zip", "my%20dir/lib%201.zip"] {
+            let url = format!("file://{}/{written}", guard.path().canonicalize().unwrap().display());
+            let src = format!("import archive sp {{ \"url\": \"{url}\" }}\nsp/sv.api\n");
+            let program = split_bulk_requests(&src, Some(dir.path())).unwrap();
+            assert_eq!(requests_of(&program), vec!["GET /spaced".to_string()], "{written}");
+        }
+    }
+
+    #[test]
+    fn an_include_of_an_imported_file_that_names_a_place_outside_is_refused_before_it_is_looked_up() {
+        let (_repo, url, _) = test_repo(&[
+            ("root.api", "/**/*.api\n"),
+            ("up.api", "../../**/*.api\n"),
+            ("home.api", "~/*.api\n"),
+            ("through.api", "sub/*/../../../../*.api\n"),
+            ("sub/in.api", "../ok.api\n../s*/../ok.api\n"),
+            ("ok.api", "GET /ok\n"),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let import = format!("import git cl {{ \"url\": \"{url}\", \"ref\": \"1.0\" }}\n");
+        for (file, line) in [
+            ("root.api", "/**/*.api"),
+            ("up.api", "../../**/*.api"),
+            ("home.api", "~/*.api"),
+            ("through.api", "sub/*/../../../../*.api"),
+        ] {
+            let started = Instant::now();
+            let err = split_bulk_requests(&format!("{import}cl/{file}\n"), Some(dir.path())).unwrap_err();
+            assert_eq!(err, format!("import cl: include leaves the import: {line}"), "{file}");
+            // Refused by its name: a walk of the disk would take far longer.
+            assert!(started.elapsed() < Duration::from_secs(5), "{file}: {:?}", started.elapsed());
+        }
+        // The same through the alias, from the batch's own file.
+        for line in ["cl/../../**/*.api", "cl//etc/*.api"] {
+            let err = split_bulk_requests(&format!("{import}{line}\n"), Some(dir.path())).unwrap_err();
+            assert_eq!(err, format!("import cl: include leaves the import: {line}"));
+        }
+        // Climbing that stays inside is an include like any other.
+        let program = split_bulk_requests(&format!("{import}cl/sub/in.api\n"), Some(dir.path())).unwrap();
+        assert_eq!(requests_of(&program), vec!["GET /ok".to_string(), "GET /ok".to_string()]);
     }
 
     #[test]
@@ -24804,6 +25773,28 @@ mod tests {
         for local in ["file:///tmp/repo", "http://localhost:8080/x.zip", "https://127.0.0.1/x.zip", "http://[::1]:9/x.zip"] {
             assert_eq!(host(local), None, "{local}");
         }
+
+        // A `\` ends the host for this client's parser and not for git's,
+        // which goes on to the host behind the `@`. No import url has one.
+        for url in [
+            r"https://github.com\@other.host/repo",
+            r"https://github.com\other.host/repo",
+            r"ssh://git@github.com\@other.host/repo",
+            r"git@github.com:a\b",
+            r"file:///tmp\repo",
+        ] {
+            let err = validate_import_url(url).unwrap_err();
+            assert!(err.starts_with("unsupported url"), "{url}: {err}");
+        }
+        for url in [r"https://github.com\@other.host/a.zip", r"https://github.com/a\b.zip", r"file:///tmp\a.zip"] {
+            let err = validate_archive_url(url).unwrap_err();
+            assert!(err.starts_with("unsupported url"), "{url}: {err}");
+        }
+        // The spellings that are meant still pass, and name their host.
+        for url in ["https://github.com/a/b", "ssh://git@github.com/a/b.git", "git@github.com:a/b.git", "file:///tmp/repo"] {
+            assert!(validate_import_url(url).is_ok(), "{url}");
+        }
+        assert_eq!(host("me@git.example.com:team/repo.git"), Some("git.example.com".to_string()));
     }
 
     #[test]
@@ -24839,6 +25830,16 @@ mod tests {
         }
         let err = check_nested_import(&archive("http://localhost:8080/x.tar.gz", None), &github).unwrap_err();
         assert!(err.contains("can import only from github.com"), "{err}");
+        // A user or a password in the url of a file's own import: the host
+        // is the same, and still nothing is fetched for it.
+        for url in ["https://user@github.com/a/b", "https://user:secret@github.com/a/b", "ssh://git@github.com/a/b.git"] {
+            let err = check_nested_import(&git(url), &github).unwrap_err();
+            assert_eq!(err, format!("import x: an imported file can't name a user or a password in a url: {url}"));
+        }
+        let err = check_nested_import(&archive("https://token@github.com/a.tar.gz", None), &github).unwrap_err();
+        assert!(err.contains("can't name a user or a password"), "{err}");
+        // A file of this machine is the user's own, and writes what it likes.
+        assert!(check_nested_import(&git("ssh://git@github.com/a/b.git"), &repo(None)).is_ok());
         // A token is refused wherever the file came from, the same host included.
         for within in [&github, &repo(None)] {
             let err = check_nested_import(&archive("https://github.com/a.tar.gz", Some("GITHUB_TOKEN")), within).unwrap_err();

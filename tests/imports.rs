@@ -983,12 +983,17 @@ fn a_truncated_archive_fails_before_any_request_and_leaves_nothing_in_the_cache(
         let batch = format!("import archive lib {{ \"url\": \"{}\" }}\nGET /never\n", server.url("/lib.tar.gz"));
         let ran = run_batch(&dir, server.port, "-sa", &batch);
         assert!(!ran.ok, "{format}");
-        assert!(ran.stderr.contains("archive"), "{format}: {}", ran.stderr);
+        let says = format!("import archive {}: could not ", server.url("/lib.tar.gz"));
+        assert!(ran.stderr.contains(&says), "{format}: {}", ran.stderr);
         assert_eq!(server.api_requests(), Vec::<String>::new(), "{format}");
+        // The cache was there to unpack into, and holds nothing now: not
+        // the half that was unpacked, and not the marker beside it.
         let left: Vec<String> = std::fs::read_dir(dir.join(".import-cache/archives"))
-            .map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect())
-            .unwrap_or_default();
-        assert!(left.iter().all(|name| name == "refs"), "{format}: {left:?}");
+            .expect("the archive cache was made")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(left, Vec::<String>::new(), "{format}");
     }
 }
 
@@ -1034,7 +1039,7 @@ fn an_import_line_that_cannot_be_meant_stops_the_batch_before_any_request() {
         (r#"import archive lib { "url": "ftp://example.com/lib.tar.gz" }"#.to_string(), "unsupported url"),
         (r#"import archive lib { "url": "file://relative/lib.tar.gz" }"#.to_string(), "unsupported url"),
         // A hash that is not one.
-        (format!(r#"import archive lib {{ "url": "{}", "sha256": "abc" }}"#, server.url("/lib.tar.gz")), "sha256"),
+        (format!(r#"import archive lib {{ "url": "{}", "sha256": "abc" }}"#, server.url("/lib.tar.gz")), "import lib: `sha256` must be 64 hexadecimal characters"),
         // An alias that already names something next to the batch.
         (format!(r#"import dir taken {{ "path": "{here}" }}"#), "import alias `taken` clashes with"),
         // The same alias twice.
@@ -1045,9 +1050,13 @@ fn an_import_line_that_cannot_be_meant_stops_the_batch_before_any_request() {
         ("import dir lib @a-list.json".to_string(), "import lib: expected a JSON object"),
         ("import dir lib @not-json.json".to_string(), "import file not-json.json: unclosed body"),
         ("import dir lib @not-json-either.json".to_string(), "import lib: invalid JSON"),
-        ("import dir lib @no-such-file.json".to_string(), "no-such-file.json"),
-        (r#"import dir lib { "path": "no-such-directory" }"#.to_string(), "no-such-directory"),
-        (r#"import svn lib { "url": "x" }"#.to_string(), "svn"),
+        ("import dir lib @no-such-file.json".to_string(), "error: File not found: no-such-file.json"),
+        (r#"import dir lib { "path": "no-such-directory" }"#.to_string(), "import lib: not a directory: no-such-directory"),
+        (r#"import svn lib { "url": "x" }"#.to_string(), "unknown import kind `svn` (expected `git`, `dir` or `archive`)"),
+        // A `file://` url that names another machine, and a `\` in any url.
+        (r#"import archive lib { "url": "file://fileserver/share/lib.tar.gz" }"#.to_string(), "a file:// url reads a file of this machine, not of the host `fileserver`"),
+        (r#"import archive lib { "url": "https://example.com\\@127.0.0.1/lib.tar.gz" }"#.to_string(), "unsupported url"),
+        (r#"import git lib { "url": "https://example.com\\@127.0.0.1/repo", "ref": "main" }"#.to_string(), "unsupported url"),
         (format!(r#"import git lib {{ "url": "file://{here}", "ref": "1.0", "path": "/etc" }}"#), "`path` must be a relative path inside the import"),
     ] {
         let ran = run_batch(&dir, server.port, "-sa", &format!("{import}\nGET /never\n"));
@@ -1075,12 +1084,13 @@ fn path_starts_the_alias_in_a_subdirectory_of_a_repository_and_of_an_archive() {
         // What is above `path` is not under the alias.
         let ran = run_batch(&dir, server.port, "-sa", &format!("{import}\nlib/seed.api\n"));
         assert!(!ran.ok, "{kind}");
+        assert!(ran.stderr.contains("include not found: lib/seed.api"), "{kind}: {}", ran.stderr);
         assert_eq!(server.api_requests(), Vec::<String>::new(), "{kind}");
 
         // A `path` that is not in the import.
         let ran = run_batch(&dir, server.port, "-sa", &format!("{}\nGET /never\n", import.replace("\"parts\"", "\"no-such\"")));
         assert!(!ran.ok, "{kind}");
-        assert!(ran.stderr.contains("no-such"), "{kind}: {}", ran.stderr);
+        assert!(ran.stderr.contains("import lib: no directory `no-such` in "), "{kind}: {}", ran.stderr);
         assert_eq!(server.api_requests(), Vec::<String>::new(), "{kind}");
     }
 }
@@ -1711,24 +1721,38 @@ fn an_imported_file_cannot_name_a_token_for_an_archive() {
     let (_guard, dir) = temp();
     let server = Server::start("1", fixture_archive());
     let nested = format!(
-        "import archive packed {{ \"url\": \"{}\", \"token_env\": \"HOME\" }}\npacked/seed.api\n",
+        "import archive packed {{ \"url\": \"{}\", \"token_env\": \"IMPORT_TEST_TOKEN\" }}\npacked/seed.api\n",
         server.url("/lib.tar.gz")
     );
     let import = own_import(&dir, &[("takes.api", &nested)]);
     for flags in ["-sa", "-spa"] {
-        let ran = run_batch(&dir, server.port, flags, &format!("{import}\nGET /first\nlib/takes.api\n"));
+        std::fs::write(dir.join("batch.api"), format!("{import}\nGET /first\nlib/takes.api\n")).unwrap();
+        let mut cmd = api(&dir, server.port);
+        cmd.args([flags, "batch.api"]).env("IMPORT_TEST_TOKEN", "s3cret-token");
+        let ran = finish(cmd, "");
         assert!(!ran.ok, "{flags}");
         assert!(ran.stderr.contains("import packed: an imported file can't name a `token_env`"), "{flags}: {}", ran.stderr);
         // Nothing was sent, and the archive was not asked for either.
         assert_eq!(server.sent(), Vec::<String>::new(), "{flags}");
     }
-    // The file that is run may, as before.
+    // The file that is run may, as before, and its token goes along.
+    let archive = fixture_archive();
+    let (named, served) = answer_once(move |_| {
+        let mut reply =
+            format!("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n", archive.len()).into_bytes();
+        reply.extend_from_slice(&archive);
+        reply
+    });
     let top = format!(
-        "import archive packed {{ \"url\": \"{}\", \"token_env\": \"HOME\" }}\npacked/seed.api\n",
-        server.url("/lib.tar.gz")
+        "import archive packed {{ \"url\": \"http://127.0.0.1:{named}/lib.tar.gz\", \"token_env\": \"IMPORT_TEST_TOKEN\" }}\npacked/parts/a.api\n"
     );
-    let ran = run_batch(&dir, server.port, "-sa", &top);
+    std::fs::write(dir.join("batch.api"), top).unwrap();
+    let mut cmd = api(&dir, server.port);
+    cmd.args(["-sa", "batch.api"]).env("IMPORT_TEST_TOKEN", "s3cret-token");
+    let ran = finish(cmd, "");
     assert!(ran.ok, "{}", ran.stderr);
+    assert_eq!(served.join().unwrap().as_deref(), Some("GET /lib.tar.gz HTTP/1.1 Bearer s3cret-token"));
+    assert_eq!(server.sent(), ["GET /parts/a"]);
 }
 
 /// One request answered on a port of its own: what it asked for and the
@@ -1802,4 +1826,547 @@ fn an_archive_token_is_not_sent_on_to_where_a_redirect_leads() {
     // The API got its key, and nothing of the token.
     assert_eq!(api_server.sent(), ["GET /parts/a"]);
     assert!(!ran.stdout.contains("s3cret-token") && !ran.stderr.contains("s3cret-token"));
+}
+
+// ----- what a file of an import may reach -----
+
+/// Environment that makes git read `https://origin.invalid/…` from the
+/// repositories under `repos`, so a test has files that came from a host
+/// without there being one.
+fn origin_is(cmd: &mut Command, repos: &Path) {
+    cmd.env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", format!("url.file://{}/.insteadOf", repos.display()))
+        .env("GIT_CONFIG_VALUE_0", "https://origin.invalid/");
+}
+
+/// A file fetched from a host imports from that host and from nowhere else:
+/// not another host, and not this machine, whose files and servers it would
+/// otherwise reach with the rights of whoever runs the batch. Its imports are
+/// fetched before the preview, so the refusal comes before any of them is.
+#[test]
+fn a_file_from_a_host_imports_from_no_other_host_and_not_from_this_machine() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", fixture_archive());
+    let repos = dir.join("repos");
+    let (local_repo, _) = fixture_repository(&repos.join("local/fixture"));
+    let local_archive = format!("file://{}", dir.join("lib.tar.gz").display());
+    std::fs::write(dir.join("lib.tar.gz"), fixture_archive()).unwrap();
+    let on_this_machine = server.url("/lib.tar.gz");
+    let archive = |url: &str| format!("import archive x {{ \"url\": \"{url}\" }}\n");
+    let refused = [
+        ("other-host.api", import_git("x", "https://other.invalid/team/repo", "main"), "https://other.invalid/team/repo"),
+        ("other-archive.api", archive("https://other.invalid/lib.tar.gz"), "https://other.invalid/lib.tar.gz"),
+        ("file-git.api", import_git("x", &local_repo, "1.0"), local_repo.as_str()),
+        ("file-archive.api", archive(&local_archive), local_archive.as_str()),
+        ("localhost.api", archive(&on_this_machine), on_this_machine.as_str()),
+    ];
+    let mut files: Vec<(String, String)> =
+        refused.iter().map(|(file, import, _)| (file.to_string(), format!("{import}GET /never\nx/seed.api\n"))).collect();
+    // The same host is fine, which is what shows the files have one.
+    files.push(("same.api".to_string(), format!("{}x/dep.api\n", import_git("x", "https://origin.invalid/team/dep", "main"))));
+    // But not with a user in front of it.
+    let with_user = "https://someone@origin.invalid/team/dep";
+    files.push(("user.api".to_string(), format!("{}x/dep.api\n", import_git("x", with_user, "main"))));
+    commit(
+        &repos.join("team/lib"),
+        &files.iter().map(|(name, text)| (name.as_str(), text.as_bytes())).collect::<Vec<_>>(),
+        None,
+    );
+    commit(&repos.join("team/dep"), &[("dep.api", b"GET /dep\n")], None);
+
+    let log = dir.join("git.log");
+    let path = format!("{}:{}", logging_git(&dir, &log).display(), std::env::var("PATH").unwrap());
+    let run = |file: &str| {
+        let batch = format!("{}GET /own\nlib/{file}\n", import_git("lib", "https://origin.invalid/team/lib", "main"));
+        std::fs::write(dir.join("batch.api"), batch).unwrap();
+        let mut cmd = api(&dir, server.port);
+        cmd.env("PATH", &path).args(["-sa", "batch.api"]);
+        origin_is(&mut cmd, &repos);
+        finish(cmd, "")
+    };
+
+    let ran = run("same.api");
+    assert!(ran.ok, "{}", ran.stderr);
+    assert_eq!(server.sent(), ["GET /own", "GET /dep"]);
+
+    for (file, _, url) in &refused {
+        let ran = run(file);
+        assert!(!ran.ok, "{file}");
+        let says = format!("import x: a file imported from origin.invalid can import only from origin.invalid, not {url}");
+        assert!(ran.stderr.contains(&says), "{file}: {}", ran.stderr);
+        // Neither the API nor the archive on this machine was asked.
+        assert_eq!(server.sent(), Vec::<String>::new(), "{file}");
+    }
+    let ran = run("user.api");
+    assert!(!ran.ok);
+    let says = format!("import x: an imported file can't name a user or a password in a url: {with_user}");
+    assert!(ran.stderr.contains(&says), "{}", ran.stderr);
+    assert_eq!(server.sent(), Vec::<String>::new());
+
+    // And git was asked for the origin alone, every time.
+    let asked = std::fs::read_to_string(&log).unwrap();
+    assert!(asked.contains("ls-remote -- https://origin.invalid/team/lib main"), "{asked}");
+    for line in asked.lines().filter(|line| line.contains("ls-remote") || line.contains(" fetch ")) {
+        assert!(line.contains("https://origin.invalid/team/"), "{line}");
+        assert!(!line.contains("someone@"), "{line}");
+    }
+}
+
+/// In a directory import, whose files are used where they are, an include is
+/// followed through a link only when the link stays inside.
+#[test]
+fn an_include_through_a_link_that_leads_out_of_a_directory_import_is_refused() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", Vec::new());
+    std::fs::create_dir_all(dir.join("elsewhere")).unwrap();
+    std::fs::write(dir.join("elsewhere/secret.api"), "GET /outside/secret\n").unwrap();
+    let import = own_import(
+        &dir,
+        &[
+            ("inside.api", "GET /lib/inside\n"),
+            ("single.api", "GET /lib/single\nout.api\n"),
+            ("globbed.api", "GET /lib/globbed\nlinks/*.api\n"),
+            ("through.api", "GET /lib/through\nlinkdir/secret.api\n"),
+            ("through-glob.api", "GET /lib/through-glob\nlinkdir/*.api\n"),
+            ("links/a.api", "GET /lib/links/a\n"),
+            ("stays.api", "in.api\n"),
+        ],
+    );
+    let lib = dir.join("libdir");
+    std::os::unix::fs::symlink(lib.join("inside.api"), lib.join("in.api")).unwrap();
+    let run = |line: &str| run_batch(&dir, server.port, "-sa", &format!("{import}\nGET /first\n{line}\n"));
+
+    // A link that stays inside is a file like any other, and so far the
+    // glob matches only files of the import.
+    let ran = run("lib/stays.api\nlib/globbed.api");
+    assert!(ran.ok, "{}", ran.stderr);
+    assert_eq!(server.sent(), ["GET /first", "GET /lib/inside", "GET /lib/globbed", "GET /lib/links/a"]);
+
+    std::os::unix::fs::symlink(dir.join("elsewhere/secret.api"), lib.join("out.api")).unwrap();
+    std::os::unix::fs::symlink(dir.join("elsewhere/secret.api"), lib.join("links/b.api")).unwrap();
+    std::os::unix::fs::symlink(dir.join("elsewhere"), lib.join("linkdir")).unwrap();
+    for (line, written) in [
+        // From a file of the import: one file, one of a glob's, and a file
+        // and a glob below a linked directory.
+        ("lib/single.api", "out.api"),
+        ("lib/globbed.api", "links/*.api"),
+        ("lib/through.api", "linkdir/secret.api"),
+        ("lib/through-glob.api", "linkdir/*.api"),
+        // And from the batch, through the alias.
+        ("lib/out.api", "lib/out.api"),
+        ("lib/links/*.api", "lib/links/*.api"),
+        ("lib/linkdir/*.api", "lib/linkdir/*.api"),
+    ] {
+        let ran = run(line);
+        assert!(!ran.ok, "{line}");
+        let refusal = format!("import lib: include leaves the import: {written}");
+        assert!(ran.stderr.contains(&refusal), "{line}: {}", ran.stderr);
+        assert_eq!(server.sent(), Vec::<String>::new(), "{line}");
+    }
+}
+
+/// `path` says where the alias starts, not where the import ends: a file
+/// under it includes a file above it, as it may send one.
+#[test]
+fn a_file_under_path_may_include_a_file_above_it() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", fixture_archive());
+    let (repo, _) = fixture_repository(&dir.join("fixture-repo"));
+    for (kind, import) in [
+        ("git", format!("import git lib {{ \"url\": \"{repo}\", \"ref\": \"1.0\", \"path\": \"nested\" }}")),
+        ("archive", format!("import archive lib {{ \"url\": \"{}\", \"path\": \"nested\" }}", server.url("/lib.tar.gz"))),
+    ] {
+        // `index.api` includes `../parts/a.api`, and `deep/leaf.api` sends
+        // `../../data/body.json`.
+        let ran = run_batch(&dir, server.port, "-sa", &format!("{import}\nlib/index.api\n"));
+        assert!(ran.ok, "{kind}: {}", ran.stderr);
+        assert_eq!(
+            server.api_requests(),
+            vec![
+                "GET /nested/index".to_string(),
+                "GET /nested/deep/leaf".to_string(),
+                format!("PUT /nested/deep/body {BODY}"),
+                "GET /parts/a".to_string(),
+            ],
+            "{kind}"
+        );
+    }
+}
+
+// ----- how git is run -----
+
+/// A `git` that writes `GIT_TERMINAL_PROMPT`, `GIT_SSH_COMMAND`, `LC_ALL` and
+/// its arguments to `log`, and then either fails the way `FAKE_GIT_SAYS`
+/// says, if that is set and this is an `ls-remote`, or runs the real one.
+fn telling_git(dir: &Path, log: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let real = Command::new("sh").args(["-c", "command -v git"]).output().expect("sh runs");
+    let real = String::from_utf8_lossy(&real.stdout).trim().to_string();
+    assert!(!real.is_empty(), "git is not on the PATH");
+    let bin = dir.join("telling-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let shim = bin.join("git");
+    let script = format!(
+        "#!/bin/sh\n\
+         echo \"prompt=$GIT_TERMINAL_PROMPT ssh=[$GIT_SSH_COMMAND] lc=$LC_ALL args=$*\" >> '{}'\n\
+         case \"$FAKE_GIT_SAYS:$*\" in\n\
+         :*) ;;\n\
+         *ls-remote*) echo \"$FAKE_GIT_SAYS\" >&2; exit 128 ;;\n\
+         esac\n\
+         exec '{real}' \"$@\"\n",
+        log.display()
+    );
+    std::fs::write(&shim, script).unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+/// The client with `telling_git` first on its `PATH`.
+fn api_with_telling_git(dir: &Path, port: u16, log: &Path) -> Command {
+    let path = format!("{}:{}", telling_git(dir, log).display(), std::env::var("PATH").unwrap());
+    let mut cmd = api(dir, port);
+    cmd.env("PATH", path).env_remove("GIT_SSH_COMMAND").env_remove("GIT_SSH").env_remove("FAKE_GIT_SAYS");
+    cmd
+}
+
+/// Nobody is there to answer when a batch runs: git may not ask for a
+/// password, and neither may the ssh it starts. A regression here is a batch
+/// that hangs.
+#[test]
+fn git_is_run_so_that_it_never_stops_to_ask() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", Vec::new());
+    let repo = dir.join("repos/asked");
+    commit(&repo, &[("step.api", b"GET /step\n")], None);
+    let log = dir.join("git.log");
+    std::fs::write(dir.join("batch.api"), format!("{}lib/step.api\n", import_git("lib", &repo_url(&repo), "main"))).unwrap();
+
+    let mut cmd = api_with_telling_git(&dir, server.port, &log);
+    cmd.args(["-sa", "batch.api"]).env("LC_ALL", "sv_SE.UTF-8");
+    let ran = finish(cmd, "");
+    assert!(ran.ok, "{}", ran.stderr);
+    assert_eq!(server.sent(), ["GET /step"]);
+    let told = std::fs::read_to_string(&log).unwrap();
+    // The lookup, and everything the fetch is made of.
+    for command in ["ls-remote", " init ", " fetch ", "rev-parse", " checkout "] {
+        assert!(told.lines().any(|line| line.contains(command)), "{command}: {told}");
+    }
+    for line in told.lines() {
+        assert!(line.starts_with("prompt=0 ssh=[ssh -oBatchMode=yes "), "{line}");
+        // It gives up on a remote that does not answer, over ssh and https.
+        assert!(line.contains("-oConnectTimeout=30 -oServerAliveInterval=15"), "{line}");
+        assert!(line.contains("-c http.lowSpeedLimit=1 -c http.lowSpeedTime=60"), "{line}");
+        // And says why in the words the client knows, whatever the locale.
+        assert!(line.contains("] lc=C args="), "{line}");
+    }
+
+    // An ssh command of the user's own is theirs to make quiet.
+    std::fs::remove_file(&log).unwrap();
+    std::fs::remove_dir_all(dir.join(".import-cache")).unwrap();
+    let mut cmd = api_with_telling_git(&dir, server.port, &log);
+    cmd.args(["-sa", "batch.api"]).env("GIT_SSH_COMMAND", "ssh -i my-key");
+    let ran = finish(cmd, "");
+    assert!(ran.ok, "{}", ran.stderr);
+    let told = std::fs::read_to_string(&log).unwrap();
+    assert!(told.lines().count() >= 5, "{told}");
+    for line in told.lines() {
+        assert!(line.starts_with("prompt=0 ssh=[ssh -i my-key] "), "{line}");
+    }
+}
+
+/// The cached copy stands in for a remote that gave no answer, and for no
+/// other failure: a remote that refuses the login, or says there is no such
+/// repository, has answered, and the files of last time are not what it said.
+#[test]
+fn a_cached_copy_stands_in_only_for_a_git_remote_that_gave_no_answer() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", Vec::new());
+    let repo = dir.join("repos/moving");
+    let first = commit(&repo, &[("step.api", b"GET /step\n")], Some("1.0"));
+    let url = repo_url(&repo);
+    let log = dir.join("git.log");
+    let run = |git_ref: &str, says: Option<&str>| {
+        std::fs::write(dir.join("batch.api"), format!("{}GET /own\nlib/step.api\n", import_git("lib", &url, git_ref))).unwrap();
+        let mut cmd = api_with_telling_git(&dir, server.port, &log);
+        cmd.args(["-sa", "batch.api"]);
+        if let Some(says) = says {
+            cmd.env("FAKE_GIT_SAYS", says);
+        }
+        finish(cmd, "")
+    };
+
+    // No copy and no answer: an error, with what git said.
+    let silent = "fatal: unable to access 'https://example.invalid/r/': Could not resolve host: example.invalid";
+    let ran = run("main", Some(silent));
+    assert!(!ran.ok);
+    assert!(ran.stderr.contains(&format!("could not reach import {url}: {silent}")), "{}", ran.stderr);
+    assert_eq!(server.sent(), Vec::<String>::new());
+
+    for git_ref in ["main", "1.0"] {
+        let ran = run(git_ref, None);
+        assert!(ran.ok, "{git_ref}: {}", ran.stderr);
+        assert_eq!(server.sent(), ["GET /own", "GET /step"], "{git_ref}");
+    }
+
+    // No answer: the commit the branch, and the tag, last resolved to.
+    for said in [
+        silent,
+        "ssh: connect to host example.invalid port 22: Operation timed out\nfatal: Could not read from remote repository.",
+        "fatal: unable to access 'https://127.0.0.1:9/r/': Failed to connect to 127.0.0.1 port 9 after 0 ms: Couldn't connect to server",
+    ] {
+        for git_ref in ["main", "1.0"] {
+            let ran = run(git_ref, Some(said));
+            assert!(ran.ok, "{git_ref} {said}: {}", ran.stderr);
+            let logged = format!("import lib {url} {git_ref} ({}, cached copy: remote unreachable)", &first[..7]);
+            assert!(ran.stdout.contains(&logged), "{git_ref} {said}: {}", ran.stdout);
+            assert_eq!(server.sent(), ["GET /own", "GET /step"], "{git_ref} {said}");
+        }
+    }
+
+    // An answer that is a refusal stops the batch, cached copy or not.
+    for said in [
+        "fatal: Authentication failed for 'https://example.invalid/r/'",
+        "fatal: could not read Username for 'https://example.invalid': terminal prompts disabled",
+        "remote: Repository not found.\nfatal: repository 'https://example.invalid/r/' not found",
+        "git@example.invalid: Permission denied (publickey).\nfatal: Could not read from remote repository.",
+    ] {
+        for git_ref in ["main", "1.0"] {
+            let ran = run(git_ref, Some(said));
+            assert!(!ran.ok, "{git_ref} {said}");
+            let reason = said.replace('\n', "; ");
+            assert!(ran.stderr.contains(&format!("could not reach import {url}: {reason}")), "{git_ref} {said}: {}", ran.stderr);
+            assert!(!ran.stdout.contains("cached copy") && !ran.stderr.contains("cached copy"), "{git_ref} {said}");
+            assert_eq!(server.sent(), Vec::<String>::new(), "{git_ref} {said}");
+        }
+    }
+}
+
+/// A server on a port of its own that answers one request with each of
+/// `replies` in turn and is gone after the last.
+fn answers_in_turn(replies: Vec<Vec<u8>>) -> (u16, JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let thread = std::thread::spawn(move || {
+        for reply in replies {
+            let Ok((mut stream, _)) = listener.accept() else { return };
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut data = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !data.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => data.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ = stream.write_all(&reply);
+            let _ = stream.flush();
+        }
+    });
+    (port, thread)
+}
+
+/// The same for an archive: a status is an answer. Only a url that nothing
+/// answers at all is stood in for by what it served last.
+#[test]
+fn a_cached_copy_stands_in_only_for_an_archive_url_that_gave_no_answer() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", Vec::new());
+    let archive = fixture_archive();
+    let mut served = format!("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n", archive.len()).into_bytes();
+    served.extend_from_slice(&archive);
+    let statuses = ["404 Not Found", "401 Unauthorized", "403 Forbidden", "500 Internal Server Error"];
+    let mut replies = vec![served];
+    for status in statuses {
+        replies.push(format!("HTTP/1.1 {status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").into_bytes());
+    }
+    let (port, answering) = answers_in_turn(replies);
+    let url = format!("http://127.0.0.1:{port}/lib.tar.gz");
+    let batch = format!("import archive lib {{ \"url\": \"{url}\" }}\nGET /own\nlib/parts/a.api\n");
+
+    let ran = run_batch(&dir, server.port, "-sa", &batch);
+    assert!(ran.ok, "{}", ran.stderr);
+    assert_eq!(server.sent(), ["GET /own", "GET /parts/a"]);
+
+    // It is in the cache now, and the url says no: that is what stands.
+    for status in statuses {
+        let ran = run_batch(&dir, server.port, "-sa", &batch);
+        assert!(!ran.ok, "{status}");
+        assert!(ran.stderr.contains(&format!("could not reach import {url}: {status}")), "{status}: {}", ran.stderr);
+        assert!(!ran.stdout.contains("cached copy") && !ran.stderr.contains("cached copy"), "{status}");
+        assert_eq!(server.sent(), Vec::<String>::new(), "{status}");
+    }
+
+    // Nothing listens there any more: no answer, and the copy is used.
+    answering.join().unwrap();
+    let ran = run_batch(&dir, server.port, "-sa", &batch);
+    assert!(ran.ok, "{}", ran.stderr);
+    assert!(ran.stdout.contains(&format!("import lib {url} (sha256 ")), "{}", ran.stdout);
+    assert!(ran.stdout.contains(", cached copy: remote unreachable)"), "{}", ran.stdout);
+    assert_eq!(server.sent(), ["GET /own", "GET /parts/a"]);
+}
+
+// ----- the order things are checked in -----
+
+/// Imports are fetched while the file is read, ahead of the `url` gate: a
+/// batch with both wrong is told about the import.
+#[test]
+fn a_bad_import_is_reported_ahead_of_a_failing_url_gate() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", Vec::new());
+    let gate = "url has production.example.com\n";
+    for (import, says) in [
+        ("import dir lib { \"path\": \"no-such-directory\" }".to_string(), "import lib: not a directory: no-such-directory".to_string()),
+        (
+            format!("import archive lib {{ \"url\": \"{}\" }}", server.url("/missing.tar.gz")),
+            format!("could not reach import {}: 404 Not Found", server.url("/missing.tar.gz")),
+        ),
+        (
+            format!("import git lib {{ \"url\": \"file://{}/no-such-repo\", \"ref\": \"main\" }}", dir.display()),
+            format!("could not reach import file://{}/no-such-repo: ", dir.display()),
+        ),
+    ] {
+        // Above the gate and below it.
+        for batch in [format!("{import}\n{gate}GET /never\n"), format!("{gate}{import}\nGET /never\n")] {
+            let ran = run_batch(&dir, server.port, "-sa", &batch);
+            assert!(!ran.ok, "{batch}");
+            assert!(ran.stderr.contains(&says), "{batch}: {}", ran.stderr);
+            assert!(!ran.stderr.contains("URL gate failed"), "{batch}: {}", ran.stderr);
+            assert!(server.api_requests().iter().all(|r| r == "GET /missing.tar.gz"), "{batch}");
+        }
+    }
+    // With the import right, the gate is what stops it.
+    let batch = format!("import dir lib {{ \"path\": \"{}\" }}\n{gate}GET /never\n", fixture().display());
+    let ran = run_batch(&dir, server.port, "-sa", &batch);
+    assert!(!ran.ok);
+    assert!(ran.stderr.contains("URL gate failed"), "{}", ran.stderr);
+    assert_eq!(server.sent(), Vec::<String>::new());
+}
+
+// ----- a pinned archive and its token -----
+
+/// Once a pinned archive is in the cache a run needs no network, and so no
+/// token either: the variable may be unset.
+#[test]
+fn a_pinned_archive_in_the_cache_runs_with_its_token_variable_unset() {
+    use sha2::Digest;
+    let (_guard, dir) = temp();
+    let server = Server::start("1", fixture_archive());
+    let sha: String = sha2::Sha256::digest(fixture_archive()).iter().map(|b| format!("{b:02x}")).collect();
+    let pinned = |sha: &str| {
+        format!(
+            "import archive lib {{ \"url\": \"{}\", \"sha256\": \"{sha}\", \"token_env\": \"IMPORT_TEST_TOKEN\" }}\nlib/parts/a.api\n",
+            server.url("/lib.tar.gz")
+        )
+    };
+    let run = |batch: &str, token: Option<&str>| {
+        std::fs::write(dir.join("batch.api"), batch).unwrap();
+        let mut cmd = api(&dir, server.port);
+        cmd.args(["-sa", "batch.api"]).env_remove("IMPORT_TEST_TOKEN");
+        if let Some(token) = token {
+            cmd.env("IMPORT_TEST_TOKEN", token);
+        }
+        finish(cmd, "")
+    };
+
+    // Not in the cache yet: it has to be downloaded, and that takes the token.
+    let ran = run(&pinned(&sha), None);
+    assert!(!ran.ok);
+    assert!(ran.stderr.contains("environment variable IMPORT_TEST_TOKEN is not set"), "{}", ran.stderr);
+    assert_eq!(server.sent(), Vec::<String>::new());
+
+    let ran = run(&pinned(&sha), Some("s3cret-token"));
+    assert!(ran.ok, "{}", ran.stderr);
+    assert_eq!(server.sent(), ["GET /lib.tar.gz", "GET /parts/a"]);
+
+    // Cached: no download, no token, set to nothing or not set at all.
+    for token in [None, Some("")] {
+        let ran = run(&pinned(&sha), token);
+        assert!(ran.ok, "{token:?}: {}", ran.stderr);
+        assert_eq!(server.sent(), ["GET /parts/a"], "{token:?}");
+    }
+    // Another hash is another archive, and not in the cache.
+    let ran = run(&pinned(&"0".repeat(64)), None);
+    assert!(!ran.ok);
+    assert!(ran.stderr.contains("environment variable IMPORT_TEST_TOKEN is not set"), "{}", ran.stderr);
+    assert_eq!(server.sent(), Vec::<String>::new());
+}
+
+// ----- --assert -----
+
+/// `--assert` answers what a run would assert, so it follows imports, and
+/// fetches one that is not in the cache: by default the one under the home
+/// directory.
+#[test]
+fn listing_assertions_fetches_an_import_into_the_default_cache_under_home() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", fixture_archive());
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    for (kind, import) in each_kind(&dir, &server) {
+        std::fs::write(dir.join("batch.api"), format!("{import}\nGET /own\nlib/described.api\n")).unwrap();
+        let mut cmd = api(&dir, server.port);
+        cmd.args(["-r", "--assert", "batch.api"]).env_remove("API_IMPORT_CACHE").env("HOME", &home);
+        let ran = finish(cmd, "");
+        assert!(ran.ok, "{kind}: {}", ran.stderr);
+        assert_eq!(ran.stdout.trim(), r#"[{"api/v1/described~count":{"is":1}}]"#, "{kind}");
+        // Nothing was sent to the API; only the archive was asked for.
+        assert_eq!(server.api_requests(), Vec::<String>::new(), "{kind}");
+    }
+    // A repository and an archive are in the cache now, and it is the one
+    // under the home directory: nothing was made beside the batch.
+    let cache = home.join(".cache/api/imports");
+    let cached: Vec<String> = std::fs::read_dir(&cache)
+        .expect("the default cache was made")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(cached.len(), 2, "{cached:?}");
+    assert!(cached.contains(&"archives".to_string()), "{cached:?}");
+    assert!(!dir.join(".import-cache").exists());
+}
+
+// ----- what the cache clears out -----
+
+/// The cache directory may be one that holds other things. Pruning removes
+/// what the client marked as its own, and nothing that only looks like it.
+#[test]
+fn a_fetch_clears_out_nothing_that_the_client_did_not_put_in_the_cache() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", fixture_archive());
+    let cache = dir.join(".import-cache");
+    let hash = |c: char, n: usize| c.to_string().repeat(n);
+    let foreign = [
+        cache.join("my-project").join(hash('a', 40)),
+        cache.join("my-project").join(".tmp-build"),
+        cache.join("archives").join(hash('b', 64)),
+        cache.join("archives").join(".tmp-1-2-3"),
+    ];
+    for path in &foreign {
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::write(path.join("precious"), "x").unwrap();
+        age(path, 400);
+    }
+    // A fetch of each kind, each of which prunes the whole cache.
+    let repo = dir.join("repos/other");
+    commit(&repo, &[("step.api", b"GET /step\n")], None);
+    let batch = format!(
+        "{}import archive packed {{ \"url\": \"{}\" }}\nlib/step.api\npacked/parts/a.api\n",
+        import_git("lib", &repo_url(&repo), "main"),
+        server.url("/lib.tar.gz")
+    );
+    let ran = run_batch(&dir, server.port, "-sa", &batch);
+    assert!(ran.ok, "{}", ran.stderr);
+    assert_eq!(server.api_requests(), ["GET /step", "GET /parts/a"]);
+    for path in &foreign {
+        assert!(path.join("precious").is_file(), "{} was removed", path.display());
+    }
+    // What the fetches left of their own work is the checkout and its
+    // marker: no scratch directory, and no marker of one.
+    for group in std::fs::read_dir(&cache).unwrap().flatten() {
+        for entry in std::fs::read_dir(group.path()).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let known = foreign.iter().any(|f| *f == entry.path());
+            assert!(known || !name.starts_with(".tmp-"), "left behind: {}", entry.path().display());
+        }
+    }
 }

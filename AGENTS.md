@@ -197,9 +197,11 @@ GET /people > clipboard                  # system clipboard, case-insensitive
   `12345678901234567890123` and `0.10` are not rounded to what a double holds.
   Only an exponent's spelling is made uniform (`1E2` and `1e2` are written
   `1e+2`).
-- A `.ndjson`/`.njson` target always holds one compact JSON value per line,
-  after `>` and after any number of `>>`: a single record is one line, and a
-  list is one line per element. Other JSON targets are indented.
+- A `.ndjson`/`.njson` target holds one compact JSON value per line, after
+  `>` and after any number of `>>`: a single record is one line, and a list
+  is one line per element. Other JSON targets are indented. Not under
+  `--stream`, where a `> file` of either kind holds the bytes the server
+  sent (see below).
 - Under the status line the client prints the target and the size written, on
   stderr: `> people.json (47.1 KB)`, `>> people.json (+1.2 KB)`. `-s` suppresses it.
 
@@ -228,7 +230,10 @@ api --stream -sa export.api
 ```
 
 - A streamed `> file.json` holds the server's bytes verbatim, not pretty-printed.
-  Parse it rather than eyeballing it, or drop `--stream`.
+  Parse it rather than eyeballing it, or drop `--stream`. A streamed
+  `> file.ndjson` is verbatim too: it holds one value per line only if that
+  is how the server sent it. A list that arrives as one JSON array stays one
+  array; it is rewritten to lines only when buffered.
 - A streaming response sends its status line before the body exists, so a `200`
   can still carry an error inside the payload. Check the content.
 - `>> file`, `> clipboard`, and any non-2xx response buffer even with `--stream`.
@@ -237,8 +242,13 @@ api --stream -sa export.api
   `<file>.<pid>.part` beside it, which is removed), and ends the run with
   exit 1. The file keeps the mode the target had, and a target that is a
   symlink is written where the link points.
+- A transfer that is interrupted leaves the target as it was too, and no
+  `.part` file: ctrl+c or a `kill` (SIGINT, SIGTERM) during a batch, which
+  still ends the run as an interrupted program ends (a shell reports 130
+  for ctrl+c), and esc during the request at the prompt. A `kill -9` can't
+  be answered and leaves the `.part` file behind.
 - Two kinds of target are written as they stand, and are cut short by a
-  transfer that fails: one that is not a regular file (`> /dev/null`, a
+  transfer that fails or is interrupted: one that is not a regular file (`> /dev/null`, a
   fifo), and a file in a directory that no file can be created in.
 
 ## 5. Chaining
@@ -339,6 +349,13 @@ import git cl @cloddy.json
 
 - Fetching uses the `git` on the `PATH` and your normal git credentials; it
   never stops to ask for a password.
+- A remote that goes quiet does not hang the batch: a transfer of less than a
+  byte a second for a minute, an ssh connection that is not made in 30
+  seconds, or any one git command that takes more than five minutes, is given
+  up on. (An ssh command of your own, in `GIT_SSH_COMMAND` or `GIT_SSH`, is
+  used as it is.)
+- A `\` in a `url` is refused, here and for an archive: it is a `/` to one
+  URL parser and part of the host to another.
 - A commit SHA already in the cache needs no network. A tag or a branch costs
   one `git ls-remote` per run and is fetched only when it points at a new
   commit. A branch is therefore looked up again on every run: pin a tag or a
@@ -371,7 +388,7 @@ import archive cl {
 
 | Key | |
 |---|---|
-| `url` | required. `https://…` or `file:///…`. Plain `http://` only for `localhost`/`127.0.0.1` |
+| `url` | required. `https://…` or `file:///…`. Plain `http://` only for `localhost`/`127.0.0.1`. A `file://` url names a file of this machine: its path may hold a blank, `%20` and the like are decoded, and `file://host/…` is refused |
 | `sha256` | optional. The archive's SHA-256, 64 hex characters |
 | `token_env` | optional. The **name** of an environment variable whose value is sent as `Authorization: Bearer …` |
 | `path` | optional. A subdirectory of the archive for the alias to stand for |
@@ -383,14 +400,18 @@ import archive cl {
   downloaded on every run, with the hash it had printed in the log.
 - An archive that holds exactly one directory at its top (`cloddy-2.1.0/…`,
   the way release tarballs are packed) starts inside that directory, so
-  `cl/sv.api` is `cloddy-2.1.0/sv.api`. `path` applies below it.
+  `cl/sv.api` is `cloddy-2.1.0/sv.api`. `path` applies below it. What a file
+  manager leaves beside that directory does not count: a name that starts
+  with a dot (`.DS_Store`) and `__MACOSX`.
 - The token goes only to the archive's host. The client's own API key is
   never sent there, and the token is never sent to the API. Keep the token
   itself out of the file: `token_env` takes a variable name, and a missing
   variable is an error.
 - Only files and directories are unpacked. Links are skipped, an entry named
   outside the archive (`../x`) is an error, and so is an archive that unpacks
-  to more than 1 GB.
+  to more than 1 GB or to more than 100,000 files and directories. A download
+  of more than 1 GB is refused too (`the archive is larger than 1 GB`), on
+  its `Content-Length` or when that much has arrived.
 
 #### Rules for every kind
 
@@ -405,15 +426,23 @@ import archive cl {
   archive, `import cl /Users/me/Source/cloddy` for a directory.
 - **Cached by content.** Git checkouts and unpacked archives live in
   `~/.cache/api/imports` (override with `API_IMPORT_CACHE`), keyed by commit
-  or by SHA-256. If a remote can't be reached, the copy that a tag, a branch
-  or an unpinned archive URL last resolved to is used, and the log line says
-  `cached copy: remote unreachable`.
+  or by SHA-256. If a remote gives no answer at all (its name does not
+  resolve, nothing accepts the connection, it times out, or a `file://` path
+  is not there), the copy that a tag, a branch or an unpinned archive URL
+  last resolved to is used, and the log line says `cached copy: remote
+  unreachable`. A remote that answers is taken at its word: a `404` or a
+  `401` for an archive, a refused login or a missing repository for git, or
+  any other failure, stops the batch with `could not reach import …` and the
+  reason, cached copy or not.
 - **The cache cleans up after itself.** Every run that uses a checkout or an
   unpacked archive marks it used. A run that fetches something new then
   removes the ones last used more than 30 days ago, so a branch that moves
   every day doesn't leave a copy per commit behind. Nothing is lost: a pruned
   commit or archive is simply fetched again the next time it is asked for.
-  The whole directory is safe to delete at any time.
+  Only what the client marked as its own is removed (the `<name>.used` file
+  beside a checkout): anything else in the directory is left alone, whatever
+  it is called, and so is a checkout from a version that wrote no marker
+  until it is used again. The whole directory is safe to delete at any time.
 - **A ref is looked up once per run, and once per line at the prompt.** A
   batch that imports the same branch in several files asks the remote once
   and runs them all against the same commit. An interactive session can
@@ -427,7 +456,9 @@ import archive cl {
   `cl/sv.api` could then mean either.
 - **An imported file stays inside its import.** Its includes and its `@file`
   bodies resolve relative to the imported file itself, and one that points
-  outside (`@/etc/hosts`, `@~/…`, `../../x.api`) is an error. Its own
+  outside (`@/etc/hosts`, `@~/…`, `../../x.api`) is an error, by what the
+  line says: it is refused before anything is looked up, whether a file is
+  there or not (`include leaves the import: …`). Its own
   `import dir` may only name a directory inside the same import. Symlinks in
   a repository or an archive are not followed. In an `import dir`, whose
   files are used where they are, a link is followed only when it stays
@@ -439,6 +470,8 @@ import archive cl {
   from a host (`import git`, `import archive`) may itself import from that
   host and no other, and not from this machine (`file://`, `localhost`):
   `a file imported from github.com can import only from github.com, not …`.
+  Nor may its `url` hold a user or a password (`https://user@host/…`,
+  `ssh://git@host/…`); `git@host:path` is fine.
   No imported file may name a `token_env`, whatever it came from: a token is
   named by the file that is run. Imports are fetched while the file is read,
   before `-p` shows anything, so this is what keeps a token and a request of
@@ -1095,6 +1128,15 @@ export API_CREDENTIALS_FILE=/run/secrets/api-credentials.json
 api --no-keychain -sa seed.api                 # uses the default connection
 api --no-keychain -c staging GET /people       # pick another by alias
 api --no-keychain -k "$API_KEY" GET /people    # URL from file, key from the CLI
+```
+
+`-c` takes a connection's alias, or its URL (with or without the scheme) when
+exactly one saved connection has that URL. A URL that several connections
+share is an error that lists them, exit 1 with nothing sent: which credential
+to send is not guessed. An alias always wins over a URL.
+
+```
+Connection "cos.example.com" fits several saved connections: staging, staging-admin. Name one of them.
 ```
 
 A `-k`/`--token` on the command line overrides the stored credential but keeps

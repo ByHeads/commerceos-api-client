@@ -64,6 +64,16 @@ flate2 = "1"
 tar = { version = "0.4", default-features = false }
 zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 
+# An interrupt (ctrl+c, `kill`) during a streamed `> file` has to remove the
+# partial file before the run ends: see `watch_for_interrupt`. Nothing new is
+# built for it: crossterm depends on all three already.
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.3"
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["consoleapi"] }
+
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
