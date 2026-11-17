@@ -206,6 +206,9 @@ fn answer(
     } else if path.contains("/about") && header("authorization") == Some("Basic OmJhZHNwZWM=") {
         // …from a server that says it has one.
         ("200 OK", r#"{"feature-flags":[],"openapi-metadata-version":"1.1"}"#.to_string())
+    } else if path.contains("/about") && header("authorization") == Some("Basic OnN0cmVhbWVy") {
+        // For a session with the key `streamer`: a server that can stream.
+        ("200 OK", r#"{"feature-flags":["response:streaming"]}"#.to_string())
     } else if path.contains("/about") {
         ("200 OK", r#"{"feature-flags":[]}"#.to_string())
     } else {
@@ -1260,6 +1263,9 @@ fn the_prompt_writes_an_outfile_as_a_batch_does() {
     let shown = enter(&mut prompt, "GET /missing > error.json", "404");
     assert!(!d.join("error.json").exists(), "the error was written to the outfile\n{shown}");
     assert!(shown.contains("{}"), "{shown}");
+    // Nor is it appended to one.
+    let shown = enter(&mut prompt, "GET /missing >> error2.json", "404");
+    assert!(!d.join("error2.json").exists(), "the error was appended to the outfile\n{shown}");
 
     // A request that was never sent has no status: the one before it is not
     // reported as what stopped the block.
@@ -1273,6 +1279,161 @@ fn the_prompt_writes_an_outfile_as_a_batch_does() {
     let shown = enter(&mut prompt, "GET /a > no-such-dir/x.json && GET /never", "Error writing");
     assert!(shown.contains("Error writing to no-such-dir/x.json"), "{shown}");
     assert_eq!(server.log.lock().unwrap().clone(), ["GET /a"], "{shown}");
+}
+
+/// Type `line` at a prompt in the place of what is there, press Enter, and
+/// wait for `wait_for` to show. Returns what the screen showed from then on.
+#[cfg(unix)]
+fn enter_line(prompt: &mut pty::Prompt, line: &str, wait_for: &str) -> String {
+    prompt.send(b"\x15");
+    prompt.pump(Duration::from_millis(60));
+    let mark = prompt.screen.len();
+    prompt.paste(line);
+    prompt.pump(Duration::from_millis(60));
+    prompt.send(b"\r");
+    pump_until(prompt, Duration::from_secs(6), |p| pty::plain(&p.screen[mark..]).contains(wait_for));
+    prompt.pump(Duration::from_millis(250));
+    pty::plain(&prompt.screen[mark..])
+}
+
+/// With streaming on, the prompt writes an outfile as a streamed batch does:
+/// whole when the body ends, not at all when it breaks off, and a path that
+/// can't be written is said to be that.
+#[cfg(unix)]
+#[test]
+fn the_prompt_streams_an_outfile_as_a_batch_does() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    let mut cmd = api_bare(d);
+    cmd.args(["-b", &url, "-k", "streamer", "--stream"]);
+    let mut prompt = pty::Prompt::open(cmd);
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(500));
+    assert!(pty::rows(&prompt.screen, 200).last().unwrap().ends_with("streaming"), "{}", screen_tail(&prompt));
+
+    let shown = enter_line(&mut prompt, "GET /a > s.json", "200 OK");
+    assert!(shown.contains("> s.json"), "{shown}");
+    // The server's bytes as they came, which is what a stream writes.
+    assert_eq!(std::fs::read_to_string(d.join("s.json")).unwrap(), r#"{"ok":"/api/v1/a"}"#);
+    assert!(server.heads().last().unwrap().contains("accept=application/json;stream=true;"), "{:?}", server.heads());
+
+    std::fs::write(d.join("kept.json"), "[\"before\"]").unwrap();
+    let shown = enter_line(&mut prompt, "GET /midfail > kept.json", "The response was cut short");
+    assert!(shown.contains("The response was cut short"), "{shown}");
+    assert_eq!(std::fs::read_to_string(d.join("kept.json")).unwrap(), "[\"before\"]");
+
+    let shown = enter_line(&mut prompt, "GET /a > no-such-dir/x.json", "Error writing");
+    assert!(shown.contains("Error writing to no-such-dir/x.json"), "{shown}");
+
+    let mut left: Vec<String> =
+        std::fs::read_dir(d).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+    left.retain(|name| !name.starts_with('.'));
+    left.sort();
+    assert_eq!(left, ["kept.json", "s.json"]);
+}
+
+/// A file that opens with a describe block runs from a paste as it would
+/// from disk: the block is read, checked, and not sent. A describe block
+/// alone sends nothing and says so.
+#[cfg(unix)]
+#[test]
+fn a_describe_block_at_the_prompt_is_read_and_not_sent() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = open_prompt(&server, dir.path(), &[]);
+
+    server.take();
+    let shown = enter_line(&mut prompt, "{ \"title\": \"Katalog\" }\rGET /d1\rPUT /d2 {\"a\":1}", "PUT /d2");
+    pump_until(&mut prompt, Duration::from_secs(5), |_| server.seen() >= 2);
+    assert_eq!(server.take(), ["GET /d1", "PUT /d2 {\"a\":1}"], "{shown}");
+    let shown = pty::plain(&prompt.screen);
+    assert!(shown.contains("describe block: title is not an object of texts by locale"), "{}", screen_tail(&prompt));
+
+    // Alone, typed or pasted, it is a program that sends nothing. (ctrl+f
+    // clears the block of several lines that is still on the input.)
+    prompt.send(b"\x06\x15");
+    prompt.pump(Duration::from_millis(100));
+    let mark = prompt.screen.len();
+    prompt.send(b"{\"title\":{}}");
+    prompt.pump(Duration::from_millis(200));
+    prompt.send(b"\r");
+    let said = pump_until(&mut prompt, Duration::from_secs(4), |p| {
+        pty::plain(&p.screen[mark..]).contains("a describe block alone sends nothing")
+    });
+    assert!(said, "{}", screen_tail(&prompt));
+    assert_eq!(server.seen(), 0);
+}
+
+/// Keys the prompt reads in more than one spelling: alt+← as the CSI
+/// sequence some terminals send, a modified letter in a name dialog, and
+/// ctrl+g on a line that is no request.
+#[cfg(unix)]
+#[test]
+fn the_prompt_reads_modified_keys_as_what_they_are() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::write(d.join("seed.api"), "GET /inc1\nGET /inc2\n").unwrap();
+    let mut prompt = open_prompt(&server, d, &[]);
+    let mut type_line = |prompt: &mut pty::Prompt, line: &str| {
+        prompt.send(b"\x15");
+        prompt.pump(Duration::from_millis(60));
+        prompt.send(line.as_bytes());
+        prompt.pump(Duration::from_millis(200));
+    };
+
+    // alt+← (CSI 1;3D) goes a word back, alt+→ (CSI 1;3C) a word on.
+    server.take();
+    type_line(&mut prompt, "GET /aaa~where(b=1)~take(2)");
+    prompt.send(b"\x1b[1;3D");
+    prompt.pump(Duration::from_millis(100));
+    prompt.send(b"\x1b[1;3D");
+    prompt.pump(Duration::from_millis(100));
+    prompt.send(b"\x1b[1;3C");
+    prompt.pump(Duration::from_millis(100));
+    prompt.send(b"\x1b[1;3C");
+    prompt.pump(Duration::from_millis(100));
+    prompt.send(b"~count\r");
+    pump_until(&mut prompt, Duration::from_secs(5), |_| server.seen() > 0);
+    assert_eq!(server.take(), ["GET /aaa~where(b=1)~take(2)~count"], "{}", screen_tail(&prompt));
+    prompt.pump(Duration::from_millis(300));
+
+    // ctrl+g on a directive or an include has no URI to GET.
+    for line in ["assert /x", "seed.api"] {
+        type_line(&mut prompt, line);
+        let mark = prompt.screen.len();
+        prompt.send(b"\x07");
+        let said = pump_until(&mut prompt, Duration::from_secs(3), |p| pty::plain(&p.screen[mark..]).contains("not a request"));
+        assert!(said, "{line}: {}", screen_tail(&prompt));
+        assert_eq!(server.seen(), 0, "{line}");
+    }
+    // On a request it GETs the URI and leaves the line: Enter then sends it.
+    type_line(&mut prompt, "PUT /x {\"a\":1}");
+    prompt.send(b"\x07");
+    pump_until(&mut prompt, Duration::from_secs(5), |_| server.seen() > 0);
+    prompt.pump(Duration::from_millis(300));
+    prompt.send(b"\r");
+    pump_until(&mut prompt, Duration::from_secs(5), |_| server.seen() > 1);
+    assert_eq!(server.take(), ["GET /x", "PUT /x {\"a\":1}"], "{}", screen_tail(&prompt));
+    prompt.pump(Duration::from_millis(300));
+
+    // In a name dialog a letter typed with alt or ctrl is not a letter.
+    prompt.send(b"\x12");
+    prompt.wait_for("Export with external identifier", Duration::from_secs(5));
+    prompt.send(b"\x1bb");
+    prompt.pump(Duration::from_millis(100));
+    prompt.send(b"\x01");
+    prompt.pump(Duration::from_millis(100));
+    prompt.send(b"com.heads.seedID");
+    prompt.pump(Duration::from_millis(200));
+    let mark = prompt.screen.len();
+    prompt.send(b"\r");
+    prompt.pump(Duration::from_millis(600));
+    let shown = pty::plain(&prompt.screen[mark..]);
+    assert!(!shown.contains("export needs a namespaced key"), "{shown}");
+    assert!(pty::rows(&prompt.screen, 200).last().unwrap().ends_with("export"), "{}", screen_tail(&prompt));
 }
 
 /// A credentials file in `dir` with these connections: `(name, url,
@@ -2152,6 +2313,72 @@ fn ask(server: &RecordingServer, dir: &Path, args: &[&str], stdin: Option<&str>)
 
 #[cfg(unix)]
 const UNANSWERED: &str = "aborted (could not read confirmation)";
+
+/// Lines the documentation promises and nothing else pinned: a `confirm`
+/// whose message holds `&&`, stdin as the body of every method that takes
+/// one, `>> clipboard` refused however it is spelled, a file with a byte
+/// order mark named as the argument, and the `url` gate in capitals.
+#[cfg(unix)]
+#[test]
+fn documented_lines_mean_what_the_documentation_says() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let file = |name: &str, text: &str| std::fs::write(d.join(name), text).unwrap();
+    let sent = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+    // Everything after `confirm` is the message: it is not a chain.
+    file("confirm.api", "confirm Seed a && b?\nGET /after\n");
+    let asked = ask(&server, d, &["-sa", "confirm.api"], Some("y\n"));
+    assert_eq!((asked.code, asked.sent), (Some(0), sent(&["GET /after"])), "{}", asked.stderr);
+    assert!(asked.stderr.contains("Seed a && b?"), "{}", asked.stderr);
+    let declined = ask(&server, d, &["-sa", "confirm.api"], Some("n\n"));
+    assert_eq!((declined.code, declined.sent.len()), (Some(0), 0), "{}", declined.stderr);
+    let typed = ask(&server, d, &["confirm Seed a && b?"], Some("y\n"));
+    assert_eq!((typed.code, typed.sent.len()), (Some(0), 0), "{}", typed.stderr);
+    assert!(typed.stderr.contains("Seed a && b?"), "{}", typed.stderr);
+
+    // Stdin is the body of a POST, a PATCH and a `put`, and of a request
+    // whose outfile is in the same argument as its URI.
+    let body = r#"{"x":1}"#;
+    for (args, request) in [
+        (&["POST", "/a"][..], r#"POST /a {"x":1}"#),
+        (&["PATCH", "/a"][..], r#"PATCH /a {"x":1}"#),
+        (&["put", "/a"][..], r#"PUT /a {"x":1}"#),
+        (&["PUT", "/a > piped.json"][..], r#"PUT /a {"x":1}"#),
+    ] {
+        let got = ask(&server, d, args, Some(body));
+        assert_eq!((got.code, got.sent), (Some(0), sent(&[request])), "{args:?}: {}", got.stderr);
+    }
+    assert!(d.join("piped.json").exists());
+    // A check is not a request that reads a body from stdin.
+    let check = ask(&server, d, &["assert", "PUT", "/x"], Some(body));
+    assert_eq!((check.code, check.sent), (Some(0), sent(&["PUT /x"])), "{}", check.stderr);
+
+    // `>> clipboard` is refused when the line is read, before anything is sent.
+    file("clip.api", "GET /first\nGET /a && GET /b >> clipboard\n");
+    for args in [&["GET", "/a", ">>clipboard"][..], &["GET", "/a", ">>", "Clipboard"], &["GET /a >> clipboard"], &["-sa", "clip.api"]] {
+        let got = run_in(&server, d, args);
+        assert_eq!((got.code, got.sent.len()), (Some(1), 0), "{args:?}: {}", got.stderr);
+        assert!(got.stderr.contains("cannot append to clipboard"), "{args:?}: {}", got.stderr);
+    }
+
+    // A byte order mark, in a file named as the argument and in an include.
+    file("bom.api", "\u{feff}GET /bom1\r\nGET /bom2\r\n");
+    file("includes-bom.api", "GET /own\nbom.api\n");
+    let named = run_in(&server, d, &["bom.api"]);
+    assert_eq!((named.code, named.sent), (Some(0), sent(&["GET /bom1", "GET /bom2"])), "{}", named.stderr);
+    let included = run_in(&server, d, &["-sa", "includes-bom.api"]);
+    assert_eq!((included.code, included.sent), (Some(0), sent(&["GET /own", "GET /bom1", "GET /bom2"])), "{}", included.stderr);
+
+    // The gate is read in any case and with any blanks, as an argument too.
+    let open = run_in(&server, d, &[&format!("URL  HAS {}\nGET /gated", server.port)]);
+    assert_eq!((open.code, open.sent), (Some(0), sent(&["GET /gated"])), "{}", open.stderr);
+    let shut = run_in(&server, d, &["URL  HAS nomatch.example\nGET /gated"]);
+    assert_eq!((shut.code, shut.sent.len()), (Some(1), 0), "{}", shut.stderr);
+    let exact = run_in(&server, d, &[&format!("Url Is http://127.0.0.1:{}\nGET /gated", server.port)]);
+    assert_eq!((exact.code, exact.sent), (Some(0), sent(&["GET /gated"])), "{}", exact.stderr);
+}
 
 /// `-p` asks before sending. End of input is nobody answering, not Enter:
 /// nothing is sent and the run fails. An empty line still accepts.
