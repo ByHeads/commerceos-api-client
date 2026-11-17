@@ -412,6 +412,13 @@ struct Config {
     export_pinned: bool,
     /// The status of the last response the prompt received, for `-f` there.
     last_status: Option<u16>,
+    /// OAuth2 client credentials of the connection, when it has them: what a
+    /// token that ran out is renewed with. Empty for a key or a plain token.
+    oauth2_client_id: String,
+    oauth2_client_secret: String,
+    /// The run is one request given as arguments (`api GET /x > file`), not
+    /// a batch: what it could not write ends it with exit 1.
+    one_shot: bool,
 }
 
 impl Default for Config {
@@ -444,6 +451,9 @@ impl Default for Config {
             export_id: None,
             export_pinned: false,
             last_status: None,
+            oauth2_client_id: String::new(),
+            oauth2_client_secret: String::new(),
+            one_shot: false,
         }
     }
 }
@@ -879,8 +889,6 @@ struct AppState {
     body_input_method: String,
     body_input_uri: String,
     // OAuth2 credentials for token refresh
-    oauth2_client_id: String,
-    oauth2_client_secret: String,
     // Bracketed-paste identifier-expansion state
     // Cycles through identifiers when the same JSON is re-pasted within 10s.
     last_paste_raw: String,
@@ -957,8 +965,6 @@ impl AppState {
             body_input_buffer: String::new(),
             body_input_method: String::new(),
             body_input_uri: String::new(),
-            oauth2_client_id: String::new(),
-            oauth2_client_secret: String::new(),
             last_paste_raw: String::new(),
             last_paste_cycle_idx: 0,
             last_paste_at: None,
@@ -2946,6 +2952,9 @@ fn require_base_uri(config: &Config) {
 // Apply a saved connection to a Config
 fn apply_connection_to_config(config: &mut Config, env: &SavedConnection) {
     config.base_uri = normalize_base_uri(&env.url);
+    // Only an OAuth2 connection has credentials to renew a token with.
+    config.oauth2_client_id.clear();
+    config.oauth2_client_secret.clear();
     match env.auth_type.as_str() {
         "token" => {
             config.token = env.credential.clone();
@@ -2957,6 +2966,8 @@ fn apply_connection_to_config(config: &mut Config, env: &SavedConnection) {
                 Ok((token, _expires)) => {
                     config.token = token;
                     config.api_key = String::new();
+                    config.oauth2_client_id = env.client_id.clone();
+                    config.oauth2_client_secret = env.credential.clone();
                 }
                 Err(e) => {
                     eprintln!("OAuth2 token exchange failed: {}", e);
@@ -3546,6 +3557,7 @@ fn main() {
                 }
             }
         }
+        config.one_shot = true;
         run_non_interactive(&mut config, &method, &uri, &body);
         return;
     }
@@ -3860,11 +3872,8 @@ fn check_connection(config: &Config) -> Result<(bool, bool, bool), u16> {
 
     let mut request = client.get(&url);
 
-    if !config.token.is_empty() {
-        request = request.header("Authorization", format!("Bearer {}", config.token));
-    } else if !config.api_key.is_empty() {
-        let encoded = BASE64.encode(format!(":{}", config.api_key));
-        request = request.header("Authorization", format!("Basic {}", encoded));
+    if let Some(authorization) = auth_header(config) {
+        request = request.header("Authorization", authorization);
     }
 
     match request.send() {
@@ -4672,8 +4681,7 @@ fn classify_streamed(status: u16, prefix: &str, overflowed: bool) -> RequestOutc
 
 /// Whether `path` names an NDJSON file (`.ndjson` or `.njson`, any case).
 fn is_ndjson_path(path: &str) -> bool {
-    let lower = path.to_lowercase();
-    lower.ends_with(".ndjson") || lower.ends_with(".njson")
+    outfile_format(path) == OutFormat::Ndjson
 }
 
 /// `content` as NDJSON, when it is one JSON value: a list becomes one compact
@@ -6846,10 +6854,7 @@ fn read_api_file(file: &str) -> Result<(String, Option<PathBuf>), String> {
         io::stdin().read_to_string(&mut contents).map_err(|_| "could not read stdin".to_string())?;
         return Ok((strip_bom(contents), None));
     }
-    let path = match (file.strip_prefix("~/"), dirs::home_dir()) {
-        (Some(rest), Some(home)) => format!("{}/{}", home.display(), rest),
-        _ => file.to_string(),
-    };
+    let path = expand_home(file);
     let contents = fs::read_to_string(&path).map_err(|e| format!("could not read {}: {}", path, e))?;
     Ok((strip_bom(contents), std::path::Path::new(&path).parent().map(|p| p.to_path_buf())))
 }
@@ -7063,15 +7068,7 @@ fn resolve_include_paths_as(
     base_dir: Option<&std::path::Path>,
     include_spec: &str,
 ) -> Result<Vec<std::path::PathBuf>, String> {
-    let expanded = if path.starts_with("~/") {
-        if let Some(home) = dirs::home_dir() {
-            format!("{}{}", home.display(), &path[1..])
-        } else {
-            path.to_string()
-        }
-    } else {
-        path.to_string()
-    };
+    let expanded = expand_home(path);
 
     let path_buf = std::path::PathBuf::from(&expanded);
     let resolved = if path_buf.is_absolute() {
@@ -7997,6 +7994,302 @@ fn run_bulk(config: &mut Config, file_path: &str) {
     run_bulk_from_str(config, &contents, base_dir.as_deref());
 }
 
+/// What one request is made of, apart from the connection it is sent on. It
+/// is what `build_request` turns into a request, as many times as needed: the
+/// first attempt, and the one after a token was renewed, are the same.
+#[derive(Debug, Clone)]
+struct RequestParts {
+    method: String,
+    /// The URI as written, without its ` > outfile`.
+    uri: String,
+    /// The body as written: JSON text, or `@file` with its `~map()`.
+    body: String,
+    /// Where the response goes, when it goes to a file: the extension asks
+    /// for a format.
+    outfile: Option<String>,
+    /// Ask the server to stream (`;stream=true`).
+    streaming: bool,
+}
+
+/// What an outfile's extension says the file holds. Read in any case, so
+/// `out.CSV` is a CSV file to `Accept` as it is to `>>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutFormat {
+    Json,
+    Ndjson,
+    Csv,
+    Sql,
+}
+
+fn outfile_format(path: &str) -> OutFormat {
+    let lower = path.to_lowercase();
+    if lower.ends_with(".ndjson") || lower.ends_with(".njson") {
+        OutFormat::Ndjson
+    } else if lower.ends_with(".csv") {
+        OutFormat::Csv
+    } else if lower.ends_with(".sql") {
+        OutFormat::Sql
+    } else {
+        OutFormat::Json
+    }
+}
+
+/// The `Accept` an outfile asks for, when its extension asks for one.
+fn accept_for_outfile(path: &str) -> Option<&'static str> {
+    match outfile_format(path) {
+        OutFormat::Ndjson => Some("application/x-ndjson"),
+        OutFormat::Csv => Some("text/csv"),
+        OutFormat::Sql => Some("application/sql"),
+        OutFormat::Json => None,
+    }
+}
+
+/// The `Authorization` header for a connection: a token is Bearer, and so is
+/// a key that has the shape of a JWT; any other key is Basic with an empty
+/// user name. Every request the client makes gets its header here, so a key
+/// is never Bearer for one call and Basic for another.
+fn auth_header(config: &Config) -> Option<String> {
+    if !config.token.is_empty() {
+        Some(format!("Bearer {}", config.token))
+    } else if config.api_key.is_empty() {
+        None
+    } else if config.api_key.starts_with("ey") && config.api_key.len() > 180 {
+        Some(format!("Bearer {}", config.api_key))
+    } else {
+        Some(format!("Basic {}", BASE64.encode(format!(":{}", config.api_key))))
+    }
+}
+
+/// `~/x` as a path in the home directory (`~\\x` too on Windows); anything
+/// else as it is.
+fn expand_home(path: &str) -> String {
+    let rest = path
+        .strip_prefix("~/")
+        .or_else(|| if cfg!(windows) { path.strip_prefix("~\\") } else { None });
+    match (rest, dirs::home_dir()) {
+        (Some(rest), Some(home)) => home.join(rest).to_string_lossy().into_owned(),
+        _ => path.to_string(),
+    }
+}
+
+/// A request ready to send, and the `Accept` it carries (which says how the
+/// response is to be read).
+struct BuiltRequest {
+    request: reqwest::blocking::RequestBuilder,
+    accept: String,
+}
+
+/// Build the request for `parts` on the connection in `config`: method, URL,
+/// authorization, `Content-Type` and `Accept`, the `~map()` header and the
+/// body. The batch, the prompt and the retry after a renewed token all build
+/// here. `Err` is an `@file` body that could not be read; nothing is sent.
+fn build_request(config: &Config, parts: &RequestParts) -> Result<BuiltRequest, String> {
+    let client = build_request_client(config.timeout_secs);
+    let url = format!("{}{}", config.base_uri, resolve_request_path(&config.api_path, &parts.uri));
+
+    let mut request = match parts.method.as_str() {
+        "GET" => client.get(&url),
+        "POST" => client.post(&url),
+        "PUT" => client.put(&url),
+        "PATCH" => client.patch(&url),
+        "DELETE" => client.delete(&url),
+        "HEAD" => client.head(&url),
+        "OPTIONS" => client.request(reqwest::Method::OPTIONS, &url),
+        _ => client.get(&url),
+    };
+
+    if let Some(authorization) = auth_header(config) {
+        request = request.header("Authorization", authorization);
+    }
+
+    let mut content_type = "application/json".to_string();
+    let mut accept = "application/json".to_string();
+    if config.ndjson {
+        content_type = "application/x-ndjson".to_string();
+        accept = "application/x-ndjson".to_string();
+    }
+
+    if parts.body.starts_with('@') {
+        // `~func(arg)` suffixes (`~map(name)`) are for `@file` bodies only.
+        let (file_body, extra_headers) = parse_body_functions(&parts.body);
+        for (name, value) in &extra_headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        let file_path_raw = file_body.trim_start_matches("@ ").trim_start_matches('@').trim();
+        let file = resolve_at_file_body(file_path_raw)?;
+        if let Some(ct) = file.content_type {
+            content_type = ct;
+        }
+        if let Some(ac) = file.accept_type {
+            accept = ac;
+        }
+        request = request.body(file.contents);
+    } else if !parts.body.is_empty() {
+        request = request.body(parts.body.clone());
+    }
+
+    if let Some(asked) = parts.outfile.as_deref().and_then(accept_for_outfile) {
+        accept = asked.to_string();
+    }
+    if parts.streaming {
+        content_type.push_str(";stream=true");
+        accept.push_str(";stream=true");
+    }
+    if config.include_nulls {
+        accept.push_str(";skipNulls=false");
+    }
+
+    let request = request.header("Content-Type", &content_type).header("Accept", &accept);
+    Ok(BuiltRequest { request, accept })
+}
+
+/// A response, and the token that was fetched to get it, if one was.
+struct Sent {
+    response: reqwest::blocking::Response,
+    /// A renewed OAuth2 token, for the caller to keep for the next request.
+    new_token: Option<String>,
+}
+
+/// Send a built request. A 401 on a connection that has OAuth2 client
+/// credentials means the token ran out: a new one is fetched, once, and the
+/// same request (`parts`, built again with the new token) is sent again. The
+/// second answer is the answer, 401 or not.
+fn send_request(config: &Config, parts: &RequestParts, built: BuiltRequest) -> Result<Sent, reqwest::Error> {
+    let response = built.request.send()?;
+    let renewable = response.status().as_u16() == 401
+        && !config.oauth2_client_id.is_empty()
+        && !config.oauth2_client_secret.is_empty();
+    if renewable {
+        let exchanged = oauth2_token_exchange(&config.base_uri, &config.oauth2_client_id, &config.oauth2_client_secret);
+        if let Ok((token, _)) = exchanged {
+            let mut renewed = config.clone();
+            renewed.token = token.clone();
+            if let Ok(again) = build_request(&renewed, parts) {
+                return Ok(Sent { response: again.request.send()?, new_token: Some(token) });
+            }
+        }
+    }
+    Ok(Sent { response, new_token: None })
+}
+
+/// Why a response streamed to an outfile did not get there.
+enum StreamFailure {
+    /// The file could not be created or put in place: a local problem.
+    Write(io::Error),
+    /// The body stopped or the transfer failed partway.
+    Body(io::Error),
+}
+
+/// Stream a response body to `path`. The bytes go to `<path>.part` and the
+/// file takes its name only once the body has ended, so a transfer that
+/// fails leaves no file that looks complete: the target is as it was.
+fn stream_to_outfile(resp: impl IoRead, path: &str) -> Result<StreamedBody, StreamFailure> {
+    let part = format!("{}.part", path);
+    let file = fs::File::create(&part).map_err(StreamFailure::Write)?;
+    let mut writer = io::BufWriter::new(file);
+    let streamed = stream_to_sink(resp, &mut writer);
+    drop(writer);
+    let result = match streamed {
+        Ok(body) => fs::rename(&part, path).map(|()| body).map_err(StreamFailure::Write),
+        Err(e) => Err(StreamFailure::Body(e)),
+    };
+    if result.is_err() {
+        let _ = fs::remove_file(&part);
+    }
+    result
+}
+
+/// A buffered body as it is written to a file or the clipboard: JSON is
+/// indented, unless `-r` or `--ndjson` asked for it as it came. Anything
+/// that is not JSON (CSV, SQL, NDJSON of several lines) is left alone.
+fn outfile_text(config: &Config, body: &str) -> String {
+    if config.raw || config.ndjson {
+        return body.to_string();
+    }
+    match serde_json::from_str::<Value>(body) {
+        Ok(json) => serde_json::to_string_pretty(&json).unwrap_or_else(|_| body.to_string()),
+        Err(_) => body.to_string(),
+    }
+}
+
+/// Where a response goes instead of the screen.
+struct OutTarget<'a> {
+    /// The path to write, `~/` expanded.
+    path: &'a str,
+    /// The path as written, for messages.
+    display: &'a str,
+    append: bool,
+}
+
+impl OutTarget<'_> {
+    fn is_clipboard(&self) -> bool {
+        is_clipboard_target(self.display)
+    }
+
+    /// Put `text` there and say how many bytes that added.
+    fn deliver(&self, text: &str) -> io::Result<u64> {
+        if self.is_clipboard() {
+            return cli_clipboard::set_contents(text.to_string())
+                .map(|()| text.len() as u64)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()));
+        }
+        if self.append {
+            let before = file_len(self.path);
+            append_to_outfile(self.path, text).map(|()| file_len(self.path).saturating_sub(before))
+        } else {
+            write_outfile(self.path, text)
+        }
+    }
+
+    /// What to say when `deliver` failed.
+    fn failure(&self, e: &io::Error) -> String {
+        if self.is_clipboard() {
+            format!("clipboard unavailable: {}", e)
+        } else {
+            format!("Error writing to {}: {}", self.path, e)
+        }
+    }
+
+    /// The `> file (size)` line under the status line.
+    fn marker(&self, bytes: u64) -> String {
+        let name = if self.is_clipboard() { "clipboard" } else { self.display };
+        outfile_marker(name, bytes, self.append)
+    }
+}
+
+/// A response body that stopped before its end, or took longer than the
+/// timeout, in words.
+fn describe_body_failure(e: &io::Error, timeout_secs: u64) -> String {
+    if io_error_is_timeout(e) {
+        format!(
+            "Timed out after {} — raise it with --timeout <seconds> (0 = no timeout)",
+            describe_timeout(timeout_secs)
+        )
+    } else {
+        format!("The response was cut short: {}", e)
+    }
+}
+
+/// A batch or a one-shot got a response it could not read to the end. That
+/// is no answer at all, like a request that got no response: the run ends
+/// with exit 1, with or without `-f`, from a plain line, a chain or a check.
+fn exit_on_body_failure(config: &Config, e: &io::Error) -> ! {
+    eprintln!();
+    eprintln!("{}\n", describe_body_failure(e, config.timeout_secs));
+    exit_process(1);
+}
+
+/// A batch or a one-shot could not write what a request was to leave behind
+/// (an outfile, the clipboard). The message is out. For a single request and
+/// under `-f` that ends the run; otherwise the batch goes on as it does past
+/// a failed request, and a chain stops there.
+fn local_write_failed(config: &Config) -> RequestOutcome {
+    if config.fail_fast || config.one_shot {
+        exit_process(1);
+    }
+    RequestOutcome::Errored
+}
+
 /// Send one request and report what it means for a `&&` chain. Errors are
 /// printed here; deciding whether they end the run is the caller's business
 /// (bulk exits 1, the TUI stops the chain and stays open).
@@ -8021,28 +8314,18 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
         config.preview = false;
     }
 
-    // Parse > / >> outfile from URI (space required before >, optional after;
-    // `>>` appends instead of overwriting)
-    let (actual_uri, outfile, display_outfile, outfile_append) = if let Some(idx) = outfile_marker_at(uri) {
-        let mut rest = &uri[idx + 2..];
-        let append = rest.starts_with('>');
-        if append {
-            rest = &rest[1..];
-        }
-        let display_path = rest.trim().to_string();
-        let outfile_path = if display_path.starts_with("~/") {
-            if let Some(home) = dirs::home_dir() {
-                format!("{}{}", home.display(), &display_path[1..])
-            } else {
-                display_path.clone()
-            }
-        } else {
-            display_path.clone()
-        };
-        (uri[..idx].trim(), Some(outfile_path), Some(display_path), append)
-    } else {
-        (uri, None, None, false)
+    // The ` > outfile` / ` >> outfile` that `parse_request_line` left on the URI.
+    let (actual_uri, redirect) = split_uri_outfile(uri);
+    let actual_uri = actual_uri.trim();
+    let outfile_append = redirect.starts_with(" >>");
+    let display_outfile: Option<String> = (!redirect.is_empty())
+        .then(|| redirect.trim_start_matches([' ', '>']).trim().to_string());
+    let outfile: Option<String> = display_outfile.as_deref().map(expand_home);
+    let target = match (&outfile, &display_outfile) {
+        (Some(path), Some(display)) => Some(OutTarget { path, display, append: outfile_append }),
+        _ => None,
     };
+    let is_clipboard = target.as_ref().is_some_and(|t| t.is_clipboard());
 
     // Streaming is opt-in and already resolved from --stream/API_STREAMING, so
     // there is no per-request feature-flag round trip here. A server that
@@ -8051,92 +8334,21 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
     // not asked for, and an error then arrives as a status, not mid-payload.
     config.streaming = config.stream_requested && config.export_id.is_none();
 
-    let client = build_request_client(config.timeout_secs);
-
-    let url = format!("{}{}", config.base_uri, resolve_request_path(&config.api_path, actual_uri));
-
-    let mut request = match method {
-        "GET" => client.get(&url),
-        "POST" => client.post(&url),
-        "PUT" => client.put(&url),
-        "PATCH" => client.patch(&url),
-        "DELETE" => client.delete(&url),
-        "HEAD" => client.head(&url),
-        "OPTIONS" => client.request(reqwest::Method::OPTIONS, &url),
-        _ => client.get(&url),
+    let parts = RequestParts {
+        method: method.to_string(),
+        uri: actual_uri.to_string(),
+        body: body.to_string(),
+        outfile: outfile.clone(),
+        streaming: config.streaming,
     };
-
-    // Set auth header
-    if !config.token.is_empty() {
-        request = request.header("Authorization", format!("Bearer {}", config.token));
-    } else if !config.api_key.is_empty() {
-        if config.api_key.starts_with("ey") && config.api_key.len() > 180 {
-            request = request.header("Authorization", format!("Bearer {}", config.api_key));
-        } else {
-            let encoded = BASE64.encode(format!(":{}", config.api_key));
-            request = request.header("Authorization", format!("Basic {}", encoded));
+    let built = match build_request(config, &parts) {
+        Ok(built) => built,
+        Err(e) => {
+            eprintln!("{}", e);
+            exit_process(1);
         }
-    }
-
-    // Set content type and accept headers
-    let mut content_type = "application/json".to_string();
-    let mut accept = "application/json".to_string();
-
-    if config.ndjson {
-        content_type = "application/x-ndjson".to_string();
-        accept = "application/x-ndjson".to_string();
-    }
-
-    // Handle @ file input for body
-    if body.starts_with("@ ") || body.starts_with("@") {
-        // Parse ~func(arg) suffixes (e.g. ~map(name)) — only for @file bodies
-        let (file_body, extra_headers) = parse_body_functions(body);
-        for (name, value) in &extra_headers {
-            request = request.header(name.as_str(), value.as_str());
-        }
-        let file_path_raw = file_body.trim_start_matches("@ ").trim_start_matches('@').trim();
-        match resolve_at_file_body(file_path_raw) {
-            Ok(res) => {
-                if let Some(ct) = res.content_type {
-                    content_type = ct;
-                }
-                if let Some(ac) = res.accept_type {
-                    accept = ac;
-                }
-                request = request.body(res.contents);
-            }
-            Err(e) => {
-                eprintln!("{}", e);
-                exit_process(1);
-            }
-        }
-    } else if !body.is_empty() {
-        request = request.body(body.to_string());
-    }
-
-    // Override accept based on outfile extension
-    if let Some(ref outfile) = outfile {
-        if outfile.ends_with(".ndjson") {
-            accept = "application/x-ndjson".to_string();
-        } else if outfile.ends_with(".csv") {
-            accept = "text/csv".to_string();
-        } else if outfile.ends_with(".sql") {
-            accept = "application/sql".to_string();
-        }
-    }
-
-    if config.streaming {
-        content_type.push_str(";stream=true");
-        accept.push_str(";stream=true");
-    }
-
-    if config.include_nulls {
-        accept.push_str(";skipNulls=false");
-    }
-
-    request = request
-        .header("Content-Type", &content_type)
-        .header("Accept", &accept);
+    };
+    let accept = built.accept.clone();
 
     let start = Instant::now();
 
@@ -8147,251 +8359,12 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
         io::stderr().is_terminal() && !config.silent && !config.quiet,
     );
 
-    match request.send() {
-        Ok(resp) => {
-            let status = resp.status();
-            let elapsed = start.elapsed();
-            progress.headers_arrived(&resp);
-
-            // `> clipboard` is a special outfile target — route to system clipboard.
-            let is_clipboard = display_outfile
-                .as_deref()
-                .map(is_clipboard_target)
-                .unwrap_or(false);
-
-            // Streaming needs a sink that accepts bytes as they arrive, which
-            // rules out everything that must see the whole body first: pretty
-            // printing, `>>` merging, and the clipboard. Non-2xx buffers too, so
-            // an error payload never streams into an outfile.
-            let stream_body = config.streaming
-                && status.is_success()
-                && !config.quiet
-                && !config.check_only
-                && !is_clipboard
-                && !outfile_append
-                && (outfile.is_some()
-                    || config.bulk_silent
-                    || config.raw
-                    || config.ndjson
-                    || !is_tty);
-
-            // Print status. A quiet poll only speaks up when the status is an
-            // error, so the abort that follows has a reason next to it.
-            if !config.silent && (!config.quiet || status_is_error(status.as_u16())) {
-                let status_str = format_status(status, config.expect_falsy);
-
-                ticker.interrupt(|| {
-                    if config.bulk_silent {
-                        // Bulk silent mode: print compact status to stdout with box-draw prefix
-                        outln!(
-                            "{}HTTP/1.1 {} {}",
-                            "└─".dimmed(),
-                            status_str,
-                            format_latency(elapsed).dimmed()
-                        );
-                    } else {
-                        eprintln!(
-                            "HTTP/1.1 {} {}",
-                            status_str,
-                            format_latency(elapsed).dimmed()
-                        );
-                        // The body follows straight under the status line; the
-                        // "> outfile" line, when there is one, takes its place.
-                    }
-                });
+    let resp = match send_request(config, &parts, built) {
+        Ok(sent) => {
+            if let Some(token) = sent.new_token {
+                config.token = token;
             }
-
-            if stream_body {
-                // A body printed live to the terminal would fight the progress
-                // line for the same screen.
-                if outfile.is_none() && !config.bulk_silent && is_tty {
-                    ticker.stop();
-                }
-                let resp = CountingReader::new(resp, &progress);
-                let streamed = if let Some(ref file_path) = outfile {
-                    match fs::File::create(file_path) {
-                        Ok(file) => {
-                            let mut writer = io::BufWriter::new(file);
-                            let res = stream_to_sink(resp, &mut writer);
-                            ticker.stop();
-                            if let (Ok(body), false, false) = (&res, config.silent, config.bulk_silent) {
-                                // Match the buffered path: status line, then `> outfile`.
-                                let display = display_outfile.as_deref().unwrap_or(file_path);
-                                eprintln!("{}", outfile_marker(display, body.bytes, false).dimmed());
-                            }
-                            res
-                        }
-                        Err(e) => Err(e),
-                    }
-                } else if config.bulk_silent {
-                    // Bodies are suppressed here, but the response still has to be
-                    // drained before the next request reuses the connection.
-                    stream_to_sink(resp, &mut io::sink())
-                } else {
-                    let mut lock = Out;
-                    let res = stream_to_sink(resp, &mut lock);
-                    ticker.stop();
-                    // Match the buffered path's trailing newline (and the blank
-                    // separator line on a TTY) so piping gives identical bytes.
-                    if let Ok(ref body) = res {
-                        if !matches!(body.last_byte, Some(b'\n') | None) {
-                            let _ = writeln!(lock);
-                        }
-                        let _ = lock.flush();
-                        if is_tty && !config.silent {
-                            eprintln!();
-                        }
-                    }
-                    res
-                };
-
-                ticker.stop();
-                return match streamed {
-                    Ok(body) => {
-                        classify_streamed(status.as_u16(), &body.prefix, body.overflowed)
-                    }
-                    Err(e) => {
-                        // A half-written outfile is worse than a loud failure —
-                        // the caller decides whether this ends a bulk run.
-                        eprintln!("Error streaming response: {}", e);
-                        RequestOutcome::Errored
-                    }
-                };
-            }
-
-            // Read once, up front: the outcome depends on the body, and the
-            // branches below each need it (or would drain it anyway).
-            let body_text = read_body_text(resp, &progress).unwrap_or_default();
-            ticker.stop();
-            let outcome = classify_response(status.as_u16(), &body_text);
-
-            // A poll or assert wants the verdict only; the body has been drained
-            // above. Keep it so the caller can explain a failed check.
-            if config.quiet || config.check_only {
-                config.last_response = Some((status.as_u16(), body_text));
-                return outcome;
-            }
-
-            // `-f`: this response ends the run. Nothing is written to an
-            // outfile; the error is not the data the file was meant to hold.
-            if fail_fast_trips(config, status.as_u16()) {
-                fail_fast_exit(&body_text);
-            }
-
-            // `--export`: what is printed, written or copied from here on is
-            // the seed data. The chain's verdict above was taken from what the
-            // server said, and an error body is left as it came.
-            let body_text = match &config.export_id {
-                Some(id_key) if status.is_success() => {
-                    let exported = export_body(
-                        &body_text,
-                        id_key,
-                        accept.starts_with("application/x-ndjson"),
-                        config.raw,
-                    );
-                    if let Some(warning) = export_warning(&exported) {
-                        eprintln!("{}", warning);
-                    }
-                    exported.text
-                }
-                _ => body_text,
-            };
-
-            // Get response body — in bulk_silent mode, only write to outfile (no stdout)
-            if config.bulk_silent {
-                if let Some(ref file_path) = outfile {
-                    {
-                        let body_text = body_text.clone();
-                        let output = if config.raw || config.ndjson {
-                            body_text
-                        } else if let Ok(json) = serde_json::from_str::<Value>(&body_text) {
-                            serde_json::to_string_pretty(&json).unwrap_or(body_text)
-                        } else {
-                            body_text
-                        };
-                        if is_clipboard {
-                            if outfile_append {
-                                eprintln!("error: cannot append to clipboard — use > clipboard");
-                                exit_process(1);
-                            }
-                            if let Err(e) = cli_clipboard::set_contents(output) {
-                                eprintln!("Error copying to clipboard: {}", e);
-                            }
-                        } else {
-                            let res = if outfile_append {
-                                append_to_outfile(file_path, &output)
-                            } else {
-                                write_outfile(file_path, &output).map(|_| ())
-                            };
-                            if let Err(e) = res {
-                                eprintln!("Error writing to {}: {}", file_path, e);
-                            }
-                        }
-                    }
-                }
-            } else {
-                let body_text = body_text.clone();
-                let output = if config.raw || config.ndjson {
-                    body_text
-                } else if is_tty || outfile.is_some() {
-                    // Pretty print for TTY or file output
-                    if let Ok(json) = serde_json::from_str::<Value>(&body_text) {
-                        serde_json::to_string_pretty(&json).unwrap_or(body_text)
-                    } else {
-                        body_text
-                    }
-                } else {
-                    // Raw for pipes
-                    body_text
-                };
-
-                // Write to file, clipboard, or stdout
-                if is_clipboard {
-                    if outfile_append {
-                        eprintln!("error: cannot append to clipboard — use > clipboard");
-                        exit_process(1);
-                    }
-                    let copied = output.len() as u64;
-                    match cli_clipboard::set_contents(output) {
-                        Ok(()) => {
-                            if !config.silent {
-                                eprintln!("{}", outfile_marker("clipboard", copied, false).dimmed());
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("error: clipboard unavailable: {}", e);
-                            exit_process(1);
-                        }
-                    }
-                } else if let Some(ref file_path) = outfile {
-                    let before = if outfile_append { file_len(file_path) } else { 0 };
-                    let res = if outfile_append {
-                        append_to_outfile(file_path, &output).map(|()| file_len(file_path).saturating_sub(before))
-                    } else {
-                        write_outfile(file_path, &output)
-                    };
-                    match res {
-                        Err(e) => eprintln!("Error writing to {}: {}", file_path, e),
-                        // Match interactive output: status line already printed,
-                        // now print ">/>> outfile (size)" (dimmed) on the next line.
-                        Ok(written) if !config.silent => {
-                            let display = display_outfile.as_deref().unwrap_or(file_path);
-                            eprintln!("{}", outfile_marker(display, written, outfile_append).dimmed());
-                        }
-                        Ok(_) => {}
-                    }
-                } else {
-                    out!("{}", output);
-                    if !output.ends_with('\n') {
-                        outln!();
-                    }
-                    if is_tty && !config.silent {
-                        eprintln!();
-                    }
-                }
-            }
-
-            outcome
+            sent.response
         }
         Err(e) => {
             ticker.stop();
@@ -8408,7 +8381,183 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
             }
             exit_process(1);
         }
+    };
+
+    let status = resp.status();
+    let elapsed = start.elapsed();
+    progress.headers_arrived(&resp);
+
+    // Streaming needs a sink that accepts bytes as they arrive, which
+    // rules out everything that must see the whole body first: pretty
+    // printing, `>>` merging, and the clipboard. Non-2xx buffers too, so
+    // an error payload never streams into an outfile.
+    let stream_body = config.streaming
+        && status.is_success()
+        && !config.quiet
+        && !config.check_only
+        && !is_clipboard
+        && !outfile_append
+        && (outfile.is_some() || config.bulk_silent || config.raw || config.ndjson || !is_tty);
+
+    // Print status. A quiet poll only speaks up when the status is an
+    // error, so the abort that follows has a reason next to it.
+    if !config.silent && (!config.quiet || status_is_error(status.as_u16())) {
+        let status_str = format_status(status, config.expect_falsy);
+
+        ticker.interrupt(|| {
+            if config.bulk_silent {
+                // Bulk silent mode: print compact status to stdout with box-draw prefix
+                outln!(
+                    "{}HTTP/1.1 {} {}",
+                    "└─".dimmed(),
+                    status_str,
+                    format_latency(elapsed).dimmed()
+                );
+            } else {
+                eprintln!(
+                    "HTTP/1.1 {} {}",
+                    status_str,
+                    format_latency(elapsed).dimmed()
+                );
+                // The body follows straight under the status line; the
+                // "> outfile" line, when there is one, takes its place.
+            }
+        });
     }
+
+    if stream_body {
+        // A body printed live to the terminal would fight the progress
+        // line for the same screen.
+        if outfile.is_none() && !config.bulk_silent && is_tty {
+            ticker.stop();
+        }
+        let resp = CountingReader::new(resp, &progress);
+        let streamed = if let Some(target) = &target {
+            let res = stream_to_outfile(resp, target.path);
+            ticker.stop();
+            match res {
+                Ok(body) => {
+                    if !config.silent && !config.bulk_silent {
+                        // Match the buffered path: status line, then `> outfile`.
+                        eprintln!("{}", target.marker(body.bytes).dimmed());
+                    }
+                    Ok(body)
+                }
+                Err(StreamFailure::Write(e)) => {
+                    eprintln!("{}", target.failure(&e));
+                    return local_write_failed(config);
+                }
+                Err(StreamFailure::Body(e)) => Err(e),
+            }
+        } else if config.bulk_silent {
+            // Bodies are suppressed here, but the response still has to be
+            // drained before the next request reuses the connection.
+            stream_to_sink(resp, &mut io::sink())
+        } else {
+            let mut lock = Out;
+            let res = stream_to_sink(resp, &mut lock);
+            ticker.stop();
+            // Match the buffered path's trailing newline (and the blank
+            // separator line on a TTY) so piping gives identical bytes.
+            if let Ok(ref body) = res {
+                if !matches!(body.last_byte, Some(b'\n') | None) {
+                    let _ = writeln!(lock);
+                }
+                let _ = lock.flush();
+                if is_tty && !config.silent {
+                    eprintln!();
+                }
+            }
+            res
+        };
+
+        ticker.stop();
+        return match streamed {
+            Ok(body) => classify_streamed(status.as_u16(), &body.prefix, body.overflowed),
+            // The body broke off partway. Nothing of it is left in the
+            // outfile, and the run ends: this was no answer.
+            Err(e) => exit_on_body_failure(config, &e),
+        };
+    }
+
+    // Read once, up front: the outcome depends on the body, and the
+    // branches below each need it (or would drain it anyway). A body that
+    // can't be read to its end is not an empty body.
+    let body_text = match read_body_text(resp, &progress) {
+        Ok(text) => text,
+        Err(e) => {
+            ticker.stop();
+            exit_on_body_failure(config, &e);
+        }
+    };
+    ticker.stop();
+    let outcome = classify_response(status.as_u16(), &body_text);
+
+    // A poll or assert wants the verdict only; the body has been drained
+    // above. Keep it so the caller can explain a failed check.
+    if config.quiet || config.check_only {
+        config.last_response = Some((status.as_u16(), body_text));
+        return outcome;
+    }
+
+    // `-f`: this response ends the run. Nothing is written to an
+    // outfile; the error is not the data the file was meant to hold.
+    if fail_fast_trips(config, status.as_u16()) {
+        fail_fast_exit(&body_text);
+    }
+
+    // `--export`: what is printed, written or copied from here on is
+    // the seed data. The chain's verdict above was taken from what the
+    // server said, and an error body is left as it came.
+    let body_text = match &config.export_id {
+        Some(id_key) if status.is_success() => {
+            let exported = export_body(
+                &body_text,
+                id_key,
+                accept.starts_with("application/x-ndjson"),
+                config.raw,
+            );
+            if let Some(warning) = export_warning(&exported) {
+                eprintln!("{}", warning);
+            }
+            exported.text
+        }
+        _ => body_text,
+    };
+
+    if let Some(target) = &target {
+        // To a file or the clipboard; in `-sa` mode too, where bodies are
+        // otherwise not shown.
+        match target.deliver(&outfile_text(config, &body_text)) {
+            Ok(written) => {
+                // Match interactive output: status line already printed,
+                // now ">/>> outfile (size)" (dimmed) on the next line.
+                if !config.silent && !config.bulk_silent {
+                    eprintln!("{}", target.marker(written).dimmed());
+                }
+            }
+            Err(e) => {
+                eprintln!("{}", target.failure(&e));
+                return local_write_failed(config);
+            }
+        }
+    } else if !config.bulk_silent {
+        let output = if config.raw || config.ndjson || !is_tty {
+            // As it came: for `-r`, and for a pipe.
+            body_text
+        } else {
+            outfile_text(config, &body_text)
+        };
+        out!("{}", output);
+        if !output.ends_with('\n') {
+            outln!();
+        }
+        if is_tty && !config.silent {
+            eprintln!();
+        }
+    }
+
+    outcome
 }
 
 fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool, connection_alias: String, connecting_to: Option<String>, oauth2_creds: Option<(String, String)>, startup_preloaded: Option<BackgroundLoadResult>, from_cli_auth: bool) -> io::Result<()> {
@@ -8570,14 +8719,14 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
     // Store OAuth2 credentials for token refresh
     if let Some((client_id, client_secret)) = oauth2_creds {
         // From setup flow or passed explicitly
-        state.oauth2_client_id = client_id;
-        state.oauth2_client_secret = client_secret;
+        state.config.oauth2_client_id = client_id;
+        state.config.oauth2_client_secret = client_secret;
     } else if !connection_alias.is_empty() {
         // From saved connection
         if let Some(env) = load_connection(&connection_alias) {
             if env.auth_type == "oauth2" {
-                state.oauth2_client_id = env.client_id.clone();
-                state.oauth2_client_secret = env.credential.clone();
+                state.config.oauth2_client_id = env.client_id.clone();
+                state.config.oauth2_client_secret = env.credential.clone();
             }
         }
     }
@@ -10017,11 +10166,7 @@ fn parse_input(state: &mut AppState, input: &str) {
             state.display_outfile = outfile_raw.clone();
             state.config.outfile = outfile_raw;
             state.config.outfile_append = append;
-            if state.config.outfile.starts_with("~/") {
-                if let Some(home) = dirs::home_dir() {
-                    state.config.outfile = format!("{}{}", home.display(), &state.config.outfile[1..]);
-                }
-            }
+            state.config.outfile = expand_home(&state.config.outfile);
             input = input[..idx].trim().to_string();
         }
     }
@@ -10117,110 +10262,38 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
         ..Default::default()
     };
 
-    // Build request
-    let client = build_request_client(state.config.timeout_secs);
-
-    let url = format!("{}{}", state.config.base_uri, resolve_request_path(&state.config.api_path, &state.uri));
-
-    let mut request = match state.method.as_str() {
-        "GET" => client.get(&url),
-        "POST" => client.post(&url),
-        "PUT" => client.put(&url),
-        "PATCH" => client.patch(&url),
-        "DELETE" => client.delete(&url),
-        "HEAD" => client.head(&url),
-        "OPTIONS" => client.request(reqwest::Method::OPTIONS, &url),
-        _ => client.get(&url),
-    };
-
-    // Set auth header
-    if !state.config.token.is_empty() {
-        request = request.header("Authorization", format!("Bearer {}", state.config.token));
-    } else if !state.config.api_key.is_empty() {
-        if state.config.api_key.starts_with("ey") && state.config.api_key.len() > 180 {
-            request = request.header("Authorization", format!("Bearer {}", state.config.api_key));
-        } else {
-            let encoded = BASE64.encode(format!(":{}", state.config.api_key));
-            request = request.header("Authorization", format!("Basic {}", encoded));
-        }
-    }
-
-    // Set content type and accept headers
-    let mut content_type = "application/json".to_string();
-    let mut accept = "application/json".to_string();
-
-    if state.config.ndjson {
-        content_type = "application/x-ndjson".to_string();
-        accept = "application/x-ndjson".to_string();
-    }
-
-    // Handle @ file input for body
-    let mut file_error: Option<String> = None;
-    if state.body.starts_with("@ ") || state.body.starts_with("@") {
-        // Parse ~func(arg) suffixes (e.g. ~map(name)) — only for @file bodies
-        let (file_body, extra_headers) = parse_body_functions(&state.body);
-        for (name, value) in &extra_headers {
-            request = request.header(name.as_str(), value.as_str());
-        }
-        let file_path_raw = file_body.trim_start_matches("@ ").trim_start_matches('@').trim();
-        match resolve_at_file_body(file_path_raw) {
-            Ok(res) => {
-                if let Some(ct) = res.content_type {
-                    content_type = ct;
-                }
-                if let Some(ac) = res.accept_type {
-                    accept = ac;
-                }
-                request = request.body(res.contents);
-            }
-            Err(e) => {
-                file_error = Some(e);
-            }
-        }
-    } else if !state.body.is_empty() {
-        request = request.body(state.body.clone());
-    }
-
-    // Override accept based on outfile extension
-    if !state.config.outfile.is_empty() {
-        if state.config.outfile.ends_with(".ndjson") {
-            accept = "application/x-ndjson".to_string();
-        } else if state.config.outfile.ends_with(".csv") {
-            accept = "text/csv".to_string();
-        } else if state.config.outfile.ends_with(".sql") {
-            accept = "application/sql".to_string();
-        }
-    }
+    // No status yet: one left from the request before would otherwise be
+    // read as this one's if it is aborted or never sent.
+    state.config.last_status = None;
 
     // `--export` rewrites the whole body, so it is read whole.
     let streaming = state.config.streaming && state.config.export_id.is_none();
-    if streaming {
-        content_type.push_str(";stream=true");
-        accept.push_str(";stream=true");
-    }
+    let parts = RequestParts {
+        method: state.method.clone(),
+        uri: state.uri.clone(),
+        body: state.body.clone(),
+        outfile: (!state.config.outfile.is_empty()).then(|| state.config.outfile.clone()),
+        streaming,
+    };
+    // The request is built by the function the batch uses, so a line means
+    // the same request here as in a file.
+    let built = match build_request(&state.config, &parts) {
+        Ok(built) => built,
+        Err(err) => {
+            // The @file couldn't be read, so nothing is sent.
+            block.head = format!("\n{}\n\n", err);
+            let display_output = block.render(state.width as usize);
+            push_output_block(state, block);
 
-    if state.config.include_nulls {
-        accept.push_str(";skipNulls=false");
-    }
-
-    request = request
-        .header("Content-Type", &content_type)
-        .header("Accept", &accept);
+            // Update input with last command (chain-aware, outfile marker included)
+            restore_input_after_send(state);
+            print_output_and_rerender(state, stdout, &display_output)?;
+            return Ok(RequestOutcome::Errored);
+        }
+    };
+    let accept = built.accept.clone();
 
     let start = Instant::now();
-
-    // If file error, show it and return
-    if let Some(err) = file_error {
-        block.head = format!("\n{}\n\n", err);
-        let display_output = block.render(state.width as usize);
-        push_output_block(state, block);
-
-        // Update input with last command (chain-aware, outfile marker included)
-        restore_input_after_send(state);
-        print_output_and_rerender(state, stdout, &display_output)?;
-        // The @file couldn't be read, so nothing was sent.
-        return Ok(RequestOutcome::Errored);
-    }
 
     // With no outfile the renderer owns the screen, so there's nothing to stream
     // into and the body stays buffered. `>>` and clipboard both need the whole
@@ -10243,18 +10316,22 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     let progress = TransferProgress::new();
     let thread_progress = Arc::clone(&progress);
     let failure_base_uri = state.config.base_uri.clone();
+    // A token renewed on a 401, handed back for the requests that follow.
+    let renewed_token: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+    let thread_renewed = Arc::clone(&renewed_token);
+    let thread_config = state.config.clone();
     let request_handle = thread::spawn(move || {
-        let result = request.send().map_err(|e| RequestFailure::of(e, &failure_base_uri)).and_then(|resp| {
+        let sent = send_request(&thread_config, &parts, built).map_err(|e| RequestFailure::of(e, &failure_base_uri));
+        let result = sent.and_then(|sent| {
+            *thread_renewed.lock().unwrap() = sent.new_token;
+            let resp = sent.response;
             let status = resp.status();
             thread_progress.headers_arrived(&resp);
             if let Some(path) = stream_outfile {
                 if status.is_success() {
-                    // Stream straight to the file. An io failure here is
+                    // Stream straight to the file. A failure here is
                     // reported through BodyDelivery — it isn't a request error.
-                    let streamed = fs::File::create(&path).and_then(|file| {
-                        let mut writer = io::BufWriter::new(file);
-                        stream_to_sink(CountingReader::new(resp, &thread_progress), &mut writer)
-                    });
+                    let streamed = stream_to_outfile(CountingReader::new(resp, &thread_progress), &path);
                     return Ok(match streamed {
                         Ok(body) => (
                             status,
@@ -10265,12 +10342,15 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
                                 bytes: body.bytes,
                             },
                         ),
-                        Err(e) => (
+                        Err(failure) => (
                             status,
                             String::new(),
                             BodyDelivery::Streamed {
                                 overflowed: false,
-                                error: Some(e.to_string()),
+                                error: Some(match failure {
+                                    StreamFailure::Write(e) => format!("Error writing to {}: {}", path, e),
+                                    StreamFailure::Body(e) => describe_body_failure(&e, thread_config.timeout_secs),
+                                }),
                                 bytes: 0,
                             },
                         ),
@@ -10360,55 +10440,16 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     let _ = request_handle.join();
 
     // Get the response
-    let mut response_opt = response_result.lock().unwrap().take();
+    let response_opt = response_result.lock().unwrap().take();
 
-    // Handle OAuth2 token refresh on 401
-    if let Some(Ok((status, _, _))) = &response_opt {
-        if status.as_u16() == 401 && !state.oauth2_client_id.is_empty() && !state.oauth2_client_secret.is_empty() {
-            // Attempt token refresh
-            if let Ok((new_token, _)) = oauth2_token_exchange(&state.config.base_uri, &state.oauth2_client_id, &state.oauth2_client_secret) {
-                state.config.token = new_token.clone();
-
-                // Retry the request with new token
-                let client = build_request_client(state.config.timeout_secs);
-
-                let url = format!("{}{}", state.config.base_uri, resolve_request_path(&state.config.api_path, &state.uri));
-                let mut retry_request = match state.method.as_str() {
-                    "GET" => client.get(&url),
-                    "POST" => client.post(&url),
-                    "PUT" => client.put(&url),
-                    "PATCH" => client.patch(&url),
-                    "DELETE" => client.delete(&url),
-                    "HEAD" => client.head(&url),
-                    "OPTIONS" => client.request(reqwest::Method::OPTIONS, &url),
-                    _ => client.get(&url),
-                };
-
-                retry_request = retry_request.header("Authorization", format!("Bearer {}", new_token));
-                retry_request = retry_request.header("Content-Type", "application/json");
-                retry_request = retry_request.header("Accept", "application/json");
-
-                if !state.body.is_empty() && !state.body.starts_with("@") {
-                    retry_request = retry_request.body(state.body.clone());
-                }
-
-                // Execute retry synchronously (token refresh should be quick)
-                if let Ok(resp) = retry_request.send() {
-                    let retry_status = resp.status();
-                    if let Ok(retry_body) = resp.text() {
-                        // The retry buffers regardless — it is a short,
-                        // plain-header request sent after the token refresh.
-                        response_opt = Some(Ok((retry_status, retry_body, BodyDelivery::Buffered)));
-                    }
-                }
-            }
-        }
+    // A token that ran out was renewed on the way: keep the new one.
+    if let Some(token) = renewed_token.lock().unwrap().take() {
+        state.config.token = token;
     }
-
 
     // What this request means for a `&&` chain. Captured before the body is
     // consumed by the outfile/clipboard branches below.
-    let outcome = match &response_opt {
+    let mut outcome = match &response_opt {
         // A streamed body only left its prefix behind, and a write that failed
         // partway is an error however truthy the bytes looked.
         Some(Ok((_, _, BodyDelivery::Streamed { error: Some(_), .. }))) => RequestOutcome::Errored,
@@ -10459,73 +10500,50 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
                 _ => body_text,
             };
 
-            // Handle outfile — including the `> clipboard` special target.
-            if is_clipboard_target(&state.display_outfile) && state.config.outfile_append {
-                // `>> clipboard` is meaningless — there's nothing to append to.
-                block.head = "cannot append to clipboard — use > clipboard\n".to_string();
-            } else if is_clipboard_target(&state.display_outfile) {
-                // Pretty-print JSON for clipboard so it's pasteable as-is.
-                let clipboard_text = if state.config.raw || state.config.ndjson {
-                    body_text.clone()
-                } else if let Ok(json) = serde_json::from_str::<Value>(&body_text) {
-                    serde_json::to_string_pretty(&json).unwrap_or_else(|_| body_text.clone())
-                } else {
-                    body_text.clone()
+            // To a file or the clipboard. Under `-f` an error is not what
+            // the outfile was meant to hold: the file is left alone and the
+            // body is shown, as a batch does it.
+            let to_target = !state.config.outfile.is_empty() && !fail_fast_trips(&state.config, status.as_u16());
+            if to_target {
+                let target = OutTarget {
+                    path: &state.config.outfile,
+                    display: &state.display_outfile,
+                    append: state.config.outfile_append,
                 };
-                let copied = clipboard_text.len() as u64;
-                match cli_clipboard::set_contents(clipboard_text) {
-                    Ok(()) => {
+                // A streamed body is already on disk — only its failure, if
+                // any, is still to be reported.
+                let delivered: Result<u64, String> = match delivery {
+                    BodyDelivery::Streamed { error: Some(ref e), .. } => Err(e.clone()),
+                    BodyDelivery::Streamed { bytes, .. } => Ok(bytes),
+                    BodyDelivery::Buffered => target
+                        .deliver(&outfile_text(&state.config, &body_text))
+                        .map_err(|e| target.failure(&e)),
+                };
+                match delivered {
+                    Err(message) => {
+                        block.head = format!("{}\n", message);
+                        // What the request was to leave behind is not there:
+                        // a chain stops here.
+                        outcome = RequestOutcome::Errored;
+                    }
+                    Ok(written) => {
                         if !state.config.silent {
                             block.head = format!(
                                 "HTTP/1.1 {} {}\n{}\n\n",
                                 status_str,
                                 format_latency(elapsed).dimmed(),
-                                outfile_marker("clipboard", copied, false).dimmed()
+                                target.marker(written).dimmed()
                             );
                         }
-                        state.status_msg = "copied to clipboard".to_string();
+                        if target.is_clipboard() {
+                            state.status_msg = "copied to clipboard".to_string();
+                        } else {
+                            state.last_outfile = state.config.outfile.clone();
+                            state.last_display_outfile = state.display_outfile.clone();
+                            state.status_msg = "ctrl+o to open file".to_string();
+                        }
                         state.status_msg_at = Some(Instant::now());
                     }
-                    Err(e) => {
-                        block.head = format!("clipboard unavailable: {}\n", e);
-                    }
-                }
-            } else if !state.config.outfile.is_empty() {
-                // A streamed body is already on disk — only its io error, if
-                // any, is still to be reported.
-                // Each arm yields the bytes this request put in the file.
-                let write_result: io::Result<u64> = match delivery {
-                    BodyDelivery::Streamed { error: Some(ref e), .. } => {
-                        Err(io::Error::new(io::ErrorKind::Other, e.clone()))
-                    }
-                    BodyDelivery::Streamed { bytes, .. } => Ok(bytes),
-                    BodyDelivery::Buffered => {
-                        if state.config.outfile_append {
-                            let before = file_len(&state.config.outfile);
-                            append_to_outfile(&state.config.outfile, &body_text)
-                                .map(|()| file_len(&state.config.outfile).saturating_sub(before))
-                        } else {
-                            write_outfile(&state.config.outfile, &body_text)
-                        }
-                    }
-                };
-                if let Err(ref e) = write_result {
-                    block.head = format!("Error writing to {}: {}\n", state.config.outfile, e);
-                } else {
-                    let written = write_result.unwrap_or(0);
-                    state.last_outfile = state.config.outfile.clone();
-                    state.last_display_outfile = state.display_outfile.clone();
-
-                    if !state.config.silent {
-                        block.head = format!(
-                            "HTTP/1.1 {} {}\n{}\n\n",
-                            status_str,
-                            format_latency(elapsed).dimmed(),
-                            outfile_marker(&state.display_outfile, written, state.config.outfile_append).dimmed()
-                        );
-                    }
-                    state.status_msg = "ctrl+o to open file".to_string();
-                    state.status_msg_at = Some(Instant::now());
                 }
             } else {
                 // Build status line
@@ -10541,13 +10559,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
                 // there's no body, so `has_body()` stays false and ctrl+j
                 // correctly finds nothing to erase.
                 if !body_text.is_empty() {
-                    let output = if state.config.raw || state.config.ndjson {
-                        body_text
-                    } else if let Ok(json) = serde_json::from_str::<Value>(&body_text) {
-                        serde_json::to_string_pretty(&json).unwrap_or(body_text)
-                    } else {
-                        body_text
-                    };
+                    let output = outfile_text(&state.config, &body_text);
                     block.tail = format_body_block(&output);
                 } else {
                     block.head.push('\n');
@@ -11898,9 +11910,9 @@ fn handle_save_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io::
     }
 
     // Determine auth type from current config
-    let (auth_type, credential, client_id) = if !state.oauth2_client_id.is_empty() && !state.oauth2_client_secret.is_empty() {
+    let (auth_type, credential, client_id) = if !state.config.oauth2_client_id.is_empty() && !state.config.oauth2_client_secret.is_empty() {
         // OAuth2 client credentials - save the credentials, not the token
-        ("oauth2".to_string(), state.oauth2_client_secret.clone(), state.oauth2_client_id.clone())
+        ("oauth2".to_string(), state.config.oauth2_client_secret.clone(), state.config.oauth2_client_id.clone())
     } else if !state.config.token.is_empty() {
         ("token".to_string(), state.config.token.clone(), String::new())
     } else {
@@ -11977,11 +11989,11 @@ fn handle_switch_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io
 
             // Store OAuth2 credentials for token refresh
             if env.auth_type == "oauth2" {
-                state.oauth2_client_id = env.client_id.clone();
-                state.oauth2_client_secret = env.credential.clone();
+                state.config.oauth2_client_id = env.client_id.clone();
+                state.config.oauth2_client_secret = env.credential.clone();
             } else {
-                state.oauth2_client_id.clear();
-                state.oauth2_client_secret.clear();
+                state.config.oauth2_client_id.clear();
+                state.config.oauth2_client_secret.clear();
             }
 
             // Use resolved config if available (avoids duplicate token exchange)
@@ -12983,11 +12995,8 @@ fn fetch_mapped_type_names(config: &Config) -> Vec<String> {
     let url = format!("{}{}/mapped-types", config.base_uri, config.api_path);
     let mut request = client.get(&url);
 
-    if !config.token.is_empty() {
-        request = request.header("Authorization", format!("Bearer {}", config.token));
-    } else if !config.api_key.is_empty() {
-        let encoded = BASE64.encode(format!(":{}", config.api_key));
-        request = request.header("Authorization", format!("Basic {}", encoded));
+    if let Some(authorization) = auth_header(config) {
+        request = request.header("Authorization", authorization);
     }
 
     match request.send() {
@@ -13057,11 +13066,8 @@ fn load_openapi_spec_into(config: &Config, result: &mut BackgroundLoadResult) {
 
     let mut request = client.get(&url);
 
-    if !config.token.is_empty() {
-        request = request.header("Authorization", format!("Bearer {}", config.token));
-    } else if !config.api_key.is_empty() {
-        let encoded = BASE64.encode(format!(":{}", config.api_key));
-        request = request.header("Authorization", format!("Basic {}", encoded));
+    if let Some(authorization) = auth_header(config) {
+        request = request.header("Authorization", authorization);
     }
 
     if let Ok(resp) = request.send() {
@@ -14857,15 +14863,7 @@ struct AtFileResult {
 /// are combined: `.ndjson`/`.njson` files concatenate as a single NDJSON stream;
 /// everything else parses as JSON and combines into a flat JSON array.
 fn resolve_at_file_body(path_raw: &str) -> Result<AtFileResult, String> {
-    let expanded = if path_raw.starts_with("~/") {
-        if let Some(home) = dirs::home_dir() {
-            format!("{}{}", home.display(), &path_raw[1..])
-        } else {
-            path_raw.to_string()
-        }
-    } else {
-        path_raw.to_string()
-    };
+    let expanded = expand_home(path_raw);
 
     let is_glob = expanded.chars().any(|c| c == '*' || c == '?' || c == '[');
 

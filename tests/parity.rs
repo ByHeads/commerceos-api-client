@@ -19,6 +19,10 @@ use std::time::{Duration, Instant};
 struct RecordingServer {
     port: u16,
     log: Arc<Mutex<Vec<String>>>,
+    /// The headers of every recorded request, in the same order: see `heads`.
+    heads: Arc<Mutex<Vec<String>>>,
+    /// How many tokens the token endpoint has handed out.
+    tokens: Arc<std::sync::atomic::AtomicUsize>,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
@@ -29,14 +33,17 @@ impl RecordingServer {
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
         let log = Arc::new(Mutex::new(Vec::new()));
+        let heads = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
-        let (log2, stop2) = (Arc::clone(&log), Arc::clone(&stop));
+        let tokens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tokens2 = Arc::clone(&tokens);
+        let (log2, heads2, stop2) = (Arc::clone(&log), Arc::clone(&heads), Arc::clone(&stop));
         let handle = std::thread::spawn(move || {
             while !stop2.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        let log = Arc::clone(&log2);
-                        std::thread::spawn(move || answer(stream, &log));
+                        let (log, heads, tokens) = (Arc::clone(&log2), Arc::clone(&heads2), Arc::clone(&tokens2));
+                        std::thread::spawn(move || answer(stream, &log, &heads, &tokens));
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(5));
@@ -45,11 +52,19 @@ impl RecordingServer {
                 }
             }
         });
-        RecordingServer { port, log, stop, handle: Some(handle) }
+        RecordingServer { port, log, heads, tokens, stop, handle: Some(handle) }
     }
 
     fn take(&self) -> Vec<String> {
+        self.heads.lock().unwrap().clear();
         std::mem::take(&mut *self.log.lock().unwrap())
+    }
+
+    /// What each recorded request carried, one line per request:
+    /// `accept=…; content-type=…; authorization=…; x-request-map=…`, a header
+    /// that was not sent as `-`. Cleared by `take`, so read it first.
+    fn heads(&self) -> Vec<String> {
+        self.heads.lock().unwrap().clone()
     }
 
     fn seen(&self) -> usize {
@@ -82,7 +97,12 @@ impl Drop for RecordingServer {
     }
 }
 
-fn answer(mut stream: std::net::TcpStream, log: &Mutex<Vec<String>>) {
+fn answer(
+    mut stream: std::net::TcpStream,
+    log: &Mutex<Vec<String>>,
+    heads: &Mutex<Vec<String>>,
+    tokens: &std::sync::atomic::AtomicUsize,
+) {
     // An accepted socket inherits the listener's non-blocking mode on macOS.
     stream.set_nonblocking(false).unwrap();
     stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -101,11 +121,12 @@ fn answer(mut stream: std::net::TcpStream, log: &Mutex<Vec<String>>) {
     let mut request = lines.next().unwrap_or("").split_whitespace();
     let method = request.next().unwrap_or("").to_string();
     let path = request.next().unwrap_or("").to_string();
-    let length: usize = lines
+    let headers: Vec<(String, String)> = lines
         .filter_map(|l| l.split_once(':'))
-        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, v)| v.trim().parse().ok())
-        .unwrap_or(0);
+        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .collect();
+    let header = |name: &str| headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
+    let length: usize = header("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
     while body.len() < length {
         match stream.read(&mut buf) {
             Ok(0) | Err(_) => break,
@@ -122,10 +143,47 @@ fn answer(mut stream: std::net::TcpStream, log: &Mutex<Vec<String>>) {
         } else {
             format!("{method} {shown} {body}")
         };
-        log.lock().unwrap().push(entry);
+        // Both under the one lock, so the two lists stay in step.
+        let mut log = log.lock().unwrap();
+        heads.lock().unwrap().push(format!(
+            "accept={}; content-type={}; authorization={}; x-request-map={}",
+            header("accept").unwrap_or("-"),
+            header("content-type").unwrap_or("-"),
+            header("authorization").unwrap_or("-"),
+            header("x-request-map").unwrap_or("-"),
+        ));
+        log.push(entry);
     }
 
-    let (status, payload) = if path.contains("/missing") {
+    // Responses that go wrong after the status line.
+    let broken: Option<(&str, Duration)> = if path.contains("/trunc") {
+        // Promises 1000 bytes, sends 9 and hangs up.
+        Some(("Content-Length: 1000\r\n\r\n{\"a\":1234", Duration::ZERO))
+    } else if path.contains("/stall") {
+        // The same, but keeps the connection open: only a timeout ends it.
+        Some(("Content-Length: 1000\r\n\r\n{\"a\":1234", Duration::from_secs(6)))
+    } else if path.contains("/midfail") {
+        // A chunked body that stops after its first chunk.
+        Some(("Transfer-Encoding: chunked\r\n\r\n9\r\n[{\"a\":1},\r\n", Duration::from_millis(100)))
+    } else {
+        None
+    };
+    if let Some((rest, hold)) = broken {
+        let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{rest}").as_bytes());
+        let _ = stream.flush();
+        std::thread::sleep(hold);
+        return;
+    }
+
+    let (status, payload) = if path.contains("/oauth2/v1/token") {
+        // The first token handed out has already run out by the time it is
+        // used; every later one is good.
+        let token = if tokens.fetch_add(1, Ordering::SeqCst) == 0 { "stale" } else { "fresh" };
+        ("200 OK", format!(r#"{{"access_token":"{token}","expires_in":3600}}"#))
+    } else if path.contains("/expired") && header("authorization") != Some("Bearer fresh") {
+        // Only the token the token endpoint hands out is let in.
+        ("401 Unauthorized", r#"{"error":"token expired"}"#.to_string())
+    } else if path.contains("/missing") {
         ("404 Not Found", "{}".to_string())
     } else if path.contains("/zero") {
         ("200 OK", "0".to_string())
@@ -505,6 +563,9 @@ fn api(port: u16, dir: &Path) -> std::process::Command {
         .current_dir(dir)
         .env("NO_COLOR", "1")
         .env("API_IMPORT_CACHE", dir.join(".import-cache"))
+        // The prompt keeps a history file in the home directory: not the
+        // real one, when it is a test that types.
+        .env("HOME", dir)
         .env_remove("API_STREAMING")
         .env_remove("API_CREDENTIALS_FILE")
         .stdin(std::process::Stdio::null());
@@ -583,6 +644,461 @@ fn a_file_read_from_stdin_is_the_same_file() {
         let shown = String::from_utf8_lossy(&out.stderr).to_string();
         check(&case, "stdin", &got, &shown, &case.sent);
     }
+}
+
+/// One request and the headers it must carry: `(flags, line, accept,
+/// content-type, x-request-map)`. `{d}` in a line is the working directory.
+#[cfg(unix)]
+type HeaderRow = (&'static [&'static str], &'static str, &'static str, &'static str, &'static str);
+
+#[cfg(unix)]
+const JSON: &str = "application/json";
+#[cfg(unix)]
+const NDJSON: &str = "application/x-ndjson";
+
+#[cfg(unix)]
+fn header_rows() -> Vec<HeaderRow> {
+    vec![
+        (&[], "GET /h", JSON, JSON, "-"),
+        // The outfile's extension chooses Accept, in any case.
+        (&[], "GET /h > {d}/h.csv", "text/csv", JSON, "-"),
+        (&[], "GET /h > {d}/h.CSV", "text/csv", JSON, "-"),
+        (&[], "GET /h > {d}/h.ndjson", NDJSON, JSON, "-"),
+        (&[], "GET /h > {d}/h.njson", NDJSON, JSON, "-"),
+        (&[], "GET /h > {d}/h.NDJSON", NDJSON, JSON, "-"),
+        (&[], "GET /h > {d}/h.sql", "application/sql", JSON, "-"),
+        (&[], "GET /h > {d}/h.txt", JSON, JSON, "-"),
+        (&[], "GET /h >> {d}/h2.csv", "text/csv", JSON, "-"),
+        // Flags
+        (&["-i"], "GET /h", "application/json;skipNulls=false", JSON, "-"),
+        (&["-i"], "GET /h > {d}/i.csv", "text/csv;skipNulls=false", JSON, "-"),
+        (&["--ndjson"], "GET /h", NDJSON, NDJSON, "-"),
+        // File bodies
+        (&[], "PUT /h @data.csv", JSON, "text/csv", "-"),
+        (&[], "PUT /h @data.csv~map(com.heads.t)", JSON, "text/csv", "com.heads.t"),
+        (&[], "PUT /h @data.csv~map(com.heads.t) > {d}/o.csv", "text/csv", "text/csv", "com.heads.t"),
+        (&[], "PUT /h @rows.ndjson", NDJSON, NDJSON, "-"),
+        (&["-i"], "PUT /h @rows.ndjson", "application/x-ndjson;skipNulls=false", NDJSON, "-"),
+        (&[], r#"PUT /h {"x":1}"#, JSON, JSON, "-"),
+    ]
+}
+
+#[cfg(unix)]
+fn header_fixtures(dir: &Path) {
+    std::fs::write(dir.join("data.csv"), "a,b\n1,2\n").unwrap();
+    std::fs::write(dir.join("rows.ndjson"), "{\"a\":1}\n{\"a\":2}\n").unwrap();
+}
+
+#[cfg(unix)]
+fn expected_head(row: &HeaderRow, authorization: &str) -> String {
+    format!("accept={}; content-type={}; authorization={}; x-request-map={}", row.2, row.3, authorization, row.4)
+}
+
+/// The headers of a request are the same whether it is a one-shot, a line of
+/// a file or typed at the prompt: one function builds them.
+#[cfg(unix)]
+#[test]
+fn a_request_carries_the_same_headers_from_every_entry_point() {
+    use pty::Prompt;
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    header_fixtures(dir.path());
+    let d = dir.path().display().to_string();
+    // `:k` as Basic.
+    let basic = "Basic Oms=";
+
+    for row in header_rows() {
+        let line = row.1.replace("{d}", &d);
+        // One-shot, as one quoted argument.
+        server.take();
+        let mut args: Vec<String> = row.0.iter().map(|f| f.to_string()).collect();
+        args.push(line.clone());
+        let out = api(server.port, dir.path()).args(&args).output().expect("spawn api");
+        server.settle(Duration::from_millis(100), Duration::from_secs(3));
+        assert_eq!(server.heads(), [expected_head(&row, basic)], "one-shot {:?} `{line}`\n{}", row.0, String::from_utf8_lossy(&out.stderr));
+
+        // A line of a file.
+        server.take();
+        std::fs::write(dir.path().join("h.api"), format!("{line}\n")).unwrap();
+        let mut args: Vec<String> = row.0.iter().map(|f| f.to_string()).collect();
+        args.extend(["-sa".to_string(), "h.api".to_string()]);
+        api(server.port, dir.path()).args(&args).output().expect("spawn api");
+        server.settle(Duration::from_millis(100), Duration::from_secs(3));
+        assert_eq!(server.heads(), [expected_head(&row, basic)], "file {:?} `{line}`", row.0);
+    }
+
+    // At the prompt, one session per set of flags.
+    for flags in [&[][..], &["-i"][..], &["--ndjson"][..]] {
+        let mut cmd = api(server.port, dir.path());
+        cmd.args(flags);
+        let mut prompt = Prompt::open(cmd);
+        prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+        prompt.pump(Duration::from_millis(400));
+        for row in header_rows().into_iter().filter(|row| row.0 == flags) {
+            let line = row.1.replace("{d}", &d);
+            prompt.send(b"\x15");
+            prompt.pump(Duration::from_millis(60));
+            server.take();
+            prompt.paste(&line);
+            prompt.pump(Duration::from_millis(60));
+            prompt.send(b"\r");
+            let start = Instant::now();
+            while server.seen() == 0 && start.elapsed() < Duration::from_secs(5) {
+                prompt.pump(Duration::from_millis(50));
+            }
+            prompt.pump(Duration::from_millis(150));
+            assert_eq!(server.heads(), [expected_head(&row, basic)], "prompt {flags:?} `{line}`\n{}", pty::plain(&prompt.screen));
+        }
+    }
+
+    // `--stream` adds `;stream=true` to both.
+    server.take();
+    api(server.port, dir.path()).args(["--stream", "GET", "/h"]).output().expect("spawn api");
+    server.settle(Duration::from_millis(100), Duration::from_secs(3));
+    assert_eq!(
+        server.heads(),
+        ["accept=application/json;stream=true; content-type=application/json;stream=true; authorization=Basic Oms=; x-request-map=-"]
+    );
+
+    // A token is Bearer; so is a key that has the shape of a JWT.
+    let jwt = format!("ey{}", "a".repeat(200));
+    for (flag, value, authorization) in [("--token", "tok", "Bearer tok".to_string()), ("-k", jwt.as_str(), format!("Bearer {jwt}"))] {
+        server.take();
+        let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("api"));
+        cmd.args(["--no-keychain", "-b", &format!("http://127.0.0.1:{}", server.port), flag, value, "GET", "/h"])
+            .current_dir(dir.path())
+            .env("HOME", dir.path())
+            .env_remove("API_STREAMING")
+            .env_remove("API_CREDENTIALS_FILE")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("spawn api");
+        server.settle(Duration::from_millis(100), Duration::from_secs(3));
+        assert_eq!(
+            server.heads(),
+            [format!("accept=application/json; content-type=application/json; authorization={authorization}; x-request-map=-")]
+        );
+    }
+}
+
+/// The client run with flags of its own choosing (`api` adds `-b` and `-k`).
+fn api_bare(dir: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("api"));
+    cmd.arg("--no-keychain")
+        .current_dir(dir)
+        .env("NO_COLOR", "1")
+        .env("HOME", dir)
+        .env_remove("API_STREAMING")
+        .env_remove("API_CREDENTIALS_FILE")
+        .stdin(std::process::Stdio::null());
+    cmd
+}
+
+/// What a run printed and how it ended.
+struct Ran {
+    sent: Vec<String>,
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+fn ran(server: &RecordingServer, mut cmd: std::process::Command) -> Ran {
+    server.take();
+    let out = cmd.output().expect("spawn api");
+    server.settle(Duration::from_millis(150), Duration::from_secs(3));
+    Ran {
+        sent: server.log.lock().unwrap().clone(),
+        code: out.status.code(),
+        stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+    }
+}
+
+fn run_in(server: &RecordingServer, dir: &Path, args: &[&str]) -> Ran {
+    let mut cmd = api(server.port, dir);
+    cmd.args(args);
+    ran(server, cmd)
+}
+
+/// A response that stops before its end is not an empty response. The run
+/// ends with exit 1, with or without `-f`, nothing is written to the outfile
+/// and nothing after it is sent.
+#[test]
+fn a_response_cut_short_ends_the_run() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let file = |name: &str, text: &str| std::fs::write(d.join(name), text).unwrap();
+
+    // One request.
+    let one = run_in(&server, d, &["GET", "/trunc", ">", "w.json"]);
+    assert_eq!(one.code, Some(1), "{}", one.stderr);
+    assert!(one.stderr.contains("The response was cut short"), "{}", one.stderr);
+    assert!(!d.join("w.json").exists(), "an outfile was written");
+    let plain = run_in(&server, d, &["GET", "/trunc"]);
+    assert_eq!((plain.code, plain.stdout.as_str()), (Some(1), ""), "{}", plain.stderr);
+
+    // A line of a file, with and without `-f`: the next line is not sent.
+    file("cut.api", "GET /trunc > w.json\nGET /never\n");
+    for flags in ["-sa", "-sfa", "-a"] {
+        let batch = run_in(&server, d, &[flags, "cut.api"]);
+        assert_eq!(batch.code, Some(1), "{flags}: {}", batch.stderr);
+        assert_eq!(batch.sent, ["GET /trunc"], "{flags}");
+        assert!(!d.join("w.json").exists(), "{flags}: an outfile was written");
+    }
+
+    // A chain does not take the empty body for an answer.
+    file("chain.api", "GET /trunc && GET /never\n");
+    let chain = run_in(&server, d, &["-sa", "chain.api"]);
+    assert_eq!((chain.code, &chain.sent[..]), (Some(1), &["GET /trunc".to_string()][..]), "{}", chain.stderr);
+    file("or.api", "GET /trunc || GET /never\n");
+    let or = run_in(&server, d, &["-sa", "or.api"]);
+    assert_eq!((or.code, &or.sent[..]), (Some(1), &["GET /trunc".to_string()][..]), "{}", or.stderr);
+
+    // Neither does a check: `assert not` must not pass on it.
+    file("assert.api", "assert not GET /trunc\nGET /never\n");
+    let assert_not = run_in(&server, d, &["-sa", "assert.api"]);
+    assert_eq!((assert_not.code, &assert_not.sent[..]), (Some(1), &["GET /trunc".to_string()][..]), "{}", assert_not.stderr);
+    file("poll.api", "sleep 1 while not GET /trunc\nGET /never\n");
+    let poll = run_in(&server, d, &["-sa", "poll.api"]);
+    assert_eq!((poll.code, &poll.sent[..]), (Some(1), &["GET /trunc".to_string()][..]), "{}", poll.stderr);
+
+    // A body that stalls past the timeout.
+    let stalled = run_in(&server, d, &["--timeout", "1", "GET", "/stall", ">", "s.json"]);
+    assert_eq!(stalled.code, Some(1), "{}", stalled.stderr);
+    assert!(stalled.stderr.contains("Timed out after"), "{}", stalled.stderr);
+    assert!(!d.join("s.json").exists());
+}
+
+/// With `--stream` a body that fails partway leaves the outfile as it was:
+/// no partial file that looks complete, and no `.part` file.
+#[test]
+fn a_stream_that_fails_leaves_no_partial_outfile() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+
+    let one = run_in(&server, d, &["--stream", "GET", "/midfail", ">", "part.json"]);
+    assert_eq!(one.code, Some(1), "{}", one.stderr);
+    assert!(one.stderr.contains("The response was cut short"), "{}", one.stderr);
+    assert!(!d.join("part.json").exists(), "a partial outfile is left");
+    assert!(!d.join("part.json.part").exists(), "the .part file is left");
+
+    // What the file held before is still there.
+    std::fs::write(d.join("kept.json"), "[\"before\"]").unwrap();
+    std::fs::write(d.join("stream.api"), "GET /midfail > kept.json\nGET /never\n").unwrap();
+    for flags in ["-sa", "-sfa"] {
+        let batch = run_in(&server, d, &["--stream", flags, "stream.api"]);
+        assert_eq!(batch.code, Some(1), "{flags}: {}", batch.stderr);
+        assert_eq!(batch.sent, ["GET /midfail"], "{flags}");
+        assert_eq!(std::fs::read_to_string(d.join("kept.json")).unwrap(), "[\"before\"]", "{flags}");
+        assert!(!d.join("kept.json.part").exists(), "{flags}");
+    }
+
+    // To stdout, and drained in `-sa`: no answer either way.
+    let to_pipe = run_in(&server, d, &["--stream", "GET", "/midfail"]);
+    assert_eq!(to_pipe.code, Some(1), "{}", to_pipe.stderr);
+    std::fs::write(d.join("drain.api"), "GET /midfail\nGET /never\n").unwrap();
+    let drained = run_in(&server, d, &["--stream", "-sa", "drain.api"]);
+    assert_eq!((drained.code, &drained.sent[..]), (Some(1), &["GET /midfail".to_string()][..]), "{}", drained.stderr);
+
+    // A stream that ends well still lands in its file, whole.
+    let good = run_in(&server, d, &["--stream", "GET", "/a", ">", "good.json"]);
+    assert_eq!(good.code, Some(0), "{}", good.stderr);
+    assert_eq!(std::fs::read_to_string(d.join("good.json")).unwrap(), r#"{"ok":"/api/v1/a"}"#);
+    assert!(!d.join("good.json.part").exists());
+}
+
+/// An outfile that can't be written is a failure of the request: exit 1 for
+/// one request and under `-f`, a stopped chain, and a reported line that a
+/// plain batch goes on past, as it goes on past a failed request.
+#[test]
+fn an_outfile_that_cannot_be_written_is_a_failure() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let file = |name: &str, text: &str| std::fs::write(d.join(name), text).unwrap();
+
+    for stream in [false, true] {
+        let with = |args: &[&'static str]| -> Vec<&'static str> {
+            let mut all = if stream { vec!["--stream"] } else { Vec::new() };
+            all.extend_from_slice(args);
+            all
+        };
+        let one = run_in(&server, d, &with(&["GET", "/a", ">", "no-such-dir/x.json"]));
+        assert_eq!(one.code, Some(1), "stream={stream}: {}", one.stderr);
+        assert!(one.stderr.contains("Error writing to no-such-dir/x.json"), "stream={stream}: {}", one.stderr);
+        let appended = run_in(&server, d, &with(&["GET", "/a", ">>", "no-such-dir/x.json"]));
+        assert_eq!(appended.code, Some(1), "stream={stream}: {}", appended.stderr);
+
+        file("w.api", "GET /a > no-such-dir/x.json\nGET /b\n");
+        let plain = run_in(&server, d, &with(&["-sa", "w.api"]));
+        assert_eq!((plain.code, plain.sent.len()), (Some(0), 2), "stream={stream}: {}", plain.stderr);
+        assert!(plain.stderr.contains("Error writing to no-such-dir/x.json"), "stream={stream}: {}", plain.stderr);
+        let fail_fast = run_in(&server, d, &with(&["-sfa", "w.api"]));
+        assert_eq!((fail_fast.code, &fail_fast.sent[..]), (Some(1), &["GET /a".to_string()][..]), "stream={stream}: {}", fail_fast.stderr);
+
+        file("wc.api", "GET /a > no-such-dir/x.json && GET /never\n");
+        let chain = run_in(&server, d, &with(&["-sa", "wc.api"]));
+        assert_eq!((chain.code, &chain.sent[..]), (Some(1), &["GET /a".to_string()][..]), "stream={stream}: {}", chain.stderr);
+    }
+}
+
+/// An OAuth2 token that has run out is renewed once, and the request that
+/// got the 401 is sent again as it was: the same method, body and headers,
+/// with only `Authorization` new. In a batch too, not just at the prompt.
+#[cfg(unix)]
+#[test]
+fn a_token_that_ran_out_is_renewed_and_the_same_request_sent_again() {
+    use pty::Prompt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    header_fixtures(d);
+    let credentials = |server: &RecordingServer| {
+        std::fs::write(
+            d.join(".api-credentials.json"),
+            format!(
+                r#"{{"connections":[{{"name":"o","url":"http://127.0.0.1:{}","auth_type":"oauth2","credential":"s&x=1+2%","client_id":"id 1"}}],"default":"o"}}"#,
+                server.port
+            ),
+        )
+        .unwrap();
+    };
+    let expect_retry = |server: &RecordingServer, how: &str| {
+        let heads = server.heads();
+        let sent = server.log.lock().unwrap().clone();
+        let requests: Vec<(&String, &String)> = sent.iter().zip(&heads).filter(|(line, _)| line.starts_with("PUT /expired")).collect();
+        assert_eq!(requests.len(), 2, "{how}: {sent:?}");
+        // The same request twice…
+        assert_eq!(requests[0].0, requests[1].0, "{how}");
+        assert!(requests[0].0.starts_with("PUT /expired a,b"), "{how}: {}", requests[0].0);
+        // …with the same headers but for the token.
+        let common = "accept=text/csv;skipNulls=false; content-type=text/csv; authorization=Bearer ";
+        assert_eq!(requests[0].1, &format!("{common}stale; x-request-map=com.heads.t"), "{how}");
+        assert_eq!(requests[1].1, &format!("{common}fresh; x-request-map=com.heads.t"), "{how}");
+        // The secret and the client ID reach the token endpoint form-encoded.
+        let token_calls: Vec<&String> = sent.iter().filter(|line| line.contains("/oauth2/v1/token")).collect();
+        assert_eq!(token_calls.len(), 2, "{how}: {sent:?}");
+        assert!(token_calls[0].ends_with("grant_type=client_credentials&client_id=id+1&client_secret=s%26x%3D1%2B2%25"), "{how}: {}", token_calls[0]);
+    };
+
+    // In a batch: the request after it uses the new token straight away.
+    let server = RecordingServer::start();
+    credentials(&server);
+    std::fs::write(d.join("o.api"), "PUT /expired @data.csv~map(com.heads.t) > out.csv\nGET /expired/again\n").unwrap();
+    server.take();
+    let mut cmd = api_bare(d);
+    cmd.args(["-i", "-sfa", "o.api"]);
+    let out = cmd.output().expect("spawn api");
+    server.settle(Duration::from_millis(150), Duration::from_secs(3));
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    expect_retry(&server, "batch");
+    let sent = server.log.lock().unwrap().clone();
+    assert_eq!(sent.iter().filter(|line| line.contains("/expired/again")).count(), 1, "{sent:?}");
+    assert!(std::fs::read_to_string(d.join("out.csv")).unwrap().contains("/api/v1/expired"));
+
+    // One request.
+    let server = RecordingServer::start();
+    credentials(&server);
+    server.take();
+    let mut cmd = api_bare(d);
+    cmd.args(["-i", "PUT", "/expired", "@data.csv~map(com.heads.t)", ">", "out1.csv"]);
+    let out = cmd.output().expect("spawn api");
+    server.settle(Duration::from_millis(150), Duration::from_secs(3));
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    expect_retry(&server, "one-shot");
+
+    // At the prompt.
+    let server = RecordingServer::start();
+    credentials(&server);
+    let mut cmd = api_bare(d);
+    cmd.arg("-i");
+    let mut prompt = Prompt::open(cmd);
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(500));
+    prompt.send(b"\x15");
+    prompt.pump(Duration::from_millis(60));
+    server.take();
+    prompt.paste("PUT /expired @data.csv~map(com.heads.t) > out2.csv");
+    prompt.pump(Duration::from_millis(60));
+    prompt.send(b"\r");
+    prompt.wait_for("200 OK", Duration::from_secs(8));
+    prompt.pump(Duration::from_millis(300));
+    // The first token of this server went to the startup exchange, so here
+    // the token endpoint is called once more.
+    let heads = server.heads();
+    let sent = server.log.lock().unwrap().clone();
+    let requests: Vec<(&String, &String)> = sent.iter().zip(&heads).filter(|(line, _)| line.starts_with("PUT /expired")).collect();
+    assert_eq!(requests.len(), 2, "prompt: {sent:?}\n{}", pty::plain(&prompt.screen));
+    assert_eq!(requests[0].0, requests[1].0);
+    let common = "accept=text/csv;skipNulls=false; content-type=text/csv; authorization=Bearer ";
+    assert_eq!(requests[0].1, &format!("{common}stale; x-request-map=com.heads.t"));
+    assert_eq!(requests[1].1, &format!("{common}fresh; x-request-map=com.heads.t"));
+    assert!(std::fs::read_to_string(d.join("out2.csv")).unwrap().contains("/api/v1/expired"));
+}
+
+/// The prompt writes an outfile as a batch does: JSON indented, and under
+/// `-f` an error is shown and not written to the file.
+#[cfg(unix)]
+#[test]
+fn the_prompt_writes_an_outfile_as_a_batch_does() {
+    use pty::{plain, Prompt};
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+
+    let one = run_in(&server, d, &["GET", "/a", ">", "batch.json"]);
+    assert_eq!(one.code, Some(0), "{}", one.stderr);
+    let from_batch = std::fs::read_to_string(d.join("batch.json")).unwrap();
+    assert_eq!(from_batch, "{\n  \"ok\": \"/api/v1/a\"\n}");
+
+    let mut cmd = api(server.port, d);
+    cmd.arg("-f");
+    let mut prompt = Prompt::open(cmd);
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(500));
+    let mut enter = |prompt: &mut Prompt, line: &str, wait_for: &str| {
+        prompt.send(b"\x15");
+        prompt.pump(Duration::from_millis(60));
+        let mark = prompt.screen.len();
+        prompt.paste(line);
+        prompt.pump(Duration::from_millis(60));
+        prompt.send(b"\r");
+        let start = Instant::now();
+        while !plain(&prompt.screen[mark..]).contains(wait_for) && start.elapsed() < Duration::from_secs(6) {
+            prompt.pump(Duration::from_millis(60));
+        }
+        prompt.pump(Duration::from_millis(250));
+        plain(&prompt.screen[mark..])
+    };
+
+    let shown = enter(&mut prompt, "GET /a > prompt.json", "200 OK");
+    assert!(shown.contains("> prompt.json"), "{shown}");
+    assert_eq!(std::fs::read_to_string(d.join("prompt.json")).unwrap(), from_batch);
+    // `>>` too: one indented value, then an array of two.
+    enter(&mut prompt, "GET /a >> prompt2.json", "200 OK");
+    assert_eq!(std::fs::read_to_string(d.join("prompt2.json")).unwrap(), from_batch);
+
+    // Under `-f` the 404 is shown, and no file holds it.
+    let shown = enter(&mut prompt, "GET /missing > error.json", "404");
+    assert!(!d.join("error.json").exists(), "the error was written to the outfile\n{shown}");
+    assert!(shown.contains("{}"), "{shown}");
+
+    // A request that was never sent has no status: the one before it is not
+    // reported as what stopped the block.
+    let shown = enter(&mut prompt, "PUT /x @no-such-file.json\rGET /never", "File not found");
+    assert!(shown.contains("File not found: no-such-file.json"), "{shown}");
+    assert!(!shown.contains("stopped at 404"), "{shown}");
+    assert!(!server.log.lock().unwrap().iter().any(|line| line.contains("/never")));
+
+    // An outfile that can't be written is said, and stops a chain.
+    server.take();
+    let shown = enter(&mut prompt, "GET /a > no-such-dir/x.json && GET /never", "Error writing");
+    assert!(shown.contains("Error writing to no-such-dir/x.json"), "{shown}");
+    assert_eq!(server.log.lock().unwrap().clone(), ["GET /a"], "{shown}");
 }
 
 /// Stdin is the body of a one-shot request that takes a body and was given

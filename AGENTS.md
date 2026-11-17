@@ -146,6 +146,11 @@ GET /people > clipboard                  # system clipboard, case-insensitive
 ```
 
 - The extension drives the `Accept` header as above; anything else asks for JSON.
+  It is read in any case (`out.CSV` is a CSV file), and `.njson` is NDJSON too.
+- An outfile that can't be written (a directory that doesn't exist, a full
+  disk) is reported as `Error writing to <path>: …`. For a single request and
+  under `-f` that is exit 1; a chain stops there; a plain batch line is
+  reported and the next line runs, as after a failed request.
 - `~/` expands to the home directory.
 - `>> file` appends by content: JSON is spliced into one array, `.ndjson`/`.njson`
   targets get one compact object per line, `.csv` appends drop the duplicate
@@ -186,6 +191,9 @@ api --stream -sa export.api
 - A streaming response sends its status line before the body exists, so a `200`
   can still carry an error inside the payload. Check the content.
 - `>> file`, `> clipboard`, and any non-2xx response buffer even with `--stream`.
+- A streamed outfile gets its name only when the body has ended. A transfer
+  that fails partway leaves the target as it was (the bytes went to
+  `<file>.part`, which is removed), and ends the run with exit 1.
 
 ## 5. Chaining
 
@@ -997,7 +1005,9 @@ ignores the variable entirely.
 
 - `auth_type` is `"key"` (Basic), `"token"` (Bearer), or `"oauth2"`.
 - For `"oauth2"`, put the client secret in `credential` and the client ID in
-  `client_id`; the client exchanges them for a token at startup.
+  `client_id`; the client exchanges them for a token at startup, and again
+  when a request is answered `401` because the token ran out. That request is
+  then sent once more, unchanged, in a batch as at the prompt.
 - For `"key"` and `"token"`, leave `client_id` as `""`.
 - A `url` without a scheme gets one inferred: `http` for localhost, an IP, or
   anything with an explicit port; `https` otherwise.
@@ -1113,6 +1123,7 @@ Run it: `api -sa workshop.api`.
 - **Expecting `--assert` to list `assert` lines** → it lists `PUT /assert` bodies. The `assert` keyword is a request judged by truthiness and is not part of the list.
 - **Trailing comma in JSON** → server returns 500 with a parse error. JSON is strict; don't trail commas in objects/arrays.
 - **Piping a body to a `GET`** → it is not sent. Stdin is read as a body only for `POST`, `PUT` and `PATCH` without a body argument. And `echo '{…}' | api -p PUT /x` with no terminal is an error: stdin can't be the body and the answer to `-p`. Give the body as an argument or an `@file`.
+- **A response that stops before its end** → a body cut short by the server or the network, or one that takes longer than `--timeout`, is no answer: `The response was cut short: …` or `Timed out after …`, exit 1, with or without `-f`. Nothing is written to the outfile, a chain or an `assert` does not take it for a "no", and nothing after it is sent.
 - **Unclosed brackets** → the whole run fails with `"unclosed body at end of bulk file"`. If a body looks wrong, check that `{}` and `[]` balance.
 - **Glob with no matches** → hard error. Check the directory and pattern.
 - **Include loops** → `a.api` including `b.api` which includes `a.api` is detected and refused.
