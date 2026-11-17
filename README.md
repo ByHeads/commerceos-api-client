@@ -275,6 +275,11 @@ the URI inserts it verbatim and promotes the method. `ctrl+y` copies the last re
 
 ### Key bindings (`ctrl+h`)
 
+`ctrl+h` opens and closes this list at the prompt. On a terminal too short for
+all of it, the last row says how many rows are missing. A terminal set to send
+`ctrl+h` for Backspace (the byte `0x08`) opens it with Backspace too, since the
+two can't be told apart: set the terminal to send DEL (`0x7f`) for Backspace.
+
 | Key | Action |
 |---|---|
 | `enter` | Send |
@@ -282,7 +287,7 @@ the URI inserts it verbatim and promotes the method. `ctrl+y` copies the last re
 | `tab` | Complete |
 | `up` / `down` | History |
 | `ctrl+space` | Cycle method; resets to GET if the last cycle was over 5s ago |
-| `ctrl+g` | GET the current URI |
+| `ctrl+g` | GET the URI on the line, whatever its method, body or outfile; the line stays as typed |
 | `ctrl+x` | Clear body |
 | `ctrl+f` | Reset to `GET /` |
 | `ctrl+u` | Clear the input line |

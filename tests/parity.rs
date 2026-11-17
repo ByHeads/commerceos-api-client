@@ -2032,9 +2032,14 @@ mod pty {
         }
 
         /// The prompt in a terminal `cols` wide.
-        pub fn open_sized(mut cmd: std::process::Command, cols: u16) -> Self {
+        pub fn open_sized(cmd: std::process::Command, cols: u16) -> Self {
+            Self::open_with(cmd, cols, 50)
+        }
+
+        /// The prompt in a terminal `cols` wide and `rows` high.
+        pub fn open_with(mut cmd: std::process::Command, cols: u16, rows: u16) -> Self {
             let (mut master, mut slave) = (0, 0);
-            let mut size = libc::winsize { ws_row: 50, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+            let mut size = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
             let rc = unsafe {
                 libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), &mut size)
             };
@@ -2768,6 +2773,223 @@ fn up_and_down_over_multi_byte_text_keep_the_session() {
     prompt.pump(Duration::from_millis(400));
     assert_eq!(prompt.exited(), None, "the session ended:\n{}", plain(&prompt.screen));
     assert!(!plain(&prompt.screen).contains("panicked"), "{}", plain(&prompt.screen));
+}
+
+/// A body typed or pasted in the body editor is the body that is sent.
+#[cfg(unix)]
+#[test]
+fn the_body_editor_sends_what_was_typed_or_pasted() {
+    use pty::{plain, Prompt};
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = Prompt::open(api(server.port, dir.path()));
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(500));
+
+    let mut edit = |prompt: &mut Prompt, line: &str, body: &[&[u8]], end: &[u8]| -> Vec<String> {
+        prompt.send(b"\x15");
+        prompt.pump(Duration::from_millis(60));
+        server.take();
+        prompt.send(line.as_bytes());
+        prompt.pump(Duration::from_millis(100));
+        prompt.send(b"\r");
+        prompt.wait_for("Enter body, ctrl+d when done", Duration::from_secs(5));
+        for part in body {
+            prompt.send(part);
+            prompt.pump(Duration::from_millis(120));
+        }
+        prompt.send(end);
+        let start = Instant::now();
+        while server.seen() == 0 && start.elapsed() < Duration::from_millis(1500) {
+            prompt.pump(Duration::from_millis(50));
+        }
+        prompt.pump(Duration::from_millis(200));
+        server.take()
+    };
+
+    // Typed.
+    assert_eq!(edit(&mut prompt, "PUT /typed", &[br#"{"a":1}"#], b"\x04"), [r#"PUT /typed {"a":1}"#]);
+    // Pasted: the paste is the body, not something for the line underneath.
+    assert_eq!(
+        edit(&mut prompt, "PUT /pasted", &[b"\x1b[200~{\"a\":1}\x1b[201~"], b"\x04"),
+        [r#"PUT /pasted {"a":1}"#],
+        "{}",
+        plain(&prompt.screen)
+    );
+    // Typed and pasted together, over several lines.
+    assert_eq!(
+        edit(&mut prompt, "POST /both", &[b"{", b"\x1b[200~\r  \"a\": 1,\r  \"b\": \"GET /x\"\r\x1b[201~", b"}"], b"\x04"),
+        ["POST /both {\n  \"a\": 1,\n  \"b\": \"GET /x\"\n}"],
+        "{}",
+        plain(&prompt.screen)
+    );
+    // Esc sends nothing.
+    assert!(edit(&mut prompt, "PUT /never", &[b"\x1b[200~{\"a\":1}\x1b[201~"], b"\x1b").is_empty());
+}
+
+/// ctrl+g GETs the URI on the line, whatever was sent before and whatever
+/// method, body or outfile the line has, and leaves the line as it was.
+#[cfg(unix)]
+#[test]
+fn ctrl_g_gets_the_uri_on_the_line() {
+    use pty::{plain, Prompt};
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = Prompt::open(api(server.port, dir.path()));
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(500));
+
+    let mut on_line = |prompt: &mut Prompt, line: &str, key: &[u8]| -> (Vec<String>, String) {
+        prompt.send(b"\x15");
+        prompt.pump(Duration::from_millis(60));
+        server.take();
+        if !line.is_empty() {
+            prompt.send(line.as_bytes());
+            prompt.pump(Duration::from_millis(150));
+        }
+        let mark = prompt.screen.len();
+        prompt.send(key);
+        let start = Instant::now();
+        while server.seen() == 0 && start.elapsed() < Duration::from_millis(1200) {
+            prompt.pump(Duration::from_millis(50));
+        }
+        prompt.pump(Duration::from_millis(250));
+        (server.take(), plain(&prompt.screen[mark..]))
+    };
+
+    assert_eq!(on_line(&mut prompt, "GET /first", b"\r").0, ["GET /first"]);
+    // The line, not the last request.
+    assert_eq!(on_line(&mut prompt, "GET /second", b"\x07").0, ["GET /second"]);
+    // A line that is a PUT with a body and an outfile: its URI, as a GET,
+    // and no file.
+    let (sent, shown) = on_line(&mut prompt, r#"PUT /third {"x":1} > never.json"#, b"\x07");
+    assert_eq!(sent, ["GET /third"], "{shown}");
+    assert!(!dir.path().join("never.json").exists());
+    // The line is still the PUT that was being written.
+    let rows = pty::rows(&prompt.screen, 200);
+    assert!(rows.iter().any(|row| row.starts_with(r#"PUT /third {"x":1} > never.json"#)), "{}", rows.join("\n"));
+    // An empty line is `GET /`.
+    assert_eq!(on_line(&mut prompt, "", b"\x07").0, ["GET /"]);
+    // A chain has no one URI.
+    let (sent, shown) = on_line(&mut prompt, "GET /a && GET /b", b"\x07");
+    assert!(sent.is_empty(), "{shown}");
+    assert!(shown.contains("not a request"), "{shown}");
+}
+
+/// A paste into a name dialog fills its input.
+#[cfg(unix)]
+#[test]
+fn a_paste_fills_a_name_dialog() {
+    use pty::{plain, Prompt};
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = Prompt::open(api(server.port, dir.path()));
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(500));
+
+    prompt.send(b"\x13");
+    prompt.wait_for("Save connection as", Duration::from_secs(5));
+    prompt.paste("pasted-name\r");
+    prompt.pump(Duration::from_millis(200));
+    prompt.send(b"\r");
+    prompt.wait_for("connection pasted-name saved", Duration::from_secs(5));
+    let saved = std::fs::read_to_string(dir.path().join(".api-credentials.json")).unwrap();
+    assert!(saved.contains(r#""name":"pasted-name""#), "{saved}");
+
+    prompt.pump(Duration::from_millis(300));
+    prompt.send(b"\x12");
+    prompt.wait_for("Export with external identifier", Duration::from_secs(5));
+    prompt.paste("com.heads.seedID");
+    prompt.pump(Duration::from_millis(200));
+    let mark = prompt.screen.len();
+    prompt.send(b"\r");
+    prompt.pump(Duration::from_millis(600));
+    let shown = plain(&prompt.screen[mark..]);
+    assert!(!shown.contains("cancelled"), "{shown}");
+    assert!(pty::rows(&prompt.screen, 200).last().unwrap().ends_with("export"), "{shown}");
+}
+
+/// On a terminal narrower than its text, the save dialog keeps to its rows
+/// however long it stands, and a status message is still said.
+#[cfg(unix)]
+#[test]
+fn a_narrow_terminal_keeps_the_save_dialog_and_the_status_line() {
+    use pty::Prompt;
+
+    const COLS: usize = 20;
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = Prompt::open_sized(api(server.port, dir.path()), COLS as u16);
+    // Too narrow for the splash and for the standing hint: wait for the ruler.
+    prompt.wait_for("─", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(1200));
+
+    // ctrl+c once: the notice must show, cut to the width.
+    prompt.send(b"\x03");
+    prompt.pump(Duration::from_millis(400));
+    let rows = pty::rows(&prompt.screen, COLS);
+    assert!(rows.iter().any(|row| row.contains("ctrl+c again")), "{}", rows.join("\n"));
+    assert!(rows.iter().all(|row| row.chars().count() <= COLS), "{}", rows.join("\n"));
+    // Any other key takes the notice back.
+    prompt.send(b" ");
+    prompt.pump(Duration::from_millis(300));
+
+    let before = pty::rows(&prompt.screen, COLS).len();
+    prompt.send(b"\x13");
+    prompt.pump(Duration::from_millis(400));
+    let opened = pty::rows(&prompt.screen, COLS);
+    // It stands for a while, redrawn many times over.
+    prompt.pump(Duration::from_millis(1500));
+    let stood = pty::rows(&prompt.screen, COLS);
+    assert_eq!(stood.len(), opened.len(), "the dialog grew:\n{}", stood.join("\n"));
+    assert!(stood.len() <= before + 1, "the dialog took more rows than the command area:\n{}", stood.join("\n"));
+    assert!(stood.iter().all(|row| row.chars().count() <= COLS), "{}", stood.join("\n"));
+    prompt.send(b"\x1b");
+    prompt.pump(Duration::from_millis(400));
+    assert_eq!(prompt.exited(), None);
+}
+
+/// Help on a terminal too short for it is cut to what the closing clear can
+/// reach, and says how much is missing; on a tall one it is all there.
+#[cfg(unix)]
+#[test]
+fn help_is_cut_to_a_short_terminal() {
+    use pty::{plain, Prompt};
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+
+    let mut short = Prompt::open_with(api(server.port, dir.path()), 80, 24);
+    short.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    short.pump(Duration::from_millis(500));
+    let mark = short.screen.len();
+    short.send(b"\x08");
+    short.pump(Duration::from_millis(500));
+    let shown = plain(&short.screen[mark..]);
+    assert!(shown.contains("more rows: enlarge the window. ctrl+h or esc to close"), "{shown}");
+    assert!(shown.contains("enter      Send request"), "{shown}");
+    assert!(!shown.contains("ctrl+c     Quit"), "{shown}");
+    // Ruler, rows and the cursor's row: no more than the screen holds.
+    let drawn = shown.matches("\r\n").count().max(shown.lines().count());
+    assert!(drawn <= 24, "{drawn} rows drawn on 24:\n{shown}");
+    // Closing brings the prompt back.
+    let mark = short.screen.len();
+    short.send(b"\x1b");
+    short.pump(Duration::from_millis(500));
+    assert!(plain(&short.screen[mark..]).contains("ctrl+h for shortcuts"));
+
+    let mut tall = Prompt::open_with(api(server.port, dir.path()), 80, 50);
+    tall.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    tall.pump(Duration::from_millis(500));
+    let mark = tall.screen.len();
+    tall.send(b"\x08");
+    tall.pump(Duration::from_millis(500));
+    let shown = plain(&tall.screen[mark..]);
+    assert!(shown.contains("ctrl+c     Quit") && shown.contains("GET the URI on the line"), "{shown}");
+    assert!(!shown.contains("more rows"), "{shown}");
 }
 
 /// A session started with `--export <name>` has its name: ctrl+r turns

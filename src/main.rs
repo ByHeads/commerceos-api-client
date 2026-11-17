@@ -205,23 +205,74 @@ fn streaming_help_lines(base_uri: &str) -> Vec<String> {
     lines
 }
 
-/// Rows the ctrl+h panel occupies: the ruler, its 25 fixed lines, and the
+/// The shortcuts the ctrl+h panel lists, one per row.
+const HELP_LINES: [&str; 24] = [
+    "  enter      Send request",
+    "  opt+enter  New line (multiline body) [or ctrl+n]",
+    "  up/down    Navigate input history",
+    "  tab        Complete URI (endpoints, operators, properties)",
+    "  ctrl+space Cycle method: GET → PUT → PATCH → POST",
+    "  ctrl+g     GET the URI on the line",
+    "  ctrl+x     Clear body (keep method and URI)",
+    "  ctrl+f     Clear all (reset to GET /)",
+    "  ctrl+u     Clear entire input line (empty)",
+    "  ctrl+k     Kill from cursor to end of line",
+    "  alt+←/→    Move by word (or ctrl+←/→, alt+b/f)",
+    "  alt+bksp   Delete word backward (or ctrl+w)",
+    "  alt+d      Delete word forward",
+    "  ctrl+y     Copy last request as curl command",
+    "  ctrl+j     Erase last response body",
+    "  ctrl+l     Erase all output",
+    "  ctrl+s     Save connection",
+    "  ctrl+q     Switch connection",
+    "  ctrl+b     Open API docs in browser",
+    "  ctrl+o     Open last saved file",
+    "  ctrl+t     Toggle response streaming",
+    "  ctrl+r     Toggle export mode (responses as seed data)",
+    "  ctrl+c     Quit",
+    "",
+];
+
+/// The rows of the ctrl+h panel under its ruler, exactly as they are drawn:
+/// a blank row, the shortcuts, the line that says how to close it, and the
 /// streaming section (a blank separator plus its text) when streaming is on.
-/// Derived rather than hardcoded so the clear span always matches what's drawn.
 ///
-/// The streaming lines are measured against the terminal width rather than
-/// counted: the docs link carries the connection's host, and a long one would
-/// wrap into rows the clear span didn't know about.
-fn help_line_count(state: &AppState) -> u16 {
-    let base = 27;
-    if !state.config.streaming {
-        return base;
+/// What is drawn and what is cleared on closing are both taken from here, so
+/// they can't disagree. Two things keep the panel to rows that can be
+/// cleared again:
+///
+/// - The streaming lines are wrapped to the terminal width here rather than
+///   by the terminal: the docs link carries the connection's host, and a
+///   long one takes more than one row.
+/// - The panel never grows past the screen. Rows that scrolled off the top
+///   could not be reached to clear them and would be left behind, so on a
+///   terminal too short for all of it the last row says how much is missing.
+fn help_rows(state: &AppState) -> Vec<String> {
+    let mut rows: Vec<String> = vec![String::new()];
+    rows.extend(HELP_LINES.iter().map(|line| line.to_string()));
+    rows.push("  ctrl+h or esc to close".to_string());
+    if state.config.streaming {
+        rows.push(String::new());
+        for line in streaming_help_lines(&state.config.base_uri) {
+            rows.extend(hard_wrap_ansi(&line, state.width as usize).split("\r\n").map(str::to_string));
+        }
     }
-    let rows: u16 = streaming_help_lines(&state.config.base_uri)
-        .iter()
-        .map(|line| visual_line_count(line, state.width as usize))
-        .sum();
-    base + 1 + rows
+    // The ruler above and these rows have to fit on the screen with the
+    // cursor's row under them. A height of 0 is a terminal that gave none.
+    let fits = (state.height as usize).saturating_sub(2).max(2);
+    if state.height > 0 && rows.len() > fits {
+        let hidden = rows.len() - (fits - 1);
+        rows.truncate(fits - 1);
+        rows.push(format!("  … {} more rows: enlarge the window. ctrl+h or esc to close", hidden));
+    }
+    rows
+}
+
+/// Rows from the ctrl+h panel's ruler down to the cursor under its last
+/// row: the ruler and the rows of `help_rows`. It is how far up the clear
+/// has to start.
+fn help_line_count(state: &AppState) -> u16 {
+    1 + help_rows(state).len() as u16
 }
 
 // Braille spinner frames (consistent everywhere)
@@ -969,6 +1020,9 @@ struct AppState {
     // Body input mode (for POST/PUT/PATCH without body)
     body_input_mode: bool,
     body_input_buffer: String,
+    /// The terminal was resized during a wait; the screen is drawn again as
+    /// soon as the prompt is back.
+    resize_pending: bool,
     body_input_method: String,
     body_input_uri: String,
     // OAuth2 credentials for token refresh
@@ -1046,6 +1100,7 @@ impl AppState {
             method_auto_promoted_uri: String::new(),
             body_input_mode: false,
             body_input_buffer: String::new(),
+            resize_pending: false,
             body_input_method: String::new(),
             body_input_uri: String::new(),
             last_paste_raw: String::new(),
@@ -1607,6 +1662,22 @@ fn fit_tail_to_width(text: &str, budget: usize) -> String {
     }
     let tail: String = text.chars().skip(len - (budget - 1)).collect();
     format!("…{}", tail)
+}
+
+/// `s` without its ANSI colour codes: what `visible_len` counts.
+fn visible_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_escape = false;
+    for c in s.chars() {
+        if in_escape {
+            in_escape = c != 'm';
+        } else if c == '\x1b' {
+            in_escape = true;
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 // Strip ANSI escape codes and return visible character count
@@ -8933,6 +9004,11 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
     }
 
     loop {
+        // A resize that arrived during a wait is drawn now.
+        if state.resize_pending {
+            let (w, h) = (state.width, state.height);
+            redraw_after_resize(&mut state, &mut stdout, w, h)?;
+        }
         // Poll for events with timeout for resize handling
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
@@ -8956,41 +9032,7 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
                     handle_paste(&mut state, &s, &mut stdout)?;
                 }
                 Event::Resize(w, h) => {
-                    state.width = w;
-                    state.height = h;
-
-                    // Disable raw mode first (same as original working code)
-                    terminal::disable_raw_mode()?;
-
-                    // Clear screen and scrollback, move cursor to home
-                    out!("\x1b[2J\x1b[3J\x1b[H");
-                    io::stdout().flush().ok();
-
-                    // Re-print splash with current terminal width
-                    print_splash_with_width(&state.config, w);
-
-                    // Re-print previous output, re-fitting each request line to the
-                    // new width rather than replaying it at the old one.
-                    for block in &state.output_history {
-                        out!("{}", block.render(w as usize));
-                    }
-
-                    // Placeholder lines for input area (match actual input height)
-                    let input_lines = state.input.split('\n').count() as u16;
-                    let placeholder_count = 2 + input_lines; // ruler + input lines + hint
-                    for _ in 0..placeholder_count {
-                        outln!();
-                    }
-                    io::stdout().flush().ok();
-
-                    // Re-enable raw mode
-                    terminal::enable_raw_mode()?;
-
-                    // Reset prev_input_lines so render clears the right amount
-                    state.prev_input_lines = input_lines;
-
-                    // Render input area
-                    render(&mut stdout, &mut state)?;
+                    redraw_after_resize(&mut state, &mut stdout, w, h)?;
                 }
                 _ => {}
             }
@@ -9054,8 +9096,11 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
                 apply_background_result(&mut state, result);
             }
 
-            // Always update splash URL line after background load completes
-            {
+            // Update the splash URL line after the background load completes:
+            // when the splash is the box that has such a line. On a terminal
+            // too narrow for the box the splash is one blank row, and the
+            // rewrite would land on a row that is not its own.
+            if splash_line_count(state.width) == 5 {
                 // Loading resolved — update just the splash URL line in place
                 // From cursor (bottom of input area), the URL line is:
                 //   hint + input_lines + ruler + blank_after_splash + bottom_border
@@ -9140,6 +9185,59 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
     terminal::disable_raw_mode()?;
 
     Ok(())
+}
+
+/// Draw the whole screen again for a terminal that is now `w` by `h`: the
+/// splash, what has been printed (each request line fitted to the new
+/// width), and the command area.
+fn redraw_after_resize(state: &mut AppState, stdout: &mut io::Stdout, w: u16, h: u16) -> io::Result<()> {
+    state.width = w;
+    state.height = h;
+    state.resize_pending = false;
+
+    // Disable raw mode first (same as original working code)
+    terminal::disable_raw_mode()?;
+
+    // Clear screen and scrollback, move cursor to home
+    out!("\x1b[2J\x1b[3J\x1b[H");
+    io::stdout().flush().ok();
+
+    // Re-print splash with current terminal width
+    print_splash_with_width(&state.config, w);
+
+    // Re-print previous output, re-fitting each request line to the
+    // new width rather than replaying it at the old one.
+    for block in &state.output_history {
+        out!("{}", block.render(w as usize));
+    }
+
+    // Placeholder lines for input area (match actual input height)
+    let input_lines = state.input.split('\n').count() as u16;
+    let placeholder_count = 2 + input_lines; // ruler + input lines + hint
+    for _ in 0..placeholder_count {
+        outln!();
+    }
+    io::stdout().flush().ok();
+
+    // Re-enable raw mode
+    terminal::enable_raw_mode()?;
+
+    // Reset prev_input_lines so render clears the right amount
+    state.prev_input_lines = input_lines;
+
+    // Render input area
+    render(stdout, state)
+}
+
+/// A resize that arrived while the prompt was waiting (for a response, a
+/// `sleep`, an answer): the new size is taken at once, so what is drawn
+/// during the wait fits, and the screen is drawn again when the wait ends.
+fn note_resize(state: &mut AppState, event: &Event) {
+    if let Event::Resize(w, h) = event {
+        state.width = *w;
+        state.height = *h;
+        state.resize_pending = true;
+    }
 }
 
 fn handle_key_event(
@@ -9400,15 +9498,37 @@ fn handle_key_event(
 
         // Quick GET
         (KeyModifiers::CONTROL, KeyCode::Char('g')) => {
-            state.prev_method = state.method.clone();
-            state.prev_uri = state.uri.clone();
-            state.prev_body = state.body.clone();
-            state.prev_outfile = state.config.outfile.clone();
-            state.method = "GET".to_string();
-            state.body.clear();
-            state.method_auto_promoted = false;
+            // GET the URI on the line, whatever method, body or outfile the
+            // line has: a look at the resource being written to. The line
+            // itself is left as it was typed.
+            let typed = (state.input.clone(), state.cursor_pos);
+            let line = if state.input.trim().is_empty() { "GET /".to_string() } else { state.input.trim().to_string() };
+            match classify_prompt_line(&line, typed_export(&state.config)) {
+                PromptLine::Request(request) => {
+                    parse_input(state, &request);
+                    state.method = "GET".to_string();
+                    state.body.clear();
+                    state.config.outfile.clear();
+                    state.config.outfile_append = false;
+                    state.display_outfile.clear();
+                    state.method_auto_promoted = false;
+                    state.prev_method = state.method.clone();
+                    state.prev_uri = state.uri.clone();
+                    state.prev_body = String::new();
+                    state.prev_outfile = String::new();
 
-            execute_request(state, stdout)?;
+                    execute_request(state, stdout)?;
+
+                    (state.input, state.cursor_pos) = typed;
+                    render(stdout, state)?;
+                }
+                // A chain, a directive, a file: there is no one URI to GET.
+                _ => {
+                    state.status_msg = "not a request".to_string();
+                    state.status_msg_at = Some(Instant::now());
+                    render(stdout, state)?;
+                }
+            }
         }
 
         // Clear body
@@ -10173,6 +10293,13 @@ fn handle_paste<W: Write>(
     paste: &str,
     stdout: &mut W,
 ) -> io::Result<()> {
+    // In the body editor the paste is body text: it goes into the body being
+    // written, as it is. The line under the editor is not what is on screen.
+    if state.body_input_mode {
+        state.body_input_buffer.push_str(&normalize_paste_newlines(paste));
+        return render(stdout, state);
+    }
+
     let inside_body = cursor_inside_brackets(&state.input, state.cursor_pos);
 
     let normalized = normalize_paste_newlines(paste);
@@ -10526,9 +10653,13 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
             }
         }
 
-        // Check for ctrl+c to abort (short poll to stay responsive)
+        // Check for ctrl+c to abort (short poll to stay responsive). Any
+        // other key, and a paste, is dropped: the prompt is not there to
+        // take it while a request is on its way.
         if event::poll(Duration::from_millis(80))? {
-            if let Event::Key(key) = event::read()? {
+            let event = event::read()?;
+            note_resize(state, &event);
+            if let Event::Key(key) = event {
                 if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                     aborted = true;
                     break;
@@ -11018,7 +11149,7 @@ fn run_program_steps(state: &mut AppState, stdout: &mut io::Stdout, steps: &[Bul
             }
             BulkStep::Confirm(message) => {
                 let prompt = confirm_prompt_text(message);
-                let yes = confirm_in_hint(stdout, &prompt)?;
+                let yes = confirm_in_hint(state, stdout, &prompt)?;
                 let answer = if yes { "y" } else { "n" };
                 log_directive_line(
                     state,
@@ -11178,7 +11309,9 @@ fn wait_interruptible(
     while start.elapsed() < d {
         let remaining = d - start.elapsed();
         if event::poll(remaining.min(Duration::from_millis(80)))? {
-            if let Event::Key(key) = event::read()? {
+            let event = event::read()?;
+            note_resize(state, &event);
+            if let Event::Key(key) = event {
                 let ctrl_c = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
                 if ctrl_c || key.code == KeyCode::Esc {
                     show_program_status(state, stdout, format!("{} cancelled", label))?;
@@ -11212,7 +11345,7 @@ Print(transient_hint_line(
 /// Ask a yes/no question in the hint line (where the cursor rests after a
 /// render) and wait for a key. Enter and y accept; n and esc decline. The
 /// line is redrawn by whatever the caller prints next.
-fn confirm_in_hint(stdout: &mut io::Stdout, prompt: &str) -> io::Result<bool> {
+fn confirm_in_hint(state: &mut AppState, stdout: &mut io::Stdout, prompt: &str) -> io::Result<bool> {
     execute!(
         stdout,
         cursor::MoveToColumn(0),
@@ -11222,7 +11355,9 @@ fn confirm_in_hint(stdout: &mut io::Stdout, prompt: &str) -> io::Result<bool> {
     stdout.flush()?;
     loop {
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
+            let event = event::read()?;
+            note_resize(state, &event);
+            if let Event::Key(key) = event {
                 if key.kind != event::KeyEventKind::Press {
                     continue;
                 }
@@ -11809,7 +11944,12 @@ fn read_inline_input_within(
             idle(stdout)?;
         }
         if event::poll(wait)? {
-            if let Event::Key(key) = event::read()? {
+            let event = event::read()?;
+            // A paste fills the input: its first line, since the input is one.
+            if let Event::Paste(text) = &event {
+                buf.push_str(text.lines().next().unwrap_or("").trim());
+            }
+            if let Event::Key(key) = event {
                 if key.kind != event::KeyEventKind::Press { continue; }
                 // Like esc, both leave the cursor on the row under the prompt.
                 let quit = key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c');
@@ -12016,13 +12156,19 @@ fn handle_save_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io::
 
     // Print placeholder lines for bottom ruler + hint so terminal doesn't scroll
     let ruler_line = format!("\x1b[38;5;239m{}\x1b[0m", ruler);
+    // Nothing here may wrap: a row more than was counted would put every
+    // redraw a row too low. So the hint is cut to the width and drawn with
+    // auto-wrap off, and the input keeps to the width, as in `ask_export_name`.
+    let hint: String = "enter to save, esc to cancel".chars().take(width.saturating_sub(2)).collect();
+    execute!(stdout, Print("\x1b[?7l"))?;
     execute!(stdout, Print("\r\n"))?; // placeholder for prompt line
     execute!(stdout, Print(format!("{}\r\n", ruler_line)))?; // bottom ruler
-    execute!(stdout, Print(format!("  {}", "enter to save, esc to cancel".dimmed())))?; // hint
+    execute!(stdout, Print(format!("  {}", hint.dimmed())))?; // hint
+    execute!(stdout, Print("\x1b[?7h"))?;
     // Move back up to prompt line
     execute!(stdout, cursor::MoveUp(2), cursor::MoveToColumn(0))?;
 
-    let name = match read_inline_input(stdout, &prompt, false, &prefill)? {
+    let name = match read_inline_input_within(stdout, &prompt, false, &prefill, Some(width), None)? {
         InlineInput::Entered(n) if !n.is_empty() => n,
         ended => {
             // Restore normal command area
@@ -12796,44 +12942,9 @@ fn render<W: Write>(stdout: &mut W, state: &mut AppState) -> io::Result<()> {
         queue!(stdout, Print(format!("{}\r\n", msg.dimmed())))?;
         state.prev_input_lines = 1; // single spinner line — keep the span exact
     } else if state.show_help {
-        queue!(
-            stdout,
-            Print("\r\n"),
-            Print(format!("{}\r\n", "  enter      Send request".dimmed())),
-            Print(format!("{}\r\n", "  opt+enter  New line (multiline body) [or ctrl+n]".dimmed())),
-            Print(format!("{}\r\n", "  up/down    Navigate input history".dimmed()))
-        )?;
-        queue!(stdout, Print(format!("{}\r\n", "  tab        Complete URI (endpoints, operators, properties)".dimmed())))?;
-        queue!(
-            stdout,
-            Print(format!("{}\r\n", "  ctrl+space Cycle method: GET → PUT → PATCH → POST".dimmed())),
-            Print(format!("{}\r\n", "  ctrl+g     Quick GET current URI".dimmed())),
-            Print(format!("{}\r\n", "  ctrl+x     Clear body (keep method and URI)".dimmed())),
-            Print(format!("{}\r\n", "  ctrl+f     Clear all (reset to GET /)".dimmed())),
-            Print(format!("{}\r\n", "  ctrl+u     Clear entire input line (empty)".dimmed())),
-            Print(format!("{}\r\n", "  ctrl+k     Kill from cursor to end of line".dimmed())),
-            Print(format!("{}\r\n", "  alt+←/→    Move by word (or ctrl+←/→, alt+b/f)".dimmed())),
-            Print(format!("{}\r\n", "  alt+bksp   Delete word backward (or ctrl+w)".dimmed())),
-            Print(format!("{}\r\n", "  alt+d      Delete word forward".dimmed())),
-            Print(format!("{}\r\n", "  ctrl+y     Copy last request as curl command".dimmed())),
-            Print(format!("{}\r\n", "  ctrl+j     Erase last response body".dimmed())),
-            Print(format!("{}\r\n", "  ctrl+l     Erase all output".dimmed())),
-            Print(format!("{}\r\n", "  ctrl+s     Save connection".dimmed())),
-            Print(format!("{}\r\n", "  ctrl+q     Switch connection".dimmed())),
-            Print(format!("{}\r\n", "  ctrl+b     Open API docs in browser".dimmed())),
-            Print(format!("{}\r\n", "  ctrl+o     Open last saved file".dimmed())),
-            Print(format!("{}\r\n", "  ctrl+t     Toggle response streaming".dimmed())),
-            Print(format!("{}\r\n", "  ctrl+r     Toggle export mode (responses as seed data)".dimmed())),
-            Print(format!("{}\r\n", "  ctrl+c     Quit".dimmed())),
-            Print("\r\n"),
-            Print(format!("{}\r\n", "  ctrl+h or esc to close".dimmed()))
-        )?;
-        // Only worth the rows when it applies — see `help_line_count`.
-        if state.config.streaming {
-            queue!(stdout, Print("\r\n"))?;
-            for line in streaming_help_lines(&state.config.base_uri) {
-                queue!(stdout, Print(format!("{}\r\n", line.dimmed())))?;
-            }
+        // Drawn from the rows the closing clear counts — see `help_rows`.
+        for row in help_rows(state) {
+            queue!(stdout, Print(format!("{}\r\n", row.dimmed())))?;
         }
     } else if state.body_input_mode {
         // Show method + URI on first line, prompt on second, buffer with cursor below
@@ -12879,17 +12990,25 @@ fn render<W: Write>(stdout: &mut W, state: &mut AppState) -> io::Result<()> {
     if !state.show_help {
         queue!(stdout, Print(format!("{}\r\n", ruler_line)))?;
 
-        // Hint line (only if terminal is wide enough - "ctrl+h for shortcuts" is 21 chars + 2 indent)
-        if width >= 22 {
-            if !state.status_msg.is_empty() {
-                let msg_style = status_msg_styled(&state.status_msg, state.status_msg_at);
-                queue!(stdout, Print(format!("  {}", msg_style)))?;
-                queue!(stdout, Print(streaming_indicator(state, visible_len(&state.status_msg))))?;
+        // Hint line. A status message is always said, cut to the width if
+        // it has to be: "ctrl+c again to exit" and a program's error are not
+        // to go missing on a narrow terminal. The standing hint is only
+        // drawn where it fits ("ctrl+h for shortcuts" is 21 chars + 2 indent).
+        if !state.status_msg.is_empty() {
+            let shown = if width >= 22 {
+                state.status_msg.clone()
             } else {
-                let hint = "ctrl+h for shortcuts";
-                queue!(stdout, Print(format!("  {}", hint.dimmed())))?;
-                queue!(stdout, Print(streaming_indicator(state, hint.len())))?;
+                fit_to_width(&visible_text(&state.status_msg), width.saturating_sub(2))
+            };
+            let msg_style = status_msg_styled(&shown, state.status_msg_at);
+            queue!(stdout, Print(format!("  {}", msg_style)))?;
+            if width >= 22 {
+                queue!(stdout, Print(streaming_indicator(state, visible_len(&state.status_msg))))?;
             }
+        } else if width >= 22 {
+            let hint = "ctrl+h for shortcuts";
+            queue!(stdout, Print(format!("  {}", hint.dimmed())))?;
+            queue!(stdout, Print(streaming_indicator(state, hint.len())))?;
         }
     }
 
@@ -19686,7 +19805,23 @@ mod tests {
         // is drawn and what is counted corrupts the screen on close.
         let mut state = AppState::new(Config::default());
         state.width = 80;
+        state.height = 60;
         let plain = help_line_count(&state);
+        assert_eq!(plain, 27, "the ruler, a blank row, 24 lines and the closing line");
+
+        // On a terminal too short for it the panel is cut to what can be
+        // cleared again: the ruler, its rows and the cursor's row all fit.
+        for height in [24u16, 12, 6] {
+            state.height = height;
+            let rows = help_rows(&state);
+            assert_eq!(help_line_count(&state), height - 1, "height {height}");
+            assert!(rows.last().unwrap().contains("more rows"), "height {height}: {:?}", rows.last());
+            assert!(rows.last().unwrap().contains("ctrl+h or esc to close"));
+        }
+        state.height = 28;
+        assert_eq!(help_line_count(&state), 27);
+        assert!(!help_rows(&state).last().unwrap().contains("more rows"));
+        state.height = 60;
 
         state.config.base_uri = "http://localhost:5000".to_string();
         state.config.streaming = true;
