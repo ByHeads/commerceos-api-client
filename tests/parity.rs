@@ -1101,6 +1101,304 @@ fn the_prompt_writes_an_outfile_as_a_batch_does() {
     assert_eq!(server.log.lock().unwrap().clone(), ["GET /a"], "{shown}");
 }
 
+/// A credentials file in `dir` with these connections: `(name, url,
+/// auth_type, credential, client_id)`.
+fn write_credentials(dir: &Path, connections: &[(&str, String, &str, &str, &str)], default: &str) {
+    let entries: Vec<String> = connections
+        .iter()
+        .map(|(name, url, auth_type, credential, client_id)| {
+            format!(
+                r#"{{"name":"{name}","url":"{url}","auth_type":"{auth_type}","credential":"{credential}","client_id":"{client_id}"}}"#
+            )
+        })
+        .collect();
+    std::fs::write(
+        dir.join(".api-credentials.json"),
+        format!(r#"{{"connections":[{}],"default":"{default}"}}"#, entries.join(",")),
+    )
+    .unwrap();
+}
+
+fn run_bare(server: &RecordingServer, dir: &Path, args: &[&str]) -> Ran {
+    let mut cmd = api_bare(dir);
+    cmd.args(args);
+    ran(server, cmd)
+}
+
+/// The authorization of the one request a run sent.
+fn authorization(server: &RecordingServer) -> String {
+    let heads = server.heads();
+    assert_eq!(heads.len(), 1, "{heads:?}");
+    heads[0].split("authorization=").nth(1).unwrap().split(';').next().unwrap().to_string()
+}
+
+/// A saved connection is found by default, by alias and by URL, and what the
+/// command line gives (`-k`, `--token`, `-b`) wins over what it has stored.
+#[test]
+fn flags_win_over_the_connection_chosen_with_c() {
+    let server = RecordingServer::start();
+    let other = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    let other_url = format!("http://127.0.0.1:{}", other.port);
+    write_credentials(
+        d,
+        &[
+            ("local", url.clone(), "key", "STOREDKEY", ""),
+            ("tok", url.clone(), "token", "STOREDTOKEN", ""),
+            ("oauth", url.clone(), "oauth2", "secret", "id"),
+        ],
+        "local",
+    );
+    // `:STOREDKEY` and `:CLIKEY` as Basic.
+    let (stored, cli) = ("Basic OlNUT1JFREtFWQ==", "Basic OkNMSUtFWQ==");
+
+    // Which connection.
+    for (args, authorization_sent) in [
+        (&["GET", "/a"][..], stored),
+        (&["-c", "local", "GET", "/a"][..], stored),
+        (&["-c", "tok", "GET", "/a"][..], "Bearer STOREDTOKEN"),
+        (&["-c", &url, "GET", "/a"][..], stored),
+        (&["-c", url.trim_start_matches("http://"), "GET", "/a"][..], stored),
+        // Flags over the default connection…
+        (&["-k", "CLIKEY", "GET", "/a"][..], cli),
+        (&["--token", "T", "GET", "/a"][..], "Bearer T"),
+        // …and over one chosen with -c, whatever kind it is.
+        (&["-c", "local", "-k", "CLIKEY", "GET", "/a"][..], cli),
+        (&["-c", "local", "--token", "T", "GET", "/a"][..], "Bearer T"),
+        (&["-c", "tok", "-k", "CLIKEY", "GET", "/a"][..], cli),
+        (&["-c", "tok", "--token", "T", "GET", "/a"][..], "Bearer T"),
+        (&["-c", "oauth", "-k", "CLIKEY", "GET", "/a"][..], cli),
+    ] {
+        let got = run_bare(&server, d, args);
+        assert_eq!((got.code, &got.sent[..]), (Some(0), &["GET /a".to_string()][..]), "{args:?}: {}", got.stderr);
+        assert_eq!(authorization(&server), authorization_sent, "{args:?}");
+    }
+
+    // `-b` sends the stored credential to another host.
+    other.take();
+    let got = run_bare(&server, d, &["-c", "local", "-b", &other_url, "GET", "/a"]);
+    assert_eq!((got.code, got.sent.len()), (Some(0), 0), "{}", got.stderr);
+    assert_eq!(other.log.lock().unwrap().clone(), ["GET /a"]);
+    assert_eq!(authorization(&other), stored);
+
+    // A connection that is not saved.
+    let missing = run_bare(&server, d, &["-c", "nope", "GET", "/a"]);
+    assert_eq!((missing.code, missing.sent.len()), (Some(1), 0));
+    assert!(missing.stderr.contains("Connection \"nope\" not found. Saved connections: local, tok, oauth"), "{}", missing.stderr);
+
+    // An entry without `client_id` is a whole entry.
+    std::fs::write(
+        d.join(".api-credentials.json"),
+        format!(r#"{{"connections":[{{"name":"bare","url":"{url}","auth_type":"key","credential":"STOREDKEY"}}],"default":"bare"}}"#),
+    )
+    .unwrap();
+    let bare = run_bare(&server, d, &["GET", "/a"]);
+    assert_eq!((bare.code, &bare.sent[..]), (Some(0), &["GET /a".to_string()][..]), "{}", bare.stderr);
+
+    // A base URL is read in any case of its scheme, and without its prefix.
+    for base in [url.replace("http://", "HTTP://"), format!("{url}/api/v1"), format!("{url}/")] {
+        let got = run_bare(&server, d, &["-b", &base, "-k", "k", "GET", "/a"]);
+        assert_eq!((got.code, &got.sent[..]), (Some(0), &["GET /a".to_string()][..]), "{base}: {}", got.stderr);
+    }
+}
+
+/// A credentials file that can't be read is said to be so, not taken for an
+/// empty one, and is never written over.
+#[cfg(unix)]
+#[test]
+fn a_malformed_credentials_file_is_reported_and_left_alone() {
+    use pty::{plain, Prompt};
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let file = d.join(".api-credentials.json");
+    // One trailing comma.
+    let broken = r#"{"connections":[{"name":"keep","url":"http://x","auth_type":"key","credential":"SECRET","client_id":""},],"default":"keep"}"#;
+    std::fs::write(&file, broken).unwrap();
+
+    let got = run_bare(&server, d, &["GET", "/a"]);
+    assert_eq!((got.code, got.sent.len()), (Some(1), 0));
+    assert!(got.stderr.contains("WARNING: could not read"), "{}", got.stderr);
+    assert!(got.stderr.contains(".api-credentials.json"), "{}", got.stderr);
+    assert!(got.stderr.contains("no base URL specified"), "{}", got.stderr);
+
+    // At the prompt, saving the connection in use does not replace the file.
+    let mut prompt = Prompt::open(api(server.port, d));
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(500));
+    prompt.send(b"\x13");
+    prompt.pump(Duration::from_millis(400));
+    prompt.send(b"newone");
+    prompt.pump(Duration::from_millis(200));
+    prompt.send(b"\r");
+    prompt.pump(Duration::from_millis(400));
+    // The dialog may ask whether this is the default; either way.
+    prompt.send(b"\r");
+    prompt.pump(Duration::from_millis(600));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), broken, "{}", plain(&prompt.screen));
+    assert!(plain(&prompt.screen).contains("left as it is"), "{}", plain(&prompt.screen));
+    // ctrl+q says why there is nothing to pick from.
+    prompt.send(b"\x11");
+    prompt.pump(Duration::from_millis(500));
+    assert_eq!(prompt.exited(), None);
+    let shown = plain(&prompt.screen);
+    assert!(shown.matches("could not read").count() >= 2, "{shown}");
+
+    // A good file is still saved to, and what was in it is kept.
+    write_credentials(d, &[("keep", "http://x".to_string(), "key", "SECRET", "")], "keep");
+    let mut prompt = Prompt::open(api(server.port, d));
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(500));
+    prompt.send(b"\x13");
+    prompt.pump(Duration::from_millis(400));
+    prompt.send(b"newone");
+    prompt.pump(Duration::from_millis(200));
+    prompt.send(b"\r");
+    prompt.wait_for("connection newone saved", Duration::from_secs(5));
+    let saved = std::fs::read_to_string(&file).unwrap();
+    assert!(saved.contains(r#""name":"keep""#) && saved.contains(r#""name":"newone""#), "{saved}");
+    assert!(saved.contains(r#""default":"keep""#), "{saved}");
+}
+
+/// Switching connection with ctrl+q changes where requests go and what they
+/// are signed with, and nothing else: the flags the session was started with
+/// still hold.
+#[cfg(unix)]
+#[test]
+fn switching_connection_at_the_prompt_keeps_the_flags() {
+    use pty::{plain, Prompt};
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    write_credentials(d, &[("other", url.clone(), "key", "STOREDKEY", "")], "");
+
+    let mut cmd = api(server.port, d);
+    cmd.args(["-i", "-f"]);
+    let mut prompt = Prompt::open(cmd);
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(500));
+    let mut get = |prompt: &mut Prompt, line: &str| {
+        prompt.send(b"\x15");
+        prompt.pump(Duration::from_millis(60));
+        server.take();
+        prompt.paste(line);
+        prompt.pump(Duration::from_millis(60));
+        prompt.send(b"\r");
+        let start = Instant::now();
+        while server.seen() == 0 && start.elapsed() < Duration::from_secs(5) {
+            prompt.pump(Duration::from_millis(50));
+        }
+        prompt.pump(Duration::from_millis(250));
+        server.heads()
+    };
+    let before = get(&mut prompt, "GET /a");
+    assert_eq!(before, ["accept=application/json;skipNulls=false; content-type=application/json; authorization=Basic Oms=; x-request-map=-"]);
+
+    prompt.send(b"\x11");
+    prompt.wait_for("other", Duration::from_secs(5));
+    prompt.pump(Duration::from_millis(300));
+    prompt.send(b"\r");
+    prompt.wait_for("connected to: other", Duration::from_secs(8));
+    prompt.pump(Duration::from_millis(600));
+
+    // `-i` still holds, and the stored key signs the request.
+    let after = get(&mut prompt, "GET /a");
+    assert_eq!(
+        after,
+        ["accept=application/json;skipNulls=false; content-type=application/json; authorization=Basic OlNUT1JFREtFWQ==; x-request-map=-"],
+        "{}",
+        plain(&prompt.screen)
+    );
+    // `-f` still holds: a pasted block stops at the 404.
+    prompt.send(b"\x15");
+    prompt.pump(Duration::from_millis(60));
+    server.take();
+    prompt.paste("GET /missing\rGET /never");
+    prompt.pump(Duration::from_millis(60));
+    prompt.send(b"\r");
+    prompt.wait_for("stopped at 404 (--fail-fast)", Duration::from_secs(6));
+    assert_eq!(server.log.lock().unwrap().clone(), ["GET /missing"]);
+}
+
+/// A batch or a program line never opens the "New connection" form, even at
+/// a terminal with a URL and no credential: it runs, as one request does.
+#[cfg(unix)]
+#[test]
+fn a_batch_without_a_credential_runs_and_opens_no_form() {
+    use pty::{plain, Prompt};
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::write(d.join("one.api"), "GET /from-file\n").unwrap();
+    let url = format!("http://127.0.0.1:{}", server.port);
+
+    for (args, sent) in [
+        (&["-b", &url, "-sa", "one.api"][..], &["GET /from-file"][..]),
+        (&["-b", &url, "GET /x && GET /y"][..], &["GET /x", "GET /y"][..]),
+        (&["-b", &url, "GET", "/z"][..], &["GET /z"][..]),
+    ] {
+        server.take();
+        let mut cmd = api_bare(d);
+        cmd.args(args);
+        let mut prompt = Prompt::open(cmd);
+        let start = Instant::now();
+        while prompt.exited().is_none() && start.elapsed() < Duration::from_secs(8) {
+            prompt.pump(Duration::from_millis(100));
+        }
+        let shown = plain(&prompt.screen);
+        assert_eq!(prompt.exited(), Some(true), "{args:?}: still running\n{shown}");
+        assert!(!shown.contains("API key:"), "{args:?}: the form was opened\n{shown}");
+        assert_eq!(server.log.lock().unwrap().clone(), sent, "{args:?}\n{shown}");
+    }
+}
+
+/// An OAuth2 connection whose token can't be fetched ends a batch with the
+/// reason. At the prompt the connection dialog says so and stays.
+#[cfg(unix)]
+#[test]
+fn a_failed_token_exchange_does_not_end_the_prompt() {
+    use pty::{plain, Prompt};
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    // Nothing listens on the port of the OAuth2 connection.
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    write_credentials(d, &[("gone", format!("http://127.0.0.1:{dead}"), "oauth2", "secret", "id")], "");
+
+    let batch = run_bare(&server, d, &["-c", "gone", "GET", "/a"]);
+    assert_eq!((batch.code, batch.sent.len()), (Some(1), 0));
+    assert!(batch.stderr.contains("OAuth2 token exchange failed"), "{}", batch.stderr);
+
+    let mut prompt = Prompt::open(api(server.port, d));
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(500));
+    prompt.send(b"\x11");
+    prompt.wait_for("gone", Duration::from_secs(5));
+    prompt.pump(Duration::from_millis(300));
+    prompt.send(b"\r");
+    prompt.wait_for("OAuth2 token exchange failed", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(300));
+    assert_eq!(prompt.exited(), None, "the client ended:\n{}", plain(&prompt.screen));
+    // Esc leaves the dialog, and the session is the one it was.
+    prompt.send(b"\x1b");
+    prompt.pump(Duration::from_millis(500));
+    prompt.send(b"\x15");
+    prompt.pump(Duration::from_millis(60));
+    server.take();
+    prompt.paste("GET /still-here");
+    prompt.pump(Duration::from_millis(60));
+    prompt.send(b"\r");
+    prompt.wait_for("200 OK", Duration::from_secs(6));
+    assert_eq!(server.log.lock().unwrap().clone(), ["GET /still-here"]);
+}
+
 /// Stdin is the body of a one-shot request that takes a body and was given
 /// none. A GET leaves it alone, and so can be answered a `-p` from it; a PUT
 /// under `-p` with no terminal would need stdin twice and says so.
@@ -1834,8 +2132,16 @@ mod pty {
     impl Drop for Prompt {
         fn drop(&mut self) {
             let _ = self.child.kill();
-            let _ = self.child.wait();
+            // A process can't finish exiting while its terminal still holds
+            // output that nobody read (macOS waits for it to drain). So the
+            // output is read away until the client is gone, and the terminal
+            // is closed before the last wait.
+            let start = Instant::now();
+            while matches!(self.child.try_wait(), Ok(None)) && start.elapsed() < Duration::from_secs(5) {
+                self.pump(Duration::from_millis(20));
+            }
             unsafe { libc::close(self.master) };
+            let _ = self.child.wait();
         }
     }
 

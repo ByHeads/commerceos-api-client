@@ -515,13 +515,16 @@ struct SavedConnection {
     url: String,
     auth_type: String,   // "key", "token", or "oauth2"
     credential: String,  // API key, Bearer token, or OAuth2 client_secret
-    client_id: String,   // OAuth2 client ID (empty for key/token)
+    /// OAuth2 client ID. Only an OAuth2 connection has one, so a key or a
+    /// token connection may leave it out.
+    #[serde(default)]
+    client_id: String,
 }
 
 // All connection data stored in a single keychain entry
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct KeychainData {
-    #[serde(alias = "environments")]
+    #[serde(default, alias = "environments")]
     connections: Vec<SavedConnection>,
     #[serde(default)]
     default: String,
@@ -551,39 +554,110 @@ thread_local! {
     static KEYCHAIN_CACHE: std::cell::RefCell<Option<KeychainData>> = const { std::cell::RefCell::new(None) };
 }
 
+/// Why the store of saved connections could not be read, if it couldn't.
+/// Said once on stderr when that is safe, and kept for the prompt to show.
+static STORE_PROBLEM: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn store_problem() -> Option<String> {
+    STORE_PROBLEM.lock().ok().and_then(|problem| problem.clone())
+}
+
+/// The saved connections in `json`. Nothing at all is an empty store, as a
+/// file that was created but never written to.
+fn parse_store(json: &str) -> Result<KeychainData, String> {
+    if json.trim().is_empty() {
+        return Ok(KeychainData::default());
+    }
+    serde_json::from_str(json).map_err(|e| format!("it is not what the client wrote there ({})", e))
+}
+
+/// Read a credentials file. One that does not exist is an empty store; one
+/// that can't be read, or doesn't hold what the client writes, is an error.
+/// The difference matters: an empty store may be written, a broken one must
+/// not be written over.
+fn read_store_file(path: &std::path::Path) -> Result<KeychainData, String> {
+    match fs::read_to_string(path) {
+        Ok(json) => parse_store(&json).map_err(|e| format!("could not read {}: {}", path.display(), e)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(KeychainData::default()),
+        Err(e) => Err(format!("could not read {}: {}", path.display(), e)),
+    }
+}
+
+/// Write a credentials file in one step: to a file beside it, then renamed
+/// over it, so a reader never finds half a file. The mode of the file that
+/// was there is kept.
+fn write_store_file(path: &std::path::Path, data: &KeychainData) -> Result<(), String> {
+    let json = serde_json::to_string(data).map_err(|e| e.to_string())?;
+    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(format!(".tmp-{}", std::process::id()));
+    let tmp = path.with_file_name(name);
+    let written = fs::write(&tmp, &json)
+        .and_then(|()| match fs::metadata(path) {
+            Ok(existing) => fs::set_permissions(&tmp, existing.permissions()),
+            Err(_) => Ok(()),
+        })
+        .and_then(|()| fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written.map_err(|e| format!("credentials file error: {}", e))
+}
+
+/// Read the store from where it is kept, not from the cache.
+fn read_store() -> Result<KeychainData, String> {
+    if let Some(path) = no_keychain_file() {
+        return read_store_file(&path);
+    }
+    match keychain_entry().get_password() {
+        Ok(json) => parse_store(&json).map_err(|e| format!("could not read the saved connections in the keychain: {}", e)),
+        Err(keyring::Error::NoEntry) => Ok(KeychainData::default()),
+        Err(e) => Err(format!("could not read the keychain: {}", e)),
+    }
+}
+
+/// The saved connections, read once per run. A store that could not be read
+/// counts as empty here, and the reason is said: once on stderr, unless the
+/// prompt has the terminal, where `store_problem` is shown instead.
 fn load_keychain_data() -> KeychainData {
     KEYCHAIN_CACHE.with(|cache| {
         if let Some(ref data) = *cache.borrow() {
             return data.clone();
         }
-        let data = if let Some(path) = no_keychain_file() {
-            // File-backed mode: missing/unreadable file is treated as empty.
-            match fs::read_to_string(&path) {
-                Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
-                Err(_) => KeychainData::default(),
+        let data = read_store().unwrap_or_else(|problem| {
+            if !terminal::is_raw_mode_enabled().unwrap_or(false) {
+                eprintln!("WARNING: {}. No saved connection is used.", problem);
             }
-        } else {
-            match keychain_entry().get_password() {
-                Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
-                Err(_) => KeychainData::default(),
+            if let Ok(mut kept) = STORE_PROBLEM.lock() {
+                *kept = Some(problem);
             }
-        };
+            KeychainData::default()
+        });
         *cache.borrow_mut() = Some(data.clone());
         data
     })
 }
 
 fn save_keychain_data(data: &KeychainData) -> Result<(), String> {
-    let json = serde_json::to_string(data).map_err(|e| e.to_string())?;
     if let Some(path) = no_keychain_file() {
-        fs::write(&path, &json).map_err(|e| format!("credentials file error: {}", e))?;
+        write_store_file(&path, data)?;
     } else {
+        let json = serde_json::to_string(data).map_err(|e| e.to_string())?;
         keychain_entry().set_password(&json).map_err(|e| format!("keychain error: {}", e))?;
     }
     KEYCHAIN_CACHE.with(|cache| {
         *cache.borrow_mut() = Some(data.clone());
     });
     Ok(())
+}
+
+/// Change the store: read it afresh, apply `change`, write it back. Read
+/// afresh so that what another session saved in the meantime is kept, and so
+/// that a store which can't be read is never written over: the change is
+/// refused with the reason, and the store is left as it is.
+fn update_store(change: impl FnOnce(&mut KeychainData)) -> Result<(), String> {
+    let mut data = read_store().map_err(|problem| format!("{}; left as it is", problem))?;
+    change(&mut data);
+    save_keychain_data(&data)
 }
 
 fn list_connections() -> Vec<String> {
@@ -594,23 +668,34 @@ fn load_connection(name: &str) -> Option<SavedConnection> {
     load_keychain_data().connections.iter().find(|e| e.name == name).cloned()
 }
 
-fn save_connection(env: &SavedConnection) -> Result<(), String> {
-    let mut data = load_keychain_data();
-    if let Some(existing) = data.connections.iter_mut().find(|e| e.name == env.name) {
-        *existing = env.clone();
-    } else {
-        data.connections.push(env.clone());
+/// Put `env` in the store, in the place of the connection of the same name
+/// if there is one. With `replaces`, the connection of that name is being
+/// saved under a new one: the old entry goes, and if it was the default the
+/// new name is.
+fn put_connection(data: &mut KeychainData, env: &SavedConnection, replaces: Option<&str>) {
+    if let Some(old) = replaces.filter(|old| *old != env.name) {
+        data.connections.retain(|e| e.name != old);
+        if data.default == old {
+            data.default = env.name.clone();
+        }
     }
-    save_keychain_data(&data)
+    match data.connections.iter_mut().find(|e| e.name == env.name) {
+        Some(existing) => *existing = env.clone(),
+        None => data.connections.push(env.clone()),
+    }
+}
+
+fn save_connection(env: &SavedConnection, replaces: Option<&str>) -> Result<(), String> {
+    update_store(|data| put_connection(data, env, replaces))
 }
 
 fn delete_connection(name: &str) -> Result<(), String> {
-    let mut data = load_keychain_data();
-    data.connections.retain(|e| e.name != name);
-    if data.default == name {
-        data.default.clear();
-    }
-    save_keychain_data(&data)
+    update_store(|data| {
+        data.connections.retain(|e| e.name != name);
+        if data.default == name {
+            data.default.clear();
+        }
+    })
 }
 
 fn get_default_connection() -> Option<String> {
@@ -619,9 +704,7 @@ fn get_default_connection() -> Option<String> {
 }
 
 fn set_default_connection(name: &str) -> Result<(), String> {
-    let mut data = load_keychain_data();
-    data.default = name.to_string();
-    save_keychain_data(&data)
+    update_store(|data| data.default = name.to_string())
 }
 
 /// A value as it is written in an `application/x-www-form-urlencoded` body:
@@ -2504,7 +2587,12 @@ impl ConnectionFlow {
 
     fn test_picker_connection_animated(&mut self, env: &SavedConnection, stdout: &mut io::Stdout) -> io::Result<Option<(BackgroundLoadResult, Config)>> {
         let mut test_config = Config::default();
-        apply_connection_to_config(&mut test_config, env);
+        if let Err(e) = apply_connection_to_config(&mut test_config, env) {
+            // Said where a failed connection test is said; the picker stays.
+            self.picker_error_msg = Some(format!("{}: {}", env.name, e));
+            self.picker_error_clear_at = Some(Instant::now() + Duration::from_secs(3));
+            return Ok(None);
+        }
         let resolved_config = test_config.clone();
         let env_name = env.name.clone();
 
@@ -2672,28 +2760,10 @@ impl ConnectionFlow {
         match &self.setup_active_field {
             SetupField::Url => match key.code {
                 KeyCode::Enter if !self.setup_url.is_empty() => {
-                    // Add scheme if not present
-                    if !self.setup_url.starts_with("http://") && !self.setup_url.starts_with("https://") {
-                        if self.setup_url.starts_with("localhost") || self.setup_url.starts_with("127.0.0.1") || self.setup_url.starts_with("[::1]") || self.setup_url.contains(':') {
-                            self.setup_url = format!("http://{}", self.setup_url);
-                        } else {
-                            self.setup_url = format!("https://{}", self.setup_url);
-                        }
-                    }
-                    // Strip /api/v1 and anything after - we only need base URL
-                    // Strip path suffixes - we only need base URL
-                    let trimmed = if let Some(idx) = self.setup_url.find("/api/v1") {
-                        self.setup_url.truncate(idx);
-                        true
-                    } else if let Some(idx) = self.setup_url.find("/api") {
-                        self.setup_url.truncate(idx);
-                        true
-                    } else if self.setup_url.ends_with("/") {
-                        self.setup_url.pop();
-                        true
-                    } else {
-                        false
-                    };
+                    // Scheme added, and the API prefix cut: only the base URL
+                    // is kept, read the way `-b` reads it.
+                    let (base_url, trimmed) = base_url_of(&self.setup_url);
+                    self.setup_url = base_url;
                     if trimmed {
                         self.setup_status = "trimmed to base URL".dimmed().to_string();
                         self.setup_status_clear_at = Some(Instant::now() + Duration::from_secs(3));
@@ -2925,18 +2995,60 @@ impl ConnectionFlow {
     }
 }
 
-/// Add a scheme to a bare base URI: http for localhost/127.0.0.1 or anything
-/// carrying an explicit port, https for everything else. Already-schemed URIs
-/// pass through untouched.
-fn normalize_base_uri(uri: &str) -> String {
-    if uri.starts_with("http://") || uri.starts_with("https://") {
-        return uri.to_string();
-    }
-    if uri.starts_with("localhost") || uri.starts_with("127.0.0.1") || uri.contains(':') {
-        format!("http://{}", uri)
+/// A base URL as the client keeps it, from what was typed for one, and
+/// whether a path was cut off it.
+///
+/// - The scheme is read in any case (`HTTP://host`) and kept in lower case.
+///   Without one it is `http` for `localhost`, an IP address, or a host with
+///   an explicit port, and `https` for everything else.
+/// - The API prefix is not part of the base: `/api`, `/api/v1` and whatever
+///   follows are cut, and so is a trailing slash. Only a path component is
+///   cut, so the `api` of `api.example.com` stays.
+fn base_url_of(text: &str) -> (String, bool) {
+    let text = text.trim();
+    let lower = text.to_ascii_lowercase();
+    let (scheme, rest) = if lower.starts_with("https://") {
+        (Some("https://"), &text[8..])
+    } else if lower.starts_with("http://") {
+        (Some("http://"), &text[7..])
     } else {
-        format!("https://{}", uri)
+        (None, text)
+    };
+    let (host, path) = match rest.find('/') {
+        Some(at) => rest.split_at(at),
+        None => (rest, ""),
+    };
+    // The first `/api` that is a whole path component, and all after it.
+    let mut kept = path;
+    let mut from = 0;
+    while let Some(found) = path[from..].find("/api") {
+        let at = from + found;
+        let after = &path[at + 4..];
+        if after.is_empty() || after.starts_with('/') {
+            kept = &path[..at];
+            break;
+        }
+        from = at + 4;
     }
+    let kept = kept.trim_end_matches('/');
+    let scheme = scheme.unwrap_or(if host_is_local(host) { "http://" } else { "https://" });
+    (format!("{}{}{}", scheme, host, kept), kept.len() != path.len())
+}
+
+/// Whether a host written without a scheme is one to reach over plain
+/// `http`: `localhost`, an IP address, or anything with an explicit port.
+fn host_is_local(host: &str) -> bool {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host.starts_with('[')
+        || bare.parse::<std::net::IpAddr>().is_ok()
+        || host.contains(':')
+}
+
+/// The base URL for what was given as one, on the command line or in a saved
+/// connection. See `base_url_of`.
+fn normalize_base_uri(uri: &str) -> String {
+    base_url_of(uri).0
 }
 
 /// Bail out when there's no host to send to. Without this the request goes to a
@@ -2949,8 +3061,16 @@ fn require_base_uri(config: &Config) {
     }
 }
 
-// Apply a saved connection to a Config
-fn apply_connection_to_config(config: &mut Config, env: &SavedConnection) {
+/// Point `config` at a saved connection: its URL and its credentials, and
+/// nothing else. Flags (`-i`, `--timeout`, `-f`, `--export`…) are the
+/// session's and stay as they are.
+///
+/// An OAuth2 connection exchanges its client credentials for a token here.
+/// When that fails the URL and the client credentials are still set, so a
+/// later request can renew the token; `Err` says why there is none yet. It is
+/// the caller's to decide what a failure means: a batch ends, the prompt and
+/// the connection picker say so and stay.
+fn apply_connection_to_config(config: &mut Config, env: &SavedConnection) -> Result<(), String> {
     config.base_uri = normalize_base_uri(&env.url);
     // Only an OAuth2 connection has credentials to renew a token with.
     config.oauth2_client_id.clear();
@@ -2961,19 +3081,13 @@ fn apply_connection_to_config(config: &mut Config, env: &SavedConnection) {
             config.api_key = String::new();
         }
         "oauth2" => {
-            // Exchange for token at startup
-            match oauth2_token_exchange(&config.base_uri, &env.client_id, &env.credential) {
-                Ok((token, _expires)) => {
-                    config.token = token;
-                    config.api_key = String::new();
-                    config.oauth2_client_id = env.client_id.clone();
-                    config.oauth2_client_secret = env.credential.clone();
-                }
-                Err(e) => {
-                    eprintln!("OAuth2 token exchange failed: {}", e);
-                    exit_process(1);
-                }
-            }
+            config.api_key = String::new();
+            config.token = String::new();
+            config.oauth2_client_id = env.client_id.clone();
+            config.oauth2_client_secret = env.credential.clone();
+            let (token, _expires) = oauth2_token_exchange(&config.base_uri, &env.client_id, &env.credential)
+                .map_err(|e| format!("OAuth2 token exchange failed: {}", e))?;
+            config.token = token;
         }
         _ => {
             // "key" or anything else
@@ -2981,6 +3095,47 @@ fn apply_connection_to_config(config: &mut Config, env: &SavedConnection) {
             config.token = String::new();
         }
     }
+    Ok(())
+}
+
+/// Take over the connection another config holds (URL and credentials) and
+/// leave everything else in `config` alone.
+fn adopt_connection(config: &mut Config, from: &Config) {
+    config.base_uri = from.base_uri.clone();
+    config.api_key = from.api_key.clone();
+    config.token = from.token.clone();
+    config.oauth2_client_id = from.oauth2_client_id.clone();
+    config.oauth2_client_secret = from.oauth2_client_secret.clone();
+}
+
+/// Switch `config` to a connection the connection dialog returned. The
+/// dialog has usually connected already and hands back what it resolved (a
+/// token exchanged once, not twice); otherwise the connection is applied.
+fn connect(config: &mut Config, env: &SavedConnection, resolved: Option<Config>) -> Result<(), String> {
+    match resolved {
+        Some(resolved) => {
+            adopt_connection(config, &resolved);
+            Ok(())
+        }
+        None => apply_connection_to_config(config, env),
+    }
+}
+
+/// A saved connection with what the command line gave in its place: `-b`
+/// for its URL, `-k` or `--token` for its credential. The flags win, so one
+/// saved connection can be used with another key, or against another host.
+fn override_connection(env: &SavedConnection, url: Option<&str>, key: Option<&str>, token: Option<&str>) -> SavedConnection {
+    let mut env = env.clone();
+    if let Some(url) = url {
+        env.url = url.to_string();
+    }
+    let given = token.map(|t| ("token", t)).or(key.map(|k| ("key", k)));
+    if let Some((auth_type, credential)) = given {
+        env.auth_type = auth_type.to_string();
+        env.credential = credential.to_string();
+        env.client_id.clear();
+    }
+    env
 }
 
 fn main() {
@@ -3090,10 +3245,10 @@ fn main() {
     let op_selector = args.one_password;
     if op_selector.is_none() {
         // Set auth from args (only when not using 1Password)
-        if let Some(key) = args.key {
+        if let Some(key) = args.key.clone() {
             config.api_key = key;
         }
-        if let Some(token) = args.token {
+        if let Some(token) = args.token.clone() {
             config.token = token;
         }
     }
@@ -3183,48 +3338,45 @@ fn main() {
         }
     }
 
+    // Whether this run opens the prompt: no request, no file, no program
+    // line. Only then may a dialog be shown; a batch never opens one.
+    let wants_prompt = uri.is_empty() && args.all.is_none() && program_line.is_none();
+
     // Handle -c flag: load saved connection by alias or URL
     if let Some(ref connection_selector) = args.connection {
         let envs = list_connections();
-        let mut found = false;
-        // Try exact alias match first
-        for name in &envs {
-            if name == connection_selector {
-                if let Some(env) = load_connection(name) {
-                    apply_connection_to_config(&mut config, &env);
-                    loaded_connection_alias = name.clone();
-                    found = true;
-                    break;
-                }
-            }
-        }
-        // Try URL match if no alias match
-        if !found {
-            for name in &envs {
-                if let Some(env) = load_connection(name) {
-                    let url_bare = env.url.trim_start_matches("https://").trim_start_matches("http://");
-                    if env.url == *connection_selector || url_bare == *connection_selector {
-                        apply_connection_to_config(&mut config, &env);
-                        loaded_connection_alias = name.clone();
-                        found = true;
-                        break;
-                    }
-                }
-            }
-        }
-        if !found {
+        // An exact alias first, then a URL, with or without its scheme.
+        let by_alias = envs.iter().find(|name| *name == connection_selector).and_then(|name| load_connection(name));
+        let found = by_alias.or_else(|| {
+            envs.iter().filter_map(|name| load_connection(name)).find(|env| {
+                let url_bare = env.url.trim_start_matches("https://").trim_start_matches("http://");
+                env.url == *connection_selector || url_bare == *connection_selector
+            })
+        });
+        let Some(env) = found else {
             eprintln!("Connection \"{}\" not found. Saved connections: {}", connection_selector,
                 if envs.is_empty() { "none".to_string() } else { envs.join(", ") });
             exit_process(1);
+        };
+        loaded_connection_alias = env.name.clone();
+        // `-b`, `-k` and `--token` win over what the connection has stored.
+        let env = override_connection(&env, args.base_uri.as_deref(), args.key.as_deref(), args.token.as_deref());
+        if let Err(e) = apply_connection_to_config(&mut config, &env) {
+            eprintln!("{}", e);
+            // The prompt opens all the same, where another connection can
+            // be picked; a batch has nothing to run against.
+            if !(wants_prompt && io::stdout().is_terminal()) {
+                exit_process(1);
+            }
         }
         // Show UI immediately with async loading (like 1P and picker)
-        if !loaded_connection_alias.is_empty() && uri.is_empty() && io::stdout().is_terminal() {
+        if !loaded_connection_alias.is_empty() && wants_prompt && io::stdout().is_terminal() {
             connecting_to = Some(loaded_connection_alias.clone());
         }
     }
 
     // If -b provided without auth, go straight to setup with URL pre-filled
-    if has_explicit_uri && !has_explicit_auth && uri.is_empty() && io::stdout().is_terminal() {
+    if has_explicit_uri && !has_explicit_auth && args.connection.is_none() && wants_prompt && io::stdout().is_terminal() {
         let (term_width, _) = terminal::size().unwrap_or((80, 24));
         let envs: Vec<String> = Vec::new();
         let mut flow = ConnectionFlow::for_startup(&envs, term_width, true);
@@ -3242,10 +3394,8 @@ fn main() {
                 if env.auth_type == "oauth2" {
                     oauth2_creds = Some((env.client_id.clone(), env.credential.clone()));
                 }
-                if let Some(rc) = resolved_config {
-                    config = rc;
-                } else {
-                    apply_connection_to_config(&mut config, &env);
+                if let Err(e) = connect(&mut config, &env, resolved_config) {
+                    eprintln!("{}\r", e);
                 }
 
                 // Stay on form with animated spinner while loading
@@ -3315,10 +3465,15 @@ fn main() {
                         config.base_uri = normalize_base_uri(&env.url);
                     } else {
                         loaded_connection_alias = env.name.clone();
-                        apply_connection_to_config(&mut config, &env);
+                        if let Err(e) = apply_connection_to_config(&mut config, &env) {
+                            eprintln!("{}", e);
+                            if !(wants_prompt && io::stdout().is_terminal()) {
+                                exit_process(1);
+                            }
+                        }
                     }
                 }
-            } else if !has_explicit_auth && uri.is_empty() && io::stdout().is_terminal() {
+            } else if !has_explicit_auth && wants_prompt && io::stdout().is_terminal() {
                 // No default set + interactive: show unified connection flow
                 let (term_width, _) = terminal::size().unwrap_or((80, 24));
                 let mut flow = ConnectionFlow::for_startup(&envs, term_width, true);
@@ -3339,10 +3494,8 @@ fn main() {
                             oauth2_creds = Some((env.client_id.clone(), env.credential.clone()));
                         }
                         // Use resolved config if available (avoids duplicate token exchange)
-                        if let Some(rc) = resolved_config {
-                            config = rc;
-                        } else {
-                            apply_connection_to_config(&mut config, &env);
+                        if let Err(e) = connect(&mut config, &env, resolved_config) {
+                            eprintln!("{}\r", e);
                         }
 
                         // Stay on form with animated spinner while loading
@@ -3392,7 +3545,7 @@ fn main() {
                     }
                 }
             }
-        } else if !has_explicit_auth && uri.is_empty() && io::stdout().is_terminal() {
+        } else if !has_explicit_auth && wants_prompt && io::stdout().is_terminal() {
             // No saved connections + interactive: show unified connection flow (setup only)
             let (term_width, _) = terminal::size().unwrap_or((80, 24));
             let envs: Vec<String> = Vec::new();
@@ -3410,10 +3563,8 @@ fn main() {
                     }
 
                     // Apply config first so splash shows correct URL
-                    if let Some(rc) = resolved_config {
-                        config = rc;
-                    } else {
-                        apply_connection_to_config(&mut config, &env);
+                    if let Err(e) = connect(&mut config, &env, resolved_config) {
+                        eprintln!("{}\r", e);
                     }
 
                     // Stay on form with animated spinner while loading
@@ -8606,13 +8757,10 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
 
                 match flow.run(&mut stdout) {
                     Ok(ConnectionFlowResult::Connected(env, preloaded, resolved_config)) => {
-                        let new_config = if let Some(rc) = resolved_config {
-                            rc
-                        } else {
-                            let mut nc = config.clone();
-                            apply_connection_to_config(&mut nc, &env);
-                            nc
-                        };
+                        // The session's flags stay; only the connection is new.
+                        // A failed token exchange shows when the load below fails.
+                        let mut new_config = config.clone();
+                        let _ = connect(&mut new_config, &env, resolved_config);
                         // Stay on form with animated spinner while loading
                         let new_result = if let Some(pre) = preloaded {
                             pre
@@ -11919,11 +12067,6 @@ fn handle_save_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io::
         ("key".to_string(), state.config.api_key.clone(), String::new())
     };
 
-    // If alias changed, delete old entry
-    if !state.connection_alias.is_empty() && name != state.connection_alias {
-        let _ = delete_connection(&state.connection_alias);
-    }
-
     let env = SavedConnection {
         name: name.clone(),
         url: state.config.base_uri.clone(),
@@ -11932,7 +12075,10 @@ fn handle_save_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io::
         client_id,
     };
 
-    match save_connection(&env) {
+    // Saved under a new name, the connection is renamed: the old entry goes
+    // and its default flag moves with it.
+    let replaces = (!state.connection_alias.is_empty()).then(|| state.connection_alias.clone());
+    match save_connection(&env, replaces.as_deref()) {
         Ok(()) => {
             state.connection_alias = name.clone();
             state.status_msg = format!("connection {} saved", name);
@@ -11954,7 +12100,8 @@ fn handle_save_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io::
 fn handle_switch_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<Option<std::sync::mpsc::Receiver<BackgroundLoadResult>>> {
     let envs = list_connections();
     if envs.is_empty() {
-        state.status_msg = "no saved connections".to_string();
+        // A store that could not be read is not the same as none saved.
+        state.status_msg = store_problem().unwrap_or_else(|| "no saved connections".to_string());
         state.status_msg_at = Some(Instant::now());
         render(stdout, state)?;
         return Ok(None);
@@ -11987,20 +12134,11 @@ fn handle_switch_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io
             }
             state.status_msg_at = Some(Instant::now());
 
-            // Store OAuth2 credentials for token refresh
-            if env.auth_type == "oauth2" {
-                state.config.oauth2_client_id = env.client_id.clone();
-                state.config.oauth2_client_secret = env.credential.clone();
-            } else {
-                state.config.oauth2_client_id.clear();
-                state.config.oauth2_client_secret.clear();
-            }
-
-            // Use resolved config if available (avoids duplicate token exchange)
-            if let Some(rc) = resolved_config {
-                state.config = rc;
-            } else {
-                apply_connection_to_config(&mut state.config, &env);
+            // Only the connection changes: the session keeps its flags
+            // (`-i`, `--timeout`, `-f`, `--export`, streaming…).
+            if let Err(e) = connect(&mut state.config, &env, resolved_config) {
+                state.status_msg = e;
+                state.status_msg_at = Some(Instant::now());
             }
 
             // Use preloaded result if available, otherwise load now
@@ -17382,6 +17520,188 @@ mod tests {
         // An assert may not write anywhere, and says that first.
         assert!(split_bulk_requests(r#"assert PUT /x {"a":"b > c"}"#, None).is_ok());
         assert!(split_bulk_requests("assert GET /x > o.json", None).unwrap_err().contains("can't write to a file"));
+    }
+
+    #[test]
+    fn a_base_url_gets_its_scheme_and_loses_the_api_prefix() {
+        // (typed, base URL, whether a path was cut)
+        let cases = [
+            ("http://localhost:5000", "http://localhost:5000", false),
+            ("https://cos.example.com", "https://cos.example.com", false),
+            // The scheme in any case, kept in lower case.
+            ("HTTP://host", "http://host", false),
+            ("Https://Host.Example.com", "https://Host.Example.com", false),
+            // No scheme: http for localhost, an IP, or an explicit port.
+            ("localhost", "http://localhost", false),
+            ("LOCALHOST:5000", "http://LOCALHOST:5000", false),
+            ("127.0.0.1", "http://127.0.0.1", false),
+            ("10.0.0.5", "http://10.0.0.5", false),
+            ("[::1]:5000", "http://[::1]:5000", false),
+            ("example.com:8080", "http://example.com:8080", false),
+            ("cos.example.com", "https://cos.example.com", false),
+            ("localhost.example.com", "https://localhost.example.com", false),
+            // The API prefix and what follows it are not part of the base.
+            ("host/api/v1", "https://host", true),
+            ("http://host:5000/api/v1/people", "http://host:5000", true),
+            ("https://host/api", "https://host", true),
+            ("https://host/", "https://host", true),
+            ("https://host/tenant/api/v1", "https://host/tenant", true),
+            ("https://host/tenant", "https://host/tenant", false),
+            // Only a path component: the host's own `api` stays.
+            ("api.example.com", "https://api.example.com", false),
+            ("https://api.example.com/api/v1", "https://api.example.com", true),
+            ("https://host/apiary", "https://host/apiary", false),
+            ("https://host/apiary/api/v1", "https://host/apiary", true),
+        ];
+        for (typed, base, trimmed) in cases {
+            assert_eq!(base_url_of(typed), (base.to_string(), trimmed), "{typed}");
+            assert_eq!(normalize_base_uri(typed), base, "{typed}");
+            // What it gives is a base URL already.
+            assert_eq!(base_url_of(base), (base.to_string(), false), "{base}");
+        }
+    }
+
+    #[test]
+    fn command_line_flags_win_over_a_saved_connection() {
+        let saved = |auth_type: &str, client_id: &str| SavedConnection {
+            name: "local".to_string(),
+            url: "http://localhost:5000".to_string(),
+            auth_type: auth_type.to_string(),
+            credential: "STORED".to_string(),
+            client_id: client_id.to_string(),
+        };
+        let shape = |env: SavedConnection| (env.url, env.auth_type, env.credential, env.client_id);
+        let s = |v: &str| v.to_string();
+        let stored = (s("http://localhost:5000"), s("key"), s("STORED"), s(""));
+        assert_eq!(shape(override_connection(&saved("key", ""), None, None, None)), stored);
+        assert_eq!(
+            shape(override_connection(&saved("key", ""), None, Some("CLI"), None)),
+            (s("http://localhost:5000"), s("key"), s("CLI"), s(""))
+        );
+        assert_eq!(
+            shape(override_connection(&saved("key", ""), None, None, Some("T"))),
+            (s("http://localhost:5000"), s("token"), s("T"), s(""))
+        );
+        // A key over an OAuth2 connection: no client credentials are left
+        // to exchange, so the key is what is sent.
+        assert_eq!(
+            shape(override_connection(&saved("oauth2", "id"), None, Some("CLI"), None)),
+            (s("http://localhost:5000"), s("key"), s("CLI"), s(""))
+        );
+        // Another host with the stored credential, whatever its kind.
+        assert_eq!(
+            shape(override_connection(&saved("oauth2", "id"), Some("http://other"), None, None)),
+            (s("http://other"), s("oauth2"), s("STORED"), s("id"))
+        );
+        // Applied, a key connection leaves no token and no client credentials.
+        let mut config = Config { token: "old".to_string(), oauth2_client_id: "x".to_string(), ..Config::default() };
+        apply_connection_to_config(&mut config, &override_connection(&saved("oauth2", "id"), None, Some("CLI"), None)).unwrap();
+        assert_eq!((config.api_key.as_str(), config.token.as_str(), config.oauth2_client_id.as_str()), ("CLI", "", ""));
+        assert_eq!(auth_header(&config), Some(format!("Basic {}", BASE64.encode(":CLI"))));
+    }
+
+    #[test]
+    fn switching_connection_keeps_the_sessions_flags() {
+        let mut config = Config {
+            include_nulls: true,
+            fail_fast: true,
+            timeout_secs: 7,
+            export_id: Some("com.heads.seedID".to_string()),
+            api_key: "old".to_string(),
+            ..Config::default()
+        };
+        let picked = Config { base_uri: "http://other".to_string(), token: "tok".to_string(), ..Config::default() };
+        adopt_connection(&mut config, &picked);
+        assert_eq!((config.base_uri.as_str(), config.token.as_str(), config.api_key.as_str()), ("http://other", "tok", ""));
+        assert!(config.include_nulls && config.fail_fast);
+        assert_eq!((config.timeout_secs, config.export_id.as_deref()), (7, Some("com.heads.seedID")));
+    }
+
+    #[test]
+    fn a_store_that_cannot_be_read_is_not_an_empty_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+
+        // Not there yet: empty, and fine to write.
+        assert!(read_store_file(&path).unwrap().connections.is_empty());
+        // Created but never written to: the same.
+        fs::write(&path, " \n").unwrap();
+        assert!(read_store_file(&path).unwrap().connections.is_empty());
+
+        // `client_id` and `default` may be left out.
+        fs::write(&path, r#"{"connections":[{"name":"a","url":"http://x","auth_type":"key","credential":"k"}]}"#).unwrap();
+        let data = read_store_file(&path).unwrap();
+        assert_eq!((data.connections.len(), data.connections[0].client_id.as_str(), data.default.as_str()), (1, "", ""));
+
+        // One trailing comma: an error that names the file, not an empty store.
+        let broken = r#"{"connections":[{"name":"keep","url":"http://x","auth_type":"key","credential":"SECRET","client_id":""},],"default":"keep"}"#;
+        fs::write(&path, broken).unwrap();
+        let err = read_store_file(&path).unwrap_err();
+        assert!(err.starts_with(&format!("could not read {}: ", path.display())), "{err}");
+        // A directory where the file should be: an error too.
+        assert!(read_store_file(dir.path()).is_err());
+    }
+
+    #[test]
+    fn the_store_is_written_whole_and_keeps_its_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        let connection = |name: &str| SavedConnection {
+            name: name.to_string(),
+            url: "http://x".to_string(),
+            auth_type: "key".to_string(),
+            credential: "k".to_string(),
+            client_id: String::new(),
+        };
+        let mut data = KeychainData::default();
+        put_connection(&mut data, &connection("a"), None);
+        write_store_file(&path, &data).unwrap();
+        assert_eq!(read_store_file(&path).unwrap().connections.len(), 1);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            put_connection(&mut data, &connection("b"), None);
+            write_store_file(&path, &data).unwrap();
+            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        // Nothing is left beside it.
+        let names: Vec<String> =
+            fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+        assert_eq!(names, ["credentials.json"]);
+    }
+
+    #[test]
+    fn saving_under_a_new_name_renames_and_keeps_the_default() {
+        let connection = |name: &str, credential: &str| SavedConnection {
+            name: name.to_string(),
+            url: "http://x".to_string(),
+            auth_type: "key".to_string(),
+            credential: credential.to_string(),
+            client_id: String::new(),
+        };
+        let names = |data: &KeychainData| data.connections.iter().map(|e| e.name.clone()).collect::<Vec<_>>();
+        let mut data = KeychainData::default();
+        put_connection(&mut data, &connection("a", "1"), None);
+        put_connection(&mut data, &connection("b", "1"), None);
+        data.default = "a".to_string();
+
+        // The same name: replaced in place.
+        put_connection(&mut data, &connection("a", "2"), Some("a"));
+        assert_eq!((names(&data), data.connections[0].credential.as_str(), data.default.as_str()), (vec!["a".to_string(), "b".to_string()], "2", "a"));
+
+        // A new name: the old entry goes and the default follows.
+        put_connection(&mut data, &connection("c", "3"), Some("a"));
+        assert_eq!((names(&data), data.default.as_str()), (vec!["b".to_string(), "c".to_string()], "c"));
+
+        // Renaming one that was not the default leaves the default alone.
+        put_connection(&mut data, &connection("d", "4"), Some("b"));
+        assert_eq!((names(&data), data.default.as_str()), (vec!["c".to_string(), "d".to_string()], "c"));
+
+        // Onto a name that exists: that entry is replaced, not doubled.
+        put_connection(&mut data, &connection("c", "5"), Some("d"));
+        assert_eq!((names(&data), data.connections[0].credential.as_str()), (vec!["c".to_string()], "5"));
     }
 
     #[test]

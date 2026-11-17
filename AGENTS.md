@@ -1008,9 +1008,11 @@ ignores the variable entirely.
   `client_id`; the client exchanges them for a token at startup, and again
   when a request is answered `401` because the token ran out. That request is
   then sent once more, unchanged, in a batch as at the prompt.
-- For `"key"` and `"token"`, leave `client_id` as `""`.
-- A `url` without a scheme gets one inferred: `http` for localhost, an IP, or
-  anything with an explicit port; `https` otherwise.
+- For `"key"` and `"token"`, `client_id` is `""` or left out.
+- A `url` without a scheme gets one inferred: `http` for `localhost`, an IP
+  address, or anything with an explicit port; `https` otherwise. A scheme is
+  read in any case, and a trailing `/`, `/api` or `/api/v1` is dropped, here
+  and for `-b`: the base URL is the host, not the API path.
 
 **Using it.** With a `default` set, no connection flags are needed at all:
 
@@ -1022,7 +1024,14 @@ api --no-keychain -k "$API_KEY" GET /people    # URL from file, key from the CLI
 ```
 
 A `-k`/`--token` on the command line overrides the stored credential but keeps
-the file's URL, so one file can serve several keys. `-b` overrides the URL.
+the file's URL, so one file can serve several keys. `-b` overrides the URL and
+keeps the stored credential. Both hold for the default connection and for one
+chosen with `-c`: what the command line gives always wins.
+
+```sh
+api --no-keychain -c staging -k "$OTHER_KEY" GET /people      # staging's URL, another key
+api --no-keychain -c staging -b http://localhost:5000 GET /people   # staging's credential, another host
+```
 
 **No file at all** is also fine — pass both parts explicitly and nothing is read
 or written:
@@ -1031,15 +1040,25 @@ or written:
 api --no-keychain -b https://cos.example.com -k "$API_KEY" -sa seed.api
 ```
 
-**Failure mode to know.** A missing, unreadable, or malformed file is treated as
-*empty*, not as an error. There is no warning about the bad file; you get:
+**Failure modes to know.** A file that does not exist is an empty store, with
+no warning: without `-b` you get
 
 ```
 Error: no base URL specified. Use -b <url> or -c <connection>.
 ```
 
-If you see that while expecting the file to work, check the path, the JSON
-syntax, and that `--no-keychain` was actually passed.
+If you see that while expecting the file to work, check the path and that
+`--no-keychain` was actually passed.
+
+A file that exists but can't be read, or is not valid (a trailing comma is
+enough), is said to be so and is not used:
+
+```
+WARNING: could not read /run/secrets/api-credentials.json: it is not what the client wrote there (trailing comma at line 1 column 105). No saved connection is used.
+```
+
+Such a file is never written over. Saving a connection from the prompt
+(`ctrl+s`) is refused with the same reason until the file is fixed or removed.
 
 **Security.** The file is plaintext and is created with your default umask
 (commonly world-readable `0644`) — the client does not restrict it. Keep real
@@ -1145,7 +1164,7 @@ Run it: `api -sa workshop.api`.
 - **A slashless URI on its own line in a `.api` file** → `api/v1/people` alone is read as an *include* path and fails with "could not read include". Write `GET api/v1/people`, or lead with the slash: `/api/v1/people`.
 - **`sleep while` that never ends** → `[]` and `{}` are truthy, so `sleep while GET /people~where(x)` loops forever once the list is merely empty. Poll a `~count` (or a single scalar field) instead, so the answer can become `0`/`null`.
 - **`https://` to a server with a self-signed or private certificate** → `The certificate of <host> is not trusted: it is not signed by a public certificate authority.` The client trusts the public authorities compiled into it and nothing from the machine, so such a certificate can't be made to pass; use `http://` for a local server. `Is COS running on <host>?` is kept for a host that did not answer at all.
-- **`API_CREDENTIALS_FILE` without `--no-keychain`** → the variable is ignored and the keychain is read instead. A bad path or malformed credentials file fails the same silent way: no warning, just `Error: no base URL specified`.
+- **`API_CREDENTIALS_FILE` without `--no-keychain`** → the variable is ignored and the keychain is read instead. A path that names no file fails as silently: no warning, just `Error: no base URL specified`. A file that is there but malformed is reported (`WARNING: could not read …`).
 
 ## 11. Tips for agents
 

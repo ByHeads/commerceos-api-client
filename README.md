@@ -298,8 +298,8 @@ the URI inserts it verbatim and promotes the method. `ctrl+y` copies the last re
 | `ctrl+b` | Open API docs in the browser |
 | `ctrl+t` | Toggle streaming |
 | `ctrl+r` | Toggle export mode; asks for the external identifier name the first time |
-| `ctrl+s` | Save connection |
-| `ctrl+q` | Switch connection |
+| `ctrl+s` | Save connection; under a new name it is renamed, and stays the default if it was |
+| `ctrl+q` | Switch connection; the flags the session was started with (`-i`, `-f`, `--timeout`, `--export`…) stay |
 | `ctrl+c` | Quit (press twice) |
 
 ## Connections and authentication
@@ -308,6 +308,9 @@ the URI inserts it verbatim and promotes the method. `ctrl+y` copies the last re
 - With neither, the client prompts for credentials; `ctrl+s` saves the connection, `ctrl+q` switches.
 - `-c alias` (or `-c url`) picks a saved connection: `api -c staging GET /people`.
 - A key or token without `-b` uses the default saved connection's URL.
+- `-k`, `--token` and `-b` win over what a saved connection has stored, with `-c` too:
+  `api -c staging -k OTHERKEY GET /people`.
+- An OAuth2 connection renews its token when it runs out, at the prompt and in a batch.
 - Credentials live in the OS keychain. `--no-keychain` uses a plaintext JSON file instead
   (`API_CREDENTIALS_FILE`, else `./.api-credentials.json`), for CI and agents. See `AGENTS.md`.
 
