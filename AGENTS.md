@@ -151,7 +151,7 @@ GET /people > clipboard                  # system clipboard, case-insensitive
   disk) is reported as `Error writing to <path>: …`. For a single request and
   under `-f` that is exit 1; a chain stops there; a plain batch line is
   reported and the next line runs, as after a failed request.
-- `~/` expands to the home directory.
+- `~/` expands to the home directory (on Windows `~\` does too).
 - `>> file` appends by content: JSON is spliced into one array, `.ndjson`/`.njson`
   targets get one compact object per line, `.csv` appends drop the duplicate
   header row, anything else is text-appended. `>> clipboard` is rejected
@@ -646,6 +646,8 @@ confirm Ready to deploy to production?
 POST /deploy { "go": true }
 ```
 
+- Everything after `confirm` on the line is the message, a `&&` or `||`
+  included: `confirm Seed a && b?` asks exactly that, and is not a chain.
 - Enter, `y`, or `yes` continues; anything else prints `aborted` and stops the
   batch with exit 0 (the user declined, so it's not a failure).
 - In `-sa` mode the confirm line is echoed, then the prompt appears on stderr.

@@ -4056,16 +4056,24 @@ fn op_stderr_detail(output: &std::process::Output) -> String {
     }
 }
 
+/// Whether `program` can be started at all: found on the `PATH` and
+/// runnable. What it then does with `--version` is not asked.
+fn command_exists(program: &str) -> bool {
+    use std::process::Stdio;
+    Command::new(program)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
+}
+
 fn get_1password_credentials(selector: &str) -> Result<(String, String), String> {
-    // Check if op command exists. `which` exits non-zero when it isn't found, so
-    // the exit status is what matters — `output()` itself only fails if `which`
-    // is missing, which would let a missing `op` through.
-    let has_op = Command::new("which")
-        .arg("op")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !has_op {
+    // Check that the `op` command is there by running it: that it can't be
+    // started is the answer, on every platform (there is no `which` to ask
+    // on Windows).
+    if !command_exists("op") {
         return Err("1Password CLI is required for this option (try: brew install 1password-cli)".to_string());
     }
 
@@ -4144,7 +4152,9 @@ fn get_1password_credentials(selector: &str) -> Result<(String, String), String>
                 ));
             }
 
-            return Ok((url.to_string(), api_key));
+            // A URL from 1Password is read as one given with `-b`: it may
+            // come without a scheme, or with the API prefix.
+            return Ok((normalize_base_uri(url), api_key));
         } else {
             current = current
                 .get(part)
@@ -6718,10 +6728,9 @@ fn resolve_import_dir(
             format!("import {}: `path` must be a relative path inside the import", alias)
         })?),
         None => {
-            let expanded = match (raw.strip_prefix("~/"), dirs::home_dir()) {
-                (Some(rest), Some(home)) => home.join(rest),
-                _ if raw == "~" => dirs::home_dir().unwrap_or_else(|| PathBuf::from(raw)),
-                _ => PathBuf::from(raw),
+            let expanded = match dirs::home_dir() {
+                Some(home) if raw == "~" => home,
+                _ => PathBuf::from(expand_home(raw)),
             };
             match base_dir {
                 Some(base) if expanded.is_relative() => base.join(expanded),
@@ -6890,8 +6899,15 @@ fn rebase_at_body(
 /// An include that starts with a declared alias (`cl/sv.api`): the repository
 /// it names and the path inside it.
 fn alias_include<'a>(spec: &'a str, aliases: &'a ImportAliases) -> Option<(&'a ImportedRepo, &'a str)> {
-    let (alias, rest) = spec.split_once('/')?;
+    let (alias, rest) = split_alias(spec, cfg!(windows))?;
     aliases.get(alias).map(|repo| (repo, rest))
+}
+
+/// `alias/rest` as its two parts. Where `\` separates a path too (Windows),
+/// `alias\rest` is the same include.
+fn split_alias(spec: &str, backslash_separates: bool) -> Option<(&str, &str)> {
+    let at = spec.find(|c: char| c == '/' || (backslash_separates && c == '\\'))?;
+    Some((&spec[..at], &spec[at + 1..]))
 }
 
 /// Refuse an include that an imported file (or an alias path) points outside
@@ -7906,9 +7922,11 @@ fn note_last_block(state: &mut AppState, stdout: &mut io::Stdout, note: &str) ->
 /// at a terminal, nobody agreed. That, like a read error, prints an abort
 /// message and exits 1 with nothing sent. A decline returns false (exit 0).
 /// The terminal a question is asked on when there is one, whatever stdin is:
-/// `/dev/tty`. Without it the answer is read from stdin.
+/// `/dev/tty`, or `CONIN$` on Windows. Without it the answer is read from
+/// stdin.
 fn open_answer_terminal() -> io::Result<fs::File> {
-    fs::File::open("/dev/tty")
+    // The console's input, whatever stdin was redirected to.
+    fs::File::open(if cfg!(windows) { "CONIN$" } else { "/dev/tty" })
 }
 
 /// Whether a `confirm` or a `-p` can be answered at a terminal, so that stdin
@@ -8396,13 +8414,18 @@ fn auth_header(config: &Config) -> Option<String> {
 /// `~/x` as a path in the home directory (`~\\x` too on Windows); anything
 /// else as it is.
 fn expand_home(path: &str) -> String {
-    let rest = path
-        .strip_prefix("~/")
-        .or_else(|| if cfg!(windows) { path.strip_prefix("~\\") } else { None });
-    match (rest, dirs::home_dir()) {
+    match (home_relative(path, cfg!(windows)), dirs::home_dir()) {
         (Some(rest), Some(home)) => home.join(rest).to_string_lossy().into_owned(),
         _ => path.to_string(),
     }
+}
+
+/// What follows the `~/` of a path in the home directory, or the `~\` where
+/// `\` separates a path too (Windows). `None` for any other path: a `~`
+/// elsewhere in a path, or `~user`, is not expanded.
+fn home_relative(path: &str, backslash_separates: bool) -> Option<&str> {
+    path.strip_prefix("~/")
+        .or_else(|| if backslash_separates { path.strip_prefix("~\\") } else { None })
 }
 
 /// A request ready to send, and the `Accept` it carries (which says how the
@@ -14908,12 +14931,8 @@ fn extract_file_path_context(input: &str, cursor_pos: usize) -> Option<FilePathC
 /// Get file/directory completions for a partial path.
 /// Returns full paths (from the partial's perspective) suitable for replacing the partial.
 fn get_file_completions(partial: &str) -> Vec<String> {
-    let expanded = if partial.starts_with("~/") {
-        if let Some(home) = dirs::home_dir() {
-            format!("{}{}", home.display(), &partial[1..])
-        } else {
-            partial.to_string()
-        }
+    let expanded = if partial.starts_with("~/") || (cfg!(windows) && partial.starts_with("~\\")) {
+        expand_home(partial)
     } else if partial.starts_with('~') && !partial.contains('/') {
         // Just "~" with no slash yet
         if let Some(home) = dirs::home_dir() {
@@ -18089,6 +18108,37 @@ mod tests {
         assert!(serde_json::from_str::<ApiSpec>("{}").unwrap().paths.is_empty());
         // What is not a spec still is not one.
         assert!(serde_json::from_str::<ApiSpec>("[1]").is_err());
+    }
+
+    #[test]
+    fn paths_are_read_with_either_separator_where_both_separate() {
+        // `~/` everywhere; `~\` only where `\` is a separator.
+        assert_eq!(home_relative("~/seeds/a.api", false), Some("seeds/a.api"));
+        assert_eq!(home_relative("~/seeds/a.api", true), Some("seeds/a.api"));
+        assert_eq!(home_relative(r"~\seeds\a.api", true), Some(r"seeds\a.api"));
+        assert_eq!(home_relative(r"~\seeds\a.api", false), None);
+        for other in ["seeds/a.api", "/tmp/~/a", "~user/a", "~"] {
+            assert_eq!(home_relative(other, true), None, "{other}");
+        }
+        // On this platform `~/x` is in the home directory, and nothing else is.
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(expand_home("~/x.json"), home.join("x.json").to_string_lossy());
+        assert_eq!(expand_home("x.json"), "x.json");
+        assert_eq!(expand_home("/tmp/x.json"), "/tmp/x.json");
+
+        // An alias include.
+        assert_eq!(split_alias("cl/sv.api", false), Some(("cl", "sv.api")));
+        assert_eq!(split_alias("cl/seeds/sv.api", true), Some(("cl", "seeds/sv.api")));
+        assert_eq!(split_alias(r"cl\sv.api", true), Some(("cl", "sv.api")));
+        assert_eq!(split_alias(r"cl\sv.api", false), None);
+        assert_eq!(split_alias("sv.api", true), None);
+    }
+
+    #[test]
+    fn a_command_that_is_not_installed_is_known_by_trying_it() {
+        assert!(!command_exists("no-such-command-for-the-api-client-tests"));
+        // The test runner itself is certainly there.
+        assert!(command_exists("cargo"));
     }
 
     #[test]
