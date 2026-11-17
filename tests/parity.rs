@@ -220,6 +220,11 @@ fn answer(
     } else if path.contains("/about") && header("authorization") == Some("Basic OmJhZHNwZWM=") {
         // …from a server that says it has one.
         ("200 OK", r#"{"feature-flags":[],"openapi-metadata-version":"1.1"}"#.to_string())
+    } else if path.contains("/openapi") && header("authorization") == Some("Basic OmZhaWxzcGVj") {
+        // For a session with the key `failspec`: the spec request fails.
+        ("500 Internal Server Error", "{}".to_string())
+    } else if path.contains("/about") && header("authorization") == Some("Basic OmZhaWxzcGVj") {
+        ("200 OK", r#"{"feature-flags":[],"openapi-metadata-version":"1.2"}"#.to_string())
     } else if path.contains("/about") && header("authorization") == Some("Basic OnN0cmVhbWVy") {
         // For a session with the key `streamer`: a server that can stream.
         ("200 OK", r#"{"feature-flags":["response:streaming"]}"#.to_string())
@@ -4104,6 +4109,8 @@ fn a_spec_that_cannot_be_read_is_said_with_b_and_with_c() {
     write_credentials(d, &[("bad", url.clone(), "key", "badspec", ""), ("good", url.clone(), "key", "k", "")], "");
     for (args, said) in [
         (&["-b", &url, "-k", "badspec"][..], true),
+        // A spec request that fails is no more a spec than an answer that is none.
+        (&["-b", &url, "-k", "failspec"][..], true),
         (&["-c", "bad"][..], true),
         (&["-c", "good"][..], false),
     ] {
@@ -4746,10 +4753,13 @@ fn tab_completes_an_include_at_the_prompt() {
 
     // Each entry is typed key by key; `\t` is Tab. `body.json` also starts
     // with a letter of its own but is never offered, not being a `.api` file.
-    let lines: [(&[&str], &str, &[&str]); 3] = [
+    let lines: [(&[&str], &str, &[&str]); 4] = [
         (&["se", "\t"], "seed.api", &["GET /inc1", "GET /inc2"]),
         (&["in", "\t", "b", "\t"], "inc/b.api", &["GET /g2"]),
-        (&["./in", "\t", "\t", "a", "\t"], "./inc/a.api", &["GET /g1"]),
+        // Tab on the one directory that matched goes into it, as its ghost
+        // shows, and the next Tab goes on to the file after.
+        (&["./in", "\t", "\t"], "./inc/a.api", &["GET /g1"]),
+        (&["./in", "\t", "\t", "\t"], "./inc/b.api", &["GET /g2"]),
     ];
     for (keys, completed, sent) in lines {
         prompt.send(b"\x15");

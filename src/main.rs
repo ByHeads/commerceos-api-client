@@ -13991,16 +13991,17 @@ fn load_openapi_spec_into(config: &Config, result: &mut BackgroundLoadResult) {
         request = request.header("Authorization", authorization);
     }
 
-    if let Ok(resp) = request.send() {
-        // A server without a spec (a 404) simply has none. One that answers
-        // with something that is not a spec is worth a word: see
-        // `apply_background_result`.
-        let answered = resp.status().is_success();
-        let spec = resp.json::<ApiSpec>();
-        result.spec_unreadable = answered && spec.is_err();
-        if let Ok(spec) = spec {
-            index_spec(spec, result);
-        }
+    // A server without a spec (a 404) simply has none. One that fails to
+    // answer, answers with an error, or with something that is not a spec is
+    // worth a word, or Tab would do nothing all session without one: see
+    // `apply_background_result`.
+    match request.send() {
+        Ok(resp) if resp.status().is_success() => match resp.json::<ApiSpec>() {
+            Ok(spec) => index_spec(spec, result),
+            Err(_) => result.spec_unreadable = true,
+        },
+        Ok(resp) => result.spec_unreadable = resp.status() != reqwest::StatusCode::NOT_FOUND,
+        Err(_) => result.spec_unreadable = true,
     }
 }
 
@@ -14012,6 +14013,7 @@ fn index_spec(spec: ApiSpec, result: &mut BackgroundLoadResult) {
     result.endpoints = endpoints;
 
     if let Some(components) = &spec.components {
+        let mut inline_arrays: Vec<(String, Option<String>)> = Vec::new();
         for (name, schema) in &components.schemas {
             if let Some(props) = &schema.properties {
                 let mut prop_names: Vec<String> = props.keys().cloned().collect();
@@ -14024,6 +14026,17 @@ fn index_spec(spec: ApiSpec, result: &mut BackgroundLoadResult) {
                         if let Some(type_name) = ref_path.strip_prefix("#/components/schemas/") {
                             prop_type_map.insert(prop_name.clone(), type_name.to_string());
                         }
+                    } else if prop_ref.schema_type.as_deref() == Some("array") {
+                        // An array written out in place has no schema of
+                        // its own to name. It gets one, `<element>[]`, that
+                        // says what a named collection says: an array, and
+                        // what it holds.
+                        let element = prop_ref.items.as_ref().and_then(|items| {
+                            items.ref_path.as_deref().and_then(|r| r.strip_prefix("#/components/schemas/"))
+                        });
+                        let array = format!("{}[]", element.unwrap_or_default());
+                        inline_arrays.push((array.clone(), element.map(String::from)));
+                        prop_type_map.insert(prop_name.clone(), array);
                     } else if prop_ref.examples.as_ref()
                         .and_then(|ex| ex.first())
                         .map_or(false, |v| v.is_object())
@@ -14136,6 +14149,17 @@ fn index_spec(spec: ApiSpec, result: &mut BackgroundLoadResult) {
             }
             if let Some(parent) = &schema.x_parent_type {
                 result.parent_types.insert(name.clone(), parent.clone());
+            }
+        }
+        // A real schema of the same name says more, and stays.
+        for (array, element) in inline_arrays {
+            if components.schemas.contains_key(&array) {
+                continue;
+            }
+            result.schema_types.insert(array.clone(), "array".to_string());
+            result.array_schemas.insert(array.clone());
+            if let Some(element) = element {
+                result.indexer_info.insert(array, IndexerInfo { index_type: None, return_type: Some(element) });
             }
         }
     }
@@ -14612,6 +14636,13 @@ fn handle_json_tab_completion(state: &mut AppState, reverse: bool, apply: bool) 
     let Some(ctx) = json_context_at_cursor(state) else { return };
     let cursor_byte = char_to_byte_idx(&state.input, state.cursor_pos);
 
+    // In the middle of a key or a value there is nothing to complete: what
+    // follows the cursor would be left standing behind the completion.
+    let next = state.input[cursor_byte..].chars().next();
+    if next.is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '@' | '-' | '?')) {
+        return;
+    }
+
     // Don't offer completions when cursor is on a line that already has content after cursor
     // (e.g. cursor on the " of "identifiers": { — don't insert a new key before it)
     if ctx.partial.is_empty() {
@@ -14906,7 +14937,8 @@ fn handle_file_tab_completion(state: &mut AppState) {
     // Check if cycling through completions: the current path span matching one
     // of the completions means the last Tab produced it — advance to the next.
     let current_span = state.input[path_start..path_end].to_string();
-    let is_cycling = if !state.completions.is_empty() && !state.last_tab_input.is_empty() {
+    // A list of one has no next: Tab on the directory it gave goes into it.
+    let is_cycling = if state.completions.len() > 1 && !state.last_tab_input.is_empty() {
         state.completions.iter().enumerate().any(|(i, comp)| {
             if current_span == *comp {
                 state.completion_idx = (i + 1) % state.completions.len();
@@ -15036,6 +15068,30 @@ fn pending_closer(input: &str, cursor_pos: usize) -> Option<(char, usize)> {
     if in_str || is_key {
         return None;
     }
+    // Nothing is pending where the bracket is closed behind the cursor
+    // already: writing it again would leave one too many.
+    let mut depth = 0i32;
+    let (mut in_str, mut esc) = (false, false);
+    for ch in input[byte_idx..].chars() {
+        if esc { esc = false; continue; }
+        if ch == '\\' && in_str { esc = true; continue; }
+        if ch == '"' { in_str = !in_str; continue; }
+        if !in_str {
+            match ch {
+                '{' | '[' => depth += 1,
+                // The first bracket that closes at this level: ours, or
+                // (`[{"a": "b"^]`) the one around it, with ours still open.
+                '}' | ']' if depth == 0 => {
+                    if stack.last() == Some(&ch) {
+                        return None;
+                    }
+                    break;
+                }
+                '}' | ']' => depth -= 1,
+                _ => {}
+            }
+        }
+    }
     stack.last().map(|&closer| (closer, stack.len()))
 }
 
@@ -15134,8 +15190,11 @@ fn tab_pressed(state: &mut AppState) -> bool {
         // If input already has body content (brackets), don't fall through to URI completion
         let has_body_content = find_body_start(&state.input)
             .map_or(false, |bs| state.input[bs..].trim().starts_with(|c: char| c == '[' || c == '{'));
-        if has_body_content {
-            // Tab at end of body — ignore
+        let cursor_byte = char_to_byte_idx(&state.input, state.cursor_pos);
+        let at_line_end = cursor_byte == state.input.len();
+        if has_body_content && cursor_byte > line_uri(&state.input).end {
+            // Tab behind a body — ignore. In the URI in front of one it
+            // completes the URI, as the ghost there says.
             return false;
         }
         let had_completions = !state.completions.is_empty();
@@ -15144,7 +15203,13 @@ fn tab_pressed(state: &mut AppState) -> bool {
         let uri = state.input[at.start..at.end].to_string();
 
         // Try body bracket completion first (e.g., Tab after "PUT /people ")
-        let bracket_ghost = if state.config.experimental { get_body_bracket_ghost(state, &parts, &uri) } else { String::new() };
+        // Only at the end of the line, where the ghost shows it: anywhere
+        // else the brackets would land in the middle of the request.
+        let bracket_ghost = if state.config.experimental && at_line_end {
+            get_body_bracket_ghost(state, &parts, &uri)
+        } else {
+            String::new()
+        };
         if !bracket_ghost.is_empty() {
             // Expand brackets to multiline block with matching closers on one line
             // e.g. "[{ " → "[{\n  \n}]"  or "{ " → "{\n  \n}"
@@ -15179,6 +15244,10 @@ fn get_completion_ghost(state: &AppState) -> String {
     if state.config.experimental && cursor_inside_brackets(&state.input, state.cursor_pos) {
         if let Some(ghost) = get_json_completion_ghost(state) {
             return ghost;
+        }
+        // Tab is still choosing among the subtypes of the `@type` it wrote.
+        if cycling_json_type(state) {
+            return String::new();
         }
         // Suggest closing brackets after a value
         let closing = get_closing_brackets_ghost(&state.input, state.cursor_pos);
@@ -15215,6 +15284,12 @@ fn get_completion_ghost(state: &AppState) -> String {
                 }
                 return String::new();
             }
+        }
+        // Tab is going through a list: the next press replaces what stands
+        // here with the next of the list, which is no continuation of it.
+        let written = &state.input[ctx.path_start..ctx.path_end];
+        if state.completions.len() > 1 && !state.last_tab_input.is_empty() && state.completions.iter().any(|c| c == written) {
+            return String::new();
         }
         // Reuse state.completions if populated from file Tab, else compute fresh
         let fresh;
@@ -15781,11 +15856,11 @@ fn complete_path(state: &AppState, uri: &str) -> Vec<String> {
     // Merge endpoint completions with schema completions, avoiding duplicates
     // Skip endpoint completions when schema expects an index (e.g., string array)
     // to avoid suggesting sibling endpoints as if they were array entries
-    if !expects_index {
-        for ec in &endpoint_completions {
-            if !completions.contains(ec) {
-                completions.push(ec.clone());
-            }
+    // Below a collection only an endpoint that really continues what is typed
+    // (`/people/fi` → `/people/find`) is one of them.
+    for ec in &endpoint_completions {
+        if (!expects_index || (!partial.is_empty() && ec.starts_with(uri))) && !completions.contains(ec) {
+            completions.push(ec.clone());
         }
     }
 
@@ -23119,7 +23194,9 @@ mod tests {
         "/pets": { "get": { "responses": { "200": { "content": { "application/json": {
           "schema": { "type": "array", "items": { "type": "string" } } } } } } } },
         "/settings": { "get": { "responses": { "200": { "content": { "application/json": {
-          "schema": { "$ref": "#/components/schemas/settings" } } } } } } }
+          "schema": { "$ref": "#/components/schemas/settings" } } } } } } },
+        "/yard": { "get": { "responses": { "200": { "content": { "application/json": {
+          "schema": { "$ref": "#/components/schemas/yard" } } } } } } }
       },
       "components": { "schemas": {
         "people": { "type": "array", "items": { "$ref": "#/components/schemas/person" },
@@ -23168,6 +23245,10 @@ mod tests {
             "identifiers": { "$ref": "#/components/schemas/common identifiers" },
             "title": { "$ref": "#/components/schemas/strict string" } } },
         "settings": { "properties": { "locale": { "$ref": "#/components/schemas/strict string" } } },
+        "yard": { "properties": {
+            "tags": { "type": "array", "items": { "$ref": "#/components/schemas/label" }, "examples": [{ "title": "a" }] },
+            "codes": { "type": "array", "items": { "$ref": "#/components/schemas/strict string" } },
+            "odd": { "type": "array" } } },
         "company": { "allOf": [{ "$ref": "#/components/schemas/legal entity" }, { "$ref": "elsewhere" }] },
         "strict string": { "type": "string",
           "x-primitive-members": {
@@ -23239,7 +23320,7 @@ mod tests {
         // Every path, templates too, in order.
         assert_eq!(
             spec.endpoints,
-            strings(&["/about", "/agents", "/people", "/people/find", "/people/{index}", "/people/{key}={index}", "/pets", "/settings"])
+            strings(&["/about", "/agents", "/people", "/people/find", "/people/{index}", "/people/{key}={index}", "/pets", "/settings", "/yard"])
         );
         // A schema's properties in order, and the type each one refers to.
         assert_eq!(spec.schema_props["address"], strings(&["city", "line1"]));
@@ -23290,7 +23371,7 @@ mod tests {
         assert_eq!(spec.endpoint_schemas, map(&[("/people", "people"), ("/agents", "agents")]));
         assert_eq!(
             spec.endpoint_types,
-            map(&[("/agents", "agent"), ("/people", "person"), ("/people/{index}", "person"), ("/settings", "settings")])
+            map(&[("/agents", "agent"), ("/people", "person"), ("/people/{index}", "person"), ("/settings", "settings"), ("/yard", "yard")])
         );
         let lists: Vec<&str> = {
             let mut lists: Vec<&str> = spec.array_endpoints.iter().map(String::as_str).collect();
@@ -23400,7 +23481,7 @@ mod tests {
         let complete = |uri: &str| get_completions(&state, uri);
 
         // Endpoints by their start; a template is never offered.
-        assert_eq!(complete("/"), strings(&["/about", "/agents", "/people", "/people/find", "/pets", "/settings"]));
+        assert_eq!(complete("/"), strings(&["/about", "/agents", "/people", "/people/find", "/pets", "/settings", "/yard"]));
         assert_eq!(complete("/pe"), strings(&["/people", "/people/find", "/pets"]));
         // None starts so: any that holds it.
         assert_eq!(complete("/find"), strings(&["/people/find"]));
@@ -24637,5 +24718,153 @@ mod tests {
         let drawn = String::from_utf8(drawn).unwrap();
         assert!(drawn.contains("{\r\n  \"a\": 1\x1b[48;5;247m"), "{drawn:?}");
         assert_eq!(state.prev_input_lines, 4);
+    }
+
+    #[test]
+    fn tab_writes_no_closer_that_is_already_there() {
+        // The bracket is closed behind the cursor: nothing to write, and no
+        // ghost that says otherwise.
+        for line in [
+            "PUT /people [{\n  \"name\": \"x\"^\n}]",
+            r#"PUT /people {"name": "b"^}"#,
+            r#"PUT /people [{"name": "b"}^]"#,
+            r#"PUT /people [{"name": "b"}^] > out.json"#,
+            r#"PUT /people {"name": "b"^} && GET /a"#,
+        ] {
+            assert_eq!(body_tabbed(line), line, "{line}");
+            assert_eq!(get_completion_ghost(&completing_body(line)), "", "{line}");
+        }
+        // Where it is still open, Tab closes it: the inner one, then the outer.
+        assert_eq!(body_tabbed(r#"PUT /people [{"name": "b"^"#), r#"PUT /people [{"name": "b"}^"#);
+        assert_eq!(body_tabbed(r#"PUT /people [{"name": "b"^]"#), r#"PUT /people [{"name": "b"}^]"#);
+        assert_eq!(body_tabbed(r#"PUT /people [{"a": {"b": "c"}^"#), r#"PUT /people [{"a": {"b": "c"}}^"#);
+    }
+
+    #[test]
+    fn tab_in_the_middle_of_a_key_or_a_value_leaves_it() {
+        for line in [
+            r#"PUT /people [{"na^me": "x"}]"#,
+            r#"PUT /people [{"status": "n^ew"}]"#,
+            r#"PUT /people [{"active": tr^ue}]"#,
+            r#"PUT /people [{"^name": "x"}]"#,
+            r#"PUT /people [{"gi^venName"#,
+        ] {
+            assert_eq!(body_tabbed(line), line, "{line}");
+        }
+        // At the end of what is typed it completes, as before.
+        assert_eq!(body_tabbed(r#"PUT /people [{"gi^"#), r#"PUT /people [{"givenName":^"#);
+        assert_eq!(body_tabbed(r#"PUT /people [{"status": "n^"}]"#), r#"PUT /people [{"status": "new"^}]"#);
+    }
+
+    #[test]
+    fn the_brackets_of_a_body_open_only_at_the_end_of_the_line() {
+        assert_eq!(body_tabbed("PUT /people ^"), "PUT /people [{\n  ^\n}]");
+        for line in ["PUT /pe^ople ", "P^UT /people ", "PUT /people^ "] {
+            let after = body_tabbed(line);
+            assert!(!after.contains('[') && !after.contains('{'), "{line}: {after}");
+            assert!(after.replace('^', "").starts_with("PUT /pe"), "{line}: {after}");
+        }
+    }
+
+    #[test]
+    fn an_array_written_out_in_a_property_opens_as_an_array_of_what_it_holds() {
+        let state = completing_body("");
+        assert_eq!(prop_opening_bracket(&state, "yard", "tags"), Some('['));
+        assert_eq!(prop_opening_bracket(&state, "yard", "codes"), Some('['));
+        assert_eq!(prop_opening_bracket(&state, "yard", "odd"), Some('['));
+        // An example that is an object makes an object only of a property
+        // that is not an array.
+        assert_eq!(prop_opening_bracket(&state, "person", "meta"), Some('{'));
+
+        assert_eq!(body_tabbed(r#"PUT /yard {"ta"#), r#"PUT /yard {"tags":^"#);
+        assert_eq!(body_tabbed(r#"PUT /yard {"tags":"#), r#"PUT /yard {"tags": [^"#);
+        assert_eq!(body_tabbed(r#"PUT /yard {"tags": ["#), r#"PUT /yard {"tags": [{ ^"#);
+        // Inside, the keys are those of the element.
+        assert_eq!(body_cursor(r#"PUT /yard {"tags": [{""#).unwrap(), "label|Key||||\"|");
+        assert_eq!(body_tabbed(r#"PUT /yard {"tags": [{"ti"#), r#"PUT /yard {"tags": [{"title":^"#);
+        // An array of scalars opens, and offers no object in it.
+        assert_eq!(body_tabbed(r#"PUT /yard {"codes":"#), r#"PUT /yard {"codes": [^"#);
+        assert_eq!(body_tabbed(r#"PUT /yard {"codes": ["#), r#"PUT /yard {"codes": [^"#);
+    }
+
+    #[test]
+    fn an_endpoint_below_a_collection_completes_from_what_is_typed_of_it() {
+        let state = completing("");
+        assert_eq!(get_completions(&state, "/people/f"), ["/people/find"]);
+        assert_eq!(get_completions(&state, "/people/fi"), ["/people/find"]);
+        assert_eq!(tabbed("POST /people/fi^"), "POST /people/find^");
+        // Without a letter of it, the collection lists what it holds, and
+        // no other endpoint is taken for one of its entries.
+        assert!(!get_completions(&state, "/people/").contains(&"/people/find".to_string()));
+        assert!(get_completions(&state, "/people/ab").iter().all(|c| c.starts_with("/people/")));
+    }
+
+    #[test]
+    fn tab_in_a_uri_does_what_its_ghost_says_with_a_body_behind_it() {
+        let line = r#"PUT /peo^ {"a": 1}"#;
+        assert_eq!(get_completion_ghost_at_cursor(&completing_body(line)), "ple");
+        assert_eq!(body_tabbed(line), r#"PUT /people^ {"a": 1}"#);
+        assert_eq!(tabbed(r#"PUT /peo^ [{"a": 1}]"#), r#"PUT /people^ [{"a": 1}]"#);
+        // Behind the body Tab still does nothing.
+        assert_eq!(body_tabbed(r#"PUT /peo {"a": 1}^"#), r#"PUT /peo {"a": 1}^"#);
+    }
+
+    #[test]
+    fn no_closing_ghost_while_tab_is_choosing_a_type() {
+        let mut state = completing_body(r#"POST /agents {"@t"#);
+        assert!(tab_pressed(&mut state));
+        assert_eq!(shown(&state), r#"POST /agents {"@type": "person"^"#);
+        // Tab goes on to the next subtype, so the ghost may not promise `}`.
+        assert_eq!(get_completion_ghost(&state), "");
+        assert!(tab_pressed(&mut state));
+        assert_eq!(shown(&state), r#"POST /agents {"@type": "company"^"#);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_ghost_and_tab_agree_after_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("seed.api"), "GET /about").unwrap();
+        fs::create_dir(dir.path().join("seeds")).unwrap();
+        fs::write(dir.path().join("seeds/inner.json"), "{}").unwrap();
+        fs::create_dir(dir.path().join("data")).unwrap();
+        fs::write(dir.path().join("data/one.json"), "{}").unwrap();
+        let base = relative_to_cwd(dir.path());
+        let line = |rest: &str| format!("GET /x > {}/{}", base, rest);
+
+        // Two matches: Tab goes through them, and while it does the ghost
+        // promises nothing of what is inside the first.
+        let mut state = test_state();
+        state.input = line("se");
+        state.cursor_pos = char_len(&state.input);
+        assert!(tab_pressed(&mut state));
+        let first = state.input.clone();
+        assert!(first == line("seeds/") || first == line("seed.api"), "{first}");
+        assert_eq!(get_completion_ghost(&state), "");
+        assert!(tab_pressed(&mut state));
+        assert!(state.input != first && (state.input == line("seeds/") || state.input == line("seed.api")), "{}", state.input);
+
+        // One match, a directory: the ghost shows what is inside, and the
+        // next Tab writes exactly that.
+        let mut state = test_state();
+        state.input = line("da");
+        state.cursor_pos = char_len(&state.input);
+        assert!(tab_pressed(&mut state));
+        assert_eq!(state.input, line("data/"));
+        assert_eq!(get_completion_ghost(&state), "one.json");
+        assert!(tab_pressed(&mut state));
+        assert_eq!(state.input, line("data/one.json"));
+    }
+
+    #[test]
+    fn a_spec_with_inline_arrays_keeps_its_named_collections() {
+        let result = indexed_spec();
+        // The made-up schema of an inline array says what a named one says.
+        assert_eq!(result.schema_types.get("label[]").map(String::as_str), Some("array"));
+        assert_eq!(result.indexer_info["label[]"].return_type.as_deref(), Some("label"));
+        assert!(result.array_schemas.contains("strict string[]"));
+        // Without an element type there is nothing to index by.
+        assert!(result.schema_types.contains_key("[]") && !result.indexer_info.contains_key("[]"));
+        assert_eq!(result.indexer_info["assigned labels"].return_type.as_deref(), Some("label?"));
     }
 }
