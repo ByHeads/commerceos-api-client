@@ -5118,6 +5118,10 @@ fn the_prompt_edits_its_line_with_the_usual_keys() {
         (&["/m", "\x00", "\x00", "\x00", "\x00"], "GET /m"),
         // ctrl+n starts a new line in the body.
         (&["PUT /n {\"a\":", "\x0e", "1}"], "PUT /n {\"a\":\n1}"),
+        // So do alt+enter, and shift+enter where the terminal tells it
+        // from Enter.
+        (&["PUT /n {\"a\":", "\x1b\r", "2}"], "PUT /n {\"a\":\n2}"),
+        (&["PUT /n {\"a\":", "\x1b[13;2u", "3}"], "PUT /n {\"a\":\n3}"),
         // Non-ASCII text is edited by the character.
         (&["GET /åäö", LEFT, "\x7f", "x", END, "\x7f", "y"], "GET /%C3%A5xy"),
     ];
@@ -6001,4 +6005,64 @@ fn a_long_confirm_at_the_prompt_stays_on_its_row() {
     // The session is still there.
     press(&mut prompt, &["GET /after"]);
     assert_eq!(entered(&mut prompt, &server), ["GET /after"]);
+}
+
+/// esc ends a `sleep` and a `sleep while` at the prompt, says so, and nothing
+/// after it is sent. The session goes on.
+#[cfg(unix)]
+#[test]
+fn esc_ends_a_wait_at_the_prompt_and_what_follows_it() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = pty::Prompt::open(api(server.port, dir.path()));
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+
+    for (block, polls, says) in [
+        ("sleep 30\rGET /never\r", 0, "sleeping cancelled"),
+        ("sleep 30 while GET /a\rGET /never\r", 1, "cancelled"),
+    ] {
+        prompt.send(b"\x15");
+        prompt.pump(Duration::from_millis(60));
+        server.take();
+        prompt.paste(block);
+        prompt.pump(Duration::from_millis(80));
+        let mark = prompt.screen.len();
+        prompt.send(b"\r");
+        prompt.pump(Duration::from_millis(900));
+        prompt.send(b"\x1b");
+        let said = pump_until(&mut prompt, Duration::from_secs(4), |p| pty::plain(&p.screen[mark..]).contains(says));
+        assert!(said, "{block:?}: {}", pty::plain(&prompt.screen[mark..]));
+        prompt.pump(Duration::from_millis(400));
+        let sent = server.take();
+        assert_eq!(sent.len(), polls, "{block:?}: {sent:?}");
+        assert!(!sent.iter().any(|line| line.contains("/never")), "{sent:?}");
+    }
+    press(&mut prompt, &["GET /after"]);
+    assert_eq!(entered(&mut prompt, &server), ["GET /after"]);
+}
+
+/// Without `-f` an error status is an answer like any other, and its body is
+/// what the outfile gets: `>` replaces the file with it and `>>` appends it.
+/// (Under `-f` the file is left alone, which other tests pin.)
+#[test]
+fn without_fail_fast_an_error_body_goes_to_the_outfile() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::write(d.join("out.json"), "[{\"kept\":1}]\n").unwrap();
+    std::fs::write(d.join("log.json"), "[{\"kept\":1}]\n").unwrap();
+    std::fs::write(d.join("case.api"), "GET /missing > out.json\nGET /boom >> log.json\nGET /after\n").unwrap();
+
+    let got = run_in(&server, d, &["-sa", "case.api"]);
+    assert_eq!(got.code, Some(0), "{}", got.stderr);
+    assert_eq!(got.sent, ["GET /missing", "GET /boom", "GET /after"]);
+    let json = |name: &str| serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(d.join(name)).unwrap()).unwrap();
+    assert_eq!(json("out.json"), serde_json::json!({}));
+    assert_eq!(json("log.json"), serde_json::json!([{ "kept": 1 }, {}]));
+
+    // Under `-f` neither file is touched, and the run stops at the first.
+    std::fs::write(d.join("out.json"), "[{\"kept\":1}]\n").unwrap();
+    let got = run_in(&server, d, &["-sfa", "case.api"]);
+    assert_eq!((got.code, &got.sent[..]), (Some(1), &["GET /missing".to_string()][..]), "{}", got.stderr);
+    assert_eq!(json("out.json"), serde_json::json!([{ "kept": 1 }]));
 }

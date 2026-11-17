@@ -24867,4 +24867,77 @@ mod tests {
         assert!(result.schema_types.contains_key("[]") && !result.indexer_info.contains_key("[]"));
         assert_eq!(result.indexer_info["assigned labels"].return_type.as_deref(), Some("label?"));
     }
+
+    #[test]
+    fn word_movement_goes_by_words_of_any_alphabet() {
+        let back = |marked: &str| {
+            let line = marked.replace('^', "");
+            let at = word_boundary_back(&line, char_len(&marked[..marked.find('^').unwrap()]));
+            format!("{}^{}", line.chars().take(at).collect::<String>(), line.chars().skip(at).collect::<String>())
+        };
+        let forward = |marked: &str| {
+            let line = marked.replace('^', "");
+            let at = word_boundary_forward(&line, char_len(&marked[..marked.find('^').unwrap()]));
+            format!("{}^{}", line.chars().take(at).collect::<String>(), line.chars().skip(at).collect::<String>())
+        };
+        assert_eq!(back("GET /people~where(x)^"), "GET /people~where(^x)");
+        assert_eq!(back("GET /people~^where"), "GET /^people~where");
+        assert_eq!(back("GET /åäö öl^"), "GET /åäö ^öl");
+        assert_eq!(back("GET /åäö ^öl"), "GET /^åäö öl");
+        assert_eq!(back("^GET /a"), "^GET /a");
+        assert_eq!(back("   ^"), "^   ");
+        assert_eq!(back("^"), "^");
+        assert_eq!(forward("^GET /people"), "GET /^people");
+        assert_eq!(forward("GET /^åäö öl"), "GET /åäö ^öl");
+        assert_eq!(forward("GET /a~b^"), "GET /a~b^");
+        assert_eq!(forward("GET^   "), "GET   ^");
+        assert_eq!(forward("^"), "^");
+        // There and back over the same word ends where it started.
+        assert_eq!(back(&forward("GET /^given_name~x")), "GET /^given_name~x");
+    }
+
+    #[test]
+    fn plain_http_is_for_this_machine_only_whatever_the_url_looks_like() {
+        for local in ["http://localhost/c.zip", "http://localhost:8080/c.zip", "http://127.0.0.1:9/c.tar.gz", "http://[::1]/c.zip"] {
+            assert!(validate_archive_url(local).is_ok(), "{local}");
+        }
+        // A user name, a subdomain or a suffix that reads like this machine.
+        for remote in [
+            "http://localhost@example.com/c.zip",
+            "http://localhost:x@example.com/c.zip",
+            "http://localhost.example.com/c.zip",
+            "http://127.0.0.1.example.com/c.zip",
+            "http://example.com/localhost/c.zip",
+            "http://example.com/c.zip?localhost",
+            "http://127.0.0.2/c.zip",
+            "ftp://localhost/c.zip",
+        ] {
+            let err = validate_archive_url(remote).unwrap_err();
+            assert!(err.starts_with("unsupported url"), "{remote}: {err}");
+        }
+        assert!(validate_archive_url("https://localhost@example.com/c.zip").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_in_a_zip_is_not_unpacked() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut bytes);
+            let options = zip::write::SimpleFileOptions::default();
+            zip.start_file("a.api", options).unwrap();
+            zip.write_all(b"GET /a\n").unwrap();
+            zip.add_symlink("passwd", "/etc/passwd", options).unwrap();
+            zip.add_symlink("up", "..", options).unwrap();
+            zip.finish().unwrap();
+        }
+        let dest = dir.path().join("zip");
+        unpack_archive(bytes.get_ref(), &dest).unwrap();
+        assert!(dest.join("a.api").is_file());
+        // Neither as a link nor as a file holding the link's target.
+        assert!(fs::symlink_metadata(dest.join("passwd")).is_err());
+        assert!(fs::symlink_metadata(dest.join("up")).is_err());
+    }
 }

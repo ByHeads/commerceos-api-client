@@ -1665,3 +1665,76 @@ fn an_imported_file_cannot_name_a_token_for_an_archive() {
     let ran = run_batch(&dir, server.port, "-sa", &top);
     assert!(ran.ok, "{}", ran.stderr);
 }
+
+/// One request answered on a port of its own: what it asked for and the
+/// `Authorization` it carried (`-` for none) come back when the thread ends.
+fn answer_once(reply: impl FnOnce(u16) -> Vec<u8> + Send + 'static) -> (u16, JoinHandle<Option<String>>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let thread = std::thread::spawn(move || {
+        let start = std::time::Instant::now();
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(_) if start.elapsed() > Duration::from_secs(8) => return None,
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut data = Vec::new();
+        let mut buf = [0u8; 4096];
+        while !data.windows(4).any(|w| w == b"\r\n\r\n") {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => data.extend_from_slice(&buf[..n]),
+            }
+        }
+        let head = String::from_utf8_lossy(&data).to_string();
+        let authorization = head
+            .lines()
+            .filter_map(|l| l.split_once(':'))
+            .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+            .map_or("-".to_string(), |(_, v)| v.trim().to_string());
+        let _ = stream.write_all(&reply(port));
+        let _ = stream.flush();
+        Some(format!("{} {}", head.lines().next().unwrap_or(""), authorization))
+    });
+    (port, thread)
+}
+
+/// The token of an `import archive` goes to the host the file names. When
+/// that host sends the download elsewhere, the token does not go along, and
+/// neither it nor the client's API key ever reaches the other side.
+#[test]
+fn an_archive_token_is_not_sent_on_to_where_a_redirect_leads() {
+    let (_guard, dir) = temp();
+    let api_server = Server::start("1", Vec::new());
+    let archive = fixture_archive();
+    let (elsewhere, served) = answer_once(move |_| {
+        let mut reply =
+            format!("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n", archive.len()).into_bytes();
+        reply.extend_from_slice(&archive);
+        reply
+    });
+    let (named, redirected) = answer_once(move |_| {
+        format!("HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{elsewhere}/lib.tar.gz\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+            .into_bytes()
+    });
+
+    let batch = format!(
+        "import archive lib {{ \"url\": \"http://127.0.0.1:{named}/first.tar.gz\", \"token_env\": \"IMPORT_TEST_TOKEN\" }}\nlib/parts/a.api\n"
+    );
+    std::fs::write(dir.join("batch.api"), batch).unwrap();
+    let mut cmd = api(&dir, api_server.port);
+    cmd.args(["-sa", "batch.api"]).env("IMPORT_TEST_TOKEN", "s3cret-token");
+    let ran = finish(cmd, "");
+    assert!(ran.ok, "{}", ran.stderr);
+
+    assert_eq!(redirected.join().unwrap().as_deref(), Some("GET /first.tar.gz HTTP/1.1 Bearer s3cret-token"));
+    assert_eq!(served.join().unwrap().as_deref(), Some("GET /lib.tar.gz HTTP/1.1 -"));
+    // The API got its key, and nothing of the token.
+    assert_eq!(api_server.sent(), ["GET /parts/a"]);
+    assert!(!ran.stdout.contains("s3cret-token") && !ran.stderr.contains("s3cret-token"));
+}
