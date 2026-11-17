@@ -524,6 +524,9 @@ struct Config {
     /// not that connection: saved under a new name it is a new connection,
     /// and the stored one stays. Ends with a save and with a `ctrl+q` switch.
     connection_overridden: bool,
+    /// `-k` or `--token` gave the credential in use, so what a saved
+    /// connection has stored (a client secret to renew with) is not it.
+    credential_overridden: bool,
 }
 
 impl Default for Config {
@@ -560,6 +563,7 @@ impl Default for Config {
             oauth2_client_secret: String::new(),
             one_shot: false,
             connection_overridden: false,
+            credential_overridden: false,
         }
     }
 }
@@ -2228,17 +2232,20 @@ impl PickerState {
         }
     }
 
-    fn toggle_default(&mut self) {
+    fn toggle_default(&mut self) -> Result<(), String> {
         if let Some(Some(env)) = self.saved_connections.get(self.selected) {
+            // What the list shows is what the store holds: a default that
+            // could not be written is not shown as one.
             if self.default_name.as_deref() == Some(env.name.as_str()) {
-                let _ = set_default_connection("");
+                set_default_connection("")?;
                 self.default_name = None;
             } else {
-                let _ = set_default_connection(&env.name);
+                set_default_connection(&env.name)?;
                 self.default_name = Some(env.name.clone());
             }
             self.rebuild_items();
         }
+        Ok(())
     }
 
     fn move_up(&mut self) {
@@ -2263,10 +2270,13 @@ impl PickerState {
         self.saved_connections[self.selected].clone()
     }
 
-    fn delete_selected(&mut self) -> Option<String> {
+    /// Delete the selected connection: its name, or why it is still there.
+    fn delete_selected(&mut self) -> Option<Result<String, String>> {
         if let Some(Some(env)) = self.saved_connections.get(self.selected) {
             let env_name = env.name.clone();
-            let _ = delete_connection(&env_name);
+            if let Err(e) = delete_connection(&env_name) {
+                return Some(Err(e));
+            }
             if self.default_name.as_deref() == Some(env_name.as_str()) {
                 self.default_name = None;
             }
@@ -2285,7 +2295,7 @@ impl PickerState {
             if let Some(&last) = listed.last() {
                 self.selected = listed.iter().copied().find(|&i| i >= deleted).unwrap_or(last);
             }
-            return Some(env_name);
+            return Some(Ok(env_name));
         }
         None
     }
@@ -2968,14 +2978,21 @@ impl ConnectionFlow {
         if let Some(_idx) = self.delete_confirming {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    if let Some(deleted_name) = self.picker.delete_selected() {
-                        // If no saved connections left (only "+ Add new"), go to setup
-                        if self.picker.items.len() == 1 {
-                            self.in_setup = true;
-                            self.setup_active_field = SetupField::Url;
+                    match self.picker.delete_selected() {
+                        Some(Ok(deleted_name)) => {
+                            // If no saved connections left (only "+ Add new"), go to setup
+                            if self.picker.items.len() == 1 {
+                                self.in_setup = true;
+                                self.setup_active_field = SetupField::Url;
+                            }
+                            self.picker_error_msg = Some(format!("{} deleted", deleted_name));
+                            self.picker_error_clear_at = Some(Instant::now() + Duration::from_secs(2));
                         }
-                        self.picker_error_msg = Some(format!("{} deleted", deleted_name));
-                        self.picker_error_clear_at = Some(Instant::now() + Duration::from_secs(2));
+                        Some(Err(e)) => {
+                            self.picker_error_msg = Some(e);
+                            self.picker_error_clear_at = Some(Instant::now() + Duration::from_secs(4));
+                        }
+                        None => {}
                     }
                     self.delete_confirming = None;
                     self.render(stdout, false)?;
@@ -2999,7 +3016,10 @@ impl ConnectionFlow {
                 self.render(stdout, false)?;
             }
             (_, KeyCode::Tab) => {
-                self.picker.toggle_default();
+                if let Err(e) = self.picker.toggle_default() {
+                    self.picker_error_msg = Some(e);
+                    self.picker_error_clear_at = Some(Instant::now() + Duration::from_secs(4));
+                }
                 self.render(stdout, false)?;
             }
             (_, KeyCode::Delete) => {
@@ -3688,6 +3708,7 @@ fn main() {
         // `-b`, `-k` and `--token` win over what the connection has stored.
         let env = override_connection(&env, args.base_uri.as_deref(), args.key.as_deref(), args.token.as_deref());
         config.connection_overridden = args.base_uri.is_some() || args.key.is_some() || args.token.is_some();
+        config.credential_overridden = args.key.is_some() || args.token.is_some();
         if let Err(e) = apply_connection_to_config(&mut config, &env) {
             errln!("{}", e);
             // The prompt opens all the same, where another connection can
@@ -3799,6 +3820,13 @@ fn main() {
                             }
                         }
                     }
+                } else {
+                    // A hand-written file with a name that is not there.
+                    errln!(
+                        "WARNING: the default connection \"{}\" is not among the saved connections ({}). No saved connection is used.",
+                        def,
+                        envs.join(", ")
+                    );
                 }
             } else if !has_explicit_auth && wants_prompt && io::stdout().is_terminal() {
                 // No default set + interactive: show unified connection flow
@@ -6287,6 +6315,50 @@ struct ImportedRepo {
     checkout: PathBuf,
     /// The alias it was declared under, for messages.
     alias: String,
+    /// The host its files were fetched from. `None` for files of this
+    /// machine: a directory, a `file://` URL, a loopback address.
+    host: Option<String>,
+}
+
+/// The host an import URL names, lowercased; `None` when the files are this
+/// machine's own (`file://`, a loopback address).
+fn import_host(url: &str) -> Option<String> {
+    let host = match reqwest::Url::parse(url) {
+        Ok(parsed) if parsed.scheme() == "file" => return None,
+        Ok(parsed) if parsed.host_str().is_some() => {
+            if is_loopback_url(&parsed) {
+                return None;
+            }
+            parsed.host_str()?.to_string()
+        }
+        // `user@host:path`, which is no URL.
+        _ => url.split_once(':')?.0.rsplit_once('@')?.1.to_string(),
+    };
+    Some(host.to_ascii_lowercase())
+}
+
+/// What a file of an import may not import. It was not written by whoever
+/// runs the batch, and its imports are fetched before `-p` can show them: so
+/// it names no token, and reaches no host but the one it came from. Files of
+/// this machine are the user's own and may import from anywhere.
+fn check_nested_import(spec: &ImportSpec, within: &ImportedRepo) -> Result<(), String> {
+    let url = match &spec.source {
+        ImportSource::Dir { .. } => return Ok(()),
+        ImportSource::Archive { token_env: Some(_), .. } => {
+            return Err(format!(
+                "import {}: an imported file can't name a `token_env`. A token is named by the file that is run",
+                spec.alias
+            ));
+        }
+        ImportSource::Git { url, .. } | ImportSource::Archive { url, .. } => url,
+    };
+    match &within.host {
+        Some(host) if import_host(url).as_ref() != Some(host) => Err(format!(
+            "import {}: a file imported from {} can import only from {}, not {}",
+            spec.alias, host, host, url
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// The aliases one file declared. An included file starts with none: an
@@ -7250,6 +7322,14 @@ fn declare_import(
     program: &mut BulkProgram,
 ) -> Result<(), String> {
     let spec = parse_import_directive(text, base_dir, within)?;
+    if let Some(repo) = within {
+        check_nested_import(&spec, repo)?;
+    }
+    let host = match &spec.source {
+        ImportSource::Git { url, .. } | ImportSource::Archive { url, .. } => import_host(url),
+        // A directory of an import is part of that import.
+        ImportSource::Dir { .. } => within.and_then(|repo| repo.host.clone()),
+    };
     if !declared.insert(spec.alias.clone()) {
         return Err(format!("import alias `{}` is declared twice", spec.alias));
     }
@@ -7315,7 +7395,7 @@ fn declare_import(
     }
     aliases.insert(
         spec.alias.clone(),
-        ImportedRepo { root, checkout, alias: spec.alias },
+        ImportedRepo { root, checkout, alias: spec.alias, host },
     );
     Ok(())
 }
@@ -9506,8 +9586,9 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
         // From setup flow or passed explicitly
         state.config.oauth2_client_id = client_id;
         state.config.oauth2_client_secret = client_secret;
-    } else if !connection_alias.is_empty() {
-        // From saved connection
+    } else if !connection_alias.is_empty() && !state.config.credential_overridden {
+        // From saved connection, unless a flag gave the credential: a 401
+        // would otherwise be answered with the stored secret.
         if let Some(env) = load_connection(&connection_alias) {
             if env.auth_type == "oauth2" {
                 state.config.oauth2_client_id = env.client_id.clone();
@@ -24288,5 +24369,63 @@ mod tests {
         let around: Vec<Option<&str>> = found.iter().map(|(_, e)| e.as_deref()).collect();
         assert_eq!(around, [Some("x.y.z"), Some("a.b.c"), Some("a.b.c")]);
         assert!(spans("GET /a", Some("x.y.z")).1.is_empty());
+    }
+
+    #[test]
+    fn an_import_url_names_a_host_unless_it_is_this_machine() {
+        let host = |url: &str| import_host(url);
+        assert_eq!(host("https://GitHub.com/Polyjuice/cloddy"), Some("github.com".to_string()));
+        assert_eq!(host("ssh://git@github.com/Polyjuice/cloddy.git"), Some("github.com".to_string()));
+        assert_eq!(host("git@github.com:Polyjuice/cloddy.git"), Some("github.com".to_string()));
+        assert_eq!(host("https://user@example.com:8443/x.tar.gz"), Some("example.com".to_string()));
+        // A host that only starts like this machine is another host.
+        assert_eq!(host("https://localhost.example.com/x.zip"), Some("localhost.example.com".to_string()));
+        assert_eq!(host("https://localhost@example.com/x.zip"), Some("example.com".to_string()));
+        for local in ["file:///tmp/repo", "http://localhost:8080/x.zip", "https://127.0.0.1/x.zip", "http://[::1]:9/x.zip"] {
+            assert_eq!(host(local), None, "{local}");
+        }
+    }
+
+    #[test]
+    fn an_imported_file_imports_only_from_where_it_came_from() {
+        let repo = |host: Option<&str>| ImportedRepo {
+            root: PathBuf::from("/c"),
+            checkout: PathBuf::from("/c"),
+            alias: "lib".to_string(),
+            host: host.map(String::from),
+        };
+        let git = |url: &str| ImportSpec {
+            alias: "x".to_string(),
+            source: ImportSource::Git { url: url.to_string(), git_ref: "1.0".to_string() },
+            path: None,
+        };
+        let archive = |url: &str, token_env: Option<&str>| ImportSpec {
+            alias: "x".to_string(),
+            source: ImportSource::Archive { url: url.to_string(), sha256: None, token_env: token_env.map(String::from) },
+            path: None,
+        };
+        let dir = ImportSpec { alias: "x".to_string(), source: ImportSource::Dir { path: "sub".to_string() }, path: None };
+        let github = repo(Some("github.com"));
+
+        // The same host, however the URL is written.
+        assert!(check_nested_import(&git("https://github.com/a/b"), &github).is_ok());
+        assert!(check_nested_import(&git("git@GitHub.com:a/b.git"), &github).is_ok());
+        assert!(check_nested_import(&archive("https://github.com/a/b/archive/1.tar.gz", None), &github).is_ok());
+        assert!(check_nested_import(&dir, &github).is_ok());
+        // Another host, and this machine seen from a remote file.
+        for url in ["https://evil.example/x", "https://github.com.evil.example/x", "file:///Users/me/secrets"] {
+            let err = check_nested_import(&git(url), &github).unwrap_err();
+            assert!(err.contains("can import only from github.com"), "{url}: {err}");
+        }
+        let err = check_nested_import(&archive("http://localhost:8080/x.tar.gz", None), &github).unwrap_err();
+        assert!(err.contains("can import only from github.com"), "{err}");
+        // A token is refused wherever the file came from, the same host included.
+        for within in [&github, &repo(None)] {
+            let err = check_nested_import(&archive("https://github.com/a.tar.gz", Some("GITHUB_TOKEN")), within).unwrap_err();
+            assert!(err.contains("can't name a `token_env`"), "{err}");
+        }
+        // Files of this machine are the user's own, and import from anywhere.
+        assert!(check_nested_import(&git("https://github.com/a/b"), &repo(None)).is_ok());
+        assert!(check_nested_import(&archive("https://example.com/a.zip", None), &repo(None)).is_ok());
     }
 }

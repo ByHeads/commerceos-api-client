@@ -408,6 +408,16 @@ import archive cl {
   out of it is an error. `path` only says where the
   alias starts: the boundary is still the whole repository or archive, so a
   file under `path` may include or send a file above it.
+- **An imported file imports only from where it came from.** A file fetched
+  from a host (`import git`, `import archive`) may itself import from that
+  host and no other, and not from this machine (`file://`, `localhost`):
+  `a file imported from github.com can import only from github.com, not …`.
+  No imported file may name a `token_env`, whatever it came from: a token is
+  named by the file that is run. Imports are fetched while the file is read,
+  before `-p` shows anything, so this is what keeps a token and a request of
+  yours from going where a third party's file points. Files of this machine
+  (an `import dir`, a `file://` or loopback URL) are your own and may import
+  from anywhere.
 - **An imported `url` line can only narrow.** The `url` lines of an import
   form a gate of their own that must pass *as well as* yours. An import can
   refuse to run somewhere; it can never add an environment to your allowlist.
@@ -1055,9 +1065,14 @@ api --no-keychain -k "$API_KEY" GET /people    # URL from file, key from the CLI
 ```
 
 A `-k`/`--token` on the command line overrides the stored credential but keeps
-the file's URL, so one file can serve several keys. `-b` overrides the URL and
-keeps the stored credential. Both hold for the default connection and for one
-chosen with `-c`: what the command line gives always wins.
+the file's URL, so one file can serve several keys, for the default
+connection and for one chosen with `-c`. `-b` beside `-c` overrides the URL
+and keeps that connection's stored credential. What the command line gives
+always wins.
+
+`-b` without `-c` uses no saved connection at all: the default connection's
+credential was saved for another host and is not sent to this one. Give the
+credential too (`-b … -k …`), or name the connection that lends it (`-c`).
 
 ```sh
 api --no-keychain -c staging -k "$OTHER_KEY" GET /people      # staging's URL, another key
@@ -1080,6 +1095,13 @@ Error: no base URL specified. Use -b <url> or -c <connection>.
 
 If you see that while expecting the file to work, check the path and that
 `--no-keychain` was actually passed.
+
+A `default` that names no connection in the file is said to be that, and no
+saved connection is used:
+
+```
+WARNING: the default connection "locl" is not among the saved connections (local, stage). No saved connection is used.
+```
 
 A file that exists but can't be read, or is not valid (a trailing comma is
 enough), is said to be so and is not used:
@@ -1191,6 +1213,8 @@ Run it: `api -sa workshop.api`.
 - **An alias used in an included file** → `include not found: cl/sv.api`. Aliases don't carry into includes; repeat the `import` in the file that uses it.
 - **Importing a branch and expecting yesterday's run** → a branch is re-resolved every run. Pin a tag or a SHA, and check the commit in the `import …` log line.
 - **An archive URL without `sha256`** → downloaded again on every run, and whatever it serves that day is what runs. Add the `sha256` from the `import …` log line to pin it.
+- **`token_env` or another host in an imported file** → refused before anything is fetched. Import the second repository or archive from the file you run, next to the first.
+- **`-b` alone, expecting the default connection's key** → none is sent, and the request is answered `401`. Add `-k`, or `-c <name>` to lend that connection's credential to the other host.
 - **`"token_env": "<the token>"`** → rejected or reported as an unset variable. It takes the *name* of an environment variable, so the secret stays out of the file.
 - **`import dir cl { "path": "cl" }`** → `import alias … clashes`. An alias can't share its name with a file or directory next to the `.api` file; name the alias something else.
 - **Seeding from a plain `GET`** → the response carries `identifiers.key`, a database key of the environment it was read from. Written elsewhere it is refused (`400 failed indexing`: a `key` that names nothing). Read it with `--export <external-id>`, which takes the key out and keeps a lone one as `key?` and under the name.

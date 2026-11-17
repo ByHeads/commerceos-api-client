@@ -1638,3 +1638,30 @@ fn an_imported_file_can_import_the_api_client_repository_from_github() {
         }
     }
 }
+
+/// A file of an import was not written by whoever runs the batch, and what it
+/// imports is fetched before the preview is shown. It names no token.
+#[test]
+fn an_imported_file_cannot_name_a_token_for_an_archive() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", fixture_archive());
+    let nested = format!(
+        "import archive packed {{ \"url\": \"{}\", \"token_env\": \"HOME\" }}\npacked/seed.api\n",
+        server.url("/lib.tar.gz")
+    );
+    let import = own_import(&dir, &[("takes.api", &nested)]);
+    for flags in ["-sa", "-spa"] {
+        let ran = run_batch(&dir, server.port, flags, &format!("{import}\nGET /first\nlib/takes.api\n"));
+        assert!(!ran.ok, "{flags}");
+        assert!(ran.stderr.contains("import packed: an imported file can't name a `token_env`"), "{flags}: {}", ran.stderr);
+        // Nothing was sent, and the archive was not asked for either.
+        assert_eq!(server.sent(), Vec::<String>::new(), "{flags}");
+    }
+    // The file that is run may, as before.
+    let top = format!(
+        "import archive packed {{ \"url\": \"{}\", \"token_env\": \"HOME\" }}\npacked/seed.api\n",
+        server.url("/lib.tar.gz")
+    );
+    let ran = run_batch(&dir, server.port, "-sa", &top);
+    assert!(ran.ok, "{}", ran.stderr);
+}

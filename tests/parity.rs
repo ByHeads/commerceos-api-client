@@ -5703,3 +5703,113 @@ fn a_block_at_the_prompt_runs_on_past_an_error_status() {
     let (sent, _) = run_pasted(&mut prompt, &server, "GET /boom || GET /never\rGET /b\r");
     assert_eq!(sent, ["GET /boom"]);
 }
+
+/// `-b` alone names a host the stored credential was not saved for: the
+/// default connection's key is not sent there. With `-c` it is asked for.
+#[test]
+fn a_base_url_alone_is_not_sent_the_default_connections_credential() {
+    let saved = RecordingServer::start();
+    let other = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write_credentials(d, &[("local", format!("http://127.0.0.1:{}", saved.port), "key", "STOREDKEY", "")], "local");
+    let elsewhere = format!("http://127.0.0.1:{}", other.port);
+
+    let got = run_bare(&other, d, &["-b", &elsewhere, "GET", "/a"]);
+    assert_eq!(got.sent, ["GET /a"], "{}", got.stderr);
+    assert_eq!(authorization(&other), "-");
+    assert_eq!(saved.seen(), 0);
+    // Named, the connection lends its credential to the other host.
+    let got = run_bare(&other, d, &["-c", "local", "-b", &elsewhere, "GET", "/a"]);
+    assert_eq!(got.sent, ["GET /a"], "{}", got.stderr);
+    assert_eq!(authorization(&other), "Basic OlNUT1JFREtFWQ==");
+}
+
+/// A `default` that names no saved connection is said to be that, where it
+/// used to end in a bare "no base URL specified".
+#[test]
+fn a_default_that_names_no_connection_is_said() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    write_credentials(d, &[("local", url.clone(), "key", "k", ""), ("stage", url, "key", "k", "")], "locl");
+    let got = run_bare(&server, d, &["GET", "/a"]);
+    assert_eq!((got.code, got.sent.len()), (Some(1), 0), "{}", got.stderr);
+    assert!(
+        got.stderr.contains("the default connection \"locl\" is not among the saved connections (local, stage)"),
+        "{}",
+        got.stderr
+    );
+    // By name it still works.
+    let got = run_bare(&server, d, &["-c", "stage", "GET", "/a"]);
+    assert_eq!((got.code, &got.sent[..]), (Some(0), &["GET /a".to_string()][..]), "{}", got.stderr);
+}
+
+/// A key given with `-k` beside `-c` is the credential of the session: a 401
+/// is the answer, and is not answered by exchanging the client secret the
+/// connection has stored. Saving then stores the key, not the secret.
+#[cfg(unix)]
+#[test]
+fn a_key_beside_an_oauth2_connection_is_not_renewed_with_the_stored_secret() {
+    let server = RecordingServer::start();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write_credentials(d, &[("o", url, "oauth2", "STOREDSECRET", "id")], "");
+    let mut cmd = api_bare(d);
+    cmd.args(["-c", "o", "-k", "CLIKEY"]);
+    let mut prompt = pty::Prompt::open(cmd);
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+
+    let (sent, shown) = run_pasted(&mut prompt, &server, "GET /denied");
+    assert_eq!(sent, ["GET /denied"], "{shown}");
+    let all = server.log.lock().unwrap().clone();
+    assert_eq!(counts(&all, &["/oauth2/v1/token"]), [0], "{all:?}");
+    assert!(server.heads().iter().all(|h| !h.contains("Bearer")), "{:?}", server.heads());
+
+    save_as(&mut prompt, "mine", "saved");
+    let (connections, _) = stored(d);
+    assert!(connections.contains(&"mine=CLIKEY".to_string()), "{connections:?}");
+    assert!(connections.contains(&"o=STOREDSECRET".to_string()), "{connections:?}");
+}
+
+/// The picker shows what the store holds. When the store can't be written, a
+/// connection is not shown as deleted, nor as the default.
+#[cfg(unix)]
+#[test]
+fn the_picker_says_when_the_store_could_not_be_changed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = RecordingServer::start();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write_credentials(d, &[("alpha", url.clone(), "key", "k1", ""), ("beta", url, "key", "k2", "")], "");
+    let file = d.join(".api-credentials.json");
+    let lock = |locked: bool| {
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(if locked { 0o444 } else { 0o644 })).unwrap();
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(if locked { 0o555 } else { 0o755 })).unwrap();
+    };
+    lock(true);
+    let mut prompt = pty::Prompt::open(api_bare(d));
+    prompt.wait_for("+ Add new connection", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(400));
+
+    prompt.send(b"\t");
+    prompt.pump(Duration::from_millis(400));
+    let after_tab = selected_row(&prompt);
+    keys_then(&mut prompt, "\x1b[3~", "Delete? y/n");
+    let mark = prompt.screen.len();
+    prompt.send(b"y");
+    prompt.pump(Duration::from_millis(500));
+    let shown = pty::plain(&prompt.screen[mark..]);
+    let after_delete = selected_row(&prompt);
+    lock(false);
+
+    assert!(after_tab.contains("alpha") && !after_tab.contains('♥'), "{after_tab}");
+    assert!(!shown.contains("alpha deleted"), "{shown}");
+    assert!(shown.to_lowercase().contains("could not") || shown.contains("denied"), "{shown}");
+    assert!(after_delete.contains("alpha"), "{after_delete}");
+    assert_eq!(stored(d), (vec!["alpha=k1".to_string(), "beta=k2".to_string()], String::new()));
+}
