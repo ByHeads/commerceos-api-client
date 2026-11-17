@@ -22804,4 +22804,1198 @@ mod tests {
         let program = split_bulk_requests("PUT /assert @/nowhere/asserts.json\n", None).unwrap();
         assert!(collect_assertions(&program, "/api/v1").is_err());
     }
+
+    // ── Completion from a spec ──────────────────────────────────────────
+
+    /// A spec in the shape the server serves one: every property is a
+    /// `$ref`, to a scalar (`strict string`, `boolean`) as often as to an
+    /// object, a collection is an array with an `x-indexer`, and a record's
+    /// identifiers are `common identifiers`.
+    const COMPLETION_SPEC: &str = r##"{
+      "tags": [
+        { "name": "People", "x-type": "people" },
+        { "name": "Agents", "x-type": "agents" },
+        { "name": "Untyped" }
+      ],
+      "paths": {
+        "/about": { "get": { "responses": {} } },
+        "/agents": { "get": { "tags": ["Agents"], "responses": { "200": { "content": { "application/json": {
+          "schema": { "type": "array", "items": { "$ref": "#/components/schemas/agent" } } } } } } } },
+        "/people": { "get": { "tags": ["Untyped", "People"], "responses": { "200": { "content": { "application/json": {
+          "schema": { "type": "array", "items": { "$ref": "#/components/schemas/person" } } } } } } } },
+        "/people/find": { "get": { "responses": {} } },
+        "/people/{index}": {
+          "parameters": [{ "name": "index", "schema": { "$ref": "#/components/schemas/common identifiers" } }],
+          "get": { "responses": { "200": { "content": { "application/json": {
+            "schema": { "$ref": "#/components/schemas/person" } } } } } } },
+        "/people/{key}={index}": { "get": {
+          "parameters": [{ "name": "key" }, { "name": "index", "schema": { "$ref": "#/components/schemas/strict string" } }],
+          "responses": {} } },
+        "/pets": { "get": { "responses": { "200": { "content": { "application/json": {
+          "schema": { "type": "array", "items": { "type": "string" } } } } } } } },
+        "/settings": { "get": { "responses": { "200": { "content": { "application/json": {
+          "schema": { "$ref": "#/components/schemas/settings" } } } } } } }
+      },
+      "components": { "schemas": {
+        "people": { "type": "array", "items": { "$ref": "#/components/schemas/person" },
+          "x-indexer": { "indexType": "COS database key or common identifiers", "returnType": "person?" },
+          "x-array-members": {
+            "count": { "$ref": "#/components/schemas/number" },
+            "add": { "type": "array", "items": { "$ref": "#/components/schemas/person" } },
+            "odd": { "type": "array" } } },
+        "agents": { "type": "array",
+          "x-indexer": { "indexType": "COS database key or common identifiers", "returnType": "agent?" } },
+        "agent": { "type": "object", "x-child-types": ["person", "company"],
+          "properties": {
+            "@type": { "type": "string" },
+            "identifiers": { "$ref": "#/components/schemas/common identifiers" },
+            "name": { "$ref": "#/components/schemas/strict string" } } },
+        "person": { "type": "object", "x-parent-type": "agent",
+          "properties": {
+            "@type": { "type": "string" },
+            "identifiers": { "$ref": "#/components/schemas/common identifiers" },
+            "name": { "$ref": "#/components/schemas/strict string" },
+            "givenName": { "$ref": "#/components/schemas/strict string" },
+            "ålder": { "$ref": "#/components/schemas/number" },
+            "gdprForgotten": { "$ref": "#/components/schemas/boolean" },
+            "active": { "type": "boolean" },
+            "status": { "type": "string", "enum": ["new", "old"] },
+            "rank": { "enum": [1, 2] },
+            "addresses": { "$ref": "#/components/schemas/agent addresses" },
+            "labels": { "$ref": "#/components/schemas/assigned labels" },
+            "meta": { "examples": [{}] } } },
+        "common identifiers": { "type": "object",
+          "properties": { "key": {}, "key?": {}, "com.mi6.id": { "$ref": "#/components/schemas/strict string" } },
+          "additionalProperties": { "x-additionalPropertiesName": "[namespaced key]" } },
+        "agent addresses": { "type": "object",
+          "properties": {
+            "home": { "$ref": "#/components/schemas/address" },
+            "main": { "$ref": "#/components/schemas/address" } } },
+        "address": { "type": "object",
+          "properties": {
+            "city": { "$ref": "#/components/schemas/strict string" },
+            "line1": { "$ref": "#/components/schemas/strict string" } } },
+        "assigned labels": { "type": "array",
+          "x-indexer": { "indexType": "label identifiers", "returnType": "label?" } },
+        "label": { "type": "object",
+          "properties": {
+            "identifiers": { "$ref": "#/components/schemas/common identifiers" },
+            "title": { "$ref": "#/components/schemas/strict string" } } },
+        "settings": { "properties": { "locale": { "$ref": "#/components/schemas/strict string" } } },
+        "company": { "allOf": [{ "$ref": "#/components/schemas/legal entity" }, { "$ref": "elsewhere" }] },
+        "strict string": { "type": "string",
+          "x-primitive-members": {
+            "length": { "$ref": "#/components/schemas/number" },
+            "upper": { "$ref": "#/components/schemas/strict string" },
+            "chars": { "type": "array", "items": { "$ref": "#/components/schemas/strict string" } } } },
+        "boolean": { "type": "boolean" },
+        "number": { "type": "number" }
+      } }
+    }"##;
+
+    /// What `index_spec` reads out of `COMPLETION_SPEC`.
+    fn indexed_spec() -> BackgroundLoadResult {
+        let spec: ApiSpec = serde_json::from_str(COMPLETION_SPEC).expect("the fixture is a spec");
+        let mut result = BackgroundLoadResult { complete: true, connected: true, ..Default::default() };
+        index_spec(spec, &mut result);
+        result.mapped_types = ["com.heads.csv", "com.heads.sql", "ärende"].map(String::from).to_vec();
+        result
+    }
+
+    /// A prompt that has loaded `COMPLETION_SPEC`, with `marked` on its
+    /// line: the cursor is where the `^` is, or at the end without one.
+    fn completing(marked: &str) -> AppState {
+        let mut state = test_state();
+        apply_background_result(&mut state, indexed_spec());
+        state.input = marked.replace('^', "");
+        state.cursor_pos = marked.find('^').map_or(char_len(marked), |at| char_len(&marked[..at]));
+        state
+    }
+
+    /// The same with `-x`, where the body completes too.
+    fn completing_body(marked: &str) -> AppState {
+        let mut state = completing(marked);
+        state.config.experimental = true;
+        state
+    }
+
+    /// The line with a `^` where the cursor is.
+    fn shown(state: &AppState) -> String {
+        let at = char_to_byte_idx(&state.input, state.cursor_pos);
+        format!("{}^{}", &state.input[..at], &state.input[at..])
+    }
+
+    /// The line after Tab on `marked`.
+    fn tabbed(marked: &str) -> String {
+        let mut state = completing(marked);
+        tab_pressed(&mut state);
+        shown(&state)
+    }
+
+    /// The line after Tab on `marked`, with `-x`.
+    fn body_tabbed(marked: &str) -> String {
+        let mut state = completing_body(marked);
+        tab_pressed(&mut state);
+        shown(&state)
+    }
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn index_spec_reads_what_completion_asks_about() {
+        let spec = indexed_spec();
+        let map = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        };
+
+        // Every path, templates too, in order.
+        assert_eq!(
+            spec.endpoints,
+            strings(&["/about", "/agents", "/people", "/people/find", "/people/{index}", "/people/{key}={index}", "/pets", "/settings"])
+        );
+        // A schema's properties in order, and the type each one refers to.
+        assert_eq!(spec.schema_props["address"], strings(&["city", "line1"]));
+        assert_eq!(spec.schema_props["common identifiers"], strings(&["com.mi6.id", "key", "key?"]));
+        assert!(!spec.schema_props.contains_key("strict string"));
+        assert_eq!(spec.prop_types["agent addresses"], map(&[("home", "address"), ("main", "address")]));
+        let person = &spec.prop_types["person"];
+        assert_eq!(person["identifiers"], "common identifiers");
+        assert_eq!(person["gdprForgotten"], "boolean");
+        // A property without a type whose example is an object is one.
+        assert_eq!(person["meta"], "");
+        // One with neither is not listed: nothing is known about its value.
+        assert!(!person.contains_key("active") && !person.contains_key("status") && !person.contains_key("@type"));
+        assert!(!spec.prop_types.contains_key("boolean"));
+
+        // Collections: what indexes them and what an index gives.
+        let people = &spec.indexer_info["people"];
+        assert_eq!(people.index_type.as_deref(), Some("COS database key or common identifiers"));
+        assert_eq!(people.return_type.as_deref(), Some("person?"));
+        assert!(spec.array_schemas.contains("people") && spec.array_schemas.contains("assigned labels"));
+        assert!(!spec.array_schemas.contains("person"));
+        assert_eq!(spec.schema_types["person"], "object");
+        assert_eq!(spec.schema_types["people"], "array");
+        assert_eq!(spec.schema_types["boolean"], "boolean");
+        assert!(!spec.schema_types.contains_key("settings"));
+        // Members, by `$ref` or by the `$ref` of their items. One with neither is left out.
+        assert_eq!(spec.array_members["people"], map(&[("count", "number"), ("add", "person")]));
+        assert_eq!(
+            spec.primitive_members["strict string"],
+            map(&[("length", "number"), ("upper", "strict string"), ("chars", "strict string")])
+        );
+        assert_eq!(spec.additional_props_key, map(&[("common identifiers", "namespaced key")]));
+
+        // Enum values as they are written in a body; a boolean has its two.
+        let enums = &spec.enum_values["person"];
+        assert_eq!(enums["status"], strings(&["new", "old"]));
+        assert_eq!(enums["rank"], strings(&["1", "2"]));
+        assert_eq!(enums["active"], strings(&["true", "false"]));
+        assert!(!enums.contains_key("gdprForgotten"));
+
+        // Subtypes from `x-child-types`, else from the `allOf` of the children.
+        assert_eq!(spec.subtypes["agent"], strings(&["person", "company"]));
+        assert_eq!(spec.subtypes["legal entity"], strings(&["company"]));
+        assert_eq!(spec.parent_types, map(&[("person", "agent")]));
+
+        // An endpoint's schema: by the first of its tags that names one, and
+        // by what a GET answers with (the items of a list).
+        assert_eq!(spec.endpoint_schemas, map(&[("/people", "people"), ("/agents", "agents")]));
+        assert_eq!(
+            spec.endpoint_types,
+            map(&[("/agents", "agent"), ("/people", "person"), ("/people/{index}", "person"), ("/settings", "settings")])
+        );
+        let lists: Vec<&str> = {
+            let mut lists: Vec<&str> = spec.array_endpoints.iter().map(String::as_str).collect();
+            lists.sort();
+            lists
+        };
+        assert_eq!(lists, ["/agents", "/people", "/pets"]);
+        // A template's parameter type: the path's own parameters, else the GET's.
+        assert_eq!(
+            spec.param_types,
+            map(&[("/people/{index}", "common identifiers"), ("/people/{key}={index}", "strict string")])
+        );
+        assert!(spec.spec.is_some());
+    }
+
+    #[test]
+    fn a_spec_with_parts_missing_is_still_a_spec() {
+        for (json, endpoints) in [("{}", 0), (r#"{"paths":{"/a":{}}}"#, 1), (r#"{"paths":{"/a":{"get":{}}},"components":{}}"#, 1)] {
+            let spec: ApiSpec = serde_json::from_str(json).unwrap_or_else(|e| panic!("{json}: {e}"));
+            let mut result = BackgroundLoadResult::default();
+            index_spec(spec, &mut result);
+            assert_eq!(result.endpoints.len(), endpoints, "{json}");
+            assert!(result.schema_props.is_empty() && result.endpoint_types.is_empty(), "{json}");
+        }
+        assert!(serde_json::from_str::<ApiSpec>(r#""not a spec""#).is_err());
+    }
+
+    #[test]
+    fn a_schema_name_is_read_from_its_ref_and_ancestry_from_parent_types() {
+        assert_eq!(extract_schema_name("#/components/schemas/strict string").as_deref(), Some("strict string"));
+        assert_eq!(extract_schema_name("#/components/responses/x"), None);
+
+        let parents: HashMap<String, String> =
+            [("person", "agent"), ("agent", "thing"), ("a", "b"), ("b", "a")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        assert!(schema_inherits_from(&parents, "thing", "thing"));
+        assert!(schema_inherits_from(&parents, "person", "agent"));
+        assert!(schema_inherits_from(&parents, "person", "thing"));
+        assert!(!schema_inherits_from(&parents, "thing", "person"));
+        assert!(!schema_inherits_from(&parents, "stranger", "thing"));
+        // A loop in the spec ends.
+        assert!(!schema_inherits_from(&parents, "a", "thing"));
+    }
+
+    #[test]
+    fn a_path_resolves_to_the_schema_it_holds() {
+        let state = completing("");
+        let at = |uri: &str| resolve_type_at_path(&state, uri);
+        let hint = Some("COS database key or common identifiers".to_string());
+
+        assert_eq!(at("/"), (None, false, None));
+        assert_eq!(at("/nowhere/"), (None, false, None));
+        // A collection, and one of it once an index follows.
+        assert_eq!(at("/people"), (Some("people".to_string()), false, None));
+        assert_eq!(at("/people/"), (Some("people".to_string()), true, hint.clone()));
+        assert_eq!(at("/people/com.mi6.id=007"), (Some("person".to_string()), false, None));
+        assert_eq!(at("/people/7f3a/"), (Some("person".to_string()), false, None));
+        // An operator is not part of the path.
+        assert_eq!(at("/people/~where(name=x)"), (Some("people".to_string()), true, hint));
+        // Members of the collection, properties, and members of a scalar.
+        assert_eq!(at("/people/count/"), (Some("number".to_string()), false, None));
+        assert_eq!(at("/people/7f3a/addresses/home/"), (Some("address".to_string()), false, None));
+        assert_eq!(at("/people/7f3a/name/upper/length"), (Some("number".to_string()), false, None));
+        // A dictionary takes a key of the kind it names.
+        assert_eq!(
+            at("/people/7f3a/identifiers/"),
+            (Some("common identifiers".to_string()), true, Some("namespaced key".to_string()))
+        );
+        assert_eq!(at("/people/7f3a/identifiers/com.x.y/"), (Some("common identifiers".to_string()), true, Some("namespaced key".to_string())));
+        // An endpoint whose answer names no schema resolves to nothing.
+        assert_eq!(at("/pets/"), (None, false, None));
+        assert_eq!(at("/people/7f3a/labels/"), (Some("assigned labels".to_string()), true, Some("label identifiers".to_string())));
+        // A property with no type of its own has nothing below it, and
+        // neither has a segment that names nothing.
+        assert_eq!(at("/people/7f3a/active/"), (None, false, None));
+        assert_eq!(at("/settings/nothing/"), (None, false, None));
+
+        assert_eq!(operand_schema(&state, "/people").as_deref(), Some("person"));
+        assert_eq!(operand_schema(&state, "/people/7f3a/addresses").as_deref(), Some("agent addresses"));
+        assert_eq!(operand_schema(&state, "/settings").as_deref(), Some("settings"));
+        assert_eq!(operand_schema(&state, "/nowhere"), None);
+        // The older lookup by endpoint, kept for a path the resolver can't walk.
+        assert_eq!(get_schema_for_path(&state, "/people~take(1)"), "person");
+        assert_eq!(get_schema_for_path(&state, "/people/7f3a"), "person");
+        assert_eq!(get_schema_for_path(&state, "/people/7f3a/unknown/x"), "person");
+        assert_eq!(get_schema_for_path(&state, "/pets"), "");
+    }
+
+    #[test]
+    fn the_hint_names_the_index_a_collection_takes() {
+        let state = completing("");
+        let index = "index: COS database key or common identifiers";
+        assert_eq!(get_param_hint(&state, "/people/"), index);
+        assert_eq!(get_param_hint(&state, "/people/7f"), index);
+        assert_eq!(get_param_hint(&state, "/people/7f3a/identifiers/"), "index: namespaced key");
+        // Not for a member, a projection, a property or a plain path.
+        assert_eq!(get_param_hint(&state, "/people/count"), "");
+        assert_eq!(get_param_hint(&state, "/people/*name"), "");
+        assert_eq!(get_param_hint(&state, "/people/7f3a/identifiers/key"), "");
+        assert_eq!(get_param_hint(&state, "/people/7f3a/"), "");
+        assert_eq!(get_param_hint(&state, "/people"), "");
+        assert_eq!(get_param_hint(&state, "/"), "");
+    }
+
+    #[test]
+    fn a_path_completes_to_endpoints_members_identifiers_and_properties() {
+        let state = completing("");
+        let complete = |uri: &str| get_completions(&state, uri);
+
+        // Endpoints by their start; a template is never offered.
+        assert_eq!(complete("/"), strings(&["/about", "/agents", "/people", "/people/find", "/pets", "/settings"]));
+        assert_eq!(complete("/pe"), strings(&["/people", "/people/find", "/pets"]));
+        // None starts so: any that holds it.
+        assert_eq!(complete("/find"), strings(&["/people/find"]));
+        assert_eq!(complete("/zzz"), strings(&[]));
+        assert_eq!(complete("zzz"), strings(&[]));
+
+        // In a collection: its members and the identifiers that index it.
+        // The database key is not offered, under either name, and the
+        // members that change the collection come last.
+        assert_eq!(complete("/people/"), strings(&["/people/com.mi6.id=", "/people/count", "/people/add"]));
+        assert_eq!(complete("/people/c"), strings(&["/people/com.mi6.id=", "/people/count"]));
+        // A projection of every element.
+        assert_eq!(complete("/people/*na"), strings(&["/people/*name"]));
+        assert_eq!(complete("/people/7f3a/*gi"), strings(&["/people/7f3a/*givenName"]));
+
+        // In a record: its properties, without `@type`.
+        assert_eq!(
+            complete("/people/com.mi6.id=007/"),
+            strings(&[
+                "/people/com.mi6.id=007/active", "/people/com.mi6.id=007/addresses", "/people/com.mi6.id=007/gdprForgotten",
+                "/people/com.mi6.id=007/givenName", "/people/com.mi6.id=007/identifiers", "/people/com.mi6.id=007/labels",
+                "/people/com.mi6.id=007/meta", "/people/com.mi6.id=007/name", "/people/com.mi6.id=007/rank",
+                "/people/com.mi6.id=007/status", "/people/com.mi6.id=007/ålder",
+            ])
+        );
+        assert_eq!(complete("/people/7f3a/addresses/"), strings(&["/people/7f3a/addresses/home", "/people/7f3a/addresses/main"]));
+        assert_eq!(complete("/people/7f3a/addresses/home/l"), strings(&["/people/7f3a/addresses/home/line1"]));
+        assert_eq!(complete("/people/7f3a/å"), strings(&["/people/7f3a/ålder"]));
+        // In a scalar: what can be asked of it.
+        assert_eq!(
+            complete("/people/7f3a/name/"),
+            strings(&["/people/7f3a/name/chars", "/people/7f3a/name/length", "/people/7f3a/name/upper"])
+        );
+        // A segment already in the path is not offered below itself.
+        assert_eq!(complete("/people/7f3a/name/upper/u"), strings(&[]));
+        // Below an endpoint that has none below it, nothing; but an
+        // endpoint below an endpoint is one.
+        assert_eq!(complete("/about/"), strings(&[]));
+        assert_eq!(complete("/settings/"), strings(&["/settings/locale"]));
+        assert_eq!(complete_endpoint(&state, "/people/f"), strings(&["/people/find"]));
+        assert_eq!(complete_endpoint(&state, "/people/x"), strings(&[]));
+    }
+
+    #[test]
+    fn a_uri_is_read_into_its_open_operators() {
+        let read = |uri: &str| {
+            scan_uri(uri).map(|levels| {
+                levels.iter().map(|l| (l.paren, l.op_tilde, l.item_start, l.tilde)).collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(read(""), Some(vec![(None, None, 0, None)]));
+        assert_eq!(read("/people~wi"), Some(vec![(None, None, 0, Some(7))]));
+        // An operator that was closed leaves its `~` as the last of the item.
+        assert_eq!(read("/people~take(5)"), Some(vec![(None, None, 0, Some(7))]));
+        assert_eq!(read("/people~take(5)~with(a,b~just(c"), Some(vec![
+            (None, None, 0, Some(15)),
+            (Some(20), Some(15), 23, Some(24)),
+            (Some(29), Some(24), 30, None),
+        ]));
+        // A `(` that only groups belongs to no operator.
+        assert_eq!(read("/people~where((a"), Some(vec![(None, None, 0, Some(7)), (Some(13), Some(7), 14, None), (Some(14), None, 15, None)]));
+        // What a string holds is text, and inside one nothing completes.
+        assert_eq!(read(r#"/people~where(name="a~(,)")~"#), Some(vec![(None, None, 0, Some(27))]));
+        assert_eq!(read(r#"/people~where(name="a\"~"#), None);
+        // A `)` too many closes nothing.
+        assert_eq!(read("/people)~"), Some(vec![(None, None, 0, Some(8))]));
+    }
+
+    #[test]
+    fn an_operator_completes_by_name_and_inside_its_parentheses() {
+        let state = completing("");
+        let complete = |uri: &str| get_completions(&state, uri);
+        let all = ["active", "addresses", "gdprForgotten", "givenName", "identifiers", "labels", "meta", "name", "rank", "status", "ålder"];
+        let after = |prefix: &str, names: &[&str]| names.iter().map(|name| format!("{prefix}{name}")).collect::<Vec<_>>();
+
+        // The name of an operator.
+        assert_eq!(complete("/people~wi"), strings(&["/people~with(", "/people~without("]));
+        assert_eq!(complete("/people~").len(), API_OPERATORS.len());
+        assert_eq!(complete("/people~take(5)~c"), strings(&["/people~take(5)~count"]));
+        // One that has had its parentheses takes nothing more.
+        assert_eq!(complete("/people~take(5)"), strings(&[]));
+        assert_eq!(complete("/people~with(name)"), strings(&[]));
+
+        // Inside: the properties of what the path holds.
+        assert_eq!(complete("/people~with("), after("/people~with(", &all));
+        assert_eq!(complete("/people~with(na"), strings(&["/people~with(name"]));
+        assert_eq!(complete("/people/7f3a~just(g"), strings(&["/people/7f3a~just(gdprForgotten", "/people/7f3a~just(givenName"]));
+        assert_eq!(complete("/people/7f3a/addresses~with("), strings(&["/people/7f3a/addresses~with(home", "/people/7f3a/addresses~with(main"]));
+        assert_eq!(complete("/settings~just("), strings(&["/settings~just(locale"]));
+        // One already selected is not offered again.
+        assert_eq!(complete("/people~with(name,gi"), strings(&["/people~with(name,givenName"]));
+        let rest: Vec<&str> = all.iter().copied().filter(|name| !matches!(*name, "name" | "status")).collect();
+        assert_eq!(complete("/people~with(name,x:status,"), after("/people~with(name,x:status,", &rest));
+        // An alias and a negation stay as typed.
+        assert_eq!(complete("/people~with(n:na"), strings(&["/people~with(n:name"]));
+        assert_eq!(complete("/people~with(a:"), after("/people~with(a:", &all));
+        assert_eq!(complete("/people~without(!na"), strings(&["/people~without(!name"]));
+        assert_eq!(complete("/people~with(n:!na"), strings(&["/people~with(n:!name"]));
+        // A path into a property.
+        assert_eq!(complete("/people~with(addresses/"), strings(&["/people~with(addresses/home", "/people~with(addresses/main"]));
+        assert_eq!(complete("/people~with(name,addresses/home/c"), strings(&["/people~with(name,addresses/home/city"]));
+        assert_eq!(complete("/people~with(name/"), strings(&["/people~with(name/chars", "/people~with(name/length", "/people~with(name/upper"]));
+        assert_eq!(complete("/people~with(active/"), strings(&[]));
+        assert_eq!(complete("/people~with(nothing/"), strings(&[]));
+
+        // After an operator that came before it.
+        assert_eq!(complete("/people~take(5)~with(na"), strings(&["/people~take(5)~with(name"]));
+        assert_eq!(complete(r#"/people~where(name="a")~with(na"#), strings(&[r#"/people~where(name="a")~with(name"#]));
+        // An operator on a selector selects from what the selector holds.
+        assert_eq!(complete("/people~with(addresses~ju"), strings(&["/people~with(addresses~just("]));
+        assert_eq!(complete("/people~with(addresses~just("), strings(&["/people~with(addresses~just(home", "/people~with(addresses~just(main"]));
+        assert_eq!(complete("/people~with(name,a:addresses/home~just(c"), strings(&["/people~with(name,a:addresses/home~just(city"]));
+        assert_eq!(
+            complete("/people~with(addresses~with(home~just(l"),
+            strings(&["/people~with(addresses~with(home~just(line1"])
+        );
+        // And once it is closed, the next selector is the outer one's again.
+        assert_eq!(complete("/people~with(addresses~just(home),na"), strings(&["/people~with(addresses~just(home),name"]));
+        // Parentheses that only group.
+        assert_eq!(complete("/people~where((na"), strings(&["/people~where((name"]));
+
+        // What takes no property takes none.
+        assert_eq!(complete("/people~take("), strings(&[]));
+        assert_eq!(complete("/people~skip(1"), strings(&[]));
+        assert_eq!(complete("/people~where(name="), strings(&[]));
+        assert_eq!(complete(r#"/people~where(name="a~b"#), strings(&[]));
+        assert_eq!(complete("/nowhere~with("), strings(&[]));
+        assert_eq!(complete("/people(na"), strings(&[]));
+        assert_eq!(complete("/people~with(nothing~just("), strings(&[]));
+        // `map(` takes a mapped type, in any case.
+        assert_eq!(
+            complete("/people~map("),
+            strings(&["/people~map(com.heads.csv)", "/people~map(com.heads.sql)", "/people~map(ärende)"])
+        );
+        assert_eq!(complete("/people~map(COM.heads.s"), strings(&["/people~map(com.heads.sql)"]));
+        assert_eq!(complete("/people~map(Ä"), strings(&["/people~map(ärende)"]));
+    }
+
+    #[test]
+    fn the_uri_of_a_line_is_found_with_and_without_a_method() {
+        let found = |input: &str| {
+            let at = line_uri(input);
+            (at.method.to_string(), input[at.start..at.end].to_string(), at.start)
+        };
+        assert_eq!(found(""), ("".to_string(), "".to_string(), 0));
+        assert_eq!(found("  "), ("".to_string(), "".to_string(), 2));
+        assert_eq!(found("/people"), ("".to_string(), "/people".to_string(), 0));
+        assert_eq!(found("  /people > out.json"), ("".to_string(), "/people".to_string(), 2));
+        assert_eq!(found("GET"), ("GET".to_string(), "".to_string(), 3));
+        assert_eq!(found("GET  "), ("GET".to_string(), "".to_string(), 3));
+        assert_eq!(found("put  /å/b  {\"a\": 1}"), ("put".to_string(), "/å/b".to_string(), 5));
+        assert_eq!(found("GET people"), ("GET".to_string(), "people".to_string(), 4));
+    }
+
+    #[test]
+    fn tab_completes_the_uri_and_cycles_through_what_it_can_be() {
+        let mut state = completing("GET /pe");
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            assert!(tab_pressed(&mut state));
+            seen.push(shown(&state));
+        }
+        assert_eq!(seen, ["GET /people^", "GET /people/find^", "GET /pets^", "GET /people^"]);
+        // Shift+Tab goes the other way, and round.
+        assert!(backtab_pressed(&mut state));
+        assert_eq!(shown(&state), "GET /pets^");
+        assert!(backtab_pressed(&mut state));
+        assert_eq!(shown(&state), "GET /people/find^");
+
+        // Without a method, and after one alone.
+        assert_eq!(tabbed("/pe"), "/people^");
+        assert_eq!(tabbed("  /ab"), "/about^");
+        assert_eq!(tabbed("/people~wi"), "/people~with(^");
+        assert_eq!(tabbed("DELETE /people/com"), "DELETE /people/com.mi6.id=^");
+        // What stands after the cursor stays: the rest of the URI, a body, an outfile.
+        assert_eq!(tabbed("GET /pe^~take(5)"), "GET /people^~take(5)");
+        assert_eq!(tabbed("PUT /ab^ \"text\""), "PUT /about^ \"text\"");
+        assert_eq!(tabbed("GET /ab^ > out.json"), "GET /about^ > out.json");
+        assert_eq!(tabbed("/ab^ > out.json"), "/about^ > out.json");
+        assert_eq!(tabbed("/ab^ >/tmp/out.json"), "/about^ >/tmp/out.json");
+        // In a chain, the segment the cursor is in.
+        assert_eq!(tabbed("GET /ab^ && GET /pe"), "GET /about^ && GET /pe");
+        assert_eq!(tabbed("GET /ab && GET /pet"), "GET /ab && GET /pets^");
+
+        // Nothing to complete: the line is left alone, and nothing is drawn
+        // for a word that is not on its way to be a URI.
+        assert_eq!(tabbed("GET /zzz"), "GET /zzz^");
+        let mut state = completing("GET peo");
+        assert!(!tab_pressed(&mut state));
+        assert_eq!(shown(&state), "GET peo^");
+        let mut state = completing("PUT /people {\"a\": 1}");
+        assert!(!tab_pressed(&mut state));
+    }
+
+    #[test]
+    fn tab_in_front_of_the_uri_or_past_it_leaves_the_line() {
+        // With the cursor in the method or on the first `/`, none of the
+        // URI is behind the cursor. Tab used to write an endpoint in front
+        // of it: `GET /about/peo`.
+        for line in ["G^ET /peo", "^GET /peo", "GET^ /peo", "GET ^/peo", "^/peo", " ^ /peo"] {
+            assert_eq!(tabbed(line), line);
+        }
+        // Past the URI the cursor is where a body goes.
+        assert_eq!(tabbed("GET /peo ^"), "GET /peo ^");
+        assert_eq!(tabbed("PUT /peo \"te^xt\""), "PUT /peo \"te^xt\"");
+    }
+
+    #[test]
+    fn shift_tab_after_a_uri_completion_leaves_the_outfile() {
+        // The line has a file path, but the cursor is not in it: Shift+Tab
+        // used to write the previous endpoint over the outfile.
+        let mut state = completing("GET /pe^ > out.json");
+        tab_pressed(&mut state);
+        assert_eq!(shown(&state), "GET /people^ > out.json");
+        backtab_pressed(&mut state);
+        assert_eq!(shown(&state), "GET /pets^ > out.json");
+        backtab_pressed(&mut state);
+        assert_eq!(shown(&state), "GET /people/find^ > out.json");
+
+        // With nothing to cycle through, Shift+Tab does nothing.
+        let mut state = completing("GET /pe");
+        assert!(!backtab_pressed(&mut state));
+        assert_eq!(shown(&state), "GET /pe^");
+    }
+
+    #[test]
+    fn tab_says_when_the_server_has_no_spec_to_complete_from() {
+        let mut state = completing("GET /pe");
+        state.config.complete = false;
+        assert!(tab_pressed(&mut state));
+        assert_eq!(shown(&state), "GET /pe^");
+        assert_eq!(state.status_msg, "completion not available on this server");
+        // A file path completes all the same: it needs no spec.
+        let mut state = completing("GET /people > ~");
+        state.config.complete = false;
+        tab_pressed(&mut state);
+        assert_eq!(shown(&state), "GET /people > ~/^");
+        assert_eq!(state.status_msg, "");
+    }
+
+    #[test]
+    fn the_uri_ghost_shows_what_tab_would_add_at_the_end_of_the_uri() {
+        let ghost = |marked: &str| {
+            let state = completing(marked);
+            if state.cursor_pos == char_len(&state.input) { get_completion_ghost(&state) } else { get_completion_ghost_at_cursor(&state) }
+        };
+        assert_eq!(ghost("GET /pe"), "ople");
+        assert_eq!(ghost("/pe"), "ople");
+        assert_eq!(ghost("GET /people~wi"), "th(");
+        assert_eq!(ghost("GET /people~with(na"), "me");
+        assert_eq!(ghost("GET /people/"), "com.mi6.id=");
+        // With more of the line after the URI.
+        assert_eq!(ghost("GET /pe^ > out.json"), "ople");
+        assert_eq!(ghost("/pe^ > out.json"), "ople");
+        assert_eq!(ghost("GET /pe^ && GET /about"), "ople");
+        // Not in the middle of the URI, in front of it or past it, and
+        // not for a word without a delimiter or with nothing to add.
+        assert_eq!(ghost("GET /p^e"), "");
+        assert_eq!(ghost("GET ^/pe > out.json"), "");
+        assert_eq!(ghost("G^ET /pe"), "");
+        assert_eq!(ghost("GET /pe "), "");
+        assert_eq!(ghost("GET /pe ^> out.json"), "");
+        assert_eq!(ghost("GET /pe \"text\""), "");
+        assert_eq!(ghost("GET pe"), "");
+        assert_eq!(ghost("GET"), "");
+        assert_eq!(ghost(""), "");
+        assert_eq!(ghost("GET /people"), "");
+        assert_eq!(ghost("GET /zzz"), "");
+        assert_eq!(ghost("^GET /zzz"), "");
+        // Without a spec there is nothing to go by.
+        let mut state = completing("GET /pe");
+        state.endpoints.clear();
+        assert_eq!(get_completion_ghost(&state), "");
+        state.cursor_pos = 6;
+        assert_eq!(get_completion_ghost_at_cursor(&state), "");
+    }
+
+    #[test]
+    fn a_file_path_is_only_one_where_the_parser_reads_one() {
+        let context = |input: &str| extract_file_path_context(input, char_len(input)).map(|c| (c.partial, c.is_outfile));
+        // An `@` that starts the body, with or without a method.
+        assert_eq!(context("PUT /people @da"), Some(("da".to_string(), false)));
+        assert_eq!(context("PUT /people   @"), Some(("".to_string(), false)));
+        assert_eq!(context("/people @da"), Some(("da".to_string(), false)));
+        // One inside a body is text: Tab used to write a directory name there.
+        assert_eq!(context(r#"PUT /people {"email": "x @"#), None);
+        assert_eq!(context(r#"PUT /people {"email": "x @y"} "#), None);
+        assert_eq!(context(r#"PUT /people "a @b"#), None);
+        assert_eq!(tabbed(r#"PUT /people {"email": "x @"#), r#"PUT /people {"email": "x @^"#);
+        assert_eq!(get_completion_ghost(&completing(r#"PUT /people {"email": "x @"#)), "");
+        // The outfile still comes first when the line has both.
+        assert_eq!(context("PUT /people @data.json > ou"), Some(("ou".to_string(), true)));
+    }
+
+    #[test]
+    fn a_tilde_is_the_home_directory_unless_it_follows_a_body_file() {
+        // `~` alone is home, about to be entered: Tab used to write `~map(`.
+        assert_eq!(tabbed("GET /people > ~"), "GET /people > ~/^");
+        assert_eq!(tabbed("GET /people >> ~"), "GET /people >> ~/^");
+        assert_eq!(tabbed("PUT /people @~"), "PUT /people @~/^");
+        assert_eq!(get_completion_ghost(&completing("GET /people > ~")), "/");
+        assert_eq!(get_completion_ghost(&completing("PUT /people @~")), "/");
+        assert_eq!(get_file_completions_with("~", false), ["~/"]);
+        assert_eq!(get_file_completions_with("~", true), ["~/"]);
+
+        // After a body file it starts `~map(`, which takes a mapped type.
+        assert_eq!(tabbed("PUT /people @data.csv~"), "PUT /people @data.csv~map(^");
+        assert_eq!(tabbed("PUT /people @data.csv~m"), "PUT /people @data.csv~map(^");
+        assert_eq!(tabbed("PUT /people @~/data.csv~ma"), "PUT /people @~/data.csv~map(^");
+        assert_eq!(get_completion_ghost(&completing("PUT /people @data.csv~")), "map(");
+        assert_eq!(get_completion_ghost(&completing("PUT /people @data.csv~map(com.heads.s")), "ql)");
+        assert_eq!(get_completion_ghost(&completing("PUT /people @data.csv~map(zz")), "");
+        let mut state = completing("PUT /people @data.csv~map(");
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            tab_pressed(&mut state);
+            seen.push(shown(&state));
+        }
+        assert_eq!(seen, [
+            "PUT /people @data.csv~map(com.heads.csv)^",
+            "PUT /people @data.csv~map(com.heads.sql)^",
+            "PUT /people @data.csv~map(ärende)^",
+            "PUT /people @data.csv~map(com.heads.csv)^",
+        ]);
+        backtab_pressed(&mut state);
+        assert_eq!(shown(&state), "PUT /people @data.csv~map(ärende)^");
+        assert_eq!(tabbed("PUT /people @data.csv~map(COM.HEADS.S"), "PUT /people @data.csv~map(com.heads.sql)^");
+        // An outfile takes no operator, whatever its name has in it.
+        assert_eq!(get_completion_ghost(&completing("GET /people > nothing-here~")), "");
+        assert_eq!(tabbed("GET /people > nothing-here~"), "GET /people > nothing-here~^");
+    }
+
+    /// The cursor of a body, in one line: schema, position, key, what is
+    /// typed, the keys already there, `"` when in a string, and the schema of
+    /// the elements when in an array.
+    fn body_cursor(marked: &str) -> Option<String> {
+        json_context_at_cursor(&completing_body(marked)).map(|c| {
+            format!(
+                "{}|{:?}|{}|{}|{}|{}|{}",
+                c.schema, c.pos, c.current_key, c.partial, c.existing_keys.join(","),
+                if c.in_string { "\"" } else { "" },
+                c.element.unwrap_or_default()
+            )
+        })
+    }
+
+    #[test]
+    fn the_cursor_of_a_body_is_at_a_key_or_a_value_of_a_schema() {
+        let at = |marked: &str| body_cursor(marked).unwrap_or_else(|| "none".to_string());
+        // No body, the cursor in front of it, or a URI that holds nothing known.
+        assert_eq!(at("PUT /people"), "none");
+        assert_eq!(at("PUT /peo^ple [{"), "none");
+        assert_eq!(at("PUT /nowhere {"), "none");
+        assert_eq!(at("sleep 5"), "none");
+
+        // The body is one of what the URI holds, or a list of them.
+        assert_eq!(at("PUT /people ^[{"), "person|Value|||||");
+        assert_eq!(at("PUT /people ["), "person|Value|||||person");
+        assert_eq!(at("PUT /people [["), "person|Value|||||person");
+        assert_eq!(at("PUT /people [{"), "person|Key|||||");
+        assert_eq!(at("PUT /people/com.mi6.id=007 {"), "person|Key|||||");
+        assert_eq!(at("/people {"), "person|Key|||||");
+        assert_eq!(at("PATCH /settings {\"lo"), "settings|Key||lo||\"|");
+        assert_eq!(at("POST /agents {"), "agent|Key|||||");
+
+        // A key and its value, step by step.
+        assert_eq!(at(r#"PUT /people [{"gi"#), "person|Key||gi||\"|");
+        assert_eq!(at(r#"PUT /people [{"name""#), "person|AfterKey|name||||");
+        assert_eq!(at(r#"PUT /people [{"name":"#), "person|Value|name||name||");
+        assert_eq!(at(r#"PUT /people [{"name": "Al"#), "person|Value|name|Al|name|\"|");
+        assert_eq!(at(r#"PUT /people [{"name": "Al""#), "person|AfterValue|name||name||");
+        assert_eq!(at(r#"PUT /people [{"name": "Al", "#), "person|Key|||name||");
+        assert_eq!(at(r#"PUT /people [{"name": "a\"b, {", "gi"#), "person|Key||gi|name|\"|");
+        assert_eq!(at(r#"PUT /people [{"ålder": 4"#), "person|Value|ålder|4|ålder||");
+        assert_eq!(at(r#"PUT /people [{"ålder": 4, "name": "x"^, "rank": 1}]"#), "person|AfterValue|name||ålder,name||");
+        // Without their quotes a key is a key and a word is a word.
+        assert_eq!(at("PUT /people [{ na"), "person|Key||na|||");
+        assert_eq!(at("PUT /people [{ name: tr"), "person|Value|name|tr|name||");
+
+        // An object in an object has the schema its key refers to, or none.
+        assert_eq!(at(r#"PUT /people [{"identifiers": {"#), "common identifiers|Key|||||");
+        assert_eq!(at(r#"PUT /people [{"addresses": {"home": {"ci"#), "address|Key||ci||\"|");
+        assert_eq!(at(r#"PUT /people [{"active": {"#), "|Key|||||");
+        assert_eq!(at(r#"PUT /people [{"nothing": {"#), "|Key|||||");
+        // Back out of it, the outer object goes on with the keys it had.
+        assert_eq!(at(r#"PUT /people [{"identifiers": {"com.mi6.id": "007"}"#), "person|AfterValue|identifiers||identifiers||");
+        assert_eq!(at(r#"PUT /people [{"identifiers": {"com.mi6.id": "007"}, "#), "person|Key|||identifiers||");
+        // Every element of a list is one of the same: the second used to
+        // have no schema, or the schema of the first one's last object.
+        assert_eq!(at(r#"PUT /people [{"name": "x"}, {"#), "person|Key|||||");
+        assert_eq!(at(r#"PUT /people [{"identifiers": {}}, {"#), "person|Key|||||");
+        assert_eq!(at(r#"PUT /people [{"name": "x"}, "#), "person|Value|||||person");
+
+        // A list that is the value of a key: its elements are what the key's
+        // type holds, and in the list the key is still the one being given.
+        assert_eq!(at(r#"PUT /people [{"labels": ["#), "person|Value|labels||||label");
+        assert_eq!(at(r#"PUT /people [{"labels": [{"#), "label|Key|||||");
+        assert_eq!(at(r#"PUT /people [{"labels": [{"title": "a"}, {"ti"#), "label|Key||ti||\"|");
+        assert_eq!(at(r#"PUT /people [{"labels": [{}], "#), "person|Key|||labels||");
+        assert_eq!(at(r#"PUT /people [{"status": ["new", "#), "person|Value|status||||");
+        assert_eq!(at(r#"PUT /people [{"status": [["#), "person|Value|status||||");
+    }
+
+    #[test]
+    fn tab_in_a_body_writes_a_key_the_schema_has() {
+        // What is typed of a key is completed, with or without its quotes,
+        // and what stands before it stays: `{"active": true, na` used to
+        // become `{"active"name":`.
+        assert_eq!(body_tabbed(r#"PUT /people [{"gi"#), r#"PUT /people [{"givenName":^"#);
+        assert_eq!(body_tabbed(r#"PUT /people [{"gi^""#), r#"PUT /people [{"givenName":^"#);
+        assert_eq!(body_tabbed(r#"PUT /people [{"å"#), r#"PUT /people [{"ålder":^"#);
+        assert_eq!(body_tabbed(r#"PUT /people [{"active": true, na"#), r#"PUT /people [{"active": true, "name":^"#);
+        assert_eq!(body_tabbed(r#"PUT /people [{"active": true, "na"#), r#"PUT /people [{"active": true, "name":^"#);
+        assert_eq!(body_tabbed("PUT /people [{ na"), r#"PUT /people [{ "name":^"#);
+        assert_eq!(body_tabbed("PUT /people [{na"), r#"PUT /people [{ "name":^"#);
+        // A key that has its value is renamed and keeps it.
+        assert_eq!(body_tabbed(r#"PUT /people [{"gi^": "Ann"}]"#), r#"PUT /people [{"givenName"^: "Ann"}]"#);
+        // A key that is closed is not a key being typed.
+        assert_eq!(body_tabbed(r#"PUT /people [{"na""#), r#"PUT /people [{"na"^"#);
+        assert_eq!(body_tabbed(r#"PUT /people [{"zz"#), r#"PUT /people [{"zz^"#);
+
+        // With nothing typed: the first key, identifiers before all others
+        // and objects before the rest. An object opens at once.
+        assert_eq!(body_tabbed("PUT /people [{"), r#"PUT /people [{ "identifiers": { ^"#);
+        assert_eq!(body_tabbed("PUT /people/com.mi6.id=007 {"), r#"PUT /people/com.mi6.id=007 { "identifiers": { ^"#);
+        assert_eq!(body_tabbed(r#"PUT /people [{"identifiers": {}, "#), r#"PUT /people [{"identifiers": {}, "addresses": { ^"#);
+        assert_eq!(body_tabbed(r#"PUT /people [{"identifiers": {}, "addresses": {},"#), r#"PUT /people [{"identifiers": {}, "addresses": {}, "meta": { ^"#);
+        assert_eq!(
+            body_tabbed(r#"PUT /people [{"identifiers": {}, "addresses": {}, "meta": {}, "#),
+            r#"PUT /people [{"identifiers": {}, "addresses": {}, "meta": {}, "active":^"#
+        );
+        assert_eq!(body_tabbed(r#"PUT /people [{"ad"#), r#"PUT /people [{"addresses": { ^"#);
+        // A scalar and a list are not opened as objects (every `$ref` was).
+        assert_eq!(body_tabbed(r#"PUT /people [{"na"#), r#"PUT /people [{"name":^"#);
+        assert_eq!(body_tabbed(r#"PUT /people [{"la"#), r#"PUT /people [{"labels":^"#);
+        // In a body that has lines, an object opens on lines of its own.
+        assert_eq!(
+            body_tabbed("PUT /people [{\n  ^\n}]"),
+            "PUT /people [{\n  \"identifiers\": {\n    ^\n  }\n}]"
+        );
+        assert_eq!(
+            body_tabbed("PUT /people [{\n  \"identifiers\": {\n    ^\n  }\n}]"),
+            "PUT /people [{\n  \"identifiers\": {\n    \"com.mi6.id\":^\n  }\n}]"
+        );
+
+        // In the second element as in the first.
+        assert_eq!(body_tabbed(r#"PUT /people [{"name": "x"}, {"#), r#"PUT /people [{"name": "x"}, { "identifiers": { ^"#);
+        assert_eq!(body_tabbed(r#"PUT /people [{"identifiers": {}}, {"gi"#), r#"PUT /people [{"identifiers": {}}, {"givenName":^"#);
+        // A record's identifiers: not the database key, under either name.
+        assert_eq!(body_tabbed(r#"PUT /people [{"identifiers": {"#), r#"PUT /people [{"identifiers": { "com.mi6.id":^"#);
+        assert_eq!(body_tabbed(r#"PUT /people [{"identifiers": {"k"#), r#"PUT /people [{"identifiers": {"k^"#);
+        // A key the object has is not offered again, and with all of them
+        // there, none is.
+        assert_eq!(body_tabbed(r#"PATCH /settings {"locale": "sv", "#), r#"PATCH /settings {"locale": "sv", ^"#);
+        assert_eq!(body_tabbed(r#"PUT /people [{"name": "x", "n"#), r#"PUT /people [{"name": "x", "n^"#);
+        // In front of what the line already has, nothing is written.
+        assert_eq!(body_tabbed(r#"PUT /people [{^"name": "x"}]"#), r#"PUT /people [{^"name": "x"}]"#);
+        // An object without a schema has no keys to offer.
+        assert_eq!(body_tabbed(r#"PUT /people [{"active": {"#), r#"PUT /people [{"active": {^"#);
+    }
+
+    #[test]
+    fn tab_in_a_body_writes_a_value_the_key_allows() {
+        // After the colon, which stays: `{"active": ` used to become `{"active"true`.
+        assert_eq!(body_tabbed(r#"PUT /people [{"active": "#), r#"PUT /people [{"active": true^"#);
+        assert_eq!(body_tabbed(r#"PUT /people [{"active":"#), r#"PUT /people [{"active": true^"#);
+        assert_eq!(body_tabbed(r#"PUT /people [{"active": f"#), r#"PUT /people [{"active": false^"#);
+        // A boolean by its type as by the property's own.
+        assert_eq!(body_tabbed(r#"PUT /people [{"gdprForgotten": "#), r#"PUT /people [{"gdprForgotten": true^"#);
+        assert_eq!(body_tabbed(r#"PUT /people [{"gdprForgotten": fa"#), r#"PUT /people [{"gdprForgotten": false^"#);
+        assert_eq!(body_tabbed(r#"PUT /people [{"gdprForgotten": x"#), r#"PUT /people [{"gdprForgotten": x^"#);
+        // Tab again on what Tab wrote: the other one, and round.
+        let mut state = completing_body(r#"PUT /people [{"name": "x", "active":"#);
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            tab_pressed(&mut state);
+            seen.push(shown(&state));
+        }
+        assert_eq!(seen, [
+            r#"PUT /people [{"name": "x", "active": true^"#,
+            r#"PUT /people [{"name": "x", "active": false^"#,
+            r#"PUT /people [{"name": "x", "active": true^"#,
+        ]);
+        backtab_pressed(&mut state);
+        assert_eq!(shown(&state), r#"PUT /people [{"name": "x", "active": false^"#);
+
+        // An enum of strings is written as strings; one of numbers as numbers.
+        assert_eq!(body_tabbed(r#"PUT /people [{"status": "#), r#"PUT /people [{"status": "new"^"#);
+        assert_eq!(body_tabbed(r#"PUT /people [{"status": "o"#), r#"PUT /people [{"status": "old"^"#);
+        assert_eq!(body_tabbed(r#"PUT /people [{"status": "o^"}]"#), r#"PUT /people [{"status": "old"^}]"#);
+        assert_eq!(body_tabbed(r#"PUT /people [{"status": ["new", "#), r#"PUT /people [{"status": ["new", "new"^"#);
+        assert_eq!(body_tabbed(r#"PUT /people [{"rank": "#), r#"PUT /people [{"rank": 1^"#);
+        assert_eq!(body_tabbed(r#"PUT /people [{"rank": 2"#), r#"PUT /people [{"rank": 2^"#);
+
+        // An object opens, and a list, and in a list of objects an object.
+        assert_eq!(body_tabbed(r#"PUT /people [{"identifiers": "#), r#"PUT /people [{"identifiers": { ^"#);
+        assert_eq!(body_tabbed(r#"PUT /people [{"addresses":"#), r#"PUT /people [{"addresses": { ^"#);
+        assert_eq!(body_tabbed(r#"PUT /people [{"meta": "#), r#"PUT /people [{"meta": { ^"#);
+        assert_eq!(body_tabbed("PUT /people ["), "PUT /people [{ ^");
+        let mut state = completing_body(r#"PUT /people [{"labels": "#);
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            tab_pressed(&mut state);
+            seen.push(shown(&state));
+        }
+        assert_eq!(seen, [
+            r#"PUT /people [{"labels": [^"#,
+            r#"PUT /people [{"labels": [{ ^"#,
+            r#"PUT /people [{"labels": [{ "identifiers": { ^"#,
+        ]);
+        assert_eq!(
+            body_tabbed("PUT /people [{\n  \"addresses\": ^\n}]"),
+            "PUT /people [{\n  \"addresses\": {\n    ^\n  }\n}]"
+        );
+        // A string or a number has nothing to offer.
+        assert_eq!(body_tabbed(r#"PUT /people [{"givenName": "#), r#"PUT /people [{"givenName": ^"#);
+        assert_eq!(body_tabbed(r#"PUT /people [{"ålder": "#), r#"PUT /people [{"ålder": ^"#);
+        assert_eq!(body_tabbed(r#"PUT /people [{"nothing": "#), r#"PUT /people [{"nothing": ^"#);
+    }
+
+    #[test]
+    fn tab_chooses_among_the_subtypes_of_a_type() {
+        // A schema with subtypes takes `@type` first, and Tab again changes
+        // it in its place. It used to run on into the other keys and write
+        // one where the value was: `{"@type": "employee"ålder`.
+        let mut state = completing_body("POST /agents {");
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            tab_pressed(&mut state);
+            seen.push(shown(&state));
+        }
+        assert_eq!(seen, [
+            r#"POST /agents { "@type": "person"^"#,
+            r#"POST /agents { "@type": "company"^"#,
+            r#"POST /agents { "@type": "person"^"#,
+        ]);
+        backtab_pressed(&mut state);
+        assert_eq!(shown(&state), r#"POST /agents { "@type": "company"^"#);
+        backtab_pressed(&mut state);
+        backtab_pressed(&mut state);
+        assert_eq!(shown(&state), r#"POST /agents { "@type": "company"^"#);
+        // Any other key ends the choosing, as the key handler does it: the
+        // next Tab closes the object.
+        state.completions.clear();
+        state.last_tab_input.clear();
+        tab_pressed(&mut state);
+        assert_eq!(shown(&state), r#"POST /agents { "@type": "company"}^"#);
+
+        // What is typed of it is completed.
+        assert_eq!(body_tabbed(r#"POST /agents {"@t"#), r#"POST /agents {"@type": "person"^"#);
+        assert_eq!(body_tabbed(r#"POST /agents {"@type": "#), r#"POST /agents {"@type": "person"^"#);
+        assert_eq!(body_tabbed(r#"POST /agents {"@type": "co"#), r#"POST /agents {"@type": "company"^"#);
+        // With the type there, the other keys follow.
+        assert_eq!(body_tabbed(r#"POST /agents {"@type": "person", "#), r#"POST /agents {"@type": "person", "identifiers": { ^"#);
+        assert_eq!(body_tabbed(r#"POST /agents {"n"#), r#"POST /agents {"name":^"#);
+        // The type of an inner object is changed where it is, not the outer one's.
+        let mut state = completing_body("POST /agents {\"@type\": \"company\", \"x\": [\n");
+        state.endpoint_types.insert("/agents".to_string(), "agent".to_string());
+        state.input.push_str("  {");
+        state.cursor_pos = char_len(&state.input);
+        state.prop_types.get_mut("agent").unwrap().insert("x".to_string(), "agents".to_string());
+        tab_pressed(&mut state);
+        tab_pressed(&mut state);
+        assert_eq!(shown(&state), "POST /agents {\"@type\": \"company\", \"x\": [\n  { \"@type\": \"company\"^");
+        // A schema without subtypes has no `@type` to give.
+        assert_eq!(body_tabbed(r#"PUT /people [{"@"#), r#"PUT /people [{"@^"#);
+    }
+
+    #[test]
+    fn the_body_ghost_is_what_tab_would_write() {
+        // As the key handler does it: a key being typed in its quotes has
+        // its completions looked up for the ghost.
+        let ghost = |marked: &str| {
+            let mut state = completing_body(marked);
+            if json_context_at_cursor(&state).is_some_and(|ctx| ctx.pos == JsonPos::Key && ctx.in_string) {
+                handle_json_tab_completion(&mut state, false, false);
+            }
+            let before = shown(&state);
+            let ghost = if state.cursor_pos == char_len(&state.input) { get_completion_ghost(&state) } else { get_completion_ghost_at_cursor(&state) };
+            // Looking is not writing.
+            assert_eq!(shown(&state), before);
+            ghost
+        };
+        // Every ghost is the text Tab then puts behind the cursor.
+        for line in [
+            r#"PUT /people [{"gi"#,
+            r#"PUT /people [{"ad"#,
+            r#"POST /agents {"@t"#,
+            r#"POST /agents {""#,
+            r#"PUT /people [{"identifiers": "#,
+            r#"PUT /people [{"identifiers":"#,
+            r#"PUT /people [{"labels": "#,
+            "PUT /people [",
+            r#"PUT /people [{"name": "x""#,
+            r#"PUT /people [{"name": "x"}"#,
+        ] {
+            let shows = ghost(line);
+            assert!(!shows.is_empty(), "{line}");
+            let written = body_tabbed(line);
+            let (before, _) = written.split_once('^').unwrap();
+            assert_eq!(before.trim_end(), format!("{}{}", line, shows).trim_end(), "{line}");
+        }
+        assert_eq!(ghost(r#"PUT /people [{"gi"#), "venName\":");
+        assert_eq!(ghost(r#"PUT /people [{"ad"#), "dresses\": {");
+        assert_eq!(ghost(r#"POST /agents {"@t"#), "ype\": \"person\"");
+        assert_eq!(ghost(r#"PUT /people [{"identifiers":"#), " {");
+        assert_eq!(ghost(r#"PUT /people [{"labels": "#), "[");
+        assert_eq!(ghost(r#"PUT /people [{"name": "x""#), "}");
+        assert_eq!(ghost(r#"PUT /people [{"name": "x"}"#), "]");
+        // On an empty line of a body with lines: the first key.
+        assert_eq!(ghost("PUT /people [{\n  ^\n}]"), "\"identifiers\": {");
+        assert_eq!(ghost("POST /agents {\n  ^\n}"), "\"@type\": \"person\"");
+        assert_eq!(ghost("PUT /people [{\n  \"identifiers\": {},\n  ^\n}]"), "\"addresses\": {");
+        // Not on a line that has text, not for a scalar, a closed key or an
+        // unknown one, and not for a word typed without quotes.
+        assert_eq!(ghost("PUT /people [{"), "");
+        assert_eq!(ghost("PUT /people [{\n  ^\"name\": \"x\"\n}]"), "");
+        assert_eq!(ghost(r#"PUT /people [{"givenName": "#), "");
+        assert_eq!(ghost(r#"PUT /people [{"active": "#), "");
+        assert_eq!(ghost(r#"PUT /people [{"na""#), "");
+        assert_eq!(ghost(r#"PUT /people [{"zz"#), "");
+        assert_eq!(ghost("PUT /people [{ na"), "");
+        assert_eq!(ghost(r#"PUT /people [{"name": "x"}]"#), "");
+        // After Tab wrote a value there is nothing more to show.
+        let mut state = completing_body(r#"PUT /people [{"active": "#);
+        tab_pressed(&mut state);
+        assert_eq!(get_completion_ghost(&state), "");
+        // Before a body: the brackets the endpoint's body starts with.
+        assert_eq!(ghost("PUT /people "), "[{ ");
+        assert_eq!(ghost("POST /settings "), "{ ");
+        assert_eq!(ghost("PUT /pets "), "[ ");
+        assert_eq!(ghost("GET /people "), "");
+        assert_eq!(ghost("PUT /people"), "");
+        assert_eq!(body_tabbed("PUT /people "), "PUT /people [{\n  ^\n}]");
+        assert_eq!(body_tabbed("POST /settings "), "POST /settings {\n  ^\n}");
+        assert_eq!(body_tabbed("PUT /pets "), "PUT /pets [\n  ^\n]");
+    }
+
+    #[test]
+    fn tab_after_a_complete_value_closes_the_bracket_it_is_in() {
+        let closer = |input: &str| pending_closer(input, char_len(input));
+        assert_eq!(closer(r#"PUT /x {"a": "b""#), Some(('}', 1)));
+        assert_eq!(closer(r#"PUT /x {"a": [1, "x""#), Some((']', 2)));
+        assert_eq!(closer(r#"PUT /x {"a": {"b": "c"}"#), Some(('}', 1)));
+        assert_eq!(closer(r#"PUT /x [{"a": "}"}  "#), Some((']', 1)));
+        assert_eq!(closer(r#"PUT /x {"a": "b\"""#), Some(('}', 1)));
+        // Not after a key, a comma, a word, in a string, or with all closed.
+        assert_eq!(closer(r#"PUT /x {"a""#), None);
+        assert_eq!(closer(r#"PUT /x {"a": "b","#), None);
+        assert_eq!(closer(r#"PUT /x {"a": "b", "c""#), None);
+        assert_eq!(closer(r#"PUT /x {"a": 1"#), None);
+        assert_eq!(closer(r#"PUT /x {"a": "b"#), None);
+        assert_eq!(closer(r#"PUT /x {"a": "b"}"#), None);
+        assert_eq!(closer(""), None);
+
+        // On one line the bracket follows the value.
+        let mut state = completing_body(r#"PUT /x [{"a": "b""#);
+        tab_pressed(&mut state);
+        assert_eq!(shown(&state), r#"PUT /x [{"a": "b"}^"#);
+        tab_pressed(&mut state);
+        assert_eq!(shown(&state), r#"PUT /x [{"a": "b"}]^"#);
+        // In a body with lines it gets a line of its own, indented to the
+        // level it closes: the ghost and Tab agree on it.
+        let open = "PUT /x {\n  \"a\": {\n    \"b\": \"c\"";
+        for (line, ghost, written) in [
+            ("", "\n  }", "\n  }^"),
+            // An empty line is used, whatever indent it has. With too
+            // little of it, Tab used to write spaces and no bracket.
+            ("\n", "  }", "\n  }^"),
+            ("\n ", " }", "\n  }^"),
+            ("\n  ", "}", "\n  }^"),
+            ("\n      ", "}", "\n  }^"),
+        ] {
+            let mut state = completing_body(&format!("{open}{line}"));
+            assert_eq!(get_completion_ghost(&state), ghost, "{line:?}");
+            assert!(tab_pressed(&mut state));
+            assert_eq!(shown(&state), format!("{open}{written}"), "{line:?}");
+            // And the next one closes the outer object.
+            assert_eq!(get_completion_ghost(&state), "\n}");
+            tab_pressed(&mut state);
+            assert_eq!(shown(&state), format!("{open}\n  }}\n}}^"));
+            assert!(state.completions.is_empty());
+        }
+    }
+
+    #[test]
+    fn json_is_coloured_inside_its_brackets_only() {
+        let (r, key, string, number, literal, brace, at_key) =
+            ("\x1b[0m", "\x1b[38;5;110m", "\x1b[38;5;114m", "\x1b[38;5;179m", "\x1b[38;5;176m", "\x1b[38;5;245m", "\x1b[38;5;147m");
+        let b = |c: char| format!("{brace}{c}{r}");
+        let k = |s: &str| format!("{key}{s}{r}");
+        let v = |s: &str| format!("{string}{s}{r}");
+        let n = |s: &str| format!("{number}{s}{r}");
+        let l = |s: &str| format!("{literal}{s}{r}");
+
+        assert_eq!(highlight_json(""), "");
+        // A string is a key in an object and a value in a list: after the
+        // comma of a list it used to be coloured as a key.
+        assert_eq!(
+            highlight_json(r#"["a", "b"]"#),
+            format!("{}{}, {}{}", b('['), v("\"a\""), v("\"b\""), b(']'))
+        );
+        assert_eq!(
+            highlight_json(r#"{"a": 1, "b": [true, "x", null], "@type": "t", "c": false}"#),
+            format!(
+                "{}{}: {}, {}: {}{}, {}, {}{}, {at_key}\"@type\"{r}: {}, {}: {}{}",
+                b('{'), k("\"a\""), n("1"), k("\"b\""), b('['), l("true"), v("\"x\""), l("null"), b(']'),
+                v("\"t\""), k("\"c\""), l("false"), b('}')
+            )
+        );
+        assert_eq!(
+            highlight_json(r#"[{"a": -1.5e3}, {"b\"": "c, d"}]"#),
+            format!(
+                "{}{}{}: {}{}, {}{}: {}{}{}",
+                b('['), b('{'), k("\"a\""), n("-1.5e3"), b('}'), b('{'), k("\"b\\\"\""), v("\"c, d\""), b('}'), b(']')
+            )
+        );
+        // What is not in brackets is left as it is: an outfile used to get
+        // its digits and its `true` coloured.
+        assert_eq!(highlight_json("> /tmp/n1-true.json"), "> /tmp/n1-true.json");
+        assert_eq!(highlight_json("\"text\" 12 null"), "\"text\" 12 null");
+        assert_eq!(
+            highlight_json(r#"{"a": 1} > out-1.json"#),
+            format!("{}{}: {}{} > out-1.json", b('{'), k("\"a\""), n("1"), b('}'))
+        );
+        assert_eq!(
+            highlight_json(r#"[7] && PUT /x-2/true ["n"]"#),
+            format!("{}{}{} && PUT /x-2/true {}{}{}", b('['), n("7"), b(']'), b('['), v("\"n\""), b(']'))
+        );
+        // A string still being typed, and one that a line break ends.
+        assert_eq!(highlight_json(r#"{"na"#), format!("{}{key}\"na{r}", b('{')));
+        assert_eq!(highlight_json("{\"a\": \"b\nc"), format!("{}{}: {string}\"b{r}\nc", b('{'), k("\"a\"")));
+        assert_eq!(highlight_json("{tru, nul, fals, x"), format!("{}tru, nul, fals, x", b('{')));
+
+        // Split at the cursor, the colour the cursor is in goes on after it.
+        let full = highlight_json(r#"{"a": 1}"#);
+        assert_eq!(highlight_json_split(r#"{"a": 1}"#, None), (full.clone(), None, String::new()));
+        assert_eq!(highlight_json_split(r#"{"a": 1}"#, Some(8)), (full.clone(), None, String::new()));
+        assert_eq!(
+            highlight_json_split(r#"{"a": 1}"#, Some(2)),
+            (format!("{}{key}\"", b('{')), Some('a'), format!("{key}\"{r}: {}{}", n("1"), b('}')))
+        );
+        assert_eq!(
+            highlight_json_split(r#"{"å": 1}"#, Some(4)),
+            (format!("{}{}", b('{'), k("\"å\"")), Some(':'), format!(" {}{}", n("1"), b('}')))
+        );
+    }
+
+    #[test]
+    fn a_body_on_one_line_is_laid_out_on_several() {
+        let laid_out = |json: &str| reformat_json_multiline(json, char_len(json)).0;
+        assert_eq!(laid_out(r#"{"a":1,"b":[1,2]}"#), "{\n  \"a\": 1,\n  \"b\": [\n    1,\n    2\n  ]\n}");
+        assert_eq!(laid_out(r#"{ "a" : 1 ,	"b":{}}"#), "{\n  \"a\": 1,\n  \"b\": {\n    \n  }\n}");
+        assert_eq!(laid_out("[1,[2]]"), "[\n  1,\n  [\n    2\n  ]\n]");
+        // What a string holds is not layout.
+        assert_eq!(laid_out(r#"{"a b":"c, d: {e\"}"}"#), "{\n  \"a b\": \"c, d: {e\\\"}\"\n}");
+        // A body still being typed.
+        assert_eq!(laid_out(r#"{"a":1,"#), "{\n  \"a\": 1,\n  ");
+        assert_eq!(laid_out(r#"{"a":"#), "{\n  \"a\": ");
+        assert_eq!(laid_out(""), "");
+
+        // The cursor stays at what it was at.
+        let at = |marked: &str| {
+            let json = marked.replace('^', "");
+            let (out, cursor) = reformat_json_multiline(&json, char_len(&marked[..marked.find('^').unwrap()]));
+            let byte = char_to_byte_idx(&out, cursor);
+            format!("{}^{}", &out[..byte], &out[byte..])
+        };
+        assert_eq!(at(r#"{"a": 1,^ "b": 2}"#), "{\n  \"a\": 1,\n  ^\"b\": 2\n}");
+        assert_eq!(at(r#"^{"a": 1}"#), "^{\n  \"a\": 1\n}");
+        assert_eq!(at(r#"{^"a": 1}"#), "{\n  ^\"a\": 1\n}");
+        assert_eq!(at(r#"{"å": "ö^ä"}"#), "{\n  \"å\": \"ö^ä\"\n}");
+        assert_eq!(at(r#"{"a": 1}^"#), "{\n  \"a\": 1\n}^");
+        assert_eq!(at(r#"{"a": 1,^"#), "{\n  \"a\": 1,\n  ^");
+    }
+
+    #[test]
+    fn the_depth_of_the_cursor_counts_brackets_outside_strings() {
+        let input = r#"PUT /x {"a": [1, "]}\"", {"å": 2}], "b": 3}"#;
+        let depth = |upto: &str| bracket_depth_at(input, char_len(&input[..input.find(upto).unwrap() + upto.len()]));
+        assert_eq!(bracket_depth_at(input, 0), 0);
+        assert_eq!(depth("PUT /x "), 0);
+        assert_eq!(depth("PUT /x {"), 1);
+        assert_eq!(depth("[1, "), 2);
+        assert_eq!(depth("\"]}\\\"\""), 2);
+        assert_eq!(depth("{\"å\": "), 3);
+        assert_eq!(depth("2}]"), 1);
+        assert_eq!(bracket_depth_at(input, char_len(input)), 0);
+        assert!(cursor_inside_brackets("PUT /x [", 8));
+        assert!(!cursor_inside_brackets("PUT /x [", 7));
+        assert!(!cursor_inside_brackets("PUT /x []", 9));
+        // A bracket too many leaves the cursor outside.
+        assert!(!cursor_inside_brackets("PUT /x ]{", 8));
+    }
+
+    /// A connection picker over `names`, as `PickerState::new` builds one
+    /// from the store.
+    fn picker_of(names: &[(&str, &str)], default: Option<&str>) -> PickerState {
+        let mut saved_connections: Vec<Option<SavedConnection>> = names
+            .iter()
+            .map(|(name, url)| Some(SavedConnection {
+                name: name.to_string(),
+                url: url.to_string(),
+                auth_type: "key".to_string(),
+                credential: "k".to_string(),
+                client_id: String::new(),
+            }))
+            .collect();
+        saved_connections.push(None);
+        let mut items = vec![String::new(); names.len()];
+        items.push("+ Add new connection".to_string());
+        let mut picker = PickerState {
+            filtered_indices: (0..items.len()).collect(),
+            items,
+            saved_connections,
+            default_name: default.map(String::from),
+            max_alias_len: 0,
+            selected: 0,
+            extra_lines: 1,
+            search_query: String::new(),
+        };
+        picker.rebuild_items();
+        picker
+    }
+
+    #[test]
+    fn the_connection_picker_lists_filters_and_moves() {
+        let mut picker = picker_of(
+            &[("local", "http://localhost:5000"), ("åäö", "https://nord.example.com"), ("staging-eu", "https://staging.example.com")],
+            Some("åäö"),
+        );
+        // URLs line up by the width of the names, not by their bytes, and
+        // the default has its heart.
+        assert_eq!(picker.items, [
+            "local          http://localhost:5000",
+            "åäö ♥          https://nord.example.com",
+            "staging-eu     https://staging.example.com",
+            "+ Add new connection",
+        ]);
+        assert_eq!(picker.selected_env().unwrap().name, "local");
+
+        // Up and down stay inside the list.
+        picker.move_up();
+        assert_eq!(picker.selected, 0);
+        for expected in [1, 2, 3, 3] {
+            picker.move_down();
+            assert_eq!(picker.selected, expected);
+        }
+        assert!(picker.selected_env().is_none());
+        picker.move_up();
+        assert_eq!(picker.selected_env().unwrap().name, "staging-eu");
+
+        // Typing filters by name or URL, in order but not on end, in any
+        // case. The line that adds a connection stays, and the first match
+        // is selected.
+        for c in "EXA".chars() {
+            picker.add_search_char(c);
+        }
+        assert_eq!(picker.filtered_indices, [1, 2, 3]);
+        assert_eq!(picker.selected, 1);
+        picker.move_up();
+        assert_eq!(picker.selected, 1);
+        picker.move_down();
+        assert_eq!(picker.selected, 2);
+        picker.add_search_char('z');
+        assert_eq!(picker.filtered_indices, [3]);
+        assert_eq!(picker.selected, 3);
+        picker.delete_search_char();
+        assert_eq!((picker.filtered_indices.clone(), picker.selected), (vec![1, 2, 3], 1));
+        picker.clear_search();
+        assert_eq!(picker.search_query, "");
+        assert_eq!(picker.filtered_indices, [0, 1, 2, 3]);
+        picker.delete_search_char();
+        assert_eq!((picker.filtered_indices.clone(), picker.selected), (vec![0, 1, 2, 3], 0));
+
+        assert!(PickerState::fuzzy_matches("", "anything"));
+        assert!(PickerState::fuzzy_matches("lcl", "local"));
+        assert!(PickerState::fuzzy_matches("LOCAL", "local"));
+        assert!(PickerState::fuzzy_matches("åö", "ÅÄÖ"));
+        assert!(!PickerState::fuzzy_matches("lacol", "local"));
+        assert!(!PickerState::fuzzy_matches("locals", "local"));
+        assert!(!PickerState::fuzzy_matches("x", ""));
+    }
 }
