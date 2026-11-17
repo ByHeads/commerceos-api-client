@@ -5813,3 +5813,182 @@ fn the_picker_says_when_the_store_could_not_be_changed() {
     assert!(after_delete.contains("alpha"), "{after_delete}");
     assert_eq!(stored(d), (vec!["alpha=k1".to_string(), "beta=k2".to_string()], String::new()));
 }
+
+/// The rows of the screen that are rulers of the command area.
+#[cfg(unix)]
+fn ruler_rows(rows: &[String]) -> Vec<usize> {
+    rows.iter().enumerate().filter(|(_, row)| row.starts_with("──")).map(|(at, _)| at).collect()
+}
+
+/// ctrl+x takes the body of the request the cursor is in and ctrl+space
+/// changes its method. Neither touches an outfile, the other requests of a
+/// chain or a line that is no request, and a body put aside by ctrl+space
+/// does not come back on another line.
+#[cfg(unix)]
+#[test]
+fn clearing_a_body_and_cycling_a_method_leave_the_rest_of_the_line() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = pty::Prompt::open(api(server.port, dir.path()));
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+
+    // The outfile stays, so the request is sent and the file written.
+    press(&mut prompt, &["PUT /x {\"a\":1} > kept.json", "\x18"]);
+    assert_eq!(entered(&mut prompt, &server), ["PUT /x"]);
+    assert!(dir.path().join("kept.json").is_file());
+    // In a chain only the request the cursor is in loses its body.
+    press(&mut prompt, &["GET /a && PUT /b {\"n\":1}", "\x18"]);
+    prompt.pump(Duration::from_millis(100));
+    let sent = entered(&mut prompt, &server);
+    prompt.pump(Duration::from_millis(400));
+    assert_eq!(server.log.lock().unwrap().clone(), ["GET /a", "PUT /b"], "{sent:?}");
+    // A directive is no request with a body.
+    let shown = press(&mut prompt, &["confirm Ready to deploy now?", "\x18", "\r"]);
+    prompt.pump(Duration::from_millis(300));
+    let shown = format!("{shown}{}", screen_tail(&prompt));
+    assert!(shown.contains("Ready to deploy now? (Y/n)"), "{shown}");
+    prompt.send(b"n");
+    prompt.pump(Duration::from_millis(300));
+
+    // ctrl+space on a chain and before an outfile.
+    press(&mut prompt, &["GET /c && PUT /d {\"n\":1} > cycled.json", "\x00", "\x00"]);
+    let sent = entered(&mut prompt, &server);
+    prompt.pump(Duration::from_millis(400));
+    assert_eq!(server.log.lock().unwrap().clone(), ["GET /c", "PUT /d {\"n\":1}"], "{sent:?}");
+    assert!(dir.path().join("cycled.json").is_file());
+
+    // A body put aside on one line is not the body of the next.
+    press(&mut prompt, &["PUT /a {\"s\":1}", "\x00"]);
+    press(&mut prompt, &["GET /b", "\x00"]);
+    server.take();
+    prompt.send(b"\r");
+    prompt.pump(Duration::from_millis(800));
+    // `PUT /b` has no body: the editor opens and nothing is sent.
+    assert_eq!(server.take(), Vec::<String>::new(), "{}", screen_tail(&prompt));
+    assert!(screen_tail(&prompt).contains("Enter body"), "{}", screen_tail(&prompt));
+    prompt.send(b"\x1b");
+    prompt.pump(Duration::from_millis(200));
+}
+
+/// The question whether to write over a saved connection stands in the hint
+/// row, and both answers leave the command area where it was: two rulers,
+/// and nothing of the dialog.
+#[cfg(unix)]
+#[test]
+fn the_overwrite_question_keeps_the_command_area_in_place() {
+    let server = RecordingServer::start();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write_credentials(d, &[("a", url.clone(), "key", "k", ""), ("x", url.clone(), "key", "k", "")], "a");
+    for (cols, answer, says) in [(100u16, "n", "cancelled"), (100, "y", "connection x saved"), (30, "n", "cancelled")] {
+        write_credentials(d, &[("a", url.clone(), "key", "k", ""), ("x", url.clone(), "key", "k", "")], "a");
+        let mut cmd = api_bare(d);
+        cmd.args(["-c", "a"]);
+        let mut prompt = pty::Prompt::open_with(cmd, cols, 40);
+        prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+        prompt.pump(Duration::from_millis(500));
+        let before = ruler_rows(&pty::rows(&prompt.screen, cols as usize));
+        assert_eq!(before.len(), 2, "{cols}:\n{}", pty::rows(&prompt.screen, cols as usize).join("\n"));
+
+        prompt.send(b"\x13");
+        prompt.wait_for("Save connection as", Duration::from_secs(5));
+        prompt.pump(Duration::from_millis(150));
+        prompt.send(&[0x7f; 8]);
+        prompt.send(b"x\r");
+        prompt.wait_for("already", Duration::from_secs(5));
+        prompt.pump(Duration::from_millis(200));
+        // The question is in the hint row, under the second ruler, on one row.
+        let rows = pty::rows(&prompt.screen, cols as usize);
+        let asked = rows.iter().position(|row| row.contains("already")).unwrap();
+        assert_eq!(asked, before[1] + 1, "{cols}:\n{}", rows.join("\n"));
+        assert!(rows[asked].contains("(Y/n)") && rows.len() == asked + 1, "{cols}:\n{}", rows.join("\n"));
+
+        prompt.send(answer.as_bytes());
+        prompt.pump(Duration::from_millis(700));
+        let rows = pty::rows(&prompt.screen, cols as usize);
+        assert_eq!(ruler_rows(&rows), before, "{cols} {answer}:\n{}", rows.join("\n"));
+        assert!(!rows.iter().any(|row| row.contains("Save connection") || row.contains("already")), "{}", rows.join("\n"));
+        if cols >= 60 {
+            assert!(rows.last().unwrap().contains(says), "{cols} {answer}:\n{}", rows.join("\n"));
+        }
+    }
+}
+
+/// A window resized while the shortcuts are open keeps the output above
+/// them: the redraw moves up over the rows the shortcuts take, no further.
+#[cfg(unix)]
+#[test]
+fn a_resize_with_the_shortcuts_open_keeps_the_output() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = pty::Prompt::open_with(api(server.port, dir.path()), 100, 60);
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    press(&mut prompt, &["GET /kept"]);
+    assert_eq!(entered(&mut prompt, &server), ["GET /kept"]);
+
+    prompt.send(b"\x08");
+    prompt.wait_for("Send request", Duration::from_secs(5));
+    prompt.pump(Duration::from_millis(200));
+    let mark = prompt.screen.len();
+    prompt.resize(90, 60);
+    prompt.pump(Duration::from_millis(700));
+    let rows = pty::rows(&prompt.screen[mark..], 90);
+    assert!(rows.iter().any(|row| row.contains("/api/v1/kept")), "{}", rows.join("\n"));
+    assert!(rows.iter().any(|row| row.contains("Send request")), "{}", rows.join("\n"));
+
+    // Closed, the command area is right under the output.
+    prompt.send(b"\x1b");
+    prompt.pump(Duration::from_millis(500));
+    let rows = pty::rows(&prompt.screen[mark..], 90);
+    let rulers = ruler_rows(&rows);
+    let answered = rows.iter().rposition(|row| row.contains("/api/v1/kept")).expect("the response is still there");
+    assert_eq!(rulers.len(), 2, "{}", rows.join("\n"));
+    assert!(rulers[0] > answered && rulers[0] <= answered + 3, "{}", rows.join("\n"));
+    assert!(!rows.iter().any(|row| row.contains("Send request")), "{}", rows.join("\n"));
+    assert_eq!(rows.len(), rulers[1] + 2, "{}", rows.join("\n"));
+}
+
+/// A `confirm` whose question is longer than the terminal is wide is cut to
+/// the hint row and keeps its `(Y/n)`. Declined, nothing after it is sent.
+#[cfg(unix)]
+#[test]
+fn a_long_confirm_at_the_prompt_stays_on_its_row() {
+    const COLS: usize = 40;
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = pty::Prompt::open_sized(api(server.port, dir.path()), COLS as u16);
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(600));
+    std::fs::write(
+        dir.path().join("gate.api"),
+        "confirm Ready to deploy the whole catalogue to the production environment now\nGET /never\n",
+    )
+    .unwrap();
+
+    prompt.send(b"\x15");
+    prompt.pump(Duration::from_millis(60));
+    prompt.paste("gate.api");
+    prompt.pump(Duration::from_millis(80));
+    server.take();
+    prompt.send(b"\r");
+    prompt.wait_for("(Y/n)", Duration::from_secs(5));
+    prompt.pump(Duration::from_millis(200));
+    let rows = pty::rows(&prompt.screen, COLS);
+    let rulers = ruler_rows(&rows);
+    assert_eq!(rulers.len(), 2, "{}", rows.join("\n"));
+    let asked = rows.last().unwrap();
+    assert!(asked.contains("Ready to deploy") && asked.trim_end().ends_with("(Y/n)"), "{}", rows.join("\n"));
+    assert_eq!(rows.len(), rulers[1] + 2, "{}", rows.join("\n"));
+    assert!(rows.iter().all(|row| row.chars().count() <= COLS), "{}", rows.join("\n"));
+
+    prompt.send(b"n");
+    prompt.pump(Duration::from_millis(600));
+    assert_eq!(server.take(), Vec::<String>::new());
+    let rows = pty::rows(&prompt.screen, COLS);
+    assert_eq!(ruler_rows(&rows).len(), 2, "{}", rows.join("\n"));
+    assert!(rows.last().unwrap().contains("aborted"), "{}", rows.join("\n"));
+    // The session is still there.
+    press(&mut prompt, &["GET /after"]);
+    assert_eq!(entered(&mut prompt, &server), ["GET /after"]);
+}

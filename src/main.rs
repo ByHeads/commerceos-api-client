@@ -9858,9 +9858,14 @@ fn redraw_after_resize(state: &mut AppState, stdout: &mut io::Stdout, w: u16, h:
         out!("{}", block.render(w as usize));
     }
 
-    // Placeholder lines for input area (match actual input height)
+    // Placeholder lines for input area (match actual input height). With
+    // the shortcuts open it is their rows that the redraw moves up over.
     let input_lines = state.input.split('\n').count() as u16;
-    let placeholder_count = 2 + input_lines; // ruler + input lines + hint
+    let placeholder_count = if state.show_help {
+        help_line_count(state)
+    } else {
+        2 + input_lines // ruler + input lines + hint
+    };
     for _ in 0..placeholder_count {
         outln!();
     }
@@ -10070,10 +10075,12 @@ fn handle_key_event(
 
         // Clear body
         (KeyModifiers::CONTROL, KeyCode::Char('x')) => {
-            let parts: Vec<&str> = state.input.split_whitespace().collect();
-            if parts.len() >= 2 {
-                state.input = format!("{} {}", parts[0], parts[1]);
-                state.cursor_pos = char_len(&state.input);
+            // The body of the request the cursor is in. Its outfile, the
+            // other requests of a chain and a line that is no request stay.
+            let cursor_byte = char_to_byte_idx(&state.input, state.cursor_pos);
+            if let Some(span) = body_span_at(&state.input, cursor_byte).filter(|span| span.uri_end < span.end) {
+                state.input.replace_range(span.uri_end..span.end, "");
+                state.cursor_pos = char_len(&state.input[..span.uri_end]);
             }
             auto_revert_method_on_body_clear(state);
             render(stdout, state)?;
@@ -10086,6 +10093,8 @@ fn handle_key_event(
             state.method = "GET".to_string();
             state.uri = "/".to_string();
             state.body.clear();
+            // A body hidden by ctrl+space belonged to the line that is gone.
+            state.stashed_body.clear();
             state.method_auto_promoted = false;
             render(stdout, state)?;
         }
@@ -10097,6 +10106,7 @@ fn handle_key_event(
             state.method.clear();
             state.uri.clear();
             state.body.clear();
+            state.stashed_body.clear();
             state.method_auto_promoted = false;
             render(stdout, state)?;
         }
@@ -10225,6 +10235,7 @@ fn handle_key_event(
                     state.history_stash = state.input.clone();
                 }
                 state.history_idx += 1;
+                state.stashed_body.clear();
                 let idx = state.history.len() - 1 - state.history_idx as usize;
                 state.input = state.history[idx].clone();
                 state.cursor_pos = char_len(&state.input);
@@ -10242,12 +10253,14 @@ fn handle_key_event(
                 render(stdout, state)?;
             } else if state.history_idx > 0 {
                 state.history_idx -= 1;
+                state.stashed_body.clear();
                 let idx = state.history.len() - 1 - state.history_idx as usize;
                 state.input = state.history[idx].clone();
                 state.cursor_pos = char_len(&state.input);
                 render(stdout, state)?;
             } else if state.history_idx == 0 {
                 state.history_idx = -1;
+                state.stashed_body.clear();
                 state.input = state.history_stash.clone();
                 state.cursor_pos = char_len(&state.input);
                 render(stdout, state)?;
@@ -10270,101 +10283,8 @@ fn handle_key_event(
         // Enter - auto-indented newline if inside brackets/braces, otherwise execute request
         (KeyModifiers::NONE, KeyCode::Enter) => {
             if state.config.experimental && cursor_inside_brackets(&state.input, state.cursor_pos) {
-                // Check if body is currently single-line — if so, reformat to multi-line
-                if let Some(bs) = find_body_start(&state.input) {
-                    let body = &state.input[bs..];
-                    if !body.contains('\n') {
-                        // Body is single-line — reformat it to multi-line
-                        let prefix = state.input[..bs].trim_end();
-                        let cursor_in_body = state.cursor_pos.saturating_sub(char_len(&state.input[..bs]));
-                        let (formatted, new_body_cursor) = reformat_json_multiline(body, cursor_in_body);
-                        let prefix_char_len = char_len(prefix);
-                        // The body stays on the request line, where a body
-                        // starts: on the line under it, it is not one.
-                        state.input = format!("{} {}", prefix, formatted);
-                        // +1 for the space between prefix and body
-                        state.cursor_pos = prefix_char_len + 1 + new_body_cursor;
-
-                        // The reformat already placed the cursor on a new indented line
-                        // after the comma/bracket. Only insert an additional newline if
-                        // the cursor is NOT already on a fresh indented line (i.e., when
-                        // the cursor sits right after content, not after whitespace-only).
-                        let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
-                        let current_line_start = state.input[..byte_idx].rfind('\n')
-                            .map_or(0, |p| p + 1);
-                        let line_before_cursor = &state.input[current_line_start..byte_idx];
-                        let on_blank_indented_line = line_before_cursor.chars().all(|c| c == ' ');
-
-                        if !on_blank_indented_line {
-                            let depth = bracket_depth_at(&state.input, state.cursor_pos) as usize;
-                            let last_nws = state.input[..byte_idx].chars().rev()
-                                .find(|c| !c.is_whitespace());
-
-                            if matches!(last_nws, Some(',') | Some('{') | Some('[') | Some(':')) {
-                                let indent = "  ".repeat(depth);
-                                let insert = format!("\n{}", indent);
-                                state.input.insert_str(byte_idx, &insert);
-                                state.cursor_pos += 1 + depth * 2;
-                            } else {
-                                let dedent = depth.saturating_sub(1);
-                                let indent = "  ".repeat(dedent);
-                                let insert = format!("\n{}", indent);
-                                state.input.insert_str(byte_idx, &insert);
-                                state.cursor_pos += 1 + dedent * 2;
-                            }
-                        }
-
-                        render(stdout, state)?;
-                    } else {
-                        // Body is already multi-line — normal Enter behavior
-                        let depth = bracket_depth_at(&state.input, state.cursor_pos) as usize;
-                        let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
-
-                        let char_before = if state.cursor_pos > 0 {
-                            state.input.chars().nth(state.cursor_pos - 1)
-                        } else { None };
-                        let char_after = state.input.chars().nth(state.cursor_pos);
-                        let between_brackets = matches!(
-                            (char_before, char_after),
-                            (Some('{'), Some('}')) | (Some('['), Some(']'))
-                        );
-
-                        let last_nws = state.input[..byte_idx].chars().rev()
-                            .find(|c| !c.is_whitespace());
-
-                        if between_brackets {
-                            let indent = "  ".repeat(depth);
-                            let closing_indent = "  ".repeat(depth.saturating_sub(1));
-                            let insert = format!("\n{}\n{}", indent, closing_indent);
-                            state.input.insert_str(byte_idx, &insert);
-                            state.cursor_pos += 1 + depth * 2;
-                        } else if matches!(last_nws, Some(',') | Some('{') | Some('[') | Some(':')) {
-                            let indent = "  ".repeat(depth);
-                            let insert = format!("\n{}", indent);
-                            state.input.insert_str(byte_idx, &insert);
-                            state.cursor_pos += 1 + depth * 2;
-                        } else {
-                            // After a closing bracket without comma, de-indent to
-                            // the enclosing bracket's level (ready to close it too)
-                            let extra = if matches!(last_nws, Some('}') | Some(']')) { 2 } else { 1 };
-                            let dedent = depth.saturating_sub(extra);
-                            let indent = "  ".repeat(dedent);
-                            let insert = format!("\n{}", indent);
-                            state.input.insert_str(byte_idx, &insert);
-                            state.cursor_pos += 1 + dedent * 2;
-                        }
-                        render(stdout, state)?;
-                    }
-                } else {
-                    // No body found — just insert newline
-                    let depth = bracket_depth_at(&state.input, state.cursor_pos) as usize;
-                    let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
-                    let indent = "  ".repeat(depth);
-                    let insert = format!("\n{}", indent);
-                    state.input.insert_str(byte_idx, &insert);
-                    state.cursor_pos += 1 + depth * 2;
-                    render(stdout, state)?;
-                }
+                enter_inside_brackets(state);
+                render(stdout, state)?;
             } else {
                 let input = state.input.trim().to_string();
                 let input = if input.is_empty() { "GET /".to_string() } else { input };
@@ -10853,6 +10773,7 @@ fn handle_paste<W: Write>(
     // inside a body so a JSON string beginning with "GET " is pasted verbatim.
     if !inside_body && paste_is_api_text(paste) {
         // Normalize the method to uppercase, like typed promotion does.
+        state.stashed_body.clear();
         state.input = if paste_starts_with_method(paste) {
             uppercase_method_token(paste.trim_end())
         } else {
@@ -11665,6 +11586,109 @@ fn show_program_status(state: &mut AppState, stdout: &mut io::Stdout, msg: Strin
     render(stdout, state)
 }
 
+/// Enter with the cursor inside the brackets of a body, under `-x`: a body on
+/// one line is laid out over several, and the cursor gets a line of its own
+/// at the depth it is at.
+fn enter_inside_brackets(state: &mut AppState) {
+    // The body the cursor is in, and nothing else of the line: a `> outfile`
+    // behind it and the other requests of a chain are not JSON to lay out.
+    let cursor_byte = char_to_byte_idx(&state.input, state.cursor_pos);
+    let span = body_span_at(&state.input, cursor_byte)
+        .filter(|span| span.start < span.end && (span.start..=span.end).contains(&cursor_byte));
+    if let Some(span) = span {
+        let body = &state.input[span.start..span.end];
+        if !body.contains('\n') {
+            // Body is single-line — reformat it to multi-line
+            let prefix = state.input[..span.start].trim_end();
+            let rest = state.input[span.end..].to_string();
+            let cursor_in_body = state.cursor_pos.saturating_sub(char_len(&state.input[..span.start]));
+            let (formatted, new_body_cursor) = reformat_json_multiline(body, cursor_in_body);
+            let prefix_char_len = char_len(prefix);
+            // The body stays on the request line, where a body
+            // starts: on the line under it, it is not one.
+            state.input = format!("{} {}{}", prefix, formatted, rest);
+            // +1 for the space between prefix and body
+            state.cursor_pos = prefix_char_len + 1 + new_body_cursor;
+
+            // The reformat already placed the cursor on a new indented line
+            // after the comma/bracket. Only insert an additional newline if
+            // the cursor is NOT already on a fresh indented line (i.e., when
+            // the cursor sits right after content, not after whitespace-only).
+            let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
+            let current_line_start = state.input[..byte_idx].rfind('\n')
+                .map_or(0, |p| p + 1);
+            let line_before_cursor = &state.input[current_line_start..byte_idx];
+            let on_blank_indented_line = line_before_cursor.chars().all(|c| c == ' ');
+
+            if !on_blank_indented_line {
+                let depth = bracket_depth_at(&state.input, state.cursor_pos) as usize;
+                let last_nws = state.input[..byte_idx].chars().rev()
+                    .find(|c| !c.is_whitespace());
+
+                if matches!(last_nws, Some(',') | Some('{') | Some('[') | Some(':')) {
+                    let indent = "  ".repeat(depth);
+                    let insert = format!("\n{}", indent);
+                    state.input.insert_str(byte_idx, &insert);
+                    state.cursor_pos += 1 + depth * 2;
+                } else {
+                    let dedent = depth.saturating_sub(1);
+                    let indent = "  ".repeat(dedent);
+                    let insert = format!("\n{}", indent);
+                    state.input.insert_str(byte_idx, &insert);
+                    state.cursor_pos += 1 + dedent * 2;
+                }
+            }
+
+            } else {
+            // Body is already multi-line — normal Enter behavior
+            let depth = bracket_depth_at(&state.input, state.cursor_pos) as usize;
+            let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
+
+            let char_before = if state.cursor_pos > 0 {
+                state.input.chars().nth(state.cursor_pos - 1)
+            } else { None };
+            let char_after = state.input.chars().nth(state.cursor_pos);
+            let between_brackets = matches!(
+                (char_before, char_after),
+                (Some('{'), Some('}')) | (Some('['), Some(']'))
+            );
+
+            let last_nws = state.input[..byte_idx].chars().rev()
+                .find(|c| !c.is_whitespace());
+
+            if between_brackets {
+                let indent = "  ".repeat(depth);
+                let closing_indent = "  ".repeat(depth.saturating_sub(1));
+                let insert = format!("\n{}\n{}", indent, closing_indent);
+                state.input.insert_str(byte_idx, &insert);
+                state.cursor_pos += 1 + depth * 2;
+            } else if matches!(last_nws, Some(',') | Some('{') | Some('[') | Some(':')) {
+                let indent = "  ".repeat(depth);
+                let insert = format!("\n{}", indent);
+                state.input.insert_str(byte_idx, &insert);
+                state.cursor_pos += 1 + depth * 2;
+            } else {
+                // After a closing bracket without comma, de-indent to
+                // the enclosing bracket's level (ready to close it too)
+                let extra = if matches!(last_nws, Some('}') | Some(']')) { 2 } else { 1 };
+                let dedent = depth.saturating_sub(extra);
+                let indent = "  ".repeat(dedent);
+                let insert = format!("\n{}", indent);
+                state.input.insert_str(byte_idx, &insert);
+                state.cursor_pos += 1 + dedent * 2;
+            }
+            }
+    } else {
+        // No body found — just insert newline
+        let depth = bracket_depth_at(&state.input, state.cursor_pos) as usize;
+        let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
+        let indent = "  ".repeat(depth);
+        let insert = format!("\n{}", indent);
+        state.input.insert_str(byte_idx, &insert);
+        state.cursor_pos += 1 + depth * 2;
+    }
+}
+
 /// The step loop of `run_program_line`. Returns as soon as a step says stop,
 /// with the place of that step.
 fn run_program_steps(
@@ -11911,7 +11935,14 @@ fn confirm_in_hint(state: &mut AppState, stdout: &mut io::Stdout, prompt: &str) 
         stdout,
         cursor::MoveToColumn(0),
         Clear(ClearType::CurrentLine),
-        Print(format!("  {} ", format!("{} (Y/n)", prompt).bold()))
+        // The hint row is one row: a question longer than it is cut, and
+        // keeps its `(Y/n)`.
+        Print("\x1b[?7l"),
+        Print(format!(
+            "  {} ",
+            format!("{} (Y/n)", fit_to_width(prompt, (state.width as usize).saturating_sub(10))).bold()
+        )),
+        Print("\x1b[?7h")
     )?;
     stdout.flush()?;
     loop {
@@ -11943,6 +11974,53 @@ fn yes_no_from_key(key: &KeyEvent) -> Option<bool> {
     }
 }
 
+/// The body of the request the cursor is in, as byte offsets into the line:
+/// where its URI ends, and where the body starts and ends. The body ends
+/// before a ` > outfile` and before the next `&&` / `||`; an empty one starts
+/// and ends where the URI does.
+struct BodySpan {
+    uri_end: usize,
+    start: usize,
+    end: usize,
+}
+
+/// `None` where the cursor is in no request: a directive, an include, a
+/// method with nothing after it.
+fn body_span_at(input: &str, byte_pos: usize) -> Option<BodySpan> {
+    let (seg_start, seg_end) = chain_segment_bounds_at(input, byte_pos);
+    let segment = &input[seg_start..seg_end];
+    let text = segment.trim_start();
+    let base = seg_start + (segment.len() - text.len());
+    let first_end = text.find(char::is_whitespace).unwrap_or(text.len());
+    let first = &text[..first_end];
+    let methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+    let uri_from = if methods.contains(&first.to_uppercase().as_str()) {
+        let rest = &text[first_end..];
+        first_end + (rest.len() - rest.trim_start().len())
+    } else if starts_a_request(first) {
+        0
+    } else {
+        return None;
+    };
+    if uri_from >= text.len() {
+        return None;
+    }
+    let uri_stop = uri_from + uri_end(&text[uri_from..]);
+    let tail = &text[uri_stop..];
+    // While the body is being typed its brackets don't balance, and nothing
+    // behind it can be told from it.
+    let body = match balanced_outfile_marker(tail) {
+        Ok(Some(at)) => &tail[..at],
+        _ => tail,
+    };
+    let uri_end = base + uri_stop;
+    if body.trim().is_empty() {
+        return Some(BodySpan { uri_end, start: uri_end, end: uri_end });
+    }
+    let start = uri_end + (body.len() - body.trim_start().len());
+    Some(BodySpan { uri_end, start, end: start + body.trim().len() })
+}
+
 /// Byte range `[start, end)` of the `&&` chain segment containing `byte_pos` —
 /// the whole input when the line isn't chained. Separator bytes belong to
 /// neither segment. Same scan semantics as `split_request_chain`: separators
@@ -11970,8 +12048,9 @@ fn chain_segment_bounds_at(input: &str, byte_pos: usize) -> (usize, usize) {
         }
         if !in_string {
             match ch {
-                '{' | '[' => depth += 1,
-                '}' | ']' => depth -= 1,
+                // As `split_request_chain`: `~where(a=1||b=2)` is one request.
+                '{' | '[' | '(' => depth += 1,
+                '}' | ']' | ')' => depth -= 1,
                 c @ ('&' | '|') if depth <= 0 && iter.peek().map(|&(_, n)| n) == Some(c) => {
                     // The segment ending here contains byte_pos — done.
                     if byte_pos <= i {
@@ -12350,39 +12429,38 @@ fn wrap_pasted_array_body(state: &mut AppState, body_start: usize, body_end: usi
 }
 
 fn cycle_method(state: &mut AppState) {
-    // Split into (method, uri, raw body) preserving the body verbatim — a
-    // token-join here would flatten multi-line JSON bodies into one line.
+    // The request the cursor is in: its method, URI and body. A `> outfile`
+    // behind the body and the other requests of a chain are not the body,
+    // and stay where they are. The body is kept verbatim: a token-join here
+    // would flatten a multi-line JSON body into one line.
     let methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
-    let trimmed = state.input.trim_start();
+    let cursor_byte = char_to_byte_idx(&state.input, state.cursor_pos);
+    let (seg_start, seg_end) = chain_segment_bounds_at(&state.input, cursor_byte);
+    let segment = &state.input[seg_start..seg_end];
+    let trimmed = segment.trim_start();
     if trimmed.trim().is_empty() {
         return;
     }
+    let base = seg_start + (segment.len() - trimmed.len());
     let first_end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
     let first = &trimmed[..first_end];
     let first_upper = first.to_uppercase();
+    let has_method = methods.contains(&first_upper.as_str());
 
-    let (current, uri, body) = if methods.contains(&first_upper.as_str()) {
-        let after_method = trimmed[first_end..].trim_start();
-        if after_method.is_empty() {
-            (first_upper, "/".to_string(), String::new())
-        } else {
-            let uri_end = after_method.find(char::is_whitespace).unwrap_or(after_method.len());
-            let uri = after_method[..uri_end].to_string();
-            // Preserve the body verbatim; trim only the separating spaces/tabs.
-            let body = after_method[uri_end..]
-                .trim_start_matches(|c: char| c == ' ' || c == '\t')
-                .to_string();
-            (first_upper, uri, body)
+    // `tail_from`: where what follows the body starts.
+    let (current, uri, body, tail_from) = match body_span_at(&state.input, cursor_byte) {
+        Some(span) => {
+            let head = &state.input[base..span.uri_end];
+            let uri = if has_method { head[first_end..].trim_start() } else { head };
+            let current = if has_method { first_upper } else { "GET".to_string() };
+            (current, uri.to_string(), state.input[span.start..span.end].to_string(), span.end)
         }
-    } else if first.starts_with('/') {
-        // URI-only line: implicit GET.
-        let body = trimmed[first_end..]
-            .trim_start_matches(|c: char| c == ' ' || c == '\t')
-            .to_string();
-        ("GET".to_string(), first.to_string(), body)
-    } else {
-        return;
+        // A method alone.
+        None if has_method => (first_upper, "/".to_string(), String::new(), base + trimmed.trim_end().len()),
+        None => return,
     };
+    let before = state.input[..base].to_string();
+    let after = state.input[tail_from..].to_string();
     let body = if body.trim().is_empty() { String::new() } else { body };
 
     // If not on GET and >5s since last cycle, reset to GET instead of cycling
@@ -12400,25 +12478,28 @@ fn cycle_method(state: &mut AppState) {
     };
 
     // Switching TO GET: stash the body (verbatim) and hide it
-    if new_method == "GET" && current != "GET" {
+    let request = if new_method == "GET" && current != "GET" {
         if !body.is_empty() {
             state.stashed_body = body;
         }
-        state.input = format!("{} {}", new_method, uri);
+        format!("{} {}", new_method, uri)
     }
     // Switching FROM GET: restore stashed body if available
     else if current == "GET" && !state.stashed_body.is_empty() {
-        state.input = format!("{} {} {}", new_method, uri, state.stashed_body);
+        format!("{} {} {}", new_method, uri, state.stashed_body)
     }
     // Normal case: carry the body over verbatim
     else if body.is_empty() {
-        state.input = format!("{} {}", new_method, uri);
+        format!("{} {}", new_method, uri)
     } else {
-        state.input = format!("{} {} {}", new_method, uri, body);
-    }
+        format!("{} {} {}", new_method, uri, body)
+    };
+    // The cursor ends behind the request it was in.
+    let cursor = char_len(&before) + char_len(&request);
+    state.input = format!("{}{}{}", before, request, after);
 
     state.last_method_cycle = Some(std::time::Instant::now());
-    state.cursor_pos = char_len(&state.input);
+    state.cursor_pos = cursor;
     state.method = new_method.to_string();
     // Cycling is an explicit method choice — never auto-revert it.
     state.method_auto_promoted = false;
@@ -12560,8 +12641,11 @@ fn take_resize(state: &mut AppState, resized: &Resized) {
 }
 
 // Inline yes/no prompt in raw mode
-fn confirm_inline(stdout: &mut io::Stdout, prompt: &str, resized: &Resized) -> io::Result<bool> {
-    execute!(stdout, Print(format!("{} (Y/n) ", prompt)))?;
+/// A yes or no asked on the row the cursor is on, where it stays: `None`
+/// for ctrl+c. Nothing of it may wrap, so the question is cut to `width`.
+fn confirm_inline(stdout: &mut io::Stdout, prompt: &str, width: usize, resized: &Resized) -> io::Result<Option<bool>> {
+    let question = fit_to_width(prompt, width.saturating_sub(8));
+    execute!(stdout, Print("\x1b[?7l"), Print(format!("{} (Y/n) ", question)), Print("\x1b[?7h"))?;
     stdout.flush()?;
     loop {
         if event::poll(Duration::from_millis(100))? {
@@ -12572,13 +12656,10 @@ fn confirm_inline(stdout: &mut io::Stdout, prompt: &str, resized: &Resized) -> i
             if let Event::Key(key) = event {
                 if key.kind != event::KeyEventKind::Press { continue; }
                 if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
-                    execute!(stdout, cursor::Show)?;
-                    terminal::disable_raw_mode()?;
-                    exit_process(0);
+                    return Ok(None);
                 }
                 if let Some(answer) = yes_no_from_key(&key) {
-                    execute!(stdout, Print(if answer { "y\r\n" } else { "n\r\n" }))?;
-                    return Ok(answer);
+                    return Ok(Some(answer));
                 }
             }
         }
@@ -12798,20 +12879,26 @@ fn handle_save_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io::
     // Check if overwriting a different alias
     let envs = list_connections();
     if save_asks_to_overwrite(&envs, &name, &state.connection_alias) {
-        // Move down past bottom ruler, replace hint with confirm prompt
-        execute!(stdout, Print("\r\n"), cursor::MoveDown(1), cursor::MoveToColumn(0), Clear(ClearType::CurrentLine))?;
-        let confirmed = confirm_inline(stdout, &format!("  \"{}\" already exists. Overwrite?", name), &resized)?;
+        // The cursor is on the bottom ruler. The question takes the place
+        // of the hint, on the row under it, and leaves the cursor there.
+        execute!(stdout, Print("\r\n"), cursor::MoveToColumn(0), Clear(ClearType::CurrentLine))?;
+        let question = format!("  \"{}\" already exists. Overwrite?", name);
+        let confirmed = confirm_inline(stdout, &question, state.width as usize, &resized)?;
         take_resize(state, &resized);
-        if !confirmed {
-            execute!(stdout, cursor::MoveUp(1), cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
+        // Back to the ruler row, where the name dialog left the cursor.
+        execute!(stdout, cursor::MoveUp(1), cursor::MoveToColumn(0))?;
+        if confirmed != Some(true) {
+            execute!(stdout, Clear(ClearType::FromCursorDown))?;
             for _ in 0..input_lines { execute!(stdout, Print("\r\n"))?; }
+            if confirmed.is_none() {
+                // ctrl+c: the session's own closing clear takes it from here.
+                return Ok(true);
+            }
             state.status_msg = "cancelled".to_string();
             state.status_msg_at = Some(Instant::now());
             render(stdout, state)?;
             return Ok(false);
         }
-        // Move back up to prompt line area for cleanup
-        execute!(stdout, cursor::MoveUp(2), cursor::MoveToColumn(0))?;
     }
 
     // Determine auth type from current config
@@ -12908,8 +12995,14 @@ fn handle_switch_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io
             let result = preloaded.unwrap_or_else(|| background_load(&state.config, None));
             apply_background_result(state, result);
 
-            // Full screen clear and fresh start for new connection
+            // Full screen clear and fresh start for new connection. The last
+            // request was sent to the connection before: nothing to copy as
+            // curl against this one.
             state.output_history.clear();
+            state.prev_method.clear();
+            state.prev_uri.clear();
+            state.prev_body.clear();
+            state.stashed_body.clear();
             terminal::disable_raw_mode()?;
             out!("\x1b[2J\x1b[3J\x1b[H");
             io::stdout().flush().ok();
@@ -13596,23 +13689,15 @@ fn render<W: Write>(stdout: &mut W, state: &mut AppState) -> io::Result<()> {
         } else {
             state.body_input_buffer.split('\n').collect()
         };
+        // The cursor is always at the end. A buffer taller than the screen
+        // shows its last lines: printed whole it would scroll the terminal,
+        // and every redraw after that would leave a copy above.
         let last_idx = buf_lines.len() - 1;
-        let mut total_buf_visual_lines: u16 = 0;
-        for (i, line) in buf_lines.iter().enumerate() {
-            if i == last_idx {
-                // Account for the cursor character (1 column)
-                let line_with_cursor_width = visible_len(line) + 1;
-                let lines_for_this = if width == 0 { 1 } else {
-                    ((line_with_cursor_width + width - 1) / width).max(1) as u16
-                };
-                total_buf_visual_lines += lines_for_this;
-                let line_with_cursor = format!("{}\x1b[48;5;247m\x1b[38;5;0m \x1b[0m", line);
-                queue!(stdout, Print(format!("{}\r\n", hard_wrap_ansi(&line_with_cursor, width))))?;
-            } else {
-                total_buf_visual_lines += visual_line_count(line, width);
-                queue!(stdout, Print(format!("{}\r\n", hard_wrap_ansi(line, width))))?;
-            }
-        }
+        let mut shown: Vec<String> = buf_lines.iter().map(|line| line.to_string()).collect();
+        shown[last_idx].push_str("\x1b[48;5;247m\x1b[38;5;0m \x1b[0m");
+        let budget = state.height.saturating_sub(5 + header_lines + prompt_lines).max(3);
+        let (visible, total_buf_visual_lines) = clamp_input_viewport(&shown.join("\n"), width, budget, last_idx);
+        queue!(stdout, Print(format!("{}\r\n", hard_wrap_ansi(&visible.replace('\n', "\r\n"), width))))?;
         state.prev_input_lines = header_lines + prompt_lines + total_buf_visual_lines;
     } else {
         let (input_output, input_line_count, _ghost) = render_input_content(state, width);
@@ -24427,5 +24512,130 @@ mod tests {
         // Files of this machine are the user's own, and import from anywhere.
         assert!(check_nested_import(&git("https://github.com/a/b"), &repo(None)).is_ok());
         assert!(check_nested_import(&archive("https://example.com/a.zip", None), &repo(None)).is_ok());
+    }
+
+    #[test]
+    fn the_body_of_a_line_is_found_between_its_uri_and_what_follows_it() {
+        let span = |line: &str| {
+            let at = line.find('^').unwrap();
+            let line = line.replace('^', "");
+            body_span_at(&line, at).map(|s| (line[..s.uri_end].to_string(), line[s.start..s.end].to_string()))
+        };
+        let found = |head: &str, body: &str| Some((head.to_string(), body.to_string()));
+        assert_eq!(span(r#"PUT /a {"x":1}^"#), found("PUT /a", r#"{"x":1}"#));
+        assert_eq!(span(r#"PUT /a {"x":1}^ > out.json"#), found("PUT /a", r#"{"x":1}"#));
+        assert_eq!(span("GET /a^ > out.json"), found("GET /a", ""));
+        assert_eq!(span("GET /a^"), found("GET /a", ""));
+        assert_eq!(span(r#"/a {"x":1}^"#), found("/a", r#"{"x":1}"#));
+        // In a chain it is the body of the request the cursor is in.
+        assert_eq!(span(r#"GET /a^ && PUT /b {"n":1}"#), found("GET /a", ""));
+        assert_eq!(span(r#"GET /a && PUT /b {"n":1}^ > o.json || GET /c"#), found("GET /a && PUT /b", r#"{"n":1}"#));
+        // A blank or a separator in a quoted operator value is the URI's.
+        assert_eq!(
+            span(r#"PUT /p~where(name="a b") {"name":"John Smith"}^"#),
+            found(r#"PUT /p~where(name="a b")"#, r#"{"name":"John Smith"}"#)
+        );
+        assert_eq!(span("GET /a~where(x=1||y=2)^ @b.json"), found("GET /a~where(x=1||y=2)", "@b.json"));
+        // A body still being typed is all of what follows the URI.
+        assert_eq!(span(r#"PUT /a {"x": "b > c^"#), found("PUT /a", r#"{"x": "b > c"#));
+        assert_eq!(span("PUT /å {\"ö\":1}^ > ü.json"), found("PUT /å", "{\"ö\":1}"));
+        // No request there.
+        for line in ["confirm Ready to deploy?^", "sleep 5 while not /q~count^", "seed.api^", "PUT^", "^"] {
+            assert!(span(line).is_none(), "{line}");
+        }
+    }
+
+    /// The line after Enter was pressed at `^` under `-x`, as a request.
+    fn entered_in_brackets(line: &str) -> String {
+        let mut state = completing_body(line);
+        enter_inside_brackets(&mut state);
+        state.input
+    }
+
+    #[test]
+    fn enter_in_a_body_lays_out_the_body_and_nothing_else() {
+        // What follows the body stays as it was written.
+        // (The cursor gets a line of its own in the body, hence the gap.)
+        assert_eq!(entered_in_brackets(r#"PUT /x {"a":1^} > out.json"#), "PUT /x {\n  \"a\": 1\n\n} > out.json");
+        assert_eq!(
+            entered_in_brackets(r#"GET /a && PUT /b {"n":1^} || GET /c d"#),
+            "GET /a && PUT /b {\n  \"n\": 1\n\n} || GET /c d"
+        );
+        // A blank inside a quoted operator value does not start the body.
+        let laid_out = entered_in_brackets(r#"PUT /p~where(name="a b") {"name":"John Smith"^}"#);
+        assert_eq!(laid_out, "PUT /p~where(name=\"a b\") {\n  \"name\": \"John Smith\"\n\n}");
+        // Each still reads as the request it was.
+        for line in [
+            r#"PUT /x {"a":1^} > out.json"#,
+            r#"PUT /p~where(name="a b") {"name":"John Smith"^}"#,
+            r#"PUT /x [{"a":"b > c"},^{"d":2}] >> o.json"#,
+        ] {
+            let before = parse_request_line(&normalize_request_text(&line.replace('^', "")).unwrap()).unwrap();
+            let after = parse_request_line(&normalize_request_text(&entered_in_brackets(line)).unwrap()).unwrap();
+            let json = |body: &str| serde_json::from_str::<Value>(body).unwrap();
+            assert_eq!((&before.0, &before.1, json(&before.2)), (&after.0, &after.1, json(&after.2)), "{line}");
+        }
+    }
+
+    /// The line and cursor after ctrl+space at `^`.
+    fn cycled(state: &mut AppState) -> String {
+        cycle_method(state);
+        shown(state)
+    }
+
+    #[test]
+    fn cycling_the_method_keeps_the_outfile_and_the_rest_of_a_chain() {
+        let mut state = completing(r#"PUT /a {"x":1}^ > out.json"#);
+        state.last_method_cycle = Some(Instant::now());
+        assert_eq!(cycled(&mut state), r#"PATCH /a {"x":1}^ > out.json"#);
+        assert_eq!(cycled(&mut state), r#"POST /a {"x":1}^ > out.json"#);
+        // To GET the body is put away, and only the body.
+        assert_eq!(cycled(&mut state), "GET /a^ > out.json");
+        assert_eq!(state.stashed_body, r#"{"x":1}"#);
+        assert_eq!(cycled(&mut state), r#"PUT /a {"x":1}^ > out.json"#);
+
+        // In a chain it is the request the cursor is in.
+        let mut state = completing(r#"GET /a && PUT /b {"n":1}^ && GET /c"#);
+        state.last_method_cycle = Some(Instant::now());
+        assert_eq!(cycled(&mut state), r#"GET /a && PATCH /b {"n":1}^ && GET /c"#);
+        let mut state = completing(r#"GET /a^ && PUT /b {"n":1}"#);
+        assert_eq!(cycled(&mut state), r#"PUT /a^ && PUT /b {"n":1}"#);
+        // A method alone, and a line that is no request.
+        let mut state = completing("PUT^");
+        state.last_method_cycle = Some(Instant::now());
+        assert_eq!(cycled(&mut state), "PATCH /^");
+        let mut state = completing("confirm Ready?^");
+        assert_eq!(cycled(&mut state), "confirm Ready?^");
+    }
+
+    #[test]
+    fn the_body_editor_is_never_taller_than_the_screen() {
+        let mut state = completing("PUT /x^");
+        state.body_input_mode = true;
+        state.body_input_method = "PUT".to_string();
+        state.body_input_uri = "/x".to_string();
+        state.body_input_buffer = (0..60).map(|n| format!("  \"line{n}\": {n},")).collect::<Vec<_>>().join("\n");
+        for (width, height) in [(80u16, 24u16), (20, 12), (80, 10)] {
+            state.width = width;
+            state.height = height;
+            let mut drawn = Vec::new();
+            render(&mut drawn, &mut state).unwrap();
+            let drawn = String::from_utf8(drawn).unwrap();
+            let rows = drawn.matches("\r\n").count() + 1;
+            assert!(rows < height as usize, "{width}x{height}: {rows} rows");
+            assert_eq!(rows, 3 + state.prev_input_lines as usize, "{width}x{height}");
+            // The end of the buffer, where the cursor is, is what shows.
+            assert!(drawn.contains("\"line59\": 59,"), "{width}x{height}");
+            assert!(!drawn.contains("\"line0\": 0,"), "{width}x{height}");
+        }
+        // A short buffer is drawn whole, as before.
+        state.body_input_buffer = "{\n  \"a\": 1".to_string();
+        state.width = 80;
+        state.height = 24;
+        let mut drawn = Vec::new();
+        render(&mut drawn, &mut state).unwrap();
+        let drawn = String::from_utf8(drawn).unwrap();
+        assert!(drawn.contains("{\r\n  \"a\": 1\x1b[48;5;247m"), "{drawn:?}");
+        assert_eq!(state.prev_input_lines, 4);
     }
 }
