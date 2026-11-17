@@ -177,9 +177,17 @@ fn answer(
 
     let (status, payload) = if path.contains("/oauth2/v1/token") {
         // The first token handed out has already run out by the time it is
-        // used; every later one is good.
-        let token = if tokens.fetch_add(1, Ordering::SeqCst) == 0 { "stale" } else { "fresh" };
-        ("200 OK", format!(r#"{{"access_token":"{token}","expires_in":3600}}"#))
+        // used; every later one is good. The client `once` gets no second.
+        let nth = tokens.fetch_add(1, Ordering::SeqCst);
+        let token = if nth == 0 { "stale" } else { "fresh" };
+        if nth > 0 && body.contains("client_id=once") {
+            ("500 Internal Server Error", "{}".to_string())
+        } else {
+            ("200 OK", format!(r#"{{"access_token":"{token}","expires_in":3600}}"#))
+        }
+    } else if path.contains("/denied") {
+        // Nobody is let in here, whatever they carry.
+        ("401 Unauthorized", r#"{"error":"denied"}"#.to_string())
     } else if path.contains("/expired") && header("authorization") != Some("Bearer fresh") {
         // Only the token the token endpoint hands out is let in.
         ("401 Unauthorized", r#"{"error":"token expired"}"#.to_string())
@@ -1114,6 +1122,95 @@ fn a_token_that_ran_out_is_renewed_and_the_same_request_sent_again() {
     assert_eq!(requests[0].1, &format!("{common}stale; x-request-map=com.heads.t"));
     assert_eq!(requests[1].1, &format!("{common}fresh; x-request-map=com.heads.t"));
     assert!(std::fs::read_to_string(d.join("out2.csv")).unwrap().contains("/api/v1/expired"));
+}
+
+/// How often each of `paths` was requested, by what the server recorded.
+fn counts(sent: &[String], paths: &[&str]) -> Vec<usize> {
+    paths.iter().map(|p| sent.iter().filter(|line| line.split(' ').nth(1) == Some(p)).count()).collect()
+}
+
+/// Renewal has an end: the answer to the request sent again is the answer,
+/// a token endpoint that fails leaves the first 401 standing, and a
+/// connection without client credentials never asks for a token.
+#[test]
+fn a_token_is_renewed_once_and_only_for_an_oauth2_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let token = "/oauth2/v1/token";
+    let run = |connection: (&str, &str, &str), args: &[&str]| {
+        let server = RecordingServer::start();
+        let url = format!("http://127.0.0.1:{}", server.port);
+        write_credentials(d, &[("c", url, connection.0, connection.1, connection.2)], "c");
+        let got = run_bare(&server, d, args);
+        (got.code, got.sent, got.stderr)
+    };
+
+    // A 401 that stays: two requests, two tokens, and no third of either.
+    let (_, sent, stderr) = run(("oauth2", "secret", "id"), &["GET", "/denied"]);
+    assert_eq!(counts(&sent, &[token, "/denied"]), [2, 2], "{sent:?}\n{stderr}");
+    assert!(stderr.contains("401"), "{stderr}");
+    let (code, sent, stderr) = run(("oauth2", "secret", "id"), &["-f", "GET", "/denied"]);
+    assert_eq!((code, counts(&sent, &[token, "/denied"])), (Some(1), vec![2, 2]), "{sent:?}\n{stderr}");
+
+    // The token endpoint fails the second time: the 401 is the answer.
+    let (_, sent, stderr) = run(("oauth2", "secret", "once"), &["GET", "/expired"]);
+    assert_eq!(counts(&sent, &[token, "/expired"]), [2, 1], "{sent:?}\n{stderr}");
+    assert!(stderr.contains("401"), "{stderr}");
+
+    // A key and a plain token have nothing to renew with.
+    for kind in ["key", "token"] {
+        let (_, sent, stderr) = run((kind, "secret", ""), &["GET", "/denied"]);
+        assert_eq!(counts(&sent, &[token, "/denied"]), [0, 1], "{kind}: {sent:?}\n{stderr}");
+    }
+    // Nor has an OAuth2 connection with `-k` in the place of its secret.
+    let (_, sent, _) = run(("oauth2", "secret", "id"), &["-k", "CLIKEY", "GET", "/denied"]);
+    assert_eq!(counts(&sent, &[token, "/denied"]), [0, 1], "{sent:?}");
+
+    // A check, a poll and a chain are renewed for like any request, and
+    // judge the answer the renewed token got.
+    std::fs::write(d.join("assert.api"), "assert GET /expired\nGET /after\n").unwrap();
+    std::fs::write(d.join("poll.api"), "sleep 0 while not GET /expired\nGET /after\n").unwrap();
+    std::fs::write(d.join("chain.api"), "GET /expired && GET /after\n").unwrap();
+    for file in ["assert.api", "poll.api", "chain.api"] {
+        let (code, sent, stderr) = run(("oauth2", "secret", "id"), &["-sfa", file]);
+        assert_eq!(code, Some(0), "{file}: {stderr}");
+        assert_eq!(counts(&sent, &[token, "/expired", "/after"]), [2, 2, 1], "{file}: {sent:?}");
+    }
+}
+
+/// A token renewed at the prompt is the session's from then on: the next
+/// request carries it, and nothing more is asked of the token endpoint.
+#[cfg(unix)]
+#[test]
+fn a_renewed_token_is_kept_for_the_session() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    write_credentials(d, &[("o", url, "oauth2", "secret", "id")], "o");
+    let mut prompt = pty::Prompt::open(api_bare(d));
+    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(500));
+
+    for (line, expired_requests) in [("GET /expired/x", 2), ("GET /expired/y", 1)] {
+        prompt.send(b"\x15");
+        prompt.pump(Duration::from_millis(60));
+        let before = server.seen();
+        let mark = prompt.screen.len();
+        prompt.paste(line);
+        prompt.pump(Duration::from_millis(60));
+        prompt.send(b"\r");
+        let answered = pump_until(&mut prompt, Duration::from_secs(8), |p| pty::plain(&p.screen[mark..]).contains("200 OK"));
+        assert!(answered, "{line}: {}", screen_tail(&prompt));
+        prompt.pump(Duration::from_millis(300));
+        let sent = server.log.lock().unwrap()[before..].to_vec();
+        let path = line.trim_start_matches("GET ");
+        assert_eq!(counts(&sent, &[path]), [expired_requests], "{line}: {sent:?}");
+    }
+    // The startup exchange and the one renewal.
+    let sent = server.log.lock().unwrap().clone();
+    assert_eq!(counts(&sent, &["/oauth2/v1/token"]), [2], "{sent:?}");
+    assert!(server.heads().last().unwrap().contains("authorization=Bearer fresh;"), "{:?}", server.heads());
 }
 
 /// The prompt writes an outfile as a batch does: JSON indented, and under

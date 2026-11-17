@@ -4265,71 +4265,63 @@ fn get_1password_credentials(selector: &str) -> Result<(String, String), String>
     let env_data: Value = serde_json::from_slice(&output.stdout)
         .map_err(|e| format!("could not parse environments.json: {}", e))?;
 
-    // Navigate the nested structure
-    let parts: Vec<&str> = selector.split('/').collect();
-    let mut current = &env_data;
+    let (url, key_ref) = op_environment(&env_data, selector)?;
 
-    for (i, part) in parts.iter().enumerate() {
-        if i == parts.len() - 1 {
-            // Last part - get url and key
-            let url = current
-                .get(part)
-                .and_then(|v| v.get("url"))
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| format!("could not find an environment by '{}'. Check `COS environments` in 1P for available environments.", selector))?;
+    // Read the actual key from the reference
+    let key_output = op_read(&["read", &key_ref], "the API key")?;
 
-            let key_ref = current
-                .get(part)
-                .and_then(|v| v.get("key"))
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| format!("could not find an environment by '{}'. Check `COS environments` in 1P for available environments.", selector))?;
-
-            // Read the actual key from the reference
-            let key_output = op_read(&["read", key_ref], "the API key")?;
-
-            if !key_output.status.success() {
-                let stderr_msg = String::from_utf8_lossy(&key_output.stderr).trim().to_string();
-                let hint = if stderr_msg.to_lowercase().contains("access")
-                    || stderr_msg.to_lowercase().contains("permission")
-                    || stderr_msg.to_lowercase().contains("not found")
-                {
-                    format!(
-                        "no access to the API key for '{}' in 1Password.\n\
-                         Ask the environment owner to grant you access.",
-                        selector
-                    )
-                } else {
-                    format!(
-                        "could not read API key for '{}' from 1Password.{}",
-                        selector,
-                        op_stderr_detail(&key_output)
-                    )
-                };
-                return Err(hint);
-            }
-
-            let api_key = String::from_utf8_lossy(&key_output.stdout)
-                .trim()
-                .to_string();
-
-            if api_key.is_empty() {
-                return Err(format!(
-                    "1Password returned an empty key for '{}'.",
-                    selector
-                ));
-            }
-
-            // A URL from 1Password is read as one given with `-b`: it may
-            // come without a scheme, or with the API prefix.
-            return Ok((normalize_base_uri(url), api_key));
+    if !key_output.status.success() {
+        let stderr_msg = String::from_utf8_lossy(&key_output.stderr).trim().to_string();
+        let hint = if stderr_msg.to_lowercase().contains("access")
+            || stderr_msg.to_lowercase().contains("permission")
+            || stderr_msg.to_lowercase().contains("not found")
+        {
+            format!(
+                "no access to the API key for '{}' in 1Password.\n\
+                 Ask the environment owner to grant you access.",
+                selector
+            )
         } else {
-            current = current
-                .get(part)
-                .ok_or_else(|| format!("could not find an environment by '{}'. Check `COS environments` in 1P for available environments.", selector))?;
-        }
+            format!(
+                "could not read API key for '{}' from 1Password.{}",
+                selector,
+                op_stderr_detail(&key_output)
+            )
+        };
+        return Err(hint);
     }
 
-    Err(format!("could not find an environment by '{}'. Check `COS environments` in 1P for available environments.", selector))
+    let api_key = String::from_utf8_lossy(&key_output.stdout)
+        .trim()
+        .to_string();
+
+    if api_key.is_empty() {
+        return Err(format!(
+            "1Password returned an empty key for '{}'.",
+            selector
+        ));
+    }
+
+    Ok((url, api_key))
+}
+
+/// The environment `selector` (`<organization>/<environment>`) names in the
+/// environment list kept in 1Password: its base URL and the reference its
+/// key is read from. The URL is read as one given with `-b`: it may come
+/// without a scheme, or with the API prefix.
+fn op_environment(env_data: &Value, selector: &str) -> Result<(String, String), String> {
+    let missing = || {
+        format!(
+            "could not find an environment by '{}'. Check `COS environments` in 1P for available environments.",
+            selector
+        )
+    };
+    let mut current = env_data;
+    for part in selector.split('/') {
+        current = current.get(part).ok_or_else(missing)?;
+    }
+    let text = |member: &str| current.get(member).and_then(|v| v.as_str()).ok_or_else(missing);
+    Ok((normalize_base_uri(text("url")?), text("key")?.to_string()))
 }
 
 /// Returns (connected, complete) where:
@@ -4425,6 +4417,15 @@ fn normalize_request_text(text: &str) -> Result<String, String> {
 /// A text whose quotes or brackets don't balance has no inside or outside to
 /// go by, so there the last ` >` is taken, as it always was.
 fn outfile_marker_at(text: &str) -> Option<usize> {
+    match balanced_outfile_marker(text) {
+        Ok(found) => found,
+        Err(()) => text.rfind(" >"),
+    }
+}
+
+/// `outfile_marker_at` for a text whose quotes and brackets balance; `Err`
+/// for one where they don't, as a body that is still being typed.
+fn balanced_outfile_marker(text: &str) -> Result<Option<usize>, ()> {
     let bytes = text.as_bytes();
     let mut found = None;
     let mut depth = 0i32;
@@ -4450,9 +4451,9 @@ fn outfile_marker_at(text: &str) -> Option<usize> {
         }
     }
     if in_string || depth > 0 {
-        return text.rfind(" >");
+        return Err(());
     }
-    found
+    Ok(found)
 }
 
 /// A URI as `parse_request_line` hands it back, split into the URI and its
@@ -4470,9 +4471,18 @@ fn split_uri_outfile(uri: &str) -> (&str, &str) {
 fn uri_end(text: &str) -> usize {
     let mut depth = 0i32;
     let mut in_string = false;
+    let mut escape = false;
     for (i, ch) in text.char_indices() {
         if in_string {
-            in_string = ch != '"';
+            // An escaped quote does not end the string, as in
+            // `outfile_marker_at`.
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
             continue;
         }
         match ch {
@@ -10964,17 +10974,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     // read as this one's if it is aborted or never sent.
     state.config.last_status = None;
 
-    // This is the last request now, for ctrl+y, however it came to be sent:
-    // typed, a segment of a chain, a line of a file, ctrl+g. A poll is not
-    // something anyone sent by hand.
-    if !state.config.quiet {
-        state.prev_method = state.method.clone();
-        state.prev_uri = state.uri.clone();
-        state.prev_body = state.body.clone();
-        state.prev_outfile = state.config.outfile.clone();
-        state.prev_display_outfile = state.display_outfile.clone();
-        state.prev_outfile_append = state.config.outfile_append;
-    }
+    record_last_request(state);
 
     // `--export` rewrites the whole body, so it is read whole.
     let streaming = state.config.streaming && state.config.export_id.is_none();
@@ -12918,6 +12918,21 @@ fn build_curl(state: &AppState) -> Option<String> {
         cmd.push_str(&format!(" -o {}", sh_quote(&state.prev_outfile)));
     }
     Some(cmd)
+}
+
+/// The request about to be sent is the last request now, for ctrl+y, however
+/// it came to be sent: typed, a segment of a chain, a line of a file, ctrl+g.
+/// A poll is not something anyone sent by hand, and is not recorded.
+fn record_last_request(state: &mut AppState) {
+    if state.config.quiet {
+        return;
+    }
+    state.prev_method = state.method.clone();
+    state.prev_uri = state.uri.clone();
+    state.prev_body = state.body.clone();
+    state.prev_outfile = state.config.outfile.clone();
+    state.prev_display_outfile = state.display_outfile.clone();
+    state.prev_outfile_append = state.config.outfile_append;
 }
 
 /// Why the last request can't be written as a curl command, when it can't.
@@ -15289,8 +15304,10 @@ fn extract_file_path_context(input: &str, cursor_pos: usize) -> Option<FilePathC
     // before. Space before the marker required, optional space after.
     for (marker, is_outfile) in [(" >", true), (" @", false)] {
         // The outfile marker is found the way the parser finds it, so a `>`
-        // inside a body being typed is not taken for one.
-        let at = if is_outfile { outfile_marker_at(segment) } else { segment.rfind(marker) };
+        // inside a body is not taken for one. Nor is one in a body that is
+        // still open, where the parser would fall back on the last ` >`:
+        // what is being typed there is the body.
+        let at = if is_outfile { balanced_outfile_marker(segment).ok().flatten() } else { segment.rfind(marker) };
         if let Some(idx) = at {
             let mut after = idx + 2;
             // ` >>` — the second `>` is part of the marker, not the path.
@@ -18492,6 +18509,222 @@ mod tests {
         assert_eq!(get_file_completions_with(&slash("seeds\\a"), true), [slash("seeds\\a.api")]);
         // Elsewhere a `\` is a character of a name like any other.
         assert!(get_file_completions_with(&back("seeds\\a"), false).is_empty());
+    }
+
+    #[test]
+    fn an_environment_from_1password_has_its_url_read_as_b_is() {
+        let list = serde_json::json!({
+            "heads": {
+                "test": { "url": "test.app.heads.com", "key": "op://Shared/test/key" },
+                "local": { "url": "HTTP://localhost:5000/api/v1/", "key": "op://Shared/local/key" },
+                "nokey": { "url": "https://x.example.com" },
+                "eu": { "prod": { "url": "https://eu.example.com/api", "key": "op://Shared/eu/key" } }
+            }
+        });
+        let found = |selector: &str| op_environment(&list, selector);
+        assert_eq!(found("heads/test").unwrap(), ("https://test.app.heads.com".to_string(), "op://Shared/test/key".to_string()));
+        assert_eq!(found("heads/local").unwrap(), ("http://localhost:5000".to_string(), "op://Shared/local/key".to_string()));
+        assert_eq!(found("heads/eu/prod").unwrap().0, "https://eu.example.com");
+        for selector in ["heads/nope", "nope/test", "heads/nokey", "heads/eu", "heads/test/deeper"] {
+            let err = found(selector).unwrap_err();
+            assert!(err.starts_with(&format!("could not find an environment by '{selector}'.")), "{err}");
+        }
+    }
+
+    #[test]
+    fn the_authorization_header_is_bearer_for_a_token_and_a_jwt_shaped_key() {
+        let header = |key: &str, token: &str| {
+            auth_header(&Config { api_key: key.to_string(), token: token.to_string(), ..Config::default() })
+        };
+        assert_eq!(header("", ""), None);
+        assert_eq!(header("k", ""), Some("Basic Oms=".to_string()));
+        assert_eq!(header("", "T"), Some("Bearer T".to_string()));
+        // A token wins over a key.
+        assert_eq!(header("k", "T"), Some("Bearer T".to_string()));
+        // A key is Bearer only when it starts like a JWT and is longer than
+        // 180 characters.
+        let jwt = |len: usize| format!("ey{}", "a".repeat(len - 2));
+        assert_eq!(header(&jwt(181), ""), Some(format!("Bearer {}", jwt(181))));
+        assert!(header(&jwt(180), "").unwrap().starts_with("Basic "));
+        assert!(header(&"x".repeat(300), "").unwrap().starts_with("Basic "));
+    }
+
+    #[test]
+    fn an_outfile_says_its_format_by_its_extension_in_any_case() {
+        for (path, format, accept) in [
+            ("out.json", OutFormat::Json, None),
+            ("out", OutFormat::Json, None),
+            ("clipboard", OutFormat::Json, None),
+            ("out.txt", OutFormat::Json, None),
+            ("dir.csv/out", OutFormat::Json, None),
+            ("out.csv", OutFormat::Csv, Some("text/csv")),
+            ("OUT.CSV", OutFormat::Csv, Some("text/csv")),
+            ("out.sql", OutFormat::Sql, Some("application/sql")),
+            ("out.SQL", OutFormat::Sql, Some("application/sql")),
+            ("out.ndjson", OutFormat::Ndjson, Some("application/x-ndjson")),
+            ("out.njson", OutFormat::Ndjson, Some("application/x-ndjson")),
+            ("~/x/Out.NJSON", OutFormat::Ndjson, Some("application/x-ndjson")),
+        ] {
+            assert_eq!((outfile_format(path), accept_for_outfile(path)), (format, accept), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_body_failure_is_a_timeout_or_a_response_cut_short() {
+        let slow = io::Error::new(io::ErrorKind::TimedOut, "slow");
+        assert_eq!(
+            describe_body_failure(&slow, 5),
+            "Timed out after 5s — raise it with --timeout <seconds> (0 = no timeout)"
+        );
+        let reset = io::Error::new(io::ErrorKind::UnexpectedEof, "connection reset");
+        assert_eq!(describe_body_failure(&reset, 5), "The response was cut short: connection reset");
+        // What the prompt keeps of a failure to say the same thing.
+        let kept = RequestFailure::from(io::Error::new(io::ErrorKind::UnexpectedEof, "connection reset"));
+        assert!(!kept.timed_out && kept.tls.is_none());
+        assert_eq!(describe_body_failure(kept.body.as_ref().unwrap(), 5), "The response was cut short: connection reset");
+        assert!(RequestFailure::from(io::Error::new(io::ErrorKind::TimedOut, "slow")).timed_out);
+    }
+
+    #[test]
+    fn the_prompt_modes_are_left_once() {
+        // Nothing was turned on: nothing to undo.
+        KEYBOARD_FLAGS_PUSHED.store(false, Ordering::SeqCst);
+        BRACKETED_PASTE_ON.store(false, Ordering::SeqCst);
+        assert!(!leave_prompt_modes());
+        BRACKETED_PASTE_ON.store(true, Ordering::SeqCst);
+        assert!(leave_prompt_modes());
+        assert!(!leave_prompt_modes(), "a second call has nothing left to undo");
+        KEYBOARD_FLAGS_PUSHED.store(true, Ordering::SeqCst);
+        assert!(leave_prompt_modes());
+        assert!(!BRACKETED_PASTE_ON.load(Ordering::SeqCst) && !KEYBOARD_FLAGS_PUSHED.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn visible_text_is_the_text_without_its_colours() {
+        assert_eq!(visible_text("plain"), "plain");
+        assert_eq!(visible_text("\x1b[31mred\x1b[0m and \x1b[38;5;239mgrey\x1b[0m"), "red and grey");
+        assert_eq!(visible_text(""), "");
+        let coloured = format!("{} blåbär", "404".red());
+        assert_eq!(visible_len(&coloured), visible_text(&coloured).chars().count());
+    }
+
+    #[test]
+    fn a_resize_during_a_wait_is_noted_for_the_next_draw() {
+        let mut state = AppState::new(Config::default());
+        state.width = 100;
+        state.height = 40;
+        note_resize(&mut state, &Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)));
+        assert_eq!((state.width, state.height, state.resize_pending), (100, 40, false));
+        note_resize(&mut state, &Event::Resize(60, 20));
+        assert_eq!((state.width, state.height, state.resize_pending), (60, 20, true));
+        // What a dialog saw of a resize is told the same way, once.
+        let resized = Resized::new(Some((70, 30)));
+        state.resize_pending = false;
+        take_resize(&mut state, &resized);
+        assert_eq!((state.width, state.height, state.resize_pending), (70, 30, true));
+        state.resize_pending = false;
+        take_resize(&mut state, &resized);
+        assert!(!state.resize_pending);
+    }
+
+    #[test]
+    fn the_last_request_is_recorded_where_it_is_sent() {
+        let mut state = AppState::new(Config::default());
+        state.method = "PUT".to_string();
+        state.uri = "/people".to_string();
+        state.body = "{\"a\":1}".to_string();
+        state.config.outfile = "/home/me/out.json".to_string();
+        state.display_outfile = "~/out.json".to_string();
+        state.config.outfile_append = true;
+        record_last_request(&mut state);
+        assert_eq!(
+            (state.prev_method.as_str(), state.prev_uri.as_str(), state.prev_body.as_str()),
+            ("PUT", "/people", "{\"a\":1}")
+        );
+        assert_eq!(
+            (state.prev_outfile.as_str(), state.prev_display_outfile.as_str(), state.prev_outfile_append),
+            ("/home/me/out.json", "~/out.json", true)
+        );
+        // A poll or a check is not a request anyone sent by hand.
+        state.method = "GET".to_string();
+        state.uri = "/imports~count".to_string();
+        state.config.quiet = true;
+        record_last_request(&mut state);
+        assert_eq!((state.prev_method.as_str(), state.prev_uri.as_str()), ("PUT", "/people"));
+        // The next request, a ctrl+g GET or a chain's last segment, is.
+        state.config.quiet = false;
+        state.body.clear();
+        record_last_request(&mut state);
+        assert_eq!((state.prev_method.as_str(), state.prev_uri.as_str(), state.prev_body.as_str()), ("GET", "/imports~count", ""));
+    }
+
+    #[test]
+    fn a_marker_inside_a_body_being_typed_is_no_outfile_to_complete() {
+        let context = |input: &str| extract_file_path_context(input, char_len(input));
+        // The `>` is in a string that is still open: nothing to complete.
+        assert!(context(r#"PUT /x {"a":"b > c"#).is_none());
+        assert!(context(r#"PUT /x {"a": 1 > c"#).is_none());
+        assert!(context(r#"PUT /x {"a":"b > c"}"#).is_none());
+        // Behind the body it is an outfile again.
+        let after = context(r#"PUT /x {"a":"b > c"} > ou"#).unwrap();
+        assert!(after.is_outfile && !after.is_append);
+        assert_eq!(after.partial, "ou");
+        let appended = context(r#"PUT /x {"a":"b > c"} >> ou"#).unwrap();
+        assert!(appended.is_outfile && appended.is_append);
+        // And an `@file` body is found as before.
+        let body = context("PUT /x @peo").unwrap();
+        assert!(!body.is_outfile);
+        assert_eq!(body.partial, "peo");
+    }
+
+    #[test]
+    fn a_uri_ends_at_the_first_blank_outside_quotes_and_parentheses() {
+        for (text, uri) in [
+            ("/x", "/x"),
+            ("/x {\"a\":1}", "/x"),
+            ("/x~where(name=\"a b\") {\"a\":1}", "/x~where(name=\"a b\")"),
+            ("/x~where(a=1 || b=2)~take(5) > out.json", "/x~where(a=1 || b=2)~take(5)"),
+            // An escaped quote stays inside its string.
+            ("/x~where(name=\"a \\\" b\") {\"a\":1}", "/x~where(name=\"a \\\" b\")"),
+            ("/x~where(name=\"a\\\\\") {\"a\":1}", "/x~where(name=\"a\\\\\")"),
+            // A tab ends it as a blank does.
+            ("/x\t{\"a\":1}", "/x"),
+            // A stray `)` does not hold the URI open.
+            ("/x) {\"a\":1}", "/x)"),
+            // Unbalanced: the first blank, as it always was.
+            ("/x~where(name=\"a b {\"a\":1}", "/x~where(name=\"a"),
+            ("/x~where(a=1 {\"a\":1}", "/x~where(a=1"),
+        ] {
+            assert_eq!(&text[..uri_end(text)], uri, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn an_outfile_marker_is_the_last_one_outside_strings_and_brackets() {
+        fn marker(text: &str) -> Option<&str> {
+            outfile_marker_at(text).map(|at| &text[at..])
+        }
+        for (text, found) in [
+            ("/x > out.json", Some(" > out.json")),
+            ("/x >> out.json", Some(" >> out.json")),
+            ("/x >out.json", Some(" >out.json")),
+            ("/x", None),
+            ("/x>out.json", None),
+            // A tab before `>` is not the marker: it takes a blank.
+            ("/x\t> out.json", None),
+            ("/x {\"a\":\"b > c\"}", None),
+            ("/x {\"a\":\"b > c\"} > out.json", Some(" > out.json")),
+            ("/x {\"a\":\"\\\" > c\"} > out.json", Some(" > out.json")),
+            ("/x~where(name=\"a > b\") > o.json", Some(" > o.json")),
+            ("/x [1, 2 > 3]", None),
+            // More closed than opened: still outside.
+            ("/x) > out.json", Some(" > out.json")),
+            // Unbalanced, so the last ` >` is taken.
+            ("/x {\"a\":\"b > c", Some(" > c")),
+            ("/x {\"a\": 1 > out.json", Some(" > out.json")),
+        ] {
+            assert_eq!(marker(text), found, "{text:?}");
+        }
     }
 
     #[test]
