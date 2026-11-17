@@ -193,7 +193,12 @@ api --stream -sa export.api
 - `>> file`, `> clipboard`, and any non-2xx response buffer even with `--stream`.
 - A streamed outfile gets its name only when the body has ended. A transfer
   that fails partway leaves the target as it was (the bytes went to
-  `<file>.part`, which is removed), and ends the run with exit 1.
+  `<file>.<pid>.part` beside it, which is removed), and ends the run with
+  exit 1. The file keeps the mode the target had, and a target that is a
+  symlink is written where the link points.
+- Two kinds of target are written as they stand, and are cut short by a
+  transfer that fails: one that is not a regular file (`> /dev/null`, a
+  fifo), and a file in a directory that no file can be created in.
 
 ## 5. Chaining
 
@@ -1065,14 +1070,19 @@ WARNING: could not read /run/secrets/api-credentials.json: it is not what the cl
 Such a file is never written over. Saving a connection from the prompt
 (`ctrl+s`) is refused with the same reason until the file is fixed or removed.
 
-**Security.** The file is plaintext and is created with your default umask
-(commonly world-readable `0644`) — the client does not restrict it. Keep real
-keys out of the repo:
+**Security.** The file is plaintext. A file the client creates can be read
+by you alone (`0600`); one that was already there keeps the mode it has, so
+check a file you made yourself. Keep real keys out of the repo:
 
 ```sh
-chmod 600 "$API_CREDENTIALS_FILE"     # do this yourself
+chmod 600 "$API_CREDENTIALS_FILE"     # for a file you created yourself
 echo '.api-credentials.json' >> .gitignore
 ```
+
+A save replaces the file in one step. A file that is a symlink is written
+where the link points. Where the file can't be replaced (it is mounted on its
+own, as a container secret is, or its directory is not writable) it is
+written as it stands.
 
 Prefer a path outside the working tree (`/run/secrets/...`, `$XDG_RUNTIME_DIR`)
 for anything but a local dev key. Saving a connection with `ctrl+s` in

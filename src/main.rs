@@ -640,24 +640,93 @@ fn read_store_file(path: &std::path::Path) -> Result<KeychainData, String> {
     }
 }
 
-/// Write a credentials file in one step: to a file beside it, then renamed
-/// over it, so a reader never finds half a file. The mode of the file that
-/// was there is kept.
+/// The file a path names once every link on the way is followed: `path`
+/// itself unless it is a symlink. A link that names nothing yet gives the
+/// path it points at, where a write creates the file, as a plain write
+/// through the link does.
+fn resolve_link(path: &std::path::Path) -> PathBuf {
+    let mut at = path.to_path_buf();
+    // A chain of links ends, or it is a loop: then the write says so.
+    for _ in 0..40 {
+        match fs::read_link(&at) {
+            Ok(to) if to.is_absolute() => at = to,
+            Ok(to) => at = at.parent().unwrap_or(std::path::Path::new("")).join(to),
+            Err(_) => break,
+        }
+    }
+    at
+}
+
+/// A new file that only its owner can read, opened for writing. Fails when
+/// something already has the name, a link left there included.
+fn create_private(path: &std::path::Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+/// Write a credentials file in one step where that can be done: to a file
+/// beside it, then renamed over it, so a reader never finds half a file. The
+/// mode of the file that was there is kept, and a file that is a symlink is
+/// written where the link points.
+///
+/// Where a file can't be made beside it (a directory that is not writable)
+/// or can't take its place (a file mounted on its own, as a container's
+/// secret is), the file is written as it stands. That is not one step, but a
+/// save that fails there is worse.
 fn write_store_file(path: &std::path::Path, data: &KeychainData) -> Result<(), String> {
+    write_store_file_with(path, data, |from, to| fs::rename(from, to))
+}
+
+fn write_store_file_with(
+    path: &std::path::Path,
+    data: &KeychainData,
+    rename: impl Fn(&std::path::Path, &std::path::Path) -> io::Result<()>,
+) -> Result<(), String> {
     let json = serde_json::to_string(data).map_err(|e| e.to_string())?;
-    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    let target = resolve_link(path);
+    let failed = |e: io::Error| format!("credentials file error: {}", e);
+    let mut name = target.file_name().map(|n| n.to_os_string()).unwrap_or_default();
     name.push(format!(".tmp-{}", std::process::id()));
-    let tmp = path.with_file_name(name);
-    let written = fs::write(&tmp, &json)
-        .and_then(|()| match fs::metadata(path) {
-            Ok(existing) => fs::set_permissions(&tmp, existing.permissions()),
-            Err(_) => Ok(()),
-        })
-        .and_then(|()| fs::rename(&tmp, path));
-    if written.is_err() {
+    let tmp = target.with_file_name(name);
+    // Never readable by others, not even for a moment: created for the
+    // owner alone, and only then given the mode the file had.
+    if let Ok(mut file) = create_private(&tmp) {
+        let staged = file
+            .write_all(json.as_bytes())
+            .and_then(|()| match fs::metadata(&target) {
+                Ok(existing) => file.set_permissions(existing.permissions()),
+                Err(_) => Ok(()),
+            })
+            .and_then(|()| file.flush());
+        drop(file);
+        if let Err(e) = staged {
+            // Nothing was done to the file itself, and nothing is now: what
+            // stopped this write (a full disk) would cut that one short.
+            let _ = fs::remove_file(&tmp);
+            return Err(failed(e));
+        }
+        if rename(&tmp, &target).is_ok() {
+            return Ok(());
+        }
         let _ = fs::remove_file(&tmp);
     }
-    written.map_err(|e| format!("credentials file error: {}", e))
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(&target)
+        .and_then(|mut file| file.write_all(json.as_bytes()).and_then(|()| file.flush()))
+        .map_err(failed)
 }
 
 /// Read the store from where it is kept, not from the cache.
@@ -4954,7 +5023,7 @@ struct StreamedBody {
 /// Copy a streaming response into `sink` without holding the whole body, keeping
 /// the leading `CLASSIFY_PREFIX_BYTES` so `&&`/`||` chains still see a payload
 /// to judge.
-fn stream_to_sink(mut resp: impl IoRead, sink: &mut dyn Write) -> io::Result<StreamedBody> {
+fn stream_to_sink(mut resp: impl IoRead, sink: &mut dyn Write) -> Result<StreamedBody, StreamFailure> {
     let mut prefix: Vec<u8> = Vec::new();
     let mut overflowed = false;
     let mut last_byte = None;
@@ -4962,7 +5031,10 @@ fn stream_to_sink(mut resp: impl IoRead, sink: &mut dyn Write) -> io::Result<Str
     let mut buf = [0u8; 32 * 1024];
 
     loop {
-        let n = resp.read(&mut buf)?;
+        // What went wrong is told apart by where: a read that fails is the
+        // response breaking off, a write that fails is this machine (a full
+        // disk, a quota).
+        let n = resp.read(&mut buf).map_err(StreamFailure::Body)?;
         if n == 0 {
             break;
         }
@@ -4975,9 +5047,9 @@ fn stream_to_sink(mut resp: impl IoRead, sink: &mut dyn Write) -> io::Result<Str
         }
         last_byte = Some(buf[n - 1]);
         bytes += n as u64;
-        sink.write_all(&buf[..n])?;
+        sink.write_all(&buf[..n]).map_err(StreamFailure::Write)?;
     }
-    sink.flush()?;
+    sink.flush().map_err(StreamFailure::Write)?;
 
     Ok(StreamedBody {
         prefix: String::from_utf8_lossy(&prefix).into_owned(),
@@ -8570,27 +8642,100 @@ fn send_request(config: &Config, parts: &RequestParts, built: BuiltRequest) -> R
     Ok(Sent { response, new_token: None })
 }
 
-/// Why a response streamed to an outfile did not get there.
+/// Why a streamed response did not get where it was going.
+#[derive(Debug)]
 enum StreamFailure {
-    /// The file could not be created or put in place: a local problem.
+    /// It could not be written, or the file could not be created or put in
+    /// place: a local problem.
     Write(io::Error),
     /// The body stopped or the transfer failed partway.
     Body(io::Error),
 }
 
-/// Stream a response body to `path`. The bytes go to `<path>.part` and the
-/// file takes its name only once the body has ended, so a transfer that
-/// fails leaves no file that looks complete: the target is as it was.
+impl StreamFailure {
+    fn into_error(self) -> io::Error {
+        match self {
+            StreamFailure::Write(e) | StreamFailure::Body(e) => e,
+        }
+    }
+}
+
+/// A new file beside `target` for a transfer to be written to: `<target>.
+/// <pid>.part`, or with a number added when something has that name. It is
+/// always a file this call created, never one that was there.
+fn create_part(target: &std::path::Path) -> io::Result<(PathBuf, fs::File)> {
+    let base = target.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    let mut last = None;
+    for attempt in 0..8 {
+        let mut name = base.clone();
+        name.push(match attempt {
+            0 => format!(".{}.part", std::process::id()),
+            n => format!(".{}-{}.part", std::process::id(), n),
+        });
+        let part = target.with_file_name(name);
+        match fs::OpenOptions::new().write(true).create_new(true).open(&part) {
+            Ok(file) => return Ok((part, file)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| io::Error::new(io::ErrorKind::AlreadyExists, "no free name for a partial file")))
+}
+
+/// Stream a response body straight into `target`, which is cut short if the
+/// transfer fails.
+fn stream_in_place(resp: impl IoRead, target: &std::path::Path) -> Result<StreamedBody, StreamFailure> {
+    let file = fs::File::create(target).map_err(StreamFailure::Write)?;
+    let mut writer = io::BufWriter::new(file);
+    stream_to_sink(resp, &mut writer)
+}
+
+/// Stream a response body to `path`.
+///
+/// The bytes go to a file of their own beside the target, which takes the
+/// target's name only once the body has ended. A transfer that fails then
+/// leaves no file that looks complete: the target is as it was. The new file
+/// has the mode the target had.
+///
+/// A symlink is followed first, so the file it names is the target. And
+/// where that way is not open the target is written as it stands: one that
+/// is not a regular file (`/dev/null`, a fifo), and one in a directory that
+/// no file can be created in. Such a target is cut short by a transfer that
+/// fails.
 fn stream_to_outfile(resp: impl IoRead, path: &str) -> Result<StreamedBody, StreamFailure> {
-    let part = format!("{}.part", path);
-    let file = fs::File::create(&part).map_err(StreamFailure::Write)?;
+    stream_to_outfile_with(resp, path, |from, to| fs::rename(from, to))
+}
+
+fn stream_to_outfile_with(
+    resp: impl IoRead,
+    path: &str,
+    rename: impl Fn(&std::path::Path, &std::path::Path) -> io::Result<()>,
+) -> Result<StreamedBody, StreamFailure> {
+    let target = resolve_link(std::path::Path::new(path));
+    let existing = fs::metadata(&target).ok();
+    if existing.as_ref().is_some_and(|meta| !meta.is_file()) {
+        return stream_in_place(resp, &target);
+    }
+    let Ok((part, file)) = create_part(&target) else {
+        // No file can be made beside it. Whether the target itself can be
+        // written is for the write to say.
+        return stream_in_place(resp, &target);
+    };
+    if let Some(meta) = &existing {
+        // Best effort: a file system without modes still takes the bytes.
+        let _ = file.set_permissions(meta.permissions());
+    }
     let mut writer = io::BufWriter::new(file);
     let streamed = stream_to_sink(resp, &mut writer);
     drop(writer);
-    let result = match streamed {
-        Ok(body) => fs::rename(&part, path).map(|()| body).map_err(StreamFailure::Write),
-        Err(e) => Err(StreamFailure::Body(e)),
-    };
+    let result = streamed.and_then(|body| {
+        // A target that can't be replaced (a file mounted on its own) is
+        // given the finished bytes instead.
+        rename(&part, &target)
+            .or_else(|_| fs::copy(&part, &target).and_then(|_| fs::remove_file(&part)))
+            .map(|()| body)
+            .map_err(StreamFailure::Write)
+    });
     if result.is_err() {
         let _ = fs::remove_file(&part);
     }
@@ -8850,10 +8995,10 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
         } else if config.bulk_silent {
             // Bodies are suppressed here, but the response still has to be
             // drained before the next request reuses the connection.
-            stream_to_sink(resp, &mut io::sink())
+            stream_to_sink(resp, &mut io::sink()).map_err(StreamFailure::into_error)
         } else {
             let mut lock = Out;
-            let res = stream_to_sink(resp, &mut lock);
+            let res = stream_to_sink(resp, &mut lock).map_err(StreamFailure::into_error);
             ticker.stop();
             // Match the buffered path's trailing newline (and the blank
             // separator line on a TTY) so piping gives identical bytes.
@@ -17987,6 +18132,246 @@ mod tests {
         let names: Vec<String> =
             fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
         assert_eq!(names, ["credentials.json"]);
+    }
+
+    /// The names in a directory, sorted.
+    fn names_in(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> =
+            fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+        names.sort();
+        names
+    }
+
+    fn store_with(name: &str) -> KeychainData {
+        let mut data = KeychainData::default();
+        let connection = SavedConnection {
+            name: name.to_string(),
+            url: "http://x".to_string(),
+            auth_type: "key".to_string(),
+            credential: "k".to_string(),
+            client_id: String::new(),
+        };
+        put_connection(&mut data, &connection, None);
+        data
+    }
+
+    fn stored_names(path: &std::path::Path) -> Vec<String> {
+        read_store_file(path).unwrap().connections.into_iter().map(|c| c.name).collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_store_is_private_when_new_and_written_where_a_link_points() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &std::path::Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+
+        // A file the client creates is the user's alone.
+        let fresh = d.join("fresh.json");
+        write_store_file(&fresh, &store_with("a")).unwrap();
+        assert_eq!(mode(&fresh), 0o600);
+        // One that was there keeps the mode it was given.
+        fs::set_permissions(&fresh, fs::Permissions::from_mode(0o640)).unwrap();
+        write_store_file(&fresh, &store_with("b")).unwrap();
+        assert_eq!((mode(&fresh), stored_names(&fresh)), (0o640, vec!["b".to_string()]));
+
+        // A link stays a link, and the file it names is the one written.
+        fs::create_dir(d.join("real")).unwrap();
+        let real = d.join("real/secrets.json");
+        write_store_file(&real, &store_with("a")).unwrap();
+        let link = d.join("link.json");
+        std::os::unix::fs::symlink("real/secrets.json", &link).unwrap();
+        write_store_file(&link, &store_with("b")).unwrap();
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(stored_names(&real), ["b"]);
+        assert_eq!(names_in(&d.join("real")), ["secrets.json"]);
+        assert_eq!(names_in(d), ["fresh.json", "link.json", "real"]);
+
+        // A link to a file that is not there yet creates it.
+        let dangling = d.join("dangling.json");
+        std::os::unix::fs::symlink(d.join("real/later.json"), &dangling).unwrap();
+        write_store_file(&dangling, &store_with("c")).unwrap();
+        assert_eq!(stored_names(&d.join("real/later.json")), ["c"]);
+        assert!(fs::symlink_metadata(&dangling).unwrap().file_type().is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_store_is_written_in_place_where_it_cannot_be_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        let path = locked.join("credentials.json");
+        write_store_file(&path, &store_with("a")).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        // No file can be made beside it: the file itself is written.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+        let written = write_store_file(&path, &store_with("b"));
+        // And when the file can't be written either, it is as it was.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+        let refused = write_store_file(&path, &store_with("c"));
+        let after = stored_names(&path);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        written.unwrap();
+        assert!(refused.unwrap_err().starts_with("credentials file error: "));
+        assert_eq!(after, ["b"]);
+        assert_ne!(fs::read(&path).unwrap(), before);
+        assert_eq!(names_in(&locked), ["credentials.json"]);
+
+        // A file that can't be renamed over (mounted on its own): the same,
+        // and the file made beside it is gone.
+        let refuse = |_: &std::path::Path, _: &std::path::Path| Err(io::Error::from(io::ErrorKind::ResourceBusy));
+        write_store_file_with(&path, &store_with("d"), refuse).unwrap();
+        assert_eq!(stored_names(&path), ["d"]);
+        assert_eq!(names_in(&locked), ["credentials.json"]);
+    }
+
+    #[test]
+    fn a_save_under_an_override_leaves_the_stored_connection() {
+        // No override: a new name renames the session's connection.
+        assert_eq!(save_replaces("staging", "mine", false), Some("staging".to_string()));
+        assert_eq!(save_replaces("staging", "staging", false), Some("staging".to_string()));
+        // An override: a new name is a new connection, the same name is not.
+        assert_eq!(save_replaces("staging", "mine", true), None);
+        assert_eq!(save_replaces("staging", "staging", true), Some("staging".to_string()));
+        // A session with no saved connection replaces nothing.
+        assert_eq!(save_replaces("", "mine", false), None);
+        assert_eq!(save_replaces("", "mine", true), None);
+
+        let saved = ["a".to_string(), "x".to_string()];
+        assert!(save_asks_to_overwrite(&saved, "x", "a"));
+        assert!(!save_asks_to_overwrite(&saved, "a", "a"));
+        assert!(!save_asks_to_overwrite(&saved, "new", "a"));
+    }
+
+    /// A body that hands out `good` and then fails.
+    struct Breaks<'a> {
+        good: &'a [u8],
+    }
+
+    impl IoRead for Breaks<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.good.is_empty() {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "connection reset"));
+            }
+            let n = self.good.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.good[..n]);
+            self.good = &self.good[n..];
+            Ok(n)
+        }
+    }
+
+    /// Somewhere that can't be written to: a full disk.
+    struct Full;
+
+    impl Write for Full {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::StorageFull, "No space left on device"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_stream_tells_a_body_that_broke_off_from_a_write_that_failed() {
+        assert!(matches!(stream_to_sink(Breaks { good: b"[1," }, &mut Vec::new()), Err(StreamFailure::Body(_))));
+        assert!(matches!(stream_to_sink(&b"[1,2]"[..], &mut Full), Err(StreamFailure::Write(_))));
+    }
+
+    #[test]
+    fn a_streamed_outfile_takes_its_name_when_the_body_has_ended() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let target = d.join("out.json");
+        let path = target.to_str().unwrap();
+
+        let body = stream_to_outfile(&b"[1,2]"[..], path).unwrap();
+        assert_eq!((body.bytes, fs::read_to_string(&target).unwrap()), (5, "[1,2]".to_string()));
+        assert_eq!(names_in(d), ["out.json"]);
+
+        // A body that breaks off leaves the target as it was, and nothing else.
+        let broken = stream_to_outfile(Breaks { good: b"[9," }, path);
+        assert!(matches!(broken, Err(StreamFailure::Body(_))));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "[1,2]");
+        assert_eq!(names_in(d), ["out.json"]);
+
+        // A directory that is not there is a local failure.
+        let nowhere = d.join("nodir/out.json");
+        assert!(matches!(stream_to_outfile(&b"[1]"[..], nowhere.to_str().unwrap()), Err(StreamFailure::Write(_))));
+        // So is a target that is a directory.
+        assert!(matches!(stream_to_outfile(&b"[1]"[..], d.to_str().unwrap()), Err(StreamFailure::Write(_))));
+
+        // A file that happens to have the temporary name is the user's: it
+        // is neither written over nor removed, whether the stream ends well
+        // or not.
+        let theirs = [d.join("out.json.part"), d.join(format!("out.json.{}.part", std::process::id()))];
+        for file in &theirs {
+            fs::write(file, "mine").unwrap();
+        }
+        stream_to_outfile(&b"[3]"[..], path).unwrap();
+        assert!(stream_to_outfile(Breaks { good: b"[4," }, path).is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "[3]");
+        for file in &theirs {
+            assert_eq!(fs::read_to_string(file).unwrap(), "mine");
+        }
+        assert_eq!(names_in(d).len(), 3);
+
+        // A target that can't be renamed over gets the finished bytes.
+        let refuse = |_: &std::path::Path, _: &std::path::Path| Err(io::Error::from(io::ErrorKind::ResourceBusy));
+        stream_to_outfile_with(&b"[5]"[..], path, refuse).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "[5]");
+        assert_eq!(names_in(d).len(), 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_streamed_outfile_keeps_what_the_target_is() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+
+        // Not a regular file: written as it stands.
+        assert_eq!(stream_to_outfile(&b"[1,2]"[..], "/dev/null").unwrap().bytes, 5);
+
+        // A link stays a link, and the file it names gets the body.
+        fs::write(d.join("real.json"), "old").unwrap();
+        std::os::unix::fs::symlink("real.json", d.join("link.json")).unwrap();
+        stream_to_outfile(&b"[1]"[..], d.join("link.json").to_str().unwrap()).unwrap();
+        assert!(fs::symlink_metadata(d.join("link.json")).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_to_string(d.join("real.json")).unwrap(), "[1]");
+
+        // A link to nothing creates the file it points at.
+        std::os::unix::fs::symlink(d.join("later.json"), d.join("dangling.json")).unwrap();
+        stream_to_outfile(&b"[2]"[..], d.join("dangling.json").to_str().unwrap()).unwrap();
+        assert!(fs::symlink_metadata(d.join("dangling.json")).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_to_string(d.join("later.json")).unwrap(), "[2]");
+        assert_eq!(names_in(d), ["dangling.json", "later.json", "link.json", "real.json"]);
+
+        // A file made private stays private.
+        let private = d.join("private.json");
+        fs::write(&private, "old").unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o600)).unwrap();
+        stream_to_outfile(&b"[3]"[..], private.to_str().unwrap()).unwrap();
+        assert_eq!(fs::metadata(&private).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(fs::read_to_string(&private).unwrap(), "[3]");
+
+        // A file that can be written, in a directory that can't.
+        let locked = d.join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::write(locked.join("keep.json"), "old").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+        let written = stream_to_outfile(&b"[4]"[..], locked.join("keep.json").to_str().unwrap());
+        let created = stream_to_outfile(&b"[4]"[..], locked.join("new.json").to_str().unwrap());
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        written.unwrap();
+        assert!(matches!(created, Err(StreamFailure::Write(_))));
+        assert_eq!(fs::read_to_string(locked.join("keep.json")).unwrap(), "[4]");
+        assert_eq!(names_in(&locked), ["keep.json"]);
     }
 
     #[test]

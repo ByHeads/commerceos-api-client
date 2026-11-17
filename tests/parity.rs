@@ -910,6 +910,62 @@ fn a_stream_that_fails_leaves_no_partial_outfile() {
     assert!(!d.join("good.json.part").exists());
 }
 
+/// A streamed outfile is the file a buffered one would be: `/dev/null` takes
+/// it, a link stays a link, a private file stays private, and a file that
+/// happens to be named `<outfile>.part` is not touched.
+#[cfg(unix)]
+#[test]
+fn a_streamed_outfile_keeps_what_its_target_is() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let body = r#"{"ok":"/api/v1/a"}"#;
+    let mode = |name: &str| std::fs::metadata(d.join(name)).unwrap().permissions().mode() & 0o777;
+    let names = || {
+        let mut names: Vec<String> =
+            std::fs::read_dir(d).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+        names.retain(|n| !n.starts_with('.'));
+        names.sort();
+        names
+    };
+
+    for stream in [false, true] {
+        let with = |args: &[&'static str]| -> Vec<&'static str> {
+            let mut all = if stream { vec!["--stream", "-r"] } else { vec!["-r"] };
+            all.extend_from_slice(args);
+            all
+        };
+        let null = run_in(&server, d, &with(&["GET", "/a", ">", "/dev/null"]));
+        assert_eq!(null.code, Some(0), "stream={stream}: {}", null.stderr);
+
+        std::fs::write(d.join("real.json"), "old").unwrap();
+        std::fs::write(d.join("keep.json"), "old").unwrap();
+        std::fs::write(d.join("keep.json.part"), "mine").unwrap();
+        std::fs::set_permissions(d.join("keep.json"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        let _ = std::fs::remove_file(d.join("link.json"));
+        std::os::unix::fs::symlink("real.json", d.join("link.json")).unwrap();
+
+        let linked = run_in(&server, d, &with(&["GET", "/a", ">", "link.json"]));
+        assert_eq!(linked.code, Some(0), "stream={stream}: {}", linked.stderr);
+        assert!(std::fs::symlink_metadata(d.join("link.json")).unwrap().file_type().is_symlink(), "stream={stream}");
+        assert_eq!(std::fs::read_to_string(d.join("real.json")).unwrap(), body, "stream={stream}");
+
+        let kept = run_in(&server, d, &with(&["GET", "/a", ">", "keep.json"]));
+        assert_eq!(kept.code, Some(0), "stream={stream}: {}", kept.stderr);
+        assert_eq!((mode("keep.json"), std::fs::read_to_string(d.join("keep.json")).unwrap()), (0o600, body.to_string()), "stream={stream}");
+        assert_eq!(std::fs::read_to_string(d.join("keep.json.part")).unwrap(), "mine", "stream={stream}");
+        assert_eq!(names(), ["keep.json", "keep.json.part", "link.json", "real.json"], "stream={stream}");
+    }
+
+    // A stream that never ends is a timeout, and leaves nothing behind.
+    let stalled = run_in(&server, d, &["--stream", "--timeout", "1", "GET", "/stall", ">", "s.json"]);
+    assert_eq!(stalled.code, Some(1), "{}", stalled.stderr);
+    assert!(stalled.stderr.contains("Timed out after"), "{}", stalled.stderr);
+    assert_eq!(names(), ["keep.json", "keep.json.part", "link.json", "real.json"]);
+}
+
 /// An outfile that can't be written is a failure of the request: exit 1 for
 /// one request and under `-f`, a stopped chain, and a reported line that a
 /// plain batch goes on past, as it goes on past a failed request.
