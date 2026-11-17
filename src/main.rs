@@ -18736,6 +18736,28 @@ mod tests {
     }
 
     #[test]
+    fn the_command_area_is_drawn_with_a_host_of_non_ascii_letters_at_any_width() {
+        // A cut that lands inside `å` or `ä` used to end the session.
+        for width in 1..=60u16 {
+            let mut state = AppState::new(Config {
+                base_uri: "http://blåbär.example".to_string(),
+                api_key: "k".to_string(),
+                ..Config::default()
+            });
+            state.width = width;
+            state.height = 24;
+            state.input = "GET /blåbär~where(namn=\"åäö\")".to_string();
+            state.cursor_pos = char_len(&state.input);
+            let mut drawn: Vec<u8> = Vec::new();
+            render(&mut drawn, &mut state).unwrap();
+            let text = String::from_utf8(drawn).expect("what is drawn is whole characters");
+            assert!(!text.is_empty(), "width {width}");
+            // The splash, at the same widths, in a box or without one.
+            print_splash_with_width(&state.config, width);
+        }
+    }
+
+    #[test]
     fn a_save_under_an_override_leaves_the_stored_connection() {
         // No override: a new name renames the session's connection.
         assert_eq!(save_replaces("staging", "mine", false), Some("staging".to_string()));
@@ -18930,6 +18952,24 @@ mod tests {
         let old = "GET /a\nPUT /x {\"s\":\"a\\nb \\\\ c\"}\n\nGET /c\n";
         fs::write(&path, old).unwrap();
         assert_eq!(load_history_from(&path), ["GET /a", "PUT /x {\"s\":\"a\\nb \\\\ c\"}", "GET /c"]);
+
+        // Line breaks as a paste or a Windows file has them are line breaks
+        // too: each is one entry on one line, read back with `\n`.
+        fs::remove_file(&path).unwrap();
+        append_history_to(&path, "PUT /x {\r\n  \"a\": 1\r\n}");
+        append_history_to(&path, "PUT /y {\r  \"b\": 2\r}");
+        assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 2);
+        assert!(!fs::read_to_string(&path).unwrap().contains('\r'));
+        assert_eq!(load_history_from(&path), ["PUT /x {\n  \"a\": 1\n}", "PUT /y {\n  \"b\": 2\n}"]);
+
+        // The character that stands for a line break is read as one, also
+        // where an entry held it itself. That is the price of one line per
+        // entry, and it is paid only in the history: the request was sent
+        // as it was typed.
+        fs::remove_file(&path).unwrap();
+        append_history_to(&path, "PUT /z {\"s\":\"a\u{2424}b\"}");
+        assert_eq!(load_history_from(&path), ["PUT /z {\"s\":\"a\nb\"}"]);
+        assert_eq!(history_entry(&history_line("a\nb\r\nc\rd")), "a\nb\nc\nd");
     }
 
     #[test]

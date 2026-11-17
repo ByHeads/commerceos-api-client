@@ -1334,6 +1334,141 @@ fn the_prompt_streams_an_outfile_as_a_batch_does() {
     assert_eq!(left, ["kept.json", "s.json"]);
 }
 
+/// A request ended with esc has no status. Under `-f` the 404 of the line
+/// before is not reported as what stopped the block, and the rest of the
+/// block is not sent.
+#[cfg(unix)]
+#[test]
+fn an_aborted_request_under_fail_fast_stops_the_block_without_a_status() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = open_prompt(&server, dir.path(), &["-f"]);
+    let shown = enter_line(&mut prompt, "GET /missing", "404");
+    assert!(shown.contains("404"), "{shown}");
+
+    prompt.send(b"\x15");
+    prompt.pump(Duration::from_millis(60));
+    server.take();
+    let mark = prompt.screen.len();
+    prompt.paste("GET /stall\rGET /never");
+    prompt.pump(Duration::from_millis(60));
+    prompt.send(b"\r");
+    assert!(pump_until(&mut prompt, Duration::from_secs(5), |_| server.seen() > 0), "{}", screen_tail(&prompt));
+    prompt.pump(Duration::from_millis(400));
+    prompt.send(b"\x1b");
+    prompt.pump(Duration::from_millis(1500));
+    let shown = pty::plain(&prompt.screen[mark..]);
+    assert!(!shown.contains("stopped at 404"), "{shown}");
+    assert_eq!(server.log.lock().unwrap().clone(), ["GET /stall"], "{shown}");
+    // The session is still there.
+    let shown = enter_line(&mut prompt, "GET /after", "200 OK");
+    assert!(shown.contains("200 OK"), "{shown}");
+}
+
+/// An outfile written at the prompt is the file a batch writes: the
+/// server's bytes under `-r`, and one array after two appends.
+#[cfg(unix)]
+#[test]
+fn the_prompt_writes_a_raw_and_an_appended_outfile_as_a_batch_does() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::write(d.join("twice.api"), "GET /a >> batch.json\nGET /a >> batch.json\nGET /a > batch-raw.json\n").unwrap();
+    let batch = run_in(&server, d, &["-r", "-sa", "twice.api"]);
+    assert_eq!(batch.code, Some(0), "{}", batch.stderr);
+
+    let mut prompt = open_prompt(&server, d, &["-r"]);
+    enter_line(&mut prompt, "GET /a >> prompt.json", "200 OK");
+    enter_line(&mut prompt, "GET /a >> prompt.json", "200 OK");
+    enter_line(&mut prompt, "GET /a > prompt-raw.json", "200 OK");
+    let read = |name: &str| std::fs::read_to_string(d.join(name)).unwrap();
+    assert_eq!(read("prompt-raw.json"), r#"{"ok":"/api/v1/a"}"#);
+    assert_eq!(read("prompt-raw.json"), read("batch-raw.json"));
+    assert_eq!(read("prompt.json"), read("batch.json"));
+    let appended: serde_json::Value = serde_json::from_str(&read("prompt.json")).unwrap();
+    assert_eq!(appended.as_array().map(Vec::len), Some(2), "{appended}");
+}
+
+/// On a terminal too narrow for the splash box nothing of a box is drawn,
+/// not when the session starts and not when the connection has loaded.
+#[cfg(unix)]
+#[test]
+fn a_narrow_terminal_gets_no_piece_of_the_splash_box() {
+    let server = RecordingServer::start();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write_credentials(d, &[("a", url.clone(), "key", "k", "")], "a");
+    for args in [&["-c", "a"][..], &["-b", &url, "-k", "k"]] {
+        let mut cmd = api_bare(d);
+        cmd.args(args);
+        let mut prompt = pty::Prompt::open_sized(cmd, 30);
+        prompt.wait_for("ctrl+h", Duration::from_secs(15));
+        prompt.pump(Duration::from_millis(1500));
+        let rows = pty::rows(&prompt.screen, 30);
+        assert!(!rows.iter().any(|row| row.contains('│') || row.contains('╭') || row.contains('╰')), "{args:?}:\n{}", rows.join("\n"));
+        // The command area is there and keeps to the width.
+        assert!(rows.iter().any(|row| row.starts_with("GET /")), "{args:?}:\n{}", rows.join("\n"));
+        assert!(rows.iter().all(|row| row.chars().count() <= 30), "{args:?}:\n{}", rows.join("\n"));
+    }
+}
+
+/// `-m` at a terminal wraps the description to the terminal's width.
+#[cfg(unix)]
+#[test]
+fn describe_first_wraps_to_the_width_of_the_terminal() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let words = "Innehåller x y z och andra intressanta saker, se till att köra bananer också. ".repeat(3);
+    std::fs::write(
+        d.join("cat.api"),
+        format!("{{ \"title\": {{ \"en\": \"Catalog\" }}, \"description\": {{ \"en\": \"{}\" }} }}\nGET /a\n", words.trim()),
+    )
+    .unwrap();
+    let mut cmd = api(server.port, d);
+    cmd.args(["-spma", "cat.api"]).env("LANG", "en_GB.UTF-8").env_remove("LC_ALL").env_remove("LC_MESSAGES");
+    let mut prompt = pty::Prompt::open_sized(cmd, 40);
+    prompt.wait_for("Run?", Duration::from_secs(10));
+    let shown = pty::plain(&prompt.screen);
+    let described: Vec<&str> = shown.split("Preview").next().unwrap().lines().map(str::trim_end).collect();
+    assert!(described.iter().any(|line| *line == "Catalog"), "{shown}");
+    assert!(described.len() > 6, "the description was not wrapped:\n{shown}");
+    assert!(described.iter().all(|line| line.chars().count() <= 40), "{shown}");
+    // Every word is still there, in order.
+    let joined = described.join(" ").split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(joined.contains(words.trim()), "{shown}");
+    prompt.send(b"n");
+    prompt.pump(Duration::from_millis(500));
+    assert_eq!(server.seen(), 0);
+}
+
+/// The form for a new connection reads its URL as `-b` does: a scheme is
+/// added and the API path is cut, and it says that it cut something.
+#[cfg(unix)]
+#[test]
+fn the_connection_form_trims_its_url_to_the_base() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = pty::Prompt::open(api_bare(dir.path()));
+    assert!(
+        pump_until(&mut prompt, Duration::from_secs(10), |p| pty::plain(&p.screen).contains("URL")),
+        "{}",
+        pty::plain(&prompt.screen)
+    );
+    prompt.pump(Duration::from_millis(400));
+    let typed = format!("127.0.0.1:{}/api/v1", server.port);
+    prompt.send(typed.as_bytes());
+    prompt.pump(Duration::from_millis(300));
+    let mark = prompt.screen.len();
+    prompt.send(b"\r");
+    let said = pump_until(&mut prompt, Duration::from_secs(4), |p| pty::plain(&p.screen[mark..]).contains("trimmed to base URL"));
+    let shown = pty::plain(&prompt.screen[mark..]);
+    assert!(said, "{shown}");
+    assert!(shown.contains(&format!("http://127.0.0.1:{}", server.port)), "{shown}");
+    assert!(!shown.contains("/api/v1"), "{shown}");
+}
+
 /// A file that opens with a describe block runs from a paste as it would
 /// from disk: the block is read, checked, and not sent. A describe block
 /// alone sends nothing and says so.
@@ -1914,6 +2049,63 @@ fn a_failed_token_exchange_does_not_end_the_prompt() {
     prompt.send(b"\r");
     prompt.wait_for("200 OK", Duration::from_secs(6));
     assert_eq!(server.log.lock().unwrap().clone(), ["GET /still-here"]);
+}
+
+/// The same when the connection is the default one, or is named with `-c`
+/// for a prompt: a batch ends with the reason, a prompt says it and opens.
+#[cfg(unix)]
+#[test]
+fn a_failed_token_exchange_at_startup_is_said_and_sends_nothing() {
+    use pty::{plain, Prompt};
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    write_credentials(d, &[("gone", format!("http://127.0.0.1:{dead}"), "oauth2", "secret", "id")], "gone");
+    std::fs::write(d.join("one.api"), "GET /from-file\n").unwrap();
+
+    for args in [&["GET", "/a"][..], &["-sa", "one.api"], &["-c", "gone", "-sa", "one.api"]] {
+        let batch = run_bare(&server, d, args);
+        assert_eq!((batch.code, batch.sent.len()), (Some(1), 0), "{args:?}");
+        assert!(batch.stderr.contains("OAuth2 token exchange failed"), "{args:?}: {}", batch.stderr);
+    }
+
+    for args in [&[][..], &["-c", "gone"]] {
+        let mut cmd = api_bare(d);
+        cmd.args(args);
+        let mut prompt = Prompt::open(cmd);
+        let said = pump_until(&mut prompt, Duration::from_secs(15), |p| plain(&p.screen).contains("OAuth2 token exchange failed"));
+        assert!(said, "{args:?}: {}", plain(&prompt.screen));
+        prompt.pump(Duration::from_millis(500));
+        assert!(!plain(&prompt.screen).contains("panicked"), "{args:?}: {}", plain(&prompt.screen));
+        assert!(server.log.lock().unwrap().is_empty(), "{args:?}");
+    }
+}
+
+/// A batch at a terminal with nowhere to send to says so and ends: it does
+/// not open the connection form, which is the prompt's.
+#[cfg(unix)]
+#[test]
+fn a_batch_with_no_base_url_says_so_at_a_terminal() {
+    use pty::{plain, Prompt};
+
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::write(d.join("one.api"), "GET /from-file\n").unwrap();
+    for args in [&["-sa", "one.api"][..], &["-a", "one.api"], &["GET /x && GET /y"], &["one.api"]] {
+        let mut cmd = api_bare(d);
+        cmd.args(args);
+        let mut prompt = Prompt::open(cmd);
+        let start = Instant::now();
+        while prompt.exited().is_none() && start.elapsed() < Duration::from_secs(8) {
+            prompt.pump(Duration::from_millis(100));
+        }
+        let shown = plain(&prompt.screen);
+        assert_eq!(prompt.exited(), Some(false), "{args:?}: {shown}");
+        assert!(shown.contains("no base URL specified"), "{args:?}: {shown}");
+        assert!(!shown.contains("API key:") && !shown.contains("New connection"), "{args:?}: the form was opened\n{shown}");
+    }
 }
 
 /// A request from an imported file is logged as its line has it, with the
@@ -2874,6 +3066,15 @@ mod pty {
             }
         }
 
+        /// Whether the terminal is as a shell expects it: lines are read
+        /// whole and what is typed is echoed. A prompt has both off.
+        pub fn is_cooked(&self) -> bool {
+            let mut modes: libc::termios = unsafe { std::mem::zeroed() };
+            let rc = unsafe { libc::tcgetattr(self.master, &mut modes) };
+            assert_eq!(rc, 0, "tcgetattr");
+            modes.c_lflag & libc::ICANON != 0 && modes.c_lflag & libc::ECHO != 0
+        }
+
         /// Give the terminal a new size, as dragging its window does.
         pub fn resize(&mut self, cols: u16, rows: u16) {
             let size = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
@@ -3508,6 +3709,7 @@ fn ctrl_c_in_the_connection_dialog_restores_the_terminal() {
     let mut prompt = Prompt::open_sized(api(server.port, dir.path()), 84);
     prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
     prompt.pump(Duration::from_millis(600));
+    assert!(!prompt.is_cooked(), "a prompt reads keys, not lines");
     prompt.send(b"\x11");
     prompt.wait_for("other", Duration::from_secs(5));
     prompt.pump(Duration::from_millis(300));
@@ -3517,6 +3719,9 @@ fn ctrl_c_in_the_connection_dialog_restores_the_terminal() {
         prompt.pump(Duration::from_millis(100));
     }
     assert_eq!(prompt.exited(), Some(true), "the client did not end");
+    assert!(prompt.is_cooked(), "the terminal is left in raw mode");
+    // Keyboard flags that were pushed are popped again.
+    assert_eq!(prompt.screen.matches("\x1b[>1u").count(), prompt.screen.matches("\x1b[<1u").count());
     assert!(
         prompt.screen.rfind("\x1b[?2004l") > prompt.screen.rfind("\x1b[?2004h"),
         "paste mode is left on"
@@ -4048,6 +4253,9 @@ fn help_is_cut_to_a_short_terminal() {
     short.send(b"\x1b");
     short.pump(Duration::from_millis(500));
     assert!(plain(&short.screen[mark..]).contains("ctrl+h for shortcuts"));
+    // And nothing of the help is left on the screen.
+    let rows = pty::rows(&short.screen, 80);
+    assert!(!rows.iter().any(|row| row.contains("more rows") || row.contains("Send request")), "{}", rows.join("\n"));
 
     let mut tall = Prompt::open_with(api(server.port, dir.path()), 80, 50);
     tall.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
