@@ -1626,6 +1626,7 @@ struct BackgroundLoadResult {
     schema_types: HashMap<String, String>,  // schema → its JSON type (object, array, string, …)
     array_endpoints: std::collections::HashSet<String>,
     enum_values: HashMap<String, HashMap<String, Vec<String>>>,  // schema → prop → enum values
+    string_enums: std::collections::HashSet<(String, String)>,  // (schema, prop) whose enum values are strings
     subtypes: HashMap<String, Vec<String>>,  // base schema → list of subtype @type values
     parent_types: HashMap<String, String>,  // schema → parent schema (from x-parent-type)
     mapped_types: Vec<String>,
@@ -1705,6 +1706,9 @@ struct AppState {
     schema_types: HashMap<String, String>,  // schema → its JSON type, for what a property's value starts with
     array_endpoints: std::collections::HashSet<String>,  // endpoints that return arrays (response has items)
     enum_values: HashMap<String, HashMap<String, Vec<String>>>,  // schema → prop → enum values
+    /// The (schema, property) pairs whose enum values the spec has as
+    /// strings: `"1"` is then written with its quotes, where `1` is not.
+    string_enums: std::collections::HashSet<(String, String)>,
     subtypes: HashMap<String, Vec<String>>,  // base schema → subtype @type values
     parent_types: HashMap<String, String>,  // schema → parent schema (from x-parent-type)
     mapped_types: Vec<String>,  // mapped type names for ~map() completion
@@ -1802,6 +1806,7 @@ impl AppState {
             schema_types: HashMap::new(),
             array_endpoints: std::collections::HashSet::new(),
             enum_values: HashMap::new(),
+            string_enums: std::collections::HashSet::new(),
             subtypes: HashMap::new(),
             parent_types: HashMap::new(),
             mapped_types: Vec::new(),
@@ -17114,7 +17119,14 @@ fn apply_spec(state: &mut AppState, result: BackgroundLoadResult) {
         state.status_msg = "completion unavailable: the API spec could not be read".to_string();
         state.status_msg_at = Some(Instant::now());
     }
-    state.endpoints = result.endpoints;
+    // A server without a spec has none to complete from, and is left what
+    // it had while the spec was asked for: Tab then does what its ghost
+    // showed up to now, where it would do nothing and say nothing.
+    state.endpoints = if result.endpoints.is_empty() && !result.spec_unreadable && state.config.complete {
+        vec![FIRST_ENDPOINT.to_string()]
+    } else {
+        result.endpoints
+    };
     state.schema_props = result.schema_props;
     state.endpoint_types = result.endpoint_types;
     state.param_types = result.param_types;
@@ -17129,6 +17141,7 @@ fn apply_spec(state: &mut AppState, result: BackgroundLoadResult) {
     state.schema_types = result.schema_types;
     state.array_endpoints = result.array_endpoints;
     state.enum_values = result.enum_values;
+    state.string_enums = result.string_enums;
     state.subtypes = result.subtypes;
     state.parent_types = result.parent_types;
     state.spec = result.spec;
@@ -17276,6 +17289,9 @@ fn index_spec(spec: ApiSpec, result: &mut BackgroundLoadResult) {
                             }
                         }).collect();
                         if !values.is_empty() {
+                            if ev.iter().all(|v| v.is_string()) {
+                                result.string_enums.insert((name.clone(), prop_name.clone()));
+                            }
                             enum_map.insert(prop_name.clone(), values);
                         }
                     }
@@ -17887,7 +17903,16 @@ fn json_completion_edit(state: &AppState, ctx: &JsonContext, completion: &str, c
         }
         (None, JsonPos::Key) => format!("{}{}\":", open, completion),
         (None, _) if ctx.in_string => format!("{}\"", completion),
-        (None, _) if is_bare_json_value(completion) => completion.to_string(),
+        // A value that reads as a number or a literal is one, unless the
+        // spec has it as a string: an enum of `"1"` and `"2"`.
+        (None, _)
+            if is_bare_json_value(completion)
+                && !(completion != "{"
+                    && completion != "["
+                    && state.string_enums.contains(&(ctx.schema.clone(), ctx.current_key.clone()))) =>
+        {
+            completion.to_string()
+        }
         (None, _) => format!("\"{}\"", completion),
     };
     (ctx.token_start, format!("{}{}", lead, text), closes_string)
@@ -18335,7 +18360,11 @@ fn get_json_completion_ghost(state: &AppState) -> Option<String> {
     // What Tab would write for `completion`, less what is typed of it.
     let ghost_of = |completion: &str| {
         let (start, text, _) = json_completion_edit(state, &ctx, completion, cursor_byte);
-        text.strip_prefix(&state.input[start..cursor_byte]).map(str::to_string)
+        let typed = &state.input[start..cursor_byte];
+        // A word typed without its quote gets it from Tab, in front of
+        // what is typed: the ghost is what comes behind.
+        let unquoted = || text.trim_start().strip_prefix('"').and_then(|rest| rest.strip_prefix(typed));
+        text.strip_prefix(typed).or_else(|| unquoted().filter(|_| !typed.is_empty())).map(str::to_string)
     };
 
     // If completions are populated from a json trigger, use them
@@ -18352,24 +18381,20 @@ fn get_json_completion_ghost(state: &AppState) -> Option<String> {
             }
         }
     }
-    if !ctx.partial.is_empty() {
+    // No list from a Tab or a typed key: what Tab would write here, which
+    // is the first of what it offers, where it offers anything. The two
+    // checks are the ones `handle_json_tab_completion` starts with.
+    let next = state.input[cursor_byte..].chars().next();
+    if next.is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '@' | '-' | '?')) {
         return None;
     }
-
-    // No pre-populated completions — the first key, suggested only on an
-    // empty line (no existing content before or after cursor)
-    let line_start = state.input[..cursor_byte].rfind('\n').map_or(0, |p| p + 1);
-    let line_end = state.input[cursor_byte..].find('\n').map_or(state.input.len(), |p| cursor_byte + p);
-    let on_clean_line = state.input[line_start..line_end].chars().all(|c| c.is_whitespace());
-    if ctx.pos == JsonPos::Key {
-        return json_completions(state, &ctx).first().filter(|_| on_clean_line).and_then(|first| ghost_of(first));
+    if ctx.partial.is_empty() {
+        let line_end = state.input[cursor_byte..].find('\n').map_or(state.input.len(), |p| cursor_byte + p);
+        if !state.input[cursor_byte..line_end].trim().is_empty() {
+            return None;
+        }
     }
-
-    // Value position: the bracket a property of an object or array type opens with
-    if ctx.in_string {
-        return None;
-    }
-    value_opening_bracket(state, &ctx).and_then(|bracket| ghost_of(&bracket.to_string()))
+    json_completions(state, &ctx).first().and_then(|first| ghost_of(first)).filter(|ghost| !ghost.is_empty())
 }
 
 /// The bracket that closes what the cursor is in, and how deep that is
@@ -18611,9 +18636,17 @@ fn tab_pressed(state: &mut AppState) -> bool {
     })
 }
 
+/// Whether Tab would take the cursor to be in a file path, or behind one:
+/// what `tab_pressed` asks before anything else.
+fn in_or_behind_file_path(state: &AppState) -> bool {
+    cursor_behind_chain_segment(state) || cursor_behind_file_path(state) || cursor_in_file_path(state)
+}
+
 fn get_completion_ghost(state: &AppState) -> String {
-    // JSON body completion ghost text (experimental only)
-    if state.config.experimental && cursor_inside_brackets(&state.input, state.cursor_pos) {
+    // JSON body completion ghost text (experimental only). Not in a file
+    // path, which Tab completes first: the `[` of `@export[1].json` opens
+    // no body.
+    if state.config.experimental && cursor_inside_brackets(&state.input, state.cursor_pos) && !in_or_behind_file_path(state) {
         if let Some(ghost) = get_json_completion_ghost(state) {
             return ghost;
         }
@@ -18768,7 +18801,7 @@ fn get_body_bracket_ghost(state: &AppState, parts: &[&str], uri: &str) -> String
 }
 
 fn get_completion_ghost_at_cursor(state: &AppState) -> String {
-    if state.config.experimental && cursor_inside_brackets(&state.input, state.cursor_pos) {
+    if state.config.experimental && cursor_inside_brackets(&state.input, state.cursor_pos) && !in_or_behind_file_path(state) {
         // Only show JSON ghost if cursor is on a line with no content after it
         // (prevents ghost text from overlapping with existing content and causing visual artifacts)
         let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
@@ -18954,7 +18987,7 @@ fn extract_file_path_context(input: &str, cursor_pos: usize) -> Option<FilePathC
     // file in front of that (`PUT /x @da^ > out.json`).
     let outfile_at = balanced_outfile_marker(segment).ok().flatten();
     let before_outfile = &segment[..outfile_at.unwrap_or(segment.len())];
-    let in_outfile = outfile_at.is_some_and(|idx| cursor_byte - seg_start > idx) || body_file_marker(before_outfile).is_none();
+    let in_outfile = outfile_at.is_some_and(|idx| cursor_byte.saturating_sub(seg_start) > idx) || body_file_marker(before_outfile).is_none();
     for is_outfile in [true, false] {
         // The outfile marker is found the way the parser finds it, so a `>`
         // inside a body is not taken for one. Nor is one in a body that is
@@ -19221,7 +19254,9 @@ fn complete_path(state: &AppState, uri: &str) -> Vec<String> {
     };
 
     let mut completions = Vec::new();
-    let base_path = parent_uri.trim_end_matches('/');
+    // One `/`, the one that sets the member off: a second is part of what
+    // is typed, and a completion without it would not continue the line.
+    let base_path = parent_uri.strip_suffix('/').unwrap_or(&parent_uri);
 
     // Detect *member projection mode (e.g., /pos-profiles/*name)
     let (star_mode, clean_partial) = if partial.starts_with('*') {
@@ -27995,7 +28030,9 @@ mod tests {
         "yard": { "properties": {
             "tags": { "type": "array", "items": { "$ref": "#/components/schemas/label" }, "examples": [{ "title": "a" }] },
             "codes": { "type": "array", "items": { "$ref": "#/components/schemas/strict string" } },
-            "odd": { "type": "array" } } },
+            "odd": { "type": "array" },
+            "code": { "enum": ["1", "2", "true"] },
+            "size": { "enum": [1, "2"] } } },
         "company": { "allOf": [{ "$ref": "#/components/schemas/legal entity" }, { "$ref": "elsewhere" }] },
         "zoo": { "type": ["object", "null"], "additionalProperties": false,
           "properties": {
@@ -29042,16 +29079,51 @@ mod tests {
         assert_eq!(ghost("PUT /people [{\n  ^\n}]"), "\"identifiers\": {");
         assert_eq!(ghost("POST /agents {\n  ^\n}"), "\"@type\": \"person\"");
         assert_eq!(ghost("PUT /people [{\n  \"identifiers\": {},\n  ^\n}]"), "\"addresses\": {");
-        // Not on a line that has text, not for a scalar, a closed key or an
-        // unknown one, and not for a word typed without quotes.
-        assert_eq!(ghost("PUT /people [{"), "");
-        assert_eq!(ghost("PUT /people [{\n  ^\"name\": \"x\"\n}]"), "");
-        assert_eq!(ghost(r#"PUT /people [{"givenName": "#), "");
-        assert_eq!(ghost(r#"PUT /people [{"active": "#), "");
-        assert_eq!(ghost(r#"PUT /people [{"na""#), "");
-        assert_eq!(ghost(r#"PUT /people [{"zz"#), "");
-        assert_eq!(ghost("PUT /people [{ na"), "");
-        assert_eq!(ghost(r#"PUT /people [{"name": "x"}]"#), "");
+        // Where there is no ghost, Tab writes nothing: the two agree on
+        // every line, with a list from a typed key or without one.
+        let agreed = |line: &str| {
+            let shows = ghost(line);
+            let written = body_tabbed(line);
+            let (before, behind) = written.split_once('^').unwrap();
+            let (typed, rest) = line.split_once('^').unwrap_or((line, ""));
+            // But for the quote, and the blank in front of it, that Tab
+            // gives a word typed without one.
+            let bare = |text: &str| text.replace(['"', ' '], "");
+            assert_eq!(bare(before), bare(&format!("{}{}", typed, shows)), "{line}");
+            if shows.is_empty() {
+                assert_eq!((before, behind), (typed, rest), "{line}: Tab wrote where no ghost was");
+            }
+            shows
+        };
+        // A key with nothing typed of it, or typed without its quotes.
+        assert_eq!(agreed("PUT /people [{"), " \"identifiers\": {");
+        assert_eq!(agreed("PUT /people [{ na"), "me\":");
+        assert_eq!(agreed("PUT /people [{na"), "me\":");
+        assert_eq!(agreed(r#"PUT /people [{"active": true, na"#), "me\":");
+        assert_eq!(agreed(r#"PUT /people [{"identifiers": {}, "#), "\"addresses\": {");
+        // A value: the first of an enum, a boolean, and the rest of one
+        // that is begun, in its quotes or without them.
+        assert_eq!(agreed(r#"PUT /people [{"active": "#), "true");
+        assert_eq!(agreed(r#"PUT /people [{"gdprForgotten": fa"#), "lse");
+        assert_eq!(agreed(r#"PUT /people [{"status": "#), "\"new\"");
+        assert_eq!(agreed(r#"PUT /people [{"status": "o"#), "ld\"");
+        assert_eq!(agreed(r#"PUT /people [{"status": o"#), "ld\"");
+        // Not in front of text on the line, not for a scalar without an
+        // enum, a closed key, an unknown one or a body that is closed.
+        assert_eq!(agreed("PUT /people [{\n  ^\"name\": \"x\"\n}]"), "");
+        assert_eq!(agreed(r#"PUT /people [{"gi^venName": 1}]"#), "");
+        assert_eq!(agreed(r#"PUT /people [{"givenName": "#), "");
+        assert_eq!(agreed(r#"PUT /people [{"na""#), "");
+        assert_eq!(agreed(r#"PUT /people [{"zz"#), "");
+        assert_eq!(agreed("PUT /people [{ zz"), "");
+        assert_eq!(agreed(r#"PUT /people [{"name": "x"}]"#), "");
+        // A key whose list was looked up while it was typed, and is gone
+        // again after a key that is no character (a cursor move).
+        let mut state = completing_body(r#"PUT /people [{"gi"#);
+        handle_json_tab_completion(&mut state, false, false);
+        state.completions.clear();
+        state.last_tab_input.clear();
+        assert_eq!(get_completion_ghost(&state), "venName\":");
         // After Tab wrote a value there is nothing more to show.
         let mut state = completing_body(r#"PUT /people [{"active": "#);
         tab_pressed(&mut state);
@@ -31245,6 +31317,122 @@ mod tests {
         assert_eq!(ghost_then_tab_everywhere("GET /people~co"), "unt");
         assert_eq!(ghost_then_tab_everywhere("GET /people/fi"), "nd");
         assert_eq!(get_completions(&state, "/people~").len(), API_OPERATORS.len());
+    }
+
+    #[test]
+    fn a_second_slash_is_part_of_what_is_typed() {
+        // `/people//` used to lose a slash to Tab, with no ghost to say so.
+        // What Tab writes now continues the line, and the ghost shows it.
+        for line in ["GET /people//", "GET /people//na", "GET /people/com.mi6.id=007//na", "GET //", "GET //pe"] {
+            for experimental in [false, true] {
+                let (ghost, after) = ghost_then_tab(&format!("{line}^"), experimental);
+                assert_eq!(after, format!("{line}{ghost}^"), "{line}");
+            }
+        }
+        assert_eq!(ghost_then_tab_everywhere("GET /people//"), "com.mi6.id=");
+        assert_eq!(ghost_then_tab_everywhere("GET /people/com.mi6.id=007/na"), "me");
+    }
+
+    #[test]
+    fn completion_reads_a_line_with_text_of_any_alphabet_in_front_of_the_cursor() {
+        // Bytes, characters and columns differ in front of the cursor: in
+        // an identifier, in a value, in a body of an earlier request.
+        assert_eq!(ghost_then_tab_everywhere("GET /people/com.x.id=Åsa日本/na"), "me");
+        assert_eq!(ghost_then_tab_everywhere("GET /people~where(name=\"Åsa 日本👍\")~co"), "unt");
+        assert_eq!(ghost_then_tab_everywhere("GET /people/com.x.id=Åsa/ål"), "der");
+        for lead in ["PUT /a {\"n\": \"Åsa 日本👍\"} && ", "GET /é~where(a=\"ö ü\") || "] {
+            let (ghost, after) = ghost_then_tab(&format!("{lead}GET /peo^ > /tmp/åä.json"), false);
+            assert_eq!((ghost.as_str(), after.as_str()), ("ple", format!("{lead}GET /people^ > /tmp/åä.json").as_str()));
+            let (ghost, after) = ghost_then_tab(&format!("{lead}GET /peo^"), true);
+            assert_eq!((ghost.as_str(), after.as_str()), ("ple", format!("{lead}GET /people^").as_str()));
+        }
+        // With the cursor anywhere in such a line, Tab leaves it a line.
+        let line = "PUT /å {\"n\": \"日本\"} && GET /people~where(name=\"Åsa 👍\")~co > /tmp/åä.json";
+        for cursor in 0..=char_len(line) {
+            let at = char_to_byte_idx(line, cursor);
+            for experimental in [false, true] {
+                let mut state = completing(&format!("{}^{}", &line[..at], &line[at..]));
+                state.config.experimental = experimental;
+                let _ = render_input_content(&mut state, 200);
+                tab_pressed(&mut state);
+                backtab_pressed(&mut state);
+                assert!(state.cursor_pos <= char_len(&state.input), "cursor {cursor}");
+            }
+        }
+    }
+
+    #[test]
+    fn tab_between_the_two_characters_of_a_chain_separator_does_nothing() {
+        // The cursor is in neither segment there, and the next one's
+        // outfile is not where it is: this used to subtract below zero.
+        for line in ["GET /a &^& GET /b > out.json", "GET /a |^| PUT /b @body.json > out.json", "GET /a &^& GET /b >> out.json"] {
+            for experimental in [false, true] {
+                let mut state = completing(line);
+                state.config.experimental = experimental;
+                assert_eq!(render_input_content(&mut state, 200).2, "", "{line}");
+                tab_pressed(&mut state);
+                assert_eq!(shown(&state), line);
+                backtab_pressed(&mut state);
+                assert_eq!(shown(&state), line);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_bracket_in_a_file_name_opens_no_body() {
+        // Under `-x` the ghost took the `[` of `@export[1].json` for the
+        // start of a body and showed its `]`, where Tab completes the file.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("export[1].json"), "{}").unwrap();
+        std::fs::write(dir.path().join("out{a}.json"), "{}").unwrap();
+        let rel = relative_to_cwd(dir.path());
+        for experimental in [false, true] {
+            for (line, ghost) in [
+                (format!("PUT /x @{rel}/export[1"), "].json"),
+                (format!("PUT /x @{rel}/export["), "1].json"),
+                (format!("PUT /x @{rel}/exp"), "ort[1].json"),
+                (format!("GET /x > {rel}/out{{a}}"), ".json"),
+                (format!("PUT /x @{rel}/export[1] > {rel}/exp"), "ort[1].json"),
+                (format!("GET /a && PUT /x @{rel}/export[1"), "].json"),
+            ] {
+                let (shows, after) = ghost_then_tab(&format!("{line}^"), experimental);
+                assert_eq!(shows, ghost, "-x {experimental}: {line}");
+                assert_eq!(after, format!("{line}{ghost}^"), "-x {experimental}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_value_the_spec_has_as_a_string_is_written_as_one() {
+        // `"enum": ["1", "2"]`: a `1` without quotes is another value.
+        assert_eq!(body_tabbed(r#"PUT /yard {"code": "#), r#"PUT /yard {"code": "1"^"#);
+        assert_eq!(body_tabbed(r#"PUT /yard {"code": t"#), r#"PUT /yard {"code": "true"^"#);
+        assert_eq!(body_tabbed(r#"PUT /yard {"code": "2"#), r#"PUT /yard {"code": "2"^"#);
+        // An enum of numbers, or of both, is written as the values read.
+        assert_eq!(body_tabbed(r#"PUT /yard {"size": "#), r#"PUT /yard {"size": 1^"#);
+        assert_eq!(body_tabbed(r#"PUT /people [{"rank": "#), r#"PUT /people [{"rank": 1^"#);
+        assert_eq!(body_tabbed(r#"PUT /people [{"active": "#), r#"PUT /people [{"active": true^"#);
+        assert_eq!(body_tabbed(r#"PUT /people [{"status": "#), r#"PUT /people [{"status": "new"^"#);
+        // The ghost says the same.
+        for line in [r#"PUT /yard {"code": ^"#, r#"PUT /yard {"code": "^"#, r#"PUT /yard {"size": ^"#] {
+            ghost_then_tab(line, true);
+        }
+    }
+
+    #[test]
+    fn a_server_without_a_spec_keeps_the_endpoint_it_started_with() {
+        let mut state = completing("GET /^");
+        apply_spec(&mut state, BackgroundLoadResult::default());
+        assert!(state.config.complete);
+        assert_eq!(state.endpoints, strings(&[FIRST_ENDPOINT]));
+        assert_eq!(render_input_content(&mut state, 200).2, "about");
+        tab_pressed(&mut state);
+        assert_eq!(shown(&state), "GET /about^");
+        // A spec that could not be read is said to be that, and offers nothing.
+        let mut state = completing("GET /^");
+        apply_spec(&mut state, BackgroundLoadResult { spec_unreadable: true, ..Default::default() });
+        assert!(!state.config.complete && state.endpoints.is_empty());
     }
 
     #[test]

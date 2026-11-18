@@ -5614,6 +5614,12 @@ fn a_spec_that_cannot_be_read_is_said_with_b_and_with_c() {
         prompt.wait_ready(Duration::from_secs(15));
         let seen = pump_until(&mut prompt, Duration::from_secs(4), |p| pty::plain(&p.screen).contains(notice));
         assert_eq!(seen, said, "{args:?}: {}", pty::plain(&prompt.screen));
+        // Without a spec Tab still writes what the ghost has shown from
+        // the start. It used to go quiet once the 404 had arrived.
+        if args.contains(&"nospec") {
+            let shown = press(&mut prompt, &["GET /", "\t"]);
+            assert!(shown.contains("GET /about"), "{shown}");
+        }
     }
 }
 
