@@ -672,6 +672,67 @@ PUT /assert {
   read (a missing include, a misplaced describe block), is `error: …` on
   stderr with exit 1 and nothing on stdout.
 
+## Listing a file's imports: `--imports <file>`
+
+```sh
+api --imports svenska.api
+```
+
+Prints one object for every `import` line a run of the file reads, as one
+JSON array on stdout, with the directory each alias stands for. Nothing is
+sent and no connection is needed. It is for a tool that has to read an
+imported file itself: `<directory>/sv.api` is the file `cl/sv.api` includes.
+
+```
+# svenska.api
+import git omnium { "url": "https://github.com/ByHeads/cos-integration-omnium", "ref": "1.0.0" }
+omnium/omnium.api
+```
+
+```json
+[
+  {
+    "file": "/Users/me/cos-config/svenska.api",
+    "alias": "omnium",
+    "kind": "git",
+    "directory": "/Users/me/.cache/api/imports/…/a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+    "url": "https://github.com/ByHeads/cos-integration-omnium",
+    "ref": "1.0.0",
+    "commit": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
+  }
+]
+```
+
+| Member | Holds |
+|---|---|
+| `file` | the file that declares the import, as an absolute path. For an import declared in an imported file that is a path in the cache. `null` when the file was read from stdin |
+| `alias` | the alias |
+| `kind` | `"git"`, `"dir"` or `"archive"` |
+| `directory` | the absolute directory the alias stands for: with `path` applied and, for an archive, inside its one top directory |
+| `url` | `git`, `archive`: the URL as written |
+| `ref` | `git`: the ref as written |
+| `commit` | `git`: the full commit the ref resolved to |
+| `sha256` | `archive`: the hash of the archive that was used, whether or not the line pins one |
+| `path` | the `path` key as written, where the line has one |
+| `stale` | `true` when the remote could not be reached and a cached copy was used. Absent otherwise |
+
+- **Every file the run reads is walked**: the file itself, the files it
+  includes and the imported files it includes, to any depth. An alias belongs
+  to the file that declares it, and `file` says which that is.
+- The order is the order the lines are read in. A line reached twice, because
+  its file is included twice, is listed once. An alias nothing includes from
+  is listed too, since every import is fetched when its line is read.
+- An import that is not in the cache is fetched, and one that can't be is an
+  error. A checkout that is listed counts as used, so the cache does not
+  clear it out under a tool that reads it.
+- No `url` gate is checked.
+- `token_env` is never printed, and neither is a token.
+- A file without imports prints `[]`. `-r` prints the array on one line, and
+  `-` reads the file from stdin.
+- Anything that would stop the file from being read (a missing include, a
+  ref that does not exist) is `error: …` on stderr with exit 1 and nothing on
+  stdout.
+
 ## 7. Directives: `sleep`, `sleep while`, `assert`, `confirm`, `export`, `url`
 
 Besides requests and includes, a few control lines are recognised. `sleep while`
@@ -1407,4 +1468,5 @@ Run it: `api -sa workshop.api`.
 - Add `-f` (`-sfa`) so a failed request stops the batch: check the exit code, and on failure read the error body from the end of stdout (everything after the last `└─HTTP/1.1 …` line; it is usually several lines of JSON). Without it a batch exits 0 however many plain requests failed.
 - Open a file with a [describe block](#describe-block) (`title`, `description`, `docsLink`) so a tool or a person can tell what it does; read one with `api --describe file.api`, which sends nothing.
 - To see what a file checks without running it, `api --assert file.api` prints every `PUT /assert` body it sends as one JSON array.
+- To read a file of an import yourself, ask `api --imports file.api` for the directory its alias stands for. Don't rebuild a path into the import cache: its layout is the client's own.
 - Run with `--no-keychain` and an absolute `API_CREDENTIALS_FILE` so nothing depends on an unlocked keychain or on the working directory.

@@ -502,6 +502,10 @@ struct Args {
     #[arg(long = "export", value_name = "EXTERNAL_ID")]
     export: Option<String>,
 
+    /// Print where every `import` a .api file reads resolved to, includes and imports followed, as one JSON array, and send nothing
+    #[arg(long = "imports", value_name = "FILE")]
+    imports: Option<String>,
+
     /// Stream the response body instead of buffering it (also: API_STREAMING=1)
     #[arg(short = 't', long = "stream")]
     stream: bool,
@@ -4157,11 +4161,19 @@ fn main() {
         exit_process(0);
     }
 
-    // `--describe` and `--assert` read a file and print what it says. Nothing
-    // is sent, so neither needs a connection.
-    if args.describe.is_some() && args.assert.is_some() {
-        errln!("error: --describe and --assert each print a document of their own: use one");
+    // `--describe`, `--assert` and `--imports` read a file and print what it
+    // says. Nothing is sent, so none of them needs a connection.
+    let documents: Vec<&str> = [("--describe", &args.describe), ("--assert", &args.assert), ("--imports", &args.imports)]
+        .into_iter()
+        .filter_map(|(flag, file)| file.as_ref().map(|_| flag))
+        .collect();
+    if documents.len() > 1 {
+        let (last, rest) = documents.split_last().unwrap_or((&"", &[]));
+        errln!("error: {} and {} each print a document of their own: use one", rest.join(", "), last);
         exit_process(1);
+    }
+    if let Some(file) = &args.imports {
+        exit_process(print_imports(file, args.raw));
     }
     if let Some(file) = &args.describe {
         exit_process(print_describe_block(file, args.raw));
@@ -6797,6 +6809,12 @@ struct BulkProgram {
     import_gates: Vec<ImportGate>,
     /// The imports the program made, in the order they were declared.
     import_notes: Vec<ImportNote>,
+    /// Every `import` line read, as `--imports` prints it: where it stands
+    /// and what it resolved to.
+    import_listing: Vec<serde_json::Value>,
+    /// The file being read, for `import_listing`. None for text that is no
+    /// file: stdin, a line at the prompt.
+    reading: Option<PathBuf>,
     /// The describe block of the file itself. One in an included or imported
     /// file is checked and left where it is: it describes that file.
     describe: Option<serde_json::Map<String, serde_json::Value>>,
@@ -8504,22 +8522,23 @@ fn declare_import(
 
     // The directory the alias's files live under (which nothing in them may
     // leave), where the alias starts, and how the log describes the import.
-    let (checkout, top, described, stale) = match &spec.source {
+    // The last is the commit or the hash that was used, for `--imports`.
+    let (checkout, top, described, stale, resolved) = match &spec.source {
         ImportSource::Git { url, git_ref } => {
             let fetched = fetch_git_import(url, git_ref)?;
             let short_sha: String = fetched.sha.chars().take(7).collect();
             let described = format!("{} {} ({}", url, git_ref, short_sha);
-            (fetched.checkout.clone(), fetched.checkout, described, fetched.stale)
+            (fetched.checkout.clone(), fetched.checkout, described, fetched.stale, Some(fetched.sha))
         }
         ImportSource::Dir { path } => {
             let dir = resolve_import_dir(&spec.alias, path, base_dir, within)?;
-            (dir.clone(), dir.clone(), dir.display().to_string(), false)
+            (dir.clone(), dir.clone(), dir.display().to_string(), false, None)
         }
         ImportSource::Archive { url, sha256, token_env } => {
             let fetched = fetch_archive_import(url, sha256.as_deref(), token_env.as_deref())?;
             let short_sha: String = fetched.sha.chars().take(7).collect();
             let top = archive_top_dir(&fetched.checkout);
-            (fetched.checkout, top, format!("{} (sha256 {}", url, short_sha), fetched.stale)
+            (fetched.checkout, top, format!("{} (sha256 {}", url, short_sha), fetched.stale, Some(fetched.sha))
         }
     };
     let root = match &spec.path {
@@ -8548,11 +8567,60 @@ fn declare_import(
     if !program.import_notes.contains(&note) {
         program.import_notes.push(note);
     }
+    let listed = import_listing_entry(&spec, program.reading.as_deref(), &root, resolved, stale);
+    if !program.import_listing.contains(&listed) {
+        program.import_listing.push(listed);
+    }
     aliases.insert(
         spec.alias.clone(),
         ImportedRepo { root, checkout, alias: spec.alias, host },
     );
     Ok(())
+}
+
+/// One `import` line as `--imports` prints it: the file it stands in, what
+/// it asks for as it is written, and what that resolved to. `token_env` is
+/// left out, name included: where a token is kept is not for a listing.
+fn import_listing_entry(
+    spec: &ImportSpec,
+    file: Option<&std::path::Path>,
+    directory: &std::path::Path,
+    resolved: Option<String>,
+    stale: bool,
+) -> serde_json::Value {
+    let mut entry = serde_json::Map::new();
+    let mut put = |name: &str, value: serde_json::Value| {
+        entry.insert(name.to_string(), value);
+    };
+    let text = |path: &std::path::Path| serde_json::Value::String(path.display().to_string());
+    put("file", file.map_or(serde_json::Value::Null, text));
+    put("alias", spec.alias.clone().into());
+    let kind = match &spec.source {
+        ImportSource::Git { .. } => "git",
+        ImportSource::Dir { .. } => "dir",
+        ImportSource::Archive { .. } => "archive",
+    };
+    put("kind", kind.into());
+    put("directory", text(directory));
+    match &spec.source {
+        ImportSource::Git { url, git_ref } => {
+            put("url", url.clone().into());
+            put("ref", git_ref.clone().into());
+            put("commit", resolved.into());
+        }
+        ImportSource::Archive { url, .. } => {
+            put("url", url.clone().into());
+            put("sha256", resolved.into());
+        }
+        ImportSource::Dir { path } => put("path", path.clone().into()),
+    }
+    if let Some(path) = &spec.path {
+        put("path", path.clone().into());
+    }
+    if stale {
+        put("stale", true.into());
+    }
+    entry.into()
 }
 
 /// Where a describe block may stand: before the first request, import,
@@ -8961,6 +9029,40 @@ fn print_assertions(file: &str, api_path: &str, raw: bool) -> i32 {
     }
 }
 
+/// `--imports <file>`: every `import` line a run of the file reads and where
+/// it resolved to, as one JSON array on stdout. Returns the exit code.
+fn print_imports(file: &str, raw: bool) -> i32 {
+    let listing = read_api_file(file).and_then(|(contents, base_dir)| {
+        let mut program = BulkProgram::default();
+        if file != "-" {
+            let path = PathBuf::from(expand_home(file));
+            program.reading = Some(path.canonicalize().unwrap_or(path));
+        }
+        split_bulk_requests_inner(
+            &contents,
+            base_dir.as_deref(),
+            None,
+            &mut ImportAliases::new(),
+            &mut std::collections::HashSet::new(),
+            &mut program,
+            None,
+            None,
+        )
+        .map_err(|e| describe_program_error(&e))?;
+        Ok(program.import_listing)
+    });
+    match listing {
+        Ok(listing) => {
+            print_json_document(&serde_json::Value::Array(listing), raw);
+            0
+        }
+        Err(e) => {
+            errln!("error: {}", e);
+            1
+        }
+    }
+}
+
 /// Evaluate every gate of a program: the batch's own `url` lines, then each
 /// imported repository's. All of them must pass.
 fn evaluate_program_gates(program: &BulkProgram, url: &str) -> Result<(), String> {
@@ -9153,6 +9255,7 @@ fn split_bulk_requests_inner(
                     if export.is_some() {
                         program.steps.push(BulkStep::Export { name: None, written: false });
                     }
+                    let reading = program.reading.replace(canonical.clone());
                     let left_in = split_bulk_requests_inner(
                         &included,
                         new_base.as_deref(),
@@ -9163,6 +9266,7 @@ fn split_bulk_requests_inner(
                         None,
                         Some(trimmed),
                     )?;
+                    program.reading = reading;
                     if export.is_some() || left_in.is_some() {
                         program.steps.push(BulkStep::Export { name: export.clone(), written: false });
                     }

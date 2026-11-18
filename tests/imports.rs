@@ -1205,6 +1205,228 @@ fn without_git_on_the_path_a_git_import_says_so_and_the_other_kinds_still_work()
     assert_eq!(server.sent(), vec!["GET /lib.tar.gz", "GET /parts/a"]);
 }
 
+// ----- --imports -----
+
+/// `api --imports batch.api` for `batch`, with further flags in front.
+fn list_imports(dir: &Path, port: u16, flags: &[&str], batch: &str) -> Ran {
+    std::fs::write(dir.join("batch.api"), batch).unwrap();
+    let mut cmd = api(dir, port);
+    cmd.args(flags).args(["--imports", "batch.api"]);
+    finish(cmd, "")
+}
+
+fn listed(ran: &Ran) -> Vec<serde_json::Value> {
+    assert!(ran.ok, "{}", ran.stderr);
+    serde_json::from_str(&ran.stdout).unwrap_or_else(|e| panic!("{e}: {}", ran.stdout))
+}
+
+fn member<'a>(entry: &'a serde_json::Value, name: &str) -> &'a str {
+    entry[name].as_str().unwrap_or_else(|| panic!("no `{name}` in {entry}"))
+}
+
+fn member_names(entry: &serde_json::Value) -> Vec<&str> {
+    entry.as_object().unwrap().keys().map(String::as_str).collect()
+}
+
+fn is_hex(text: &str, len: usize) -> bool {
+    text.len() == len && text.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+#[test]
+fn imports_lists_each_kind_with_the_directory_its_alias_stands_for() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", fixture_archive());
+    let batch_file = dir.join("batch.api").display().to_string();
+    let seed = std::fs::read_to_string(fixture().join("seed.api")).unwrap();
+    for (kind, import) in each_kind(&dir, &server) {
+        let ran = list_imports(&dir, server.port, &[], &format!("{import}\nlib/seed.api\n"));
+        let entries = listed(&ran);
+        assert_eq!(entries.len(), 1, "{kind}: {}", ran.stdout);
+        let entry = &entries[0];
+        assert_eq!(member(entry, "file"), batch_file, "{kind}");
+        assert_eq!(member(entry, "alias"), "lib", "{kind}");
+        assert_eq!(member(entry, "kind"), kind);
+        // The file `lib/seed.api` includes is `<directory>/seed.api`.
+        let directory = Path::new(member(entry, "directory"));
+        assert!(directory.is_absolute(), "{kind}: {entry}");
+        assert_eq!(std::fs::read_to_string(directory.join("seed.api")).unwrap(), seed, "{kind}");
+        match kind {
+            "dir" => {
+                assert_eq!(member_names(entry), ["file", "alias", "kind", "directory", "path"]);
+                assert_eq!(member(entry, "path"), fixture().display().to_string());
+            }
+            "git" => {
+                assert_eq!(member_names(entry), ["file", "alias", "kind", "directory", "url", "ref", "commit"]);
+                assert_eq!(member(entry, "ref"), "1.0");
+                assert!(import.contains(member(entry, "url")), "{entry}");
+                assert!(is_hex(member(entry, "commit"), 40), "{entry}");
+            }
+            _ => {
+                assert_eq!(member_names(entry), ["file", "alias", "kind", "directory", "url", "sha256"]);
+                assert_eq!(member(entry, "url"), server.url("/lib.tar.gz"));
+                // The hash of what was used, though the line pins none.
+                assert!(is_hex(member(entry, "sha256"), 64), "{entry}");
+                // Inside the one directory the archive is packed under.
+                assert!(directory.ends_with("fixture-1.0"), "{entry}");
+            }
+        }
+        // Nothing is sent to the API, and no gate is checked.
+        assert_eq!(server.api_requests(), Vec::<String>::new(), "{kind}");
+        let ran = list_imports(&dir, server.port, &[], &format!("url is https://elsewhere.example.com\n{import}\n"));
+        assert_eq!(listed(&ran).len(), 1, "{kind}");
+    }
+}
+
+#[test]
+fn imports_applies_path_and_prints_it_as_written() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", fixture_archive());
+    let (repo, _) = fixture_repository(&dir.join("fixture-repo"));
+    for (kind, import) in [
+        ("git", format!("import git lib {{ \"url\": \"{repo}\", \"ref\": \"1.0\", \"path\": \"parts\" }}")),
+        ("archive", format!("import archive lib {{ \"url\": \"{}\", \"path\": \"parts\" }}", server.url("/lib.tar.gz"))),
+    ] {
+        let entries = listed(&list_imports(&dir, server.port, &[], &format!("{import}\n")));
+        let directory = Path::new(member(&entries[0], "directory"));
+        assert!(directory.ends_with("parts"), "{kind}: {}", entries[0]);
+        assert!(directory.join("a.api").is_file(), "{kind}");
+        assert_eq!(member(&entries[0], "path"), "parts", "{kind}");
+        assert_eq!(member_names(&entries[0]).last(), Some(&"path"), "{kind}");
+    }
+}
+
+#[test]
+fn imports_follows_includes_and_imported_files_and_lists_a_line_once() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", fixture_archive());
+    let (outer, middle, fixture_url) = nested_repositories(&dir, &server);
+
+    // A file of the batch's own directory that declares an import, included
+    // twice, and an alias in the batch that nothing includes from.
+    std::fs::create_dir_all(dir.join("shared")).unwrap();
+    std::fs::write(dir.join("shared/own.api"), format!("{}GET /own\n", import_git("fx", &fixture_url, "1.0"))).unwrap();
+    let batch = format!(
+        "{}{}shared/own.api\nshared/own.api\nlib/top.api\n",
+        import_git("lib", &outer, "main"),
+        import_git("unused", &fixture_url, "1.0"),
+    );
+    let ran = list_imports(&dir, server.port, &[], &batch);
+    let entries = listed(&ran);
+    let seen: Vec<(String, &str, &str)> = entries
+        .iter()
+        .map(|e| {
+            let file = Path::new(member(e, "file")).file_name().unwrap().to_string_lossy().to_string();
+            (file, member(e, "alias"), member(e, "kind"))
+        })
+        .collect();
+    let expect = |file: &str, alias: &'static str, kind: &'static str| (file.to_string(), alias, kind);
+    assert_eq!(
+        seen,
+        vec![
+            expect("batch.api", "lib", "git"),
+            expect("batch.api", "unused", "git"),
+            expect("own.api", "fx", "git"),
+            expect("top.api", "lib", "git"),
+            expect("top.api", "packed", "archive"),
+            expect("mid.api", "lib", "git"),
+            expect("mid.api", "mine", "dir"),
+        ],
+        "{}",
+        ran.stdout
+    );
+    assert_eq!(member(&entries[2], "file"), dir.join("shared/own.api").display().to_string());
+    // An import declared in an imported file stands in the cache, in the
+    // directory the import above it resolved to.
+    let outer_directory = member(&entries[0], "directory");
+    assert_eq!(member(&entries[3], "file"), Path::new(outer_directory).join("top.api").display().to_string());
+    assert_eq!(member(&entries[3], "url"), middle);
+    let middle_directory = member(&entries[3], "directory");
+    assert_eq!(member(&entries[5], "file"), Path::new(middle_directory).join("mid.api").display().to_string());
+    assert_eq!(member(&entries[6], "directory"), Path::new(middle_directory).join("own").display().to_string());
+    assert_eq!(server.api_requests(), Vec::<String>::new());
+}
+
+#[test]
+fn imports_prints_an_empty_list_one_line_with_r_and_reads_stdin() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", fixture_archive());
+    let ran = list_imports(&dir, server.port, &[], "GET /a\n");
+    assert!(ran.ok, "{}", ran.stderr);
+    assert_eq!(ran.stdout, "[]\n");
+
+    let import = format!("import dir lib {{ \"path\": \"{}\" }}\n", fixture().display());
+    let ran = list_imports(&dir, server.port, &["-r"], &import);
+    assert_eq!(ran.stdout.lines().count(), 1, "{}", ran.stdout);
+    assert_eq!(listed(&ran).len(), 1);
+
+    // From stdin there is no file to name.
+    let mut cmd = api(&dir, server.port);
+    cmd.args(["--imports", "-"]);
+    let ran = finish(cmd, &import);
+    let entries = listed(&ran);
+    assert!(entries[0]["file"].is_null(), "{}", ran.stdout);
+    assert_eq!(member(&entries[0], "directory"), fixture().canonicalize().unwrap().display().to_string());
+    assert_eq!(server.sent(), Vec::<String>::new());
+}
+
+#[test]
+fn imports_that_cannot_be_read_print_nothing_and_exit_1() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", fixture_archive());
+    let (repo, _) = fixture_repository(&dir.join("fixture-repo"));
+    for (batch, said) in [
+        ("shared/none.api\n".to_string(), "error: include not found: shared/none.api"),
+        (import_git("lib", &repo, "no-such-ref"), "error: "),
+        (format!("{}lib/none.api\n", import_git("lib", &repo, "1.0")), "error: include not found: lib/none.api"),
+    ] {
+        let ran = list_imports(&dir, server.port, &[], &batch);
+        assert!(!ran.ok, "{batch}");
+        assert_eq!(ran.stdout, "", "{batch}");
+        assert!(ran.stderr.starts_with(said), "{batch}: {}", ran.stderr);
+    }
+    // One document per run.
+    let mut cmd = api(&dir, server.port);
+    cmd.args(["--imports", "batch.api", "--assert", "batch.api"]);
+    let ran = finish(cmd, "");
+    assert!(!ran.ok);
+    assert_eq!(ran.stderr, "error: --assert and --imports each print a document of their own: use one\n");
+    assert_eq!(server.sent(), Vec::<String>::new());
+}
+
+#[test]
+fn imports_never_prints_a_token_or_where_it_is_kept() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", fixture_archive());
+    let batch = format!(
+        "import archive lib {{ \"url\": \"{}\", \"token_env\": \"IMPORTS_TEST_TOKEN\" }}\n",
+        server.url("/lib.tar.gz")
+    );
+    std::fs::write(dir.join("batch.api"), batch).unwrap();
+    let mut cmd = api(&dir, server.port);
+    cmd.env("IMPORTS_TEST_TOKEN", "s3cret-token").args(["--imports", "batch.api"]);
+    let ran = finish(cmd, "");
+    assert_eq!(listed(&ran).len(), 1);
+    for hidden in ["token_env", "IMPORTS_TEST_TOKEN", "s3cret-token"] {
+        assert!(!ran.stdout.contains(hidden) && !ran.stderr.contains(hidden), "{hidden}: {}{}", ran.stdout, ran.stderr);
+    }
+}
+
+#[test]
+fn imports_marks_a_cached_copy_that_stood_in_for_the_remote() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", fixture_archive());
+    let (repo, _) = fixture_repository(&dir.join("fixture-repo"));
+    let batch = import_git("lib", &repo, "1.0");
+    let fresh = listed(&list_imports(&dir, server.port, &[], &batch));
+    assert!(fresh[0].get("stale").is_none(), "{}", fresh[0]);
+    // The repository is gone: the copy the tag last resolved to is used.
+    std::fs::rename(dir.join("fixture-repo"), dir.join("moved-away")).unwrap();
+    let cached = listed(&list_imports(&dir, server.port, &[], &batch));
+    assert_eq!(cached[0]["stale"], serde_json::Value::Bool(true), "{}", cached[0]);
+    assert_eq!(member(&cached[0], "commit"), member(&fresh[0], "commit"));
+    assert_eq!(member(&cached[0], "directory"), member(&fresh[0], "directory"));
+}
+
 // ----- repositories that import repositories -----
 
 fn import_git(alias: &str, url: &str, git_ref: &str) -> String {

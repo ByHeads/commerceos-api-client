@@ -190,6 +190,7 @@ api -spa seed.api        # preview first
 api -spma seed.api       # say what the file is, then preview
 api --describe seed.api  # its describe block as JSON, nothing sent
 api --assert seed.api    # every PUT /assert body it sends, as one JSON array, nothing sent
+api --imports seed.api   # every import it reads and the directory it resolved to, nothing sent
 ```
 
 ```
@@ -343,6 +344,7 @@ Usage: api [OPTIONS] [METHOD] [URI] [BODY]
   -m, --describe-first            With -a: print the file's describe block before running it
       --describe <FILE>           Print the describe block of FILE as JSON; sends nothing
       --assert <FILE>             Print every `PUT /assert` body FILE sends as one JSON array; sends nothing
+      --imports <FILE>            Print every import FILE reads and where it resolved to, as one JSON array; sends nothing
       --export <EXTERNAL_ID>      Rewrite responses as seed data: keys dropped, a lone one kept as `key?` and EXTERNAL_ID
   -r, --raw                       No pretty-printing
   -i, --include-nulls             Include null values in the response
