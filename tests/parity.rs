@@ -1283,7 +1283,7 @@ fn a_response_cut_short_ends_the_run() {
 /// The timeout is how long nothing may arrive, not how long a response may
 /// take. A body that keeps coming for three seconds is whole under a timeout
 /// of one, buffered and streamed, by the option and by a `set` line. (From
-/// the change to one HTTP client until 3.3.2 was released it was a deadline
+/// the change to one HTTP client until 3.4.0 was released it was a deadline
 /// for the whole transfer, which ended any export longer than `--timeout`.)
 #[test]
 fn a_timeout_is_for_silence_not_for_the_whole_transfer() {
