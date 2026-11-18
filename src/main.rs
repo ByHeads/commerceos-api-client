@@ -13562,14 +13562,56 @@ fn uppercase_method_token(line: &str) -> String {
 ///
 /// In every other case the paste is inserted verbatim — so writing real JSON
 /// request bodies still works exactly as before.
-/// Whether the cursor stands in a part of its request's URI that is still
-/// open: behind a quote or a parenthesis that nothing in front of the cursor
-/// closes, as in `GET /companies~where(name="^`.
-fn cursor_in_open_uri(input: &str, cursor_byte: usize) -> bool {
+/// Whether the cursor stands in a value of its line that is still open:
+/// behind a quote or a parenthesis that nothing in front of the cursor
+/// closes, as in `GET /companies~where(name="^`. That holds for the request
+/// of an `assert` or a `sleep while` and for a body that is a string
+/// (`PUT /note "^`) too, and the message of a `confirm` is open to its end.
+fn cursor_in_open_value(input: &str, cursor_byte: usize) -> bool {
     let (start, _) = request_bounds_at(input, cursor_byte);
     let Some(typed) = input.get(start..cursor_byte) else { return false };
-    let at = line_uri_at(typed, typed.len());
-    at.start < at.end && uri_scan(&typed[at.start..]).1
+    let mut words = typed.split_whitespace();
+    if words.next().is_some_and(|first| first.eq_ignore_ascii_case("confirm")) && typed.trim_start().contains(char::is_whitespace) {
+        return true;
+    }
+    let (mut in_string, mut escape, mut parens) = (false, false, 0i32);
+    for ch in typed.chars() {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '(' => parens += 1,
+            ')' => parens -= 1,
+            _ => {}
+        }
+    }
+    in_string || parens > 0
+}
+
+/// Whether a paste that is one word and no method is more of the word the
+/// cursor stands behind, and not a line to put in the place of this one. A
+/// `#` right behind a word is no comment (`#1` behind `…id=A`: a comment
+/// needs a blank in front), and a directive or a file name behind a `/` or
+/// a `=` is a segment or a value (`url` behind `…/`). Not on the `GET /` the
+/// prompt starts with, which a pasted line always replaces.
+fn paste_continues_a_word(input: &str, before_cursor: &str, paste: &str) -> bool {
+    let one_word = paste.split_whitespace().count() == 1 && !paste_starts_with_method(paste);
+    let line = input.trim();
+    let fresh = line.is_empty()
+        || line.strip_suffix(" /").is_some_and(|method| REQUEST_METHODS.iter().any(|known| known.eq_ignore_ascii_case(method)));
+    let glued = match paste.trim_start().starts_with('#') {
+        true => before_cursor.ends_with(|c: char| !c.is_whitespace()),
+        false => before_cursor.ends_with(['/', '=']),
+    };
+    one_word && !fresh && glued
 }
 
 fn handle_paste<W: Write>(
@@ -13590,7 +13632,8 @@ fn handle_paste<W: Write>(
     let inside_body = cursor_inside_brackets(&state.input, state.cursor_pos);
     // In a quoted value or the parentheses of an operator of the URI, what
     // is pasted is that value, whatever word it starts with.
-    let inside_uri = !inside_body && cursor_in_open_uri(&state.input, char_to_byte_idx(&state.input, state.cursor_pos));
+    let cursor_byte = char_to_byte_idx(&state.input, state.cursor_pos);
+    let inside_uri = !inside_body && cursor_in_open_value(&state.input, cursor_byte);
 
     let normalized = normalize_paste_newlines(paste);
     // A copied line usually brings its newline along. Outside a body it would
@@ -13604,7 +13647,8 @@ fn handle_paste<W: Write>(
     // the cursor — so pasting "GET /people..." or "assert /x" over a "GET /"
     // prompt yields the pasted text, not "GET /assert /x". Detection is skipped
     // inside a body so a JSON string beginning with "GET " is pasted verbatim.
-    if !inside_body && !inside_uri && paste_is_api_text(paste) {
+    let continues = paste_continues_a_word(&state.input, &state.input[..cursor_byte], paste);
+    if !inside_body && !inside_uri && !continues && paste_is_api_text(paste) {
         // Normalize the method to uppercase, like typed promotion does.
         state.stashed_body.clear();
         state.input = if paste_starts_with_method(paste) {
@@ -13627,7 +13671,7 @@ fn handle_paste<W: Write>(
     // Identifier expansion only applies in "indexing mode"; pasting an
     // `identifiers` JSON then replaces/appends the URI's index slot rather than
     // inserting at the cursor, so it never accumulates duplicate segments.
-    let in_index_mode = paste_in_index_mode(&state.input, state.cursor_pos);
+    let in_index_mode = !inside_uri && paste_in_index_mode(&state.input, state.cursor_pos);
     if in_index_mode {
         let pairs = extract_identifier_pairs(paste);
         if !pairs.is_empty() {
@@ -20943,6 +20987,19 @@ mod tests {
             ("/c~where(name=\"", "Delete me\"", "/c~where(name=\"Delete me\""),
             ("GET /a && GET /c~where(name=\"", "sleep 2\"", "GET /a && GET /c~where(name=\"sleep 2\""),
             ("GET /åä~where(name=\"ö ", "Url has\"", "GET /åä~where(name=\"ö Url has\""),
+            // Identifier JSON is that value too, and no segment of the path.
+            ("GET /c~where(note=", r#"{"a":"b"}"#, r#"GET /c~where(note={"a":"b"}"#),
+            ("GET /c~where(name=\"", r#"{"identifiers":{"com.x.id":"7"}}"#, r#"GET /c~where(name="{"identifiers":{"com.x.id":"7"}}"#),
+            // The request of a check, with a method of its own or without.
+            ("assert GET /c~where(name=\"", "Head Office\"", "assert GET /c~where(name=\"Head Office\""),
+            ("assert not GET /c~where(name=\"", "Put it\"", "assert not GET /c~where(name=\"Put it\""),
+            ("assert /c~where(name=\"", "Head Office\"", "assert /c~where(name=\"Head Office\""),
+            ("sleep while GET /c~where(name=\"", "Delete me\"", "sleep while GET /c~where(name=\"Delete me\""),
+            ("sleep 5 while not /c~where(name=", "GET it", "sleep 5 while not /c~where(name=GET it"),
+            // A body that is a string, and the message of a `confirm`.
+            ("PUT /note \"", "Head of sales\"", "PUT /note \"Head of sales\""),
+            ("confirm Really ", "delete everything?", "confirm Really delete everything?"),
+            ("confirm ", "GET /x first?", "confirm GET /x first?"),
         ] {
             let mut state = test_state();
             state.input = line.to_string();
@@ -20957,8 +21014,43 @@ mod tests {
         state.cursor_pos = char_len("GET /c~where(name=\"");
         handle_paste(&mut state, "Head Office", &mut sink()).unwrap();
         assert_eq!(state.input, "GET /c~where(name=\"Head Office\") > out.json");
+        // A paste that is one word is more of the word it stands behind: a
+        // `#` behind anything but a blank, a directive or a file name behind
+        // a `/` or a `=`. Not a comment, a directive or a file in its place.
+        for (line, pasted, expected) in [
+            ("DELETE /people/com.x.id=A", "#1", "DELETE /people/com.x.id=A#1"),
+            ("GET /sync-webhooks/com.x.id=1/", "url", "GET /sync-webhooks/com.x.id=1/url"),
+            ("GET /files/", "seed.api", "GET /files/seed.api"),
+            ("GET /a/", "set", "GET /a/set"),
+            ("assert /people/com.x.id=A", "#1", "assert /people/com.x.id=A#1"),
+        ] {
+            let mut state = test_state();
+            state.input = line.to_string();
+            state.cursor_pos = char_len(line);
+            handle_paste(&mut state, pasted, &mut sink()).unwrap();
+            assert_eq!(state.input, expected, "{line} + {pasted}");
+        }
+        // Behind a blank, on an empty line and on the `GET /` the prompt
+        // starts with, such a paste is still the line.
+        for (line, pasted) in [
+            ("GET /", "seed.api"),
+            ("", "seed.api"),
+            ("put /", "#note"),
+            ("GET /people ", "seed.api"),
+            ("GET /people ", "# a comment"),
+            ("GET /people", "sleep 2"),
+            ("GET /people", "url has localhost"),
+            ("GET /people", "confirm"),
+            ("GET /people", "seed.api"),
+        ] {
+            let mut state = test_state();
+            state.input = line.to_string();
+            state.cursor_pos = char_len(line);
+            handle_paste(&mut state, pasted, &mut sink()).unwrap();
+            assert_eq!(state.input, pasted, "{line} + {pasted}");
+        }
         // A value that is closed is behind the cursor: the paste is a line.
-        for line in ["GET /c~where(name=\"a\")", "GET /c~where(name=\"a\") ", "GET /", "GET /c~where(a=1) {\"b\": 2} "] {
+        for line in ["GET /c~where(name=\"a\")", "GET /c~where(name=\"a\") ", "GET /", "GET /c~where(a=1) {\"b\": 2} ", "assert GET /c~where(name=\"a\")", "PUT /note \"a\" "] {
             let mut state = test_state();
             state.input = line.to_string();
             state.cursor_pos = char_len(line);
