@@ -10,7 +10,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use cli_clipboard;
 use reqwest::blocking::Client;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use clap::Parser;
@@ -239,7 +238,36 @@ fn exit_process(code: i32) -> ! {
     // What is still buffered goes out as everything else did. A stdout that
     // has failed is not tried again (and does not lead back here).
     let _ = Out.flush();
+    release_clipboard();
     std::process::exit(code)
+}
+
+/// The system clipboard, once something has been copied to it, kept until
+/// the process ends. On Linux what is copied is held by the program that
+/// copied it and handed out when another asks: under X11 it is gone when
+/// the clipboard is let go of, so a session keeps hold of it for as long as
+/// it runs.
+fn held_clipboard() -> std::sync::MutexGuard<'static, Option<arboard::Clipboard>> {
+    static HELD: std::sync::Mutex<Option<arboard::Clipboard>> = std::sync::Mutex::new(None);
+    HELD.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Put `text` on the system clipboard: `> clipboard` and ctrl+y.
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    let mut held = held_clipboard();
+    if held.is_none() {
+        *held = Some(arboard::Clipboard::new().map_err(|e| e.to_string())?);
+    }
+    held.as_mut().expect("just made").set_text(text).map_err(|e| e.to_string())
+}
+
+/// Let go of the clipboard as the process ends. Under X11 that is when what
+/// was copied is handed to the desktop's clipboard manager, which keeps it
+/// for a paste that comes after this process is gone: `exit` runs no
+/// destructors, so it is done by hand. Elsewhere there is nothing to hand
+/// over: macOS and Windows keep what is copied themselves.
+fn release_clipboard() {
+    held_clipboard().take();
 }
 
 /// A panic prints its message through the default hook; before that, the
@@ -4283,8 +4311,19 @@ fn override_connection(env: &SavedConnection, url: Option<&str>, key: Option<&st
     env
 }
 
+/// Lets go of the clipboard when `main` returns, as `exit_process` does
+/// when the process ends there.
+struct ClipboardGuard;
+
+impl Drop for ClipboardGuard {
+    fn drop(&mut self) {
+        release_clipboard();
+    }
+}
+
 fn main() {
     install_panic_hook();
+    let _clipboard = ClipboardGuard;
     let args = match Args::try_parse() {
         Ok(args) => args,
         Err(e) => {
@@ -10941,9 +10980,9 @@ impl OutTarget<'_> {
     /// Put `text` there and say how many bytes that added.
     fn deliver(&self, text: &str) -> io::Result<u64> {
         if self.is_clipboard() {
-            return cli_clipboard::set_contents(text.to_string())
+            return copy_to_clipboard(text)
                 .map(|()| text.len() as u64)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()));
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e));
         }
         if self.append {
             let before = file_len(self.path);
@@ -15353,7 +15392,7 @@ fn curl_refusal(state: &AppState) -> Option<&'static str> {
 }
 
 fn copy_curl(state: &AppState) -> bool {
-    build_curl(state).is_some_and(|cmd| cli_clipboard::set_contents(cmd).is_ok())
+    build_curl(state).is_some_and(|cmd| copy_to_clipboard(&cmd).is_ok())
 }
 
 fn render_input_content(state: &mut AppState, width: usize) -> (String, u16, String) {

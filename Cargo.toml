@@ -45,8 +45,9 @@ unicode-width = "0.2"
 # Base64 encoding for Basic auth
 base64 = "0.21"
 
-# Clipboard (text-only, no image deps)
-cli-clipboard = "0.4"
+# Clipboard, text only (no image support). `wayland-data-control` copies on a
+# Wayland desktop without going through XWayland; X11 is always there.
+arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
 
 # Home directory expansion
 dirs = "5"
