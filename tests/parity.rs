@@ -667,6 +667,7 @@ fn cases(dir: &Path) -> Vec<Case> {
         .fails("needs a path"),
         // A `#` in a URI is part of it, not a fragment that is never sent.
         case("a # in a path", "DELETE /people/com.x.id=A#1", Some(&["DELETE", "/people/com.x.id=A#1"]), &["DELETE /people/com.x.id=A%231"]),
+        case("a # in a bracket of a path", "DELETE /people/com.x.id=[A#1]", Some(&["DELETE", "/people/com.x.id=[A#1]"]), &["DELETE /people/com.x.id=[A%231]"]),
         case(
             "a # in a quoted value",
             r#"GET /a~where(n="x #y")"#,
@@ -725,6 +726,8 @@ fn cases(dir: &Path) -> Vec<Case> {
         // A method names nothing to send without a URI: not a request to `/`
         case("a method alone", "DELETE", Some(&["DELETE"]), &[]).fails("DELETE needs a URI"),
         case("a method alone in a chain", "GET /a && PUT", Some(&["GET", "/a", "&&", "PUT"]), &[]).fails("PUT needs a URI"),
+        // Neither does a method with its body right behind it
+        case("a body where the URI goes", "PUT {\"a\":1}", Some(&["PUT", "{\"a\":1}"]), &[]).fails("PUT needs a URI"),
         // A function an @file body does not have is not dropped
         case("an unknown body function", "PUT /x @body.json~old(1)", Some(&["PUT", "/x", "@body.json~old(1)"]), &[])
             .fails("unknown body function ~old(1)"),
@@ -12540,6 +12543,11 @@ fn describe_first_works_for_a_file_named_as_an_argument() {
     let got = ran(&server, cmd);
     assert_eq!((got.code, &got.sent[..]), (Some(0), &["GET /products".to_string()][..]), "{}", got.stderr);
     assert!(got.stderr.starts_with("Catalog\nhttps://docs.example.com/catalog\n"), "{}", got.stderr);
+    // A file with a blank in its name is that file.
+    std::fs::copy(d.join("catalog.api"), d.join("my catalog.api")).unwrap();
+    let got = run_in(&server, d, &["-m", "my catalog.api"]);
+    assert_eq!((got.code, got.sent.len()), (Some(0), 1), "{}", got.stderr);
+    assert!(got.stderr.starts_with("Catalog\n"), "{}", got.stderr);
     // A file without a block prints nothing for it, and a request is no file.
     for args in [&["-m", "bare.api"][..], &["-m", "GET", "/products"]] {
         let got = run_in(&server, d, args);

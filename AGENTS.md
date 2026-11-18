@@ -13,7 +13,7 @@ METHOD URI [BODY] [> OUTFILE]
 - `METHOD` is one of `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS`.
 - If the first token starts with `/`, `GET` is implied — `/people` is the same as `GET /people`.
 - `URI` may be written **with or without its leading slash**, and with or without the `/api/v1` prefix — `GET api/v1/people`, `GET /api/v1/people`, `GET v1/people`, and `GET /people` all request the same thing. That makes a path copied out of a browser URL or a log usable as-is. In a `.api` file this needs an explicit method, because a bare line that doesn't start with `/` is an [include](#6-includes).
-- A method needs a URI behind it. `DELETE` alone is an error (`DELETE needs a URI`), in a file, as arguments and at the prompt: it is not a request to `/`.
+- A method needs a URI behind it. `DELETE` alone is an error (`DELETE needs a URI`), in a file, as arguments and at the prompt: it is not a request to `/`. So is a method with its body right behind it (`PUT {"a":1}`): the body is not sent to a path made of it.
 - `BODY` and `OUTFILE` are optional. If both are present, `BODY` comes first; the `> path` suffix is parsed off the end. A ` >` inside a JSON string, inside brackets or inside the parentheses of a URI operator is not an outfile: `PUT /x {"a":"b > c"}` and `GET /x~where(name="a > b")` are sent as written.
 - The `>` needs a blank in front of it, a space or a tab, and a path behind it. A `>` or `>>` that names no file (`GET /x >`) stops the batch before anything is sent: ``a `>` or `>>` needs a path to write to``. That holds for a plain line, a chain segment, an `assert` and a `sleep while`.
 - A body starts on the request line. A `{` that starts a line of its own is a [describe block](#describe-block), which belongs at the top of the file.
@@ -52,6 +52,9 @@ PUT /x {"note":"a # b"}          # the string is sent whole
 A `#` that is no comment is part of the URI and is sent as `%23`: the line
 above deletes `com.x.id=A#1`, and `GET /x~where(ref="a #1")` asks for that
 text. A request has no fragment.
+
+A bracket in the middle of a word is part of the URI and opens no body:
+`GET /people/com.x.id=[A#1]` is one request, and its `#` is sent.
 
 A `confirm` line has none: all of it is the question.
 
@@ -688,7 +691,9 @@ PUT /assert {
   asserts. An import that is not in the cache is fetched, and one that can't
   be is an error.
 - A `PUT /assert` in a `&&`/`||` chain is listed, whether or not the chain
-  would reach it. An `@file` body is read.
+  would reach it. An `@file` body is read, as the bytes a run sends: a
+  comment in such a file is not stripped, and is `error: the body of `PUT
+  /assert` is not JSON`.
 - The endpoint is recognised however it is written: `/assert`, `v1/assert`,
   `/api/v1/assert`.
 - The `assert` keyword is not listed: only `PUT /assert` requests are.

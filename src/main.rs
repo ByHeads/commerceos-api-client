@@ -5876,6 +5876,14 @@ fn refuse_request(request: &str) -> Result<(), String> {
             return Err(format!("{} needs a URI: `{} /people`", method.to_uppercase(), method.to_uppercase()));
         }
     }
+    // Neither is a method with its body right behind it (`PUT {"a":1}`): no
+    // URI starts as a body does, and the body is not sent to a path made of it.
+    let mut words = written.split_whitespace();
+    if let (Some(method), Some(next)) = (words.next(), words.next()) {
+        if REQUEST_METHODS.iter().any(|known| known.eq_ignore_ascii_case(method)) && next.starts_with(['{', '[', '"', '@']) {
+            return Err(format!("{} needs a URI: `{} /people`", method.to_uppercase(), method.to_uppercase()));
+        }
+    }
     let Some((_, uri, _)) = parse_request_line(request) else {
         return Ok(());
     };
@@ -6026,11 +6034,18 @@ fn strip_body_comments_and_count(s: &str) -> (String, i32) {
     let mut depth: i32 = 0;
     // Parentheses of a URI operator, which hold no comment either.
     let mut parens: i32 = 0;
+    // Brackets in the middle of a word (`/people/com.x.id=[A#1]`): they are
+    // part of the URI and open no body, so nothing in them is a comment.
+    let mut glued: i32 = 0;
     let mut in_string = false;
     let mut escape = false;
 
     while i < chars.len() {
         let ch = chars[i];
+        // A word ends at a blank, as the URI does, and its brackets with it.
+        if !in_string && parens <= 0 && ch.is_whitespace() {
+            glued = 0;
+        }
 
         if in_string {
             out.push(ch);
@@ -6090,6 +6105,14 @@ fn strip_body_comments_and_count(s: &str) -> (String, i32) {
         match ch {
             '"' => {
                 in_string = true;
+                out.push(ch);
+            }
+            '{' | '[' if depth == 0 && i > 0 && !chars[i - 1].is_whitespace() => {
+                glued += 1;
+                out.push(ch);
+            }
+            '}' | ']' if depth == 0 && glued > 0 => {
+                glued -= 1;
                 out.push(ch);
             }
             '{' | '[' => {
@@ -9579,7 +9602,7 @@ impl DescribePlacement {
             return Ok(true);
         }
         self.bodyless = false;
-        if !matches!(parse_url_condition(trimmed), Ok(Some(_))) {
+        if !matches!(parse_url_condition(without_trailing_comment(trimmed)), Ok(Some(_))) {
             self.opened = true;
         }
         Ok(false)
@@ -10051,7 +10074,10 @@ fn print_describe_block(file: &str, raw: bool) -> i32 {
 /// is all the line is.
 fn describe_block_of_named_file(line: &str) -> Option<DescribeBlock> {
     let file = line.trim();
-    if !names_api_file(file) || file.contains(char::is_whitespace) || file.contains(['*', '?', '[']) {
+    // A name with a blank in it is the file only when that file is there:
+    // anything else with a blank is several words.
+    let spaced = file.contains(char::is_whitespace) && !std::path::Path::new(&expand_home(file)).is_file();
+    if !names_api_file(file) || spaced || file.contains(['*', '?', '[']) {
         return None;
     }
     let (contents, _) = read_api_file(file).ok()?;
@@ -10175,8 +10201,11 @@ fn collect_assertions(program: &BulkProgram, api_path: &str) -> Result<Vec<serde
                 let (file_body, _) = parse_body_functions(&body);
                 let file = file_body.trim_start_matches('@').trim().to_string();
                 let contents = resolve_at_file_body(&file)?.contents;
+                // A file body is sent as the bytes it holds: a comment in
+                // it is not stripped, and what the server could not read is
+                // not listed as an assertion.
                 let text = String::from_utf8(contents).map_err(|_| format!("not UTF-8 text: @{}", file))?;
-                normalize_request_text(&text).map_err(|e| format!("@{}: {}", file, e))?
+                text.trim_start_matches('\u{feff}').to_string()
             }
             None => body.clone(),
         };
@@ -27928,7 +27957,7 @@ mod tests {
         let src = "{ \"title\": { \"SV-se\": \"Katalog\" }, \"docsLink\": \"https://x\" }\nGET /a\n";
         assert_eq!(scan_describe_block(src).unwrap().unwrap().0, describe_of(src));
         // A `url` line may stand above it, with a bracket it never closes.
-        for above in ["url has [x", "URL  HAS {x", "# [\nurl is http://[::1"] {
+        for above in ["url has [x", "URL  HAS {x", "# [\nurl is http://[::1", "url has localhost:5000 # dev && test", "url is http://a # b || c"] {
             let src = format!("{above}\n{{ \"title\": {{ \"en\": \"T\" }} }}\nGET /a\n");
             let scanned = scan_describe_block(&src).unwrap().expect(above).0;
             assert_eq!(scanned["title"]["en"], "T", "{above}");
@@ -28017,7 +28046,7 @@ mod tests {
     fn collect_assertions_takes_every_put_assert_body_as_written() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("asserts.json");
-        std::fs::write(&file, "{ \"api/v1/file\": { \"is\": 1 } // from a file\n}").unwrap();
+        std::fs::write(&file, "{ \"api/v1/file\": { \"is\": 1 }\n}").unwrap();
         std::fs::write(dir.path().join("inc.api"), "PUT v1/assert {\"api/v1/now\":{\"is not\":null}}\n").unwrap();
         let src = format!(
             "{{ \"title\": {{}} }}\nPUT /assert {{ \"api/v1/people~count\": {{ \"is\": 3 }} }}\nGET /assert\nPUT /people/x {{ \"a\": 1 }}\ninc.api\nassert GET /people~count\nGET /a && PUT /api/v1/assert {{\n  \"z\": {{ \"is\": 1 }}, // z first\n  \"api/v1/people~count\": {{ \"is not\": 3, \"suggest\": [4] }}\n}} > /tmp/out.json\nPUT /assert @{}\n",
@@ -28045,6 +28074,12 @@ mod tests {
         assert!(err.starts_with("the body of `PUT /assert` is not JSON: "), "{err}");
         let program = split_bulk_requests("PUT /assert @/nowhere/asserts.json\n", None).unwrap();
         assert!(collect_assertions(&program, "/api/v1").is_err());
+        // A file body is sent byte for byte, so a comment in it is not
+        // stripped here either: what the server can't read is not listed.
+        std::fs::write(&file, "{\n  // from a file\n  \"api/v1/file\": { \"is\": 1 }\n}").unwrap();
+        let program = split_bulk_requests(&format!("PUT /assert @{}\n", file.display()), None).unwrap();
+        let err = collect_assertions(&program, "/api/v1").unwrap_err();
+        assert!(err.starts_with("the body of `PUT /assert` is not JSON: "), "{err}");
     }
 
     // ── Completion from a spec ──────────────────────────────────────────
@@ -29613,6 +29648,17 @@ mod tests {
         // What only looks like one is sent as written.
         assert_eq!(request("GET /a#b"), "GET /a#b");
         assert_eq!(request("GET /a~where(n=x #y)"), "GET /a~where(n=x #y)");
+        // A bracket in the middle of a word is the URI's and opens no body:
+        // a `#` or a `//` in it is sent, and the line is one request.
+        for line in ["GET /a/com.x.id=[A#1]", "DELETE /a/com.x.id={#7}", "GET /links/com.x.url=[http://a]", "GET /a~where(url=[http://a#b])"] {
+            assert_eq!(request(line), line);
+        }
+        assert_eq!(steps("GET /a/com.x.id=[A#1]\nGET /after\n").len(), 2);
+        assert_eq!(request("GET /a/com.x.id=[A#1] # note"), "GET /a/com.x.id=[A#1]");
+        // One that is never closed does not take the lines under it along.
+        assert_eq!(steps("GET /a/com.x.id=[A\nGET /after\n").len(), 2);
+        // A body is still one: behind a blank, or at the start of a line.
+        assert_eq!(request("PUT /a/com.x.id=[A] [\n  1 // one\n]"), "PUT /a/com.x.id=[A] [\n  1 \n]");
         assert_eq!(request(r#"PUT /a {"x":"a # b"}"#), r#"PUT /a {"x":"a # b"}"#);
         assert_eq!(request(r#"PUT /a "a # b""#), r#"PUT /a "a # b""#);
         // The outfile is the path, so its `Accept` is the extension's.
@@ -31899,6 +31945,13 @@ mod tests {
         for line in ["DELETE /", "GET /people", "/", "PUT /x {\"a\":1}"] {
             assert_eq!(refuse_request(line), Ok(()), "{line}");
         }
+        // A body right behind the method is no URI either: it is not sent
+        // to a path made of the body.
+        for line in ["PUT {\"a\":1}", "put { \"name\": \"x\" }", "POST [1, 2]", "PATCH \"text\"", "PUT @body.json", "PUT {\"a\":1} > out.json"] {
+            let said = refuse_request(line).unwrap_err();
+            assert!(said.contains("needs a URI: `P"), "{line}: {said}");
+        }
+        assert!(split_bulk_requests("PUT {\n  \"name\": \"x\"\n}\n", None).unwrap_err().contains("PUT needs a URI"));
         assert!(split_bulk_requests("GET /a\nDELETE\n", None).unwrap_err().contains("DELETE needs a URI"));
         assert!(split_bulk_requests("GET /a || DELETE\n", None).unwrap_err().contains("DELETE needs a URI"));
     }
