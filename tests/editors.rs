@@ -253,6 +253,59 @@ fn the_grammar_files_are_json_and_name_each_other() {
     }
 }
 
+/// Every pattern of the TextMate grammar is a pattern. The snapshot holds
+/// the grammar to the sample only as it was when the snapshot was made: a
+/// later edit that no editor could read would pass every other test here.
+#[test]
+fn every_pattern_of_the_textmate_grammar_compiles() {
+    fn walk(value: &serde_json::Value, at: &str, seen: &mut usize) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, inner) in map {
+                    let here = format!("{at}/{key}");
+                    match inner {
+                        serde_json::Value::String(pattern) if matches!(key.as_str(), "match" | "begin" | "end" | "while") => {
+                            // An `end` may refer to a group of its `begin`
+                            // (`\\1`), which only exists once that matched.
+                            let alone = if key == "end" || key == "while" {
+                                (1..=9).fold(pattern.clone(), |text, n| text.replace(&format!("\\{n}"), "x"))
+                            } else {
+                                pattern.clone()
+                            };
+                            if let Err(e) = fancy_regex::Regex::new(&alone) {
+                                panic!("{here}: {pattern:?} is no pattern: {e}");
+                            }
+                            *seen += 1;
+                        }
+                        _ => walk(inner, &here, seen),
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (n, inner) in items.iter().enumerate() {
+                    walk(inner, &format!("{at}/{n}"), seen);
+                }
+            }
+            _ => {}
+        }
+    }
+    let grammar: serde_json::Value = serde_json::from_str(&read("editors/vscode/syntaxes/api.tmLanguage.json")).unwrap();
+    let mut seen = 0;
+    walk(&grammar, "", &mut seen);
+    assert!(seen > 50, "only {seen} patterns were found");
+}
+
+/// The Vim syntax reads a file from its start. A body and a describe block
+/// are regions of many lines, and without this a jump into the middle of one
+/// colours its lines as lines of their own.
+#[test]
+fn the_vim_syntax_syncs_from_the_start_of_the_file() {
+    let syntax = read("editors/vim/syntax/api.vim");
+    assert!(syntax.lines().any(|line| line.trim() == "syn sync fromstart"), "no `syn sync fromstart`");
+    let sync = syntax.find("syn sync fromstart").unwrap();
+    assert!(sync < syntax.find("b:current_syntax = 'api'").unwrap());
+}
+
 // ------------------------------------------------------------ --install-syntax
 
 /// The client with `home` as the home directory and nothing of this machine

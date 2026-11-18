@@ -79,6 +79,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "encoding_rs",
+ "fancy-regex",
  "flate2",
  "glob",
  "keyring",

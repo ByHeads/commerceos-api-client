@@ -144,4 +144,8 @@ hi def link apiJsonString   String
 hi def link apiJsonNumber   Number
 hi def link apiJsonConst    Boolean
 
+" A body and a describe block span lines: read from the top, so that a jump
+" into the middle of one does not take its lines for lines of their own.
+syn sync fromstart
+
 let b:current_syntax = 'api'

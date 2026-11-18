@@ -278,6 +278,12 @@ fn answer(
         ("401 Unauthorized", r#"{"error":"token expired"}"#.to_string())
     } else if path.contains("/missing") {
         ("404 Not Found", "{}".to_string())
+    } else if let Some((_, until)) = path.split_once("/until/") {
+        // `1` until the clock has passed the millisecond named, then `0`:
+        // an answer that flips by itself, for a poll to wait on.
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+        let still = until.parse::<u128>().is_ok_and(|until| now < until);
+        ("200 OK", if still { "1" } else { "0" }.to_string())
     } else if let Some((_, zero)) = path.split_once("/zero/") {
         // A zero as the path spells it: `/zero/0e0` answers `0e0`.
         ("200 OK", zero.to_string())
@@ -1709,6 +1715,60 @@ fn a_csv_append_that_is_not_under_the_files_header_is_said() {
         // The answer is all there, and one that is only the header adds nothing.
         assert_eq!(std::fs::read_to_string(d.join("rows.csv")).unwrap(), "id,name\n1,Ann\n7", "{args:?}");
     }
+}
+
+/// A `sleep while` waits its interval between two checks, five seconds when
+/// none is given, and carries on when the answer has flipped. Without the
+/// wait it would ask as fast as the server answers.
+#[test]
+fn a_poll_waits_its_interval_between_checks() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let flips_in = |ms: u128| {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+        format!("/until/{}", now + ms)
+    };
+    // The answer flips after 700 ms: asked at 0, 300, 600 and 900 ms.
+    let path = flips_in(700);
+    std::fs::write(d.join("poll.api"), format!("sleep 300ms while GET {path}\nGET /after\n")).unwrap();
+    let start = Instant::now();
+    let got = run_in(&server, d, &["-sa", "poll.api"]);
+    let took = start.elapsed();
+    assert_eq!(got.code, Some(0), "{}", got.stderr);
+    let polls = got.sent.iter().filter(|line| line.contains("/until/")).count();
+    assert!((3..=5).contains(&polls), "{polls} checks: {:?}", got.sent);
+    assert_eq!(got.sent.last().map(String::as_str), Some("GET /after"));
+    assert!(took >= Duration::from_millis(700), "{took:?}");
+    assert!(got.stdout.contains(&format!("({polls} checks)")), "{}", got.stdout);
+
+    // No interval given: five seconds. The second check is the last.
+    let path = flips_in(500);
+    let start = Instant::now();
+    let got = run_in(&server, d, &[&format!("sleep while GET {path}")]);
+    let took = start.elapsed();
+    assert_eq!((got.code, got.sent.len()), (Some(0), 2), "{}: {:?}", got.stderr, got.sent);
+    assert!(took >= Duration::from_secs(5) && took < Duration::from_secs(9), "{took:?}");
+}
+
+/// ctrl+o on a file that is no longer there says so in the hint line.
+#[cfg(unix)]
+#[test]
+fn ctrl_o_says_when_the_file_could_not_be_opened() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = open_prompt(&server, dir.path(), &[]);
+    let (_, shown) = run_pasted(&mut prompt, &server, "GET /a > gone.json");
+    assert!(shown.contains("ctrl+o to open file"), "{shown}");
+    // Gone before it is asked for: nothing is opened on the machine the
+    // test runs on, and the handler says no.
+    std::fs::remove_file(dir.path().join("gone.json")).unwrap();
+    keys_then(&mut prompt, "\x0f", "could not open gone.json");
+    // The prompt is as it was: two rulers, and it still takes a line.
+    let rows = pty::rows(&prompt.screen, 200);
+    assert_eq!(ruler_rows(&rows).len(), 2, "{}", rows.join("\n"));
+    let (sent, _) = run_pasted(&mut prompt, &server, "GET /b");
+    assert_eq!(sent, ["GET /b"]);
 }
 
 /// Without `-f` a `> file` takes whatever was answered, an error too. A

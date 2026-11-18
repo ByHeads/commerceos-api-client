@@ -89,6 +89,8 @@ libc = "0.2"
 # editors/sublime/API.sublime-syntax to editors/sample.api in tests/editors.rs.
 # `regex-fancy` is the pure Rust engine: nothing in C to build.
 syntect = { version = "5", default-features = false, features = ["parsing", "yaml-load", "regex-fancy"] }
+# The engine syntect uses, to compile every pattern of the TextMate grammar
+fancy-regex = "0.16"
 # A throwaway certificate for the local https server in tests/cli.rs
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 
