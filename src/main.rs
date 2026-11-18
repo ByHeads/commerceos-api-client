@@ -321,7 +321,7 @@ fn streaming_help_lines(base_uri: &str) -> Vec<String> {
 }
 
 /// The shortcuts the ctrl+h panel lists, one per row.
-const HELP_LINES: [&str; 24] = [
+const HELP_LINES: [&str; 23] = [
     "  enter      Send request",
     "  opt+enter  New line (multiline body) [or ctrl+n]",
     "  up/down    Navigate input history",
@@ -342,8 +342,7 @@ const HELP_LINES: [&str; 24] = [
     "  ctrl+q     Switch connection",
     "  ctrl+b     Open API docs in browser",
     "  ctrl+o     Open last saved file",
-    "  ctrl+t     Toggle response streaming",
-    "  ctrl+r     Toggle export mode (responses as seed data)",
+    "  ctrl+t     Settings (streaming, export, nulls, fail fast…)",
     "  ctrl+c     Quit",
     "",
 ];
@@ -363,23 +362,87 @@ const HELP_LINES: [&str; 24] = [
 ///   could not be reached to clear them and would be left behind, so on a
 ///   terminal too short for all of it the last row says how much is missing.
 fn help_rows(state: &AppState) -> Vec<String> {
-    let mut rows: Vec<String> = vec![String::new()];
-    rows.extend(HELP_LINES.iter().map(|line| line.to_string()));
-    rows.push("  ctrl+h or esc to close".to_string());
-    if state.config.streaming {
-        rows.push(String::new());
-        for line in streaming_help_lines(&state.config.base_uri) {
-            rows.extend(hard_wrap_ansi(&line, state.width as usize).split("\r\n").map(str::to_string));
+    let settings = state.settings_open;
+    let mut rows: Vec<String> = if settings {
+        settings_rows(state)
+    } else {
+        let mut rows = vec![String::new()];
+        rows.extend(HELP_LINES.iter().map(|line| line.to_string()));
+        rows.push("  ctrl+h or esc to close".to_string());
+        if state.config.streaming {
+            rows.push(String::new());
+            for line in streaming_help_lines(&state.config.base_uri) {
+                rows.extend(hard_wrap_ansi(&line, state.width as usize).split("\r\n").map(str::to_string));
+            }
         }
-    }
+        rows
+    };
     // The ruler above and these rows have to fit on the screen with the
     // cursor's row under them. A height of 0 is a terminal that gave none.
     let fits = (state.height as usize).saturating_sub(2).max(2);
     if state.height > 0 && rows.len() > fits {
         let hidden = rows.len() - (fits - 1);
         rows.truncate(fits - 1);
-        rows.push(format!("  … {} more rows: enlarge the window. ctrl+h or esc to close", hidden));
+        let key = if settings { "ctrl+t" } else { "ctrl+h" };
+        rows.push(format!("  … {} more rows: enlarge the window. {} or esc to close", hidden, key));
     }
+    rows
+}
+
+/// What the last row of the settings menu says while nothing else is said.
+const SETTINGS_HINT: &str = "↑/↓ to move, enter to change, ctrl+t or esc to close";
+
+/// The settings of the ctrl+t menu, in its order: what the row is called,
+/// what the session has it at, and the setting Enter on the row asks for.
+/// Each row is one `set` line (`Setting::line`); for `timeout`, and for
+/// `export` without a name yet, the value is asked for first.
+fn settings_menu(state: &AppState) -> Vec<(&'static str, String, Setting)> {
+    let config = &state.config;
+    let on_off = |on: bool| if on { "on" } else { "off" }.to_string();
+    let export = match &config.given.export {
+        // Turned on: under the name the session has, when it has one.
+        None => Setting::Export(state.export_name.clone()),
+        Some(_) => Setting::Export(None),
+    };
+    vec![
+        ("Response streaming", on_off(config.streaming), Setting::Stream(!config.streaming)),
+        (
+            "Export mode (responses as seed data)",
+            config.given.export.clone().unwrap_or_else(|| "off".to_string()),
+            export,
+        ),
+        ("Include nulls", on_off(config.given.include_nulls), Setting::IncludeNulls(!config.given.include_nulls)),
+        ("Fail fast", on_off(config.given.fail_fast), Setting::FailFast(!config.given.fail_fast)),
+        ("NDJSON", on_off(config.given.ndjson), Setting::Ndjson(!config.given.ndjson)),
+        ("Raw JSON (no pretty printing)", on_off(config.given.raw), Setting::Raw(!config.given.raw)),
+        ("Timeout", describe_timeout(config.timeout_secs), Setting::Timeout(None)),
+    ]
+}
+
+/// The rows of the ctrl+t menu under its ruler, as they are drawn: a blank
+/// row, one row per setting with the one the cursor is on marked, a blank
+/// row, and the row that says how to use it. That last row is the menu's
+/// hint line: what the prompt has to say (`status_msg`) is said there, as
+/// the hint line of the command area says it. No row is wider than the
+/// terminal, so none can wrap.
+fn settings_rows(state: &AppState) -> Vec<String> {
+    let menu = settings_menu(state);
+    let width = (state.width as usize).max(1);
+    let label_width = menu.iter().map(|(label, _, _)| str_width(label)).max().unwrap_or(0);
+    let mut rows = vec![String::new()];
+    for (at, (label, value, _)) in menu.iter().enumerate() {
+        let chosen = at == state.settings_row.min(menu.len() - 1);
+        let row = format!("{} {}  {}", if chosen { "›" } else { " " }, pad_to_width(label, label_width), value);
+        let row = fit_to_width(&row, width.saturating_sub(1));
+        rows.push(if chosen { row } else { row.dimmed().to_string() });
+    }
+    rows.push(String::new());
+    let room = width.saturating_sub(3);
+    rows.push(if state.status_msg.is_empty() {
+        format!("  {}", fit_to_width(SETTINGS_HINT, room).dimmed())
+    } else {
+        format!("  {}", status_msg_styled(&fit_to_width(&visible_text(&state.status_msg), room), state.status_msg_at))
+    });
     rows
 }
 
@@ -1339,6 +1402,12 @@ struct AppState {
     last_display_outfile: String,  // Display version of last outfile
     show_help: bool,
     prev_show_help: bool,  // Track previous help state for clearing
+    /// The panel that is open (`show_help`) is the ctrl+t settings menu and
+    /// not the shortcuts. It takes the panel's place row for row, so
+    /// everything that draws and clears the one does so for the other.
+    settings_open: bool,
+    /// The row of the settings menu the cursor is on.
+    settings_row: usize,
     prev_input_lines: u16, // Track number of input lines for clearing multiline
     loading: bool,
     loading_frame: usize,
@@ -1443,6 +1512,8 @@ impl AppState {
             last_display_outfile: String::new(),
             show_help: false,
             prev_show_help: false,
+            settings_open: false,
+            settings_row: 0,
             prev_input_lines: 1,
             loading: false,
             loading_frame: 0,
@@ -11565,6 +11636,29 @@ fn handle_key_event(
     key: KeyEvent,
     stdout: &mut io::Stdout,
 ) -> io::Result<(bool, Option<std::sync::mpsc::Receiver<BackgroundLoadResult>>)> {
+    // The settings menu has the arrows, Enter and the space bar while it is
+    // open. Any other key does what it does at the prompt.
+    if state.show_help && state.settings_open {
+        let rows = settings_menu(state).len();
+        match (key.modifiers, key.code) {
+            (_, KeyCode::Up) => {
+                state.settings_row = state.settings_row.checked_sub(1).unwrap_or(rows - 1);
+                render(stdout, state)?;
+                return Ok((false, None));
+            }
+            (_, KeyCode::Down) => {
+                state.settings_row = (state.settings_row + 1) % rows;
+                render(stdout, state)?;
+                return Ok((false, None));
+            }
+            (KeyModifiers::NONE, KeyCode::Enter) | (KeyModifiers::NONE, KeyCode::Char(' ')) => {
+                let quit = change_chosen_setting(state, stdout)?;
+                return Ok((quit, None));
+            }
+            _ => {}
+        }
+    }
+
     // Body input mode: intercept all keys
     if state.body_input_mode {
         match (key.modifiers, key.code) {
@@ -11646,10 +11740,11 @@ fn handle_key_event(
     let dominated_by_completions = key.code == KeyCode::Tab
         || key.code == KeyCode::BackTab
         || key.code == KeyCode::Esc;
-    // If help is showing, close it on any key except esc/ctrl+h/ctrl+c, then process the key
+    // If help or the settings menu is showing, close it on any key except
+    // esc/ctrl+h/ctrl+t/ctrl+c, then process the key
     let is_ctrl_c = key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c');
     let is_help_key = key.code == KeyCode::Esc
-        || (key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('h'))
+        || (key.modifiers == KeyModifiers::CONTROL && matches!(key.code, KeyCode::Char('h') | KeyCode::Char('t')))
         || is_ctrl_c;
     // Reset ctrl+c pending on any non-ctrl+c key
     reset_for_input(state, stdout, !dominated_by_completions, !is_help_key, !is_ctrl_c)?;
@@ -11685,8 +11780,7 @@ fn handle_key_event(
 
         // Toggle help
         (KeyModifiers::CONTROL, KeyCode::Char('h')) => {
-            state.show_help = !state.show_help;
-            render(stdout, state)?;
+            toggle_panel(state, stdout, false)?;
         }
 
         // Shift+Tab: reverse autocomplete
@@ -11809,17 +11903,9 @@ fn handle_key_event(
             }
         }
 
-        // Toggle response streaming (ctrl+t)
+        // The settings menu (ctrl+t)
         (KeyModifiers::CONTROL, KeyCode::Char('t')) => {
-            let said = set_for_session(state, &Setting::Stream(!state.config.streaming));
-            show_program_status(state, stdout, said)?;
-        }
-
-        // Toggle export mode (ctrl+r)
-        (KeyModifiers::CONTROL, KeyCode::Char('r')) => {
-            if handle_export_toggle(state, stdout)? {
-                return Ok((true, None));
-            }
+            toggle_panel(state, stdout, true)?;
         }
 
         // Save connection (ctrl+s)
@@ -14498,38 +14584,97 @@ fn confirm_inline(stdout: &mut io::Stdout, prompt: &str, width: usize, resized: 
 
 /// What the hint line says when the name typed for export mode is refused.
 const EXPORT_NAME_REFUSED: &str = "export needs a namespaced key, like com.heads.seedID";
+/// And when what is typed for the timeout is no number of seconds.
+const TIMEOUT_REFUSED: &str = "a timeout is whole seconds, 0 for none";
 
-/// ctrl+r: turn export mode on or off for the session, as `--export` does for
-/// a run. Turning it on needs the external identifier's name. There is no
-/// default: it is asked for the first time, and remembered until the session
-/// ends (a session started with `--export <name>` knows it already).
-///
-/// Returns `true` when ctrl+c in the dialog asked to leave the client.
-fn handle_export_toggle(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<bool> {
-    let notice = |state: &mut AppState, stdout: &mut io::Stdout, text: String| -> io::Result<bool> {
-        state.status_msg = text;
-        state.status_msg_at = Some(Instant::now());
+/// ctrl+h and ctrl+t: open the shortcuts or the settings menu, or close the
+/// one that is open. The two share the panel's place, so going from one to
+/// the other closes the first: its rows are cleared by its own count.
+fn toggle_panel(state: &mut AppState, stdout: &mut io::Stdout, settings: bool) -> io::Result<()> {
+    let open = state.show_help && state.settings_open == settings;
+    if state.show_help {
+        state.show_help = false;
         render(stdout, state)?;
-        Ok(false)
-    };
-    if state.config.given.export.is_some() {
-        let said = set_for_session(state, &Setting::Export(None));
-        return notice(state, stdout, said);
     }
-    let name = match state.export_name.clone() {
-        Some(name) => name,
-        None => match ask_export_name(state, stdout)? {
-            InlineInput::Quit => return Ok(true),
-            InlineInput::Cancelled => return notice(state, stdout, "cancelled".to_string()),
-            InlineInput::Entered(name) => name,
-        },
+    state.settings_open = settings;
+    // The menu opens with the cursor on its first row, every time: the same
+    // keys then always reach the same setting.
+    state.settings_row = 0;
+    state.show_help = !open;
+    render(stdout, state)
+}
+
+/// Enter or the space bar on a row of the settings menu: change that
+/// setting for the session, as a `set` line typed at the prompt does, and
+/// say so in the menu's hint row. The menu stays open.
+///
+/// A value that has to be typed (the timeout, and the name export mode
+/// needs the first time) is asked for in the command area, the way ctrl+s
+/// asks for a connection's name: the menu makes way for the dialog and is
+/// back when it ends. The name is remembered until the session ends, so
+/// turning export on again does not ask.
+///
+/// Returns `true` when ctrl+c in a dialog asked to leave the client.
+fn change_chosen_setting(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<bool> {
+    let mut menu = settings_menu(state);
+    let (_, _, setting) = menu.swap_remove(state.settings_row.min(menu.len() - 1));
+    let asked = match setting {
+        Setting::Export(None) if state.config.given.export.is_none() => Some(ValueDialog {
+            prompt: "› Export with external identifier: ",
+            hint: "enter to turn export on, esc to cancel",
+            refused: EXPORT_NAME_REFUSED,
+            accepts: is_namespaced_key,
+        }),
+        Setting::Timeout(_) => Some(ValueDialog {
+            prompt: "› Timeout in seconds: ",
+            hint: "enter to set the timeout, esc to cancel",
+            refused: TIMEOUT_REFUSED,
+            accepts: |typed| typed.parse::<u64>().is_ok(),
+        }),
+        _ => None,
     };
-    let said = set_for_session(state, &Setting::Export(Some(name)));
-    notice(state, stdout, said)
+    let said = match asked {
+        None => set_for_session(state, &setting),
+        Some(dialog) => {
+            // The dialog stands where the command area does.
+            state.show_help = false;
+            render(stdout, state)?;
+            let answer = ask_setting_value(state, stdout, &dialog)?;
+            // Leaving the client from the dialog leaves the command area,
+            // which is what is on the screen: the menu is not drawn again.
+            if matches!(answer, InlineInput::Quit) {
+                return Ok(true);
+            }
+            state.show_help = true;
+            match answer {
+                InlineInput::Quit => return Ok(true),
+                InlineInput::Cancelled => "cancelled".to_string(),
+                InlineInput::Entered(value) => {
+                    let setting = match setting {
+                        Setting::Timeout(_) => Setting::Timeout(value.parse().ok()),
+                        _ => Setting::Export(Some(value)),
+                    };
+                    set_for_session(state, &setting)
+                }
+            }
+        }
+    };
+    show_program_status(state, stdout, said)?;
+    Ok(false)
+}
+
+/// What a dialog of the settings menu asks: its prompt, the hint under the
+/// ruler, and which answers it takes, with what is said about one it does
+/// not.
+struct ValueDialog {
+    prompt: &'static str,
+    hint: &'static str,
+    refused: &'static str,
+    accepts: fn(&str) -> bool,
 }
 
 /// Change one of the session's own settings: a `set` line typed at the
-/// prompt, or its key. It holds for everything sent from here on, a file run
+/// prompt, or its row in the ctrl+t menu. It holds for everything sent from here on, a file run
 /// from the prompt included, until it is changed again. Returns what the hint
 /// line says about it.
 fn set_for_session(state: &mut AppState, setting: &Setting) -> String {
@@ -14538,17 +14683,12 @@ fn set_for_session(state: &mut AppState, setting: &Setting) -> String {
     }
     state.config.given.put(setting);
     state.config.apply_settings();
+    // The markers at the right of the hint line pulse for what was turned on.
+    state.streaming_flash_at = (!setting.is_off()).then(Instant::now);
     match setting {
-        Setting::Stream(true) => {
-            state.streaming_flash_at = Some(Instant::now());
-            STREAMING_INFO_MSG.to_string()
-        }
-        Setting::Stream(false) => {
-            state.streaming_flash_at = None;
-            "streaming off".to_string()
-        }
+        Setting::Stream(true) => STREAMING_INFO_MSG.to_string(),
+        Setting::Stream(false) => "streaming off".to_string(),
         Setting::Export(Some(name)) => {
-            state.streaming_flash_at = Some(Instant::now());
             state.export_name = Some(name.clone());
             format!("export on: {}", name)
         }
@@ -14563,15 +14703,16 @@ fn set_for_session(state: &mut AppState, setting: &Setting) -> String {
     }
 }
 
-/// Ask, in the command area, for the name export mode keeps a lone key
-/// under, the way ctrl+s asks for a connection's name: a prompt on the input
-/// line, and `enter to …, esc to cancel` under the ruler.
+/// Ask, in the command area, for a value a setting needs (the name export
+/// mode keeps a lone key under, the seconds of the timeout), the way ctrl+s
+/// asks for a connection's name: a prompt on the input line, and `enter to
+/// …, esc to cancel` under the ruler.
 ///
-/// The dialog stays open until it has a name that can be used, or is left:
-/// `Entered` holds a namespaced key, esc or an empty answer is `Cancelled`,
-/// ctrl+c is `Quit`. A name that is not a namespaced key is refused with the
-/// prompt's regular notice, in the hint line, styled and timed as `render`
-/// shows one, and what was typed stays on the line to correct.
+/// The dialog stays open until it has an answer that can be used, or is
+/// left: `Entered` holds one the dialog accepts, esc or an empty answer is
+/// `Cancelled`, ctrl+c is `Quit`. An answer it does not accept is refused
+/// with the prompt's regular notice, in the hint line, styled and timed as
+/// `render` shows one, and what was typed stays on the line to correct.
 ///
 /// The dialog takes the command area's place, row for row: the top ruler
 /// stays, the prompt stands on the first input line, and the bottom ruler
@@ -14582,12 +14723,11 @@ fn set_for_session(state: &mut AppState, setting: &Setting) -> String {
 /// it are drawn with auto-wrap off, as `render` draws its own. However it
 /// ends, the cursor is left on the command area's hint line, where `render`
 /// and the session's closing clear both start from.
-fn ask_export_name(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<InlineInput> {
+fn ask_setting_value(state: &mut AppState, stdout: &mut io::Stdout, dialog: &ValueDialog) -> io::Result<InlineInput> {
     let width = state.width as usize;
     let ruler_line = format!("\x1b[38;5;239m{}\x1b[0m", "─".repeat(width));
     let input_lines = state.prev_input_lines;
-    let prompt = "› Export with external identifier: ";
-    let hint = "enter to turn export on, esc to cancel";
+    let (prompt, hint) = (dialog.prompt, dialog.hint);
 
     // From the hint line, where `render` leaves the cursor, up to the first
     // input line. Clear the command area from there; the top ruler is kept.
@@ -14619,7 +14759,7 @@ fn ask_export_name(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
         let width = resized.get().map_or(width, |(w, _)| w as usize);
         let fits = |text: &str| -> String { head_chars(text, width.saturating_sub(2)).to_string() };
         let line = match active {
-            Some(at) => status_msg_styled(&fits(EXPORT_NAME_REFUSED), Some(at)),
+            Some(at) => status_msg_styled(&fits(dialog.refused), Some(at)),
             None if notice_shown => fits(hint).dimmed().to_string(),
             None => return Ok(()),
         };
@@ -14647,7 +14787,7 @@ fn ask_export_name(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
                 if name.is_empty() {
                     break InlineInput::Cancelled;
                 }
-                if is_namespaced_key(&name) {
+                if (dialog.accepts)(&name) {
                     break InlineInput::Entered(name);
                 }
                 // Refused: say so, and ask again with the name left to
@@ -14705,7 +14845,7 @@ fn handle_save_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io::
     let ruler_line = format!("\x1b[38;5;239m{}\x1b[0m", ruler);
     // Nothing here may wrap: a row more than was counted would put every
     // redraw a row too low. So the hint is cut to the width and drawn with
-    // auto-wrap off, and the input keeps to the width, as in `ask_export_name`.
+    // auto-wrap off, and the input keeps to the width, as in `ask_setting_value`.
     let hint = head_chars("enter to save, esc to cancel", width.saturating_sub(2));
     execute!(stdout, Print("\x1b[?7l"))?;
     execute!(stdout, Print("\r\n"))?; // placeholder for prompt line
@@ -15226,7 +15366,7 @@ const STREAMING_INDICATOR_MARGIN: usize = 2;
 /// Auto-wrap is disabled around this block, so even writing to the final column
 /// is safe — no phantom line appears.
 fn streaming_indicator(state: &AppState, left_width: usize) -> String {
-    let (Some(pad), Some(label)) = (streaming_indicator_pad(state, left_width), footer_indicator(state)) else {
+    let Some((pad, label)) = footer_indicator(state, left_width) else {
         return String::new();
     };
 
@@ -15260,27 +15400,46 @@ fn streaming_indicator(state: &AppState, left_width: usize) -> String {
     format!("{}{}", " ".repeat(pad), styled)
 }
 
-/// The marker at the right of the hint line: `export` while export mode is
-/// on, `streaming` while streaming is, nothing otherwise. Export wins, since
-/// a response is read whole while it is on.
-fn footer_indicator(state: &AppState) -> Option<&'static str> {
-    if state.config.export_id.is_some() {
-        Some(EXPORT_INDICATOR)
-    } else if state.config.streaming {
-        Some(STREAMING_INDICATOR)
-    } else {
-        None
+/// What is on, as the markers at the right of the hint line, left to right:
+/// one for each setting the session has changed, and last, where it has
+/// always stood, `export` while export mode is on or `streaming` while
+/// streaming is. Export wins there, since a response is read whole while it
+/// is on.
+fn footer_markers(state: &AppState) -> Vec<String> {
+    let config = &state.config;
+    let mut markers = Vec::new();
+    let mut mark = |on: bool, text: &str| {
+        if on {
+            markers.push(text.to_string());
+        }
+    };
+    mark(config.include_nulls, "nulls");
+    mark(config.fail_fast, "fail-fast");
+    mark(config.ndjson, "ndjson");
+    mark(config.raw, "raw");
+    match config.timeout_secs {
+        DEFAULT_TIMEOUT_SECS => {}
+        0 => mark(true, "no timeout"),
+        seconds => mark(true, &format!("timeout {}s", seconds)),
     }
+    mark(config.export_id.is_some(), EXPORT_INDICATOR);
+    mark(config.export_id.is_none() && config.streaming, STREAMING_INDICATOR);
+    markers
 }
 
-/// Spaces between the left-hand text and the marker, or `None` when there is
-/// no marker to show or the line can't hold both.
-fn streaming_indicator_pad(state: &AppState, left_width: usize) -> Option<usize> {
-    let label = footer_indicator(state)?;
+/// The markers that fit beside a hint of `left_width` columns, as one text
+/// (`nulls · fail-fast · export`), and the blanks between the hint and it.
+/// On a line too narrow for all of them the ones on the left go first; `None`
+/// when there is none to show or not even the last one fits: the left-hand
+/// text is the more useful of the two.
+fn footer_indicator(state: &AppState, left_width: usize) -> Option<(usize, String)> {
+    let markers = footer_markers(state);
     let width = state.width as usize;
-    let used = 2 + left_width + label.len() + STREAMING_INDICATOR_MARGIN;
-    // Not enough room — the left-hand text is the more useful of the two.
-    (width >= used + 1).then(|| width - used)
+    (0..markers.len()).find_map(|from| {
+        let label = markers[from..].join(" · ");
+        let used = 2 + left_width + str_width(&label) + STREAMING_INDICATOR_MARGIN;
+        (width >= used + 1).then(|| (width - used, label))
+    })
 }
 
 /// One full dim-white-dim swing of the marker while data is arriving.
@@ -15341,7 +15500,7 @@ impl StreamPulse {
 fn transient_hint_line(state: &AppState, text: &str, pulse: Option<Duration>) -> String {
     let text = &fit_to_width(text, (state.width as usize).saturating_sub(3));
     let mut line = format!("  {}", text.dimmed());
-    if let (Some(pad), Some(label)) = (streaming_indicator_pad(state, str_width(text)), footer_indicator(state)) {
+    if let Some((pad, label)) = footer_indicator(state, str_width(text)) {
         line.push_str(&" ".repeat(pad));
         match pulse {
             Some(since) => line.push_str(&format!(
@@ -15569,8 +15728,12 @@ fn render<W: Write>(stdout: &mut W, state: &mut AppState) -> io::Result<()> {
         state.prev_input_lines = 1; // single spinner line — keep the span exact
     } else if state.show_help {
         // Drawn from the rows the closing clear counts — see `help_rows`.
+        // The shortcuts are dimmed whole; a row of the settings menu says
+        // itself how it is drawn.
+        let settings = state.settings_open;
         for row in help_rows(state) {
-            queue!(stdout, Print(format!("{}\r\n", row.dimmed())))?;
+            let row = if settings { row } else { row.dimmed().to_string() };
+            queue!(stdout, Print(format!("{}\r\n", row)))?;
         }
     } else if state.body_input_mode {
         // Show method + URI on first line, prompt on second, buffer with cursor below
@@ -23730,7 +23893,7 @@ mod tests {
         state.width = 80;
         state.height = 60;
         let plain = help_line_count(&state);
-        assert_eq!(plain, 27, "the ruler, a blank row, 24 lines and the closing line");
+        assert_eq!(plain, 26, "the ruler, a blank row, 23 lines and the closing line");
 
         // On a terminal too short for it the panel is cut to what can be
         // cleared again: the ruler, its rows and the cursor's row all fit.
@@ -23741,8 +23904,8 @@ mod tests {
             assert!(rows.last().unwrap().contains("more rows"), "height {height}: {:?}", rows.last());
             assert!(rows.last().unwrap().contains("ctrl+h or esc to close"));
         }
-        state.height = 28;
-        assert_eq!(help_line_count(&state), 27);
+        state.height = 27;
+        assert_eq!(help_line_count(&state), 26);
         assert!(!help_rows(&state).last().unwrap().contains("more rows"));
         state.height = 60;
 
@@ -25061,42 +25224,154 @@ mod tests {
     }
 
     #[test]
-    fn the_footer_marker_is_export_while_export_is_on_and_streaming_otherwise() {
+    fn the_footer_marks_what_is_on_with_export_or_streaming_last() {
         let mut state = AppState::new(Config::default());
         state.width = 80;
-        let shown = |state: &AppState| -> String {
-            let line = streaming_indicator(state, 20);
-            let mut plain = String::new();
-            let mut chars = line.chars();
-            while let Some(c) = chars.next() {
-                if c == '\x1b' {
-                    for skipped in chars.by_ref() {
-                        if skipped == 'm' {
-                            break;
-                        }
-                    }
-                } else {
-                    plain.push(c);
-                }
-            }
-            plain.trim_start().to_string()
-        };
-        assert_eq!((footer_indicator(&state), shown(&state).as_str()), (None, ""));
+        let shown = |state: &AppState| -> String { visible_text(&streaming_indicator(state, 20)).trim_start().to_string() };
+        let label = |state: &AppState| footer_indicator(state, 20).map(|(_, label)| label);
+        assert_eq!((label(&state), shown(&state).as_str()), (None, ""));
         state.config.streaming = true;
-        assert_eq!((footer_indicator(&state), shown(&state).as_str()), (Some("streaming"), "streaming"));
+        assert_eq!((label(&state).as_deref(), shown(&state).as_str()), (Some("streaming"), "streaming"));
         // Export reads a response whole, so it takes the marker's place.
         state.config.export_id = Some(SEED.to_string());
-        assert_eq!((footer_indicator(&state), shown(&state).as_str()), (Some("export"), "export"));
+        assert_eq!((label(&state).as_deref(), shown(&state).as_str()), (Some("export"), "export"));
         state.config.streaming = false;
-        assert_eq!((footer_indicator(&state), shown(&state).as_str()), (Some("export"), "export"));
+        assert_eq!((label(&state).as_deref(), shown(&state).as_str()), (Some("export"), "export"));
         // It ends where the streaming marker does, the margin in from the edge.
         assert_eq!(visible_len(&streaming_indicator(&state, 20)), 80 - 2 - 20 - STREAMING_INDICATOR_MARGIN);
         assert!(transient_hint_line(&state, "waiting", None).ends_with(&EXPORT_INDICATOR.dimmed().to_string()));
-        // Too narrow for both: the text on the left is kept.
+
+        // Every other setting that is on stands to its left, in one order.
+        state.config.include_nulls = true;
+        state.config.fail_fast = true;
+        assert_eq!(shown(&state), "nulls · fail-fast · export");
+        state.config.ndjson = true;
+        state.config.raw = true;
+        state.config.timeout_secs = 30;
+        assert_eq!(shown(&state), "nulls · fail-fast · ndjson · raw · timeout 30s · export");
+        assert_eq!(visible_len(&streaming_indicator(&state, 20)), 80 - 2 - 20 - STREAMING_INDICATOR_MARGIN);
+        state.config.timeout_secs = 0;
+        state.config.export_id = None;
+        state.config.streaming = true;
+        state.width = 82;
+        assert_eq!(shown(&state), "nulls · fail-fast · ndjson · raw · no timeout · streaming");
+        // On a line too narrow for all of them the ones on the left go first.
+        state.width = 81;
+        assert_eq!(shown(&state), "fail-fast · ndjson · raw · no timeout · streaming");
+        state.width = 60;
+        assert_eq!(shown(&state), "raw · no timeout · streaming");
+        state.width = 40;
+        assert_eq!(shown(&state), "streaming");
+        // Too narrow for any: the text on the left is kept.
         state.width = 30;
         assert_eq!(shown(&state), "");
-        state.config.export_id = None;
-        assert_eq!(footer_indicator(&state), None);
+        state.config = Config::default();
+        state.width = 80;
+        assert_eq!(footer_indicator(&state, 20), None);
+    }
+
+    #[test]
+    fn the_settings_menu_has_a_row_for_every_setting_and_none_wraps() {
+        let mut state = test_state();
+        state.height = 40;
+        state.settings_open = true;
+        // Each row asks for one `set` line, and together they are every
+        // setting there is, each once.
+        let mut names: Vec<&str> = settings_menu(&state).iter().map(|(_, _, setting)| setting.name()).collect();
+        names.sort_unstable();
+        let mut all = SETTING_NAMES.to_vec();
+        all.sort_unstable();
+        assert_eq!(names, all);
+
+        let rows = |state: &AppState| -> Vec<String> { help_rows(state).iter().map(|row| visible_text(row)).collect() };
+        let plain = rows(&state);
+        assert_eq!(plain.len(), 1 + SETTING_NAMES.len() + 2);
+        assert_eq!(help_line_count(&state), 1 + plain.len() as u16);
+        assert_eq!(plain[0], "");
+        assert_eq!(plain[1], "› Response streaming                    off");
+        assert_eq!(plain[2], "  Export mode (responses as seed data)  off");
+        assert_eq!(plain[3], "  Include nulls                         off");
+        assert_eq!(plain[7], "  Timeout                               600s");
+        assert_eq!(plain.last().unwrap(), &format!("  {SETTINGS_HINT}"));
+        // The values are the session's, and the cursor's row is the marked one.
+        state.config.given = Settings {
+            export: Some(SEED.to_string()),
+            include_nulls: true,
+            timeout: Some(0),
+            ..Settings::default()
+        };
+        state.config.apply_settings();
+        state.settings_row = 2;
+        let plain = rows(&state);
+        assert_eq!(plain[1], "  Response streaming                    off");
+        assert_eq!(plain[2], format!("  Export mode (responses as seed data)  {SEED}"));
+        assert_eq!(plain[3], "› Include nulls                         on");
+        assert_eq!(plain[7], "  Timeout                               no timeout");
+        // Enter on a row asks for the other value; on export, for it off.
+        let asks: Vec<Setting> = settings_menu(&state).into_iter().map(|(_, _, setting)| setting).collect();
+        assert_eq!(asks[1], Setting::Export(None));
+        assert_eq!(asks[2], Setting::IncludeNulls(false));
+        assert_eq!(asks[3], Setting::FailFast(true));
+        // What the prompt has to say is said in the menu's last row.
+        state.status_msg = "include-nulls on".to_string();
+        assert_eq!(rows(&state).last().unwrap(), "  include-nulls on");
+        state.status_msg.clear();
+
+        // No row is as wide as the terminal, at any width.
+        for width in [10u16, 24, 40, 43, 44, 60, 200] {
+            state.width = width;
+            for row in rows(&state) {
+                assert!(str_width(&row) < width as usize, "{width}: {row:?}");
+            }
+        }
+        // Too short for all of it: the last row says so, and how to close it.
+        state.width = 80;
+        state.height = 6;
+        let short = rows(&state);
+        assert_eq!(short.len(), 4);
+        assert!(short.last().unwrap().ends_with("more rows: enlarge the window. ctrl+t or esc to close"), "{short:?}");
+        // The shortcuts are what the panel holds otherwise, and say ctrl+h.
+        state.settings_open = false;
+        assert!(rows(&state).last().unwrap().ends_with("ctrl+h or esc to close"));
+        state.height = 60;
+        assert!(rows(&state).iter().any(|row| row.contains("ctrl+t     Settings")));
+        assert!(!rows(&state).iter().any(|row| row.contains("ctrl+r")));
+    }
+
+    #[test]
+    fn a_setting_changed_in_the_session_holds_until_it_is_changed_again() {
+        let mut state = test_state();
+        // What the hint line says about each change.
+        assert_eq!(set_for_session(&mut state, &Setting::IncludeNulls(true)), "include-nulls on");
+        assert!(state.config.include_nulls && state.streaming_flash_at.is_some());
+        assert_eq!(set_for_session(&mut state, &Setting::IncludeNulls(false)), "include-nulls off");
+        assert!(!state.config.include_nulls && state.streaming_flash_at.is_none());
+        assert_eq!(set_for_session(&mut state, &Setting::FailFast(true)), "fail-fast on");
+        assert_eq!(set_for_session(&mut state, &Setting::Ndjson(true)), "ndjson on");
+        assert_eq!(set_for_session(&mut state, &Setting::Raw(true)), "raw on");
+        assert_eq!(set_for_session(&mut state, &Setting::Timeout(Some(30))), "timeout 30s");
+        assert_eq!(set_for_session(&mut state, &Setting::Timeout(Some(0))), "no timeout");
+        assert_eq!(set_for_session(&mut state, &Setting::Timeout(None)), "timeout 600s");
+        assert!(state.config.fail_fast && state.config.ndjson && state.config.raw);
+        // Export remembers its name for the next time it is turned on.
+        assert_eq!(set_for_session(&mut state, &Setting::Export(Some(SEED.to_string()))), format!("export on: {SEED}"));
+        assert_eq!(set_for_session(&mut state, &Setting::Export(None)), "export off");
+        assert_eq!(state.export_name.as_deref(), Some(SEED));
+        assert_eq!(settings_menu(&state)[1].2, Setting::Export(Some(SEED.to_string())));
+        // Streaming is the server's to offer.
+        assert_eq!(set_for_session(&mut state, &Setting::Stream(true)), STREAMING_INFO_MSG);
+        assert!(state.config.streaming);
+        assert_eq!(set_for_session(&mut state, &Setting::Stream(false)), "streaming off");
+        state.config.server_streaming = false;
+        assert_eq!(set_for_session(&mut state, &Setting::Stream(true)), "streaming not available on this server");
+        assert!(!state.config.streaming && !state.config.given.stream);
+        // What a file had set is the file's: the session's own stays.
+        state.config.file.include_nulls = true;
+        state.config.apply_settings();
+        assert!(state.config.include_nulls);
+        state.config.file = Settings::default();
+        state.config.apply_settings();
+        assert!(!state.config.include_nulls && state.config.fail_fast);
     }
 
     #[test]

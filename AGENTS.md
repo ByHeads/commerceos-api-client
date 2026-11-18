@@ -895,7 +895,8 @@ GET /people~count > /tmp/count.json          # as the server answers, nulls incl
 - The `-p` preview and the `-sa` log list the line where it is written. It is
   not counted as a request.
 - **At the prompt** a `set` line changes what the session has set, and Tab
-  completes the name. The session stands where the command line stands for a
+  completes the name. [`ctrl+t` opens the same settings as a
+  menu](#the-settings-menu-ctrlt). The session stands where the command line stands for a
   batch: what it has set holds for every line typed after it and for a file
   run from the prompt, and a `set` line in that file does not turn it off
   (the log says `↳ ignored: the session has set include-nulls`). Unlike the
@@ -1195,14 +1196,10 @@ Rules:
 - It works for one request and in a batch (`api --export com.heads.seedID
   -sa export.api`, with a `> file` per request). For only some requests of
   a file, write a [`set export` line](#set-name-value) in it.
-- **At the interactive prompt, `ctrl+r` turns export mode on and off**, the
-  way `ctrl+t` does streaming, and `export` shows at the right of the hint
-  line while it is on. The first time, it asks for the name: there is no
-  default. A name that is not a namespaced key is refused with a notice in
-  the hint line, and the dialog stays open with the name there to correct,
-  until it is given one or left with `esc`. The name is remembered until the
-  session ends, so turning export on again doesn't ask. A session started with `--export <name>` starts with export
-  on and has its name. The masked-data line shows in the hint line.
+- **At the interactive prompt, export mode is a row of the [settings
+  menu](#the-settings-menu-ctrlt)** that `ctrl+t` opens, and `export` shows
+  at the right of the hint line while it is on. `set export <name>` typed at
+  the prompt does the same. The masked-data line shows in the hint line.
 - Output is indented; `-r` prints it on one line. NDJSON (`--ndjson`, or a
   `> file.ndjson`) is rewritten line by line.
 - A response that is not JSON (a `> file.csv`, a `.sql`) is written unchanged,
@@ -1211,6 +1208,56 @@ Rules:
   the rewritten body.
 - The whole body is needed, so `--stream` is ignored while export is on (at
   the prompt, `export` takes the place of the `streaming` marker).
+
+### The settings menu (`ctrl+t`)
+
+At the interactive prompt `ctrl+t` opens a menu of the settings a
+[`set` line](#set-name-value) can change, in the place of the command area,
+the way `ctrl+h` opens the shortcuts:
+
+```
+› Response streaming                    off
+  Export mode (responses as seed data)  com.heads.seedID
+  Include nulls                         on
+  Fail fast                             off
+  NDJSON                                off
+  Raw JSON (no pretty printing)         off
+  Timeout                               600s
+
+  ↑/↓ to move, enter to change, ctrl+t or esc to close
+```
+
+- `↑`/`↓` move the cursor, round from the last row to the first. `enter` or
+  the space bar changes the row it is on. The menu opens on its first row
+  every time, so the same keys always reach the same setting.
+- **It stays open** until `ctrl+t` or `esc`, so several settings can be
+  changed in one visit. Any other key closes it and does what it does at the
+  prompt.
+- **A row is a `set` line.** Changing one is typing `set include-nulls` or
+  `set fail-fast off`: it changes what the session has set, for every request
+  sent from then on and for a file run from the prompt. A setting typed with
+  `set`, or given when the session was started (`api -i`), shows in the menu
+  as it stands.
+- **A value that has to be typed is asked for** in the command area, as
+  `ctrl+s` asks for a connection's name: the seconds of the timeout, and the
+  name for export mode the first time it is turned on. An answer that can't
+  be used (a name that is not a namespaced key, a timeout that is no whole
+  number) is refused with a notice and stays on the line to correct; `esc`
+  or an empty answer leaves the setting as it was. The menu is back when the
+  dialog ends. The export name is remembered until the session ends, so
+  turning export on again doesn't ask; a session started with `--export
+  <name>` has it already, and `set export <other-name>` changes it.
+- What was changed is said in the menu's last row, in the place of the hint,
+  as the hint line of the prompt says it: `include-nulls on`, `export on:
+  com.heads.seedID`, `timeout 45s`. On a server that does not stream, the
+  first row says `streaming not available on this server` and stays off.
+- **What is on is marked at the right of the hint line**, one word each:
+  `nulls · fail-fast · ndjson · raw · timeout 45s`, and last `export` or
+  `streaming`. On a line too narrow for all of them the ones on the left go
+  first.
+- There is no key for one setting alone: `ctrl+r` no longer turns export
+  mode on and off, and `ctrl+t` opens the menu where it turned streaming on
+  and off. Streaming is the menu's first row: `ctrl+t`, `enter`.
 
 ### Credentials from disk (`--no-keychain`)
 

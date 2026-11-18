@@ -76,7 +76,7 @@ api seed.api                                                 # run a file, same 
 to another environment: database keys are dropped, a record with no other identifier keeps its key
 under the name you give and as `key?` (a key that may name nothing), and masked values become `null`
 (it says where). The name is a namespaced key such as `com.heads.seedID`. At the prompt,
-`ctrl+r` turns it on and off and asks for the name the first time. In a `.api` file, a line
+`ctrl+t` opens the settings menu, where it is a row that asks for the name the first time. In a `.api` file, a line
 `set export com.heads.seedID` turns it on for the requests below it in that file, and `set export off` ends it.
 
 ```sh
@@ -307,8 +307,7 @@ two can't be told apart: set the terminal to send DEL (`0x7f`) for Backspace.
 | `ctrl+l` | Clear output |
 | `ctrl+o` | Open the last saved file |
 | `ctrl+b` | Open API docs in the browser |
-| `ctrl+t` | Toggle streaming |
-| `ctrl+r` | Toggle export mode; asks for the external identifier name the first time |
+| `ctrl+t` | Settings menu: streaming, export mode, include nulls, fail fast, NDJSON, raw JSON, timeout. `↑`/`↓` move, `enter` or space changes a row, `ctrl+t` or `esc` closes. A row is a `set` line typed at the prompt |
 | `ctrl+s` | Save connection; under a new name it is renamed, and stays the default if it was |
 | `ctrl+q` | Switch connection; the flags the session was started with (`-i`, `-f`, `--timeout`, `--export`…) stay |
 | `ctrl+c` | Quit (press twice) |

@@ -2374,7 +2374,7 @@ fn the_prompt_reads_modified_keys_as_what_they_are() {
     prompt.pump(Duration::from_millis(300));
 
     // In a name dialog a letter typed with alt or ctrl is not a letter.
-    prompt.send(b"\x12");
+    prompt.send(EXPORT_ROW);
     prompt.wait_for("Export with external identifier", Duration::from_secs(5));
     prompt.send(b"\x1bb");
     prompt.pump(Duration::from_millis(100));
@@ -2387,6 +2387,8 @@ fn the_prompt_reads_modified_keys_as_what_they_are() {
     prompt.pump(Duration::from_millis(600));
     let shown = pty::plain(&prompt.screen[mark..]);
     assert!(!shown.contains("export needs a namespaced key"), "{shown}");
+    prompt.send(CLOSE_MENU);
+    prompt.pump(Duration::from_millis(400));
     assert!(pty::rows(&prompt.screen, 200).last().unwrap().ends_with("export"), "{}", screen_tail(&prompt));
 }
 
@@ -4616,11 +4618,12 @@ fn export_at_the_prompt_shows_the_seed_data() {
     assert!(shown.contains("\"ok\""), "{shown}");
 }
 
-/// ctrl+r turns export mode on and off in a running session. The name is
-/// asked for the first time, has to be a namespaced key, and is remembered.
+/// The export row of the settings menu turns export mode on and off in a
+/// running session. The name is asked for the first time, has to be a
+/// namespaced key, and is remembered.
 #[cfg(unix)]
 #[test]
-fn ctrl_r_toggles_export_at_the_prompt_and_asks_for_the_name_once() {
+fn the_export_row_toggles_export_at_the_prompt_and_asks_for_the_name_once() {
     use pty::Prompt;
 
     let server = RecordingServer::start();
@@ -4630,7 +4633,7 @@ fn ctrl_r_toggles_export_at_the_prompt_and_asks_for_the_name_once() {
     let mut prompt = Prompt::open(api(server.port, dir.path()));
     prompt.wait_ready(Duration::from_secs(15));
 
-    // Type `keys` (ctrl+r is \x12), and give the screen what it showed.
+    // Type `keys`, and give the screen what it showed.
     fn keys(prompt: &mut pty::Prompt, keys: &[u8]) -> String {
         let mark = prompt.screen.len();
         prompt.send(keys);
@@ -4661,14 +4664,18 @@ fn ctrl_r_toggles_export_at_the_prompt_and_asks_for_the_name_once() {
     let shown = get_keyed(&mut prompt, &server);
     assert!(shown.contains("\"key\": \"k1\"") && shown.contains("********"), "{shown}");
 
-    // ctrl+r asks for the name. There is no default to accept.
-    let shown = keys(&mut prompt, b"\x12");
+    // The row asks for the name. There is no default to accept.
+    let shown = keys(&mut prompt, EXPORT_ROW);
     assert!(shown.contains("Export with external identifier:"), "{shown}");
     assert!(shown.contains("enter to turn export on, esc to cancel"), "{shown}");
-    // Esc leaves export off, and so does an empty answer.
+    // Esc leaves export off, and the menu is back on the row it was on,
+    // with what happened said in its last row.
     let shown = keys(&mut prompt, b"\x1b");
     assert!(shown.contains("cancelled"), "{shown}");
-    keys(&mut prompt, b"\x12");
+    assert!(shown.contains("› Export mode (responses as seed data)  off"), "{shown}");
+    // Enter on the row asks again, and an empty answer leaves it off too.
+    let shown = keys(&mut prompt, b"\r");
+    assert!(shown.contains("Export with external identifier:"), "{shown}");
     let shown = keys(&mut prompt, b"\r");
     assert!(shown.contains("cancelled"), "{shown}");
     let shown = get_keyed(&mut prompt, &server);
@@ -4676,7 +4683,7 @@ fn ctrl_r_toggles_export_at_the_prompt_and_asks_for_the_name_once() {
 
     // A name that is no namespaced key is refused with the prompt's notice,
     // and the dialog stays open with what was typed left to correct.
-    keys(&mut prompt, b"\x12");
+    keys(&mut prompt, EXPORT_ROW);
     let shown = keys(&mut prompt, b"seedID\r");
     assert!(shown.contains("export needs a namespaced key, like com.heads.seedID"), "{shown}");
     assert!(shown.contains("Export with external identifier: seedID"), "{shown}");
@@ -4688,6 +4695,8 @@ fn ctrl_r_toggles_export_at_the_prompt_and_asks_for_the_name_once() {
     // Six backspaces, then a good one.
     let shown = keys(&mut prompt, b"\x7f\x7f\x7f\x7f\x7f\x7fcom.example.exportID\r");
     assert!(shown.contains("export on: com.example.exportID"), "{shown}");
+    // The menu is back and shows the name as the row's value.
+    assert!(shown.contains("› Export mode (responses as seed data)  com.example.exportID"), "{shown}");
 
     // On: the response is the seed data, under that name.
     let shown = get_keyed(&mut prompt, &server);
@@ -4697,21 +4706,21 @@ fn ctrl_r_toggles_export_at_the_prompt_and_asks_for_the_name_once() {
     let shown = keys(&mut prompt, b"\x15");
     assert!(shown.trim_end().ends_with("export"), "{shown:?}");
 
-    // ctrl+r again turns it off, and the next response is plain again.
-    let shown = keys(&mut prompt, b"\x12");
+    // The row again turns it off, and the next response is plain again.
+    let shown = keys(&mut prompt, EXPORT_ROW);
     assert!(shown.contains("export off"), "{shown}");
     let shown = get_keyed(&mut prompt, &server);
     assert!(shown.contains("\"key\": \"k1\"") && !shown.contains("key?"), "{shown}");
 
     // And on once more: the name is remembered, nothing is asked.
-    let shown = keys(&mut prompt, b"\x12");
+    let shown = keys(&mut prompt, EXPORT_ROW);
     assert!(shown.contains("export on: com.example.exportID"), "{shown}");
     assert!(!shown.contains("Export with external identifier"), "{shown}");
     let shown = get_keyed(&mut prompt, &server);
     assert!(shown.contains("\"com.example.exportID\": \"k1\""), "{shown}");
 }
 
-/// The dialog ctrl+r opens is drawn in the command area and nowhere else:
+/// The dialog the export row opens is drawn in the command area and nowhere else:
 /// the top ruler stays, the prompt takes the input line's place, the bottom
 /// ruler and a hint follow, and closing it gives the command area back as it
 /// was. In a terminal narrower than its texts, nothing may wrap: a wrapped
@@ -4768,7 +4777,7 @@ fn the_export_name_dialog_stays_in_the_command_area_at_any_width() {
             assert!(now[top + 3].starts_with(hint), "{cols}, {what}: {:?}\n{shown}", now[top + 3]);
         };
 
-        let now = keys(&mut prompt, b"\x12");
+        let now = keys(&mut prompt, EXPORT_ROW);
         dialog(&now, "opened");
         // The hint is the one every dialog of the prompt has.
         assert_eq!(now[top + 3], HINT, "{cols}");
@@ -4804,23 +4813,51 @@ fn the_export_name_dialog_stays_in_the_command_area_at_any_width() {
             assert_eq!(now[top + 3], HINT, "{cols}");
         }
 
+        // The settings menu, which is back when the dialog ends: under the
+        // top ruler, a blank row, a row per setting with the cursor on the
+        // export row, a blank row and its hint row, where `said` stands.
+        // Nothing of it reaches the margin, so nothing wraps.
+        let menu = |now: &[String], said: &str, what: &str| {
+            let shown = now.join("\n");
+            assert_eq!(now[..=top], before[..=top], "{cols}, {what}: the rows above changed\n{shown}");
+            assert_eq!(now.len(), top + 11, "{cols}, {what}: not the menu's rows\n{shown}");
+            assert_eq!(now[top + 1], "", "{cols}, {what}:\n{shown}");
+            assert!(now[top + 2].starts_with("  Response streaming"), "{cols}, {what}:\n{shown}");
+            assert!(now[top + 3].starts_with("› Export mode"), "{cols}, {what}:\n{shown}");
+            assert!(now[top + 8].starts_with("  Timeout"), "{cols}, {what}:\n{shown}");
+            assert_eq!(now[top + 9], "", "{cols}, {what}:\n{shown}");
+            let said: String = format!("  {said}").chars().take(width - 1).collect();
+            assert_eq!(now[top + 10], said.trim_end(), "{cols}, {what}:\n{shown}");
+            assert!(now[top + 1..].iter().all(|row| row.chars().count() < width), "{cols}, {what}:\n{shown}");
+            assert_eq!(ruler_rows(now).len(), 1, "{cols}, {what}: a ruler was left behind\n{shown}");
+        };
+
         // Cancelled, and opened and cancelled again: nothing is left behind,
-        // and esc discards what was typed.
+        // and esc discards what was typed. The menu is back each time, and
+        // closing it gives the command area as it was.
         let now = keys(&mut prompt, b"\x1b");
-        closed(&now, "  cancelled", "cancelled");
+        menu(&now, "cancelled", "cancelled");
+        let now = keys(&mut prompt, CLOSE_MENU);
+        closed(&now, "  cancelled", "cancelled, the menu closed");
         for round in 0..3 {
-            let now = keys(&mut prompt, b"\x12");
+            let now = keys(&mut prompt, EXPORT_ROW);
             dialog(&now, &format!("opened again, {round}"));
             assert!(now[top + 1].ends_with("identifier:"), "{cols}, {round}: {:?}", now[top + 1]);
             assert_eq!(now[top + 3], HINT, "{cols}, {round}");
             let now = keys(&mut prompt, b"\x1b");
-            closed(&now, "  cancelled", &format!("cancelled, {round}"));
+            menu(&now, "cancelled", &format!("cancelled, {round}"));
+            let now = keys(&mut prompt, CLOSE_MENU);
+            closed(&now, "  cancelled", &format!("cancelled, {round}, the menu closed"));
         }
 
-        // Answered: the command area is back, with export on.
-        keys(&mut prompt, b"\x12");
+        // Answered: the menu says so, and closed, the command area is back
+        // with export on.
+        keys(&mut prompt, EXPORT_ROW);
         let now = keys(&mut prompt, b"com.example.exportID\r");
-        closed(&now, "  export on: com.example.exportID", "answered");
+        menu(&now, "export on: com.example.exportID", "answered");
+        assert!(now[top + 3].ends_with("com.example.exportID") || width < 62, "{cols}: {:?}", now[top + 3]);
+        let now = keys(&mut prompt, CLOSE_MENU);
+        closed(&now, "  export on: com.example.exportID", "answered, the menu closed");
         assert!(now[top + 3].ends_with("export"), "{cols}: {:?}", now[top + 3]);
     }
 }
@@ -4840,13 +4877,16 @@ fn ctrl_c_in_a_name_dialog_leaves_what_quitting_at_the_prompt_leaves() {
     prepare(dir.path());
 
     // (what is pressed to leave, whether a request was sent first)
-    let ways: [(&str, &[u8], bool); 6] = [
-        ("ctrl+c twice at the prompt", b"\x03\x03", false),
-        ("ctrl+c in the export dialog", b"\x12\x03", false),
-        ("ctrl+c in the save dialog", b"\x13\x03", false),
-        ("ctrl+c twice at the prompt, after a request", b"\x03\x03", true),
-        ("ctrl+c in the export dialog, after a request", b"\x12\x03", true),
-        ("ctrl+c in the save dialog, after a request", b"\x13\x03", true),
+    // The timeout is the last row of the settings menu: up from the first.
+    let ways: [(&str, &[&[u8]], bool); 8] = [
+        ("ctrl+c twice at the prompt", &[b"\x03", b"\x03"], false),
+        ("ctrl+c in the export dialog", &[b"\x14", b"\x1b[B", b"\r", b"\x03"], false),
+        ("ctrl+c in the timeout dialog", &[b"\x14", b"\x1b[A", b"\r", b"\x03"], false),
+        ("ctrl+c in the save dialog", &[b"\x13", b"\x03"], false),
+        ("ctrl+c twice at the prompt, after a request", &[b"\x03", b"\x03"], true),
+        ("ctrl+c in the export dialog, after a request", &[b"\x14", b"\x1b[B", b"\r", b"\x03"], true),
+        ("ctrl+c in the timeout dialog, after a request", &[b"\x14", b"\x1b[A", b"\r", b"\x03"], true),
+        ("ctrl+c in the save dialog, after a request", &[b"\x13", b"\x03"], true),
     ];
     for (way, keys, used) in ways {
         let mut prompt = Prompt::open_sized(api(server.port, dir.path()), COLS as u16);
@@ -4873,7 +4913,7 @@ fn ctrl_c_in_a_name_dialog_leaves_what_quitting_at_the_prompt_leaves() {
         }
 
         for key in keys {
-            prompt.send(&[*key]);
+            prompt.send(key);
             prompt.pump(Duration::from_millis(450));
         }
         let start = Instant::now();
@@ -5143,7 +5183,7 @@ fn a_paste_fills_a_name_dialog() {
     assert!(saved.contains(r#""name":"pasted-name""#), "{saved}");
 
     prompt.pump(Duration::from_millis(300));
-    prompt.send(b"\x12");
+    prompt.send(EXPORT_ROW);
     prompt.wait_for("Export with external identifier", Duration::from_secs(5));
     prompt.paste("com.heads.seedID");
     prompt.pump(Duration::from_millis(200));
@@ -5152,6 +5192,8 @@ fn a_paste_fills_a_name_dialog() {
     prompt.pump(Duration::from_millis(600));
     let shown = plain(&prompt.screen[mark..]);
     assert!(!shown.contains("cancelled"), "{shown}");
+    prompt.send(CLOSE_MENU);
+    prompt.pump(Duration::from_millis(400));
     assert!(pty::rows(&prompt.screen, 200).last().unwrap().ends_with("export"), "{shown}");
 }
 
@@ -5241,7 +5283,7 @@ fn a_paste_of_several_lines_gives_a_name_dialog_its_first() {
         // In the export dialog the first line is the name, where the whole
         // paste would be refused.
         prompt.pump(Duration::from_millis(300));
-        prompt.send(b"\x12");
+        prompt.send(EXPORT_ROW);
         prompt.wait_for("Export with external identifier", Duration::from_secs(5));
         prompt.paste("com.heads.seedID\rcom.heads.other");
         prompt.pump(Duration::from_millis(200));
@@ -5250,6 +5292,8 @@ fn a_paste_of_several_lines_gives_a_name_dialog_its_first() {
         prompt.pump(Duration::from_millis(600));
         let shown = pty::plain(&prompt.screen[mark..]);
         assert!(!shown.contains("export needs a namespaced key"), "{shown}");
+        prompt.send(CLOSE_MENU);
+        prompt.pump(Duration::from_millis(400));
         assert!(pty::rows(&prompt.screen, 200).last().unwrap().ends_with("export"), "{shown}");
     }
 }
@@ -5461,7 +5505,7 @@ fn a_resize_during_a_wait_or_a_dialog_is_drawn_when_it_ends() {
     assert_eq!(last_ruler(&prompt.screen[mark..]), 80, "{}", pty::plain(&prompt.screen[mark..]));
 
     // In the export dialog.
-    prompt.send(b"\x12");
+    prompt.send(EXPORT_ROW);
     prompt.wait_for("Export with external identifier", Duration::from_secs(5));
     prompt.pump(Duration::from_millis(200));
     let mark = prompt.screen.len();
@@ -5476,6 +5520,9 @@ fn a_resize_during_a_wait_or_a_dialog_is_drawn_when_it_ends() {
     assert!(input.starts_with('…') && asks.chars().count() + input.chars().count() < 70, "{input:?}");
     prompt.send(b"\x1b");
     prompt.pump(Duration::from_millis(600));
+    // The settings menu is back, at the new width; closed, so is the prompt.
+    prompt.send(CLOSE_MENU);
+    prompt.pump(Duration::from_millis(400));
     assert_eq!(last_ruler(&prompt.screen[mark..]), 70, "{}", pty::plain(&prompt.screen[mark..]));
 
     // At the question whether to write over a saved connection.
@@ -5576,11 +5623,201 @@ fn help_is_cut_to_a_short_terminal() {
     assert!(!shown.contains("more rows"), "{shown}");
 }
 
-/// A session started with `--export <name>` has its name: ctrl+r turns
-/// export off and on again without asking.
+/// ctrl+t opens the settings menu in the command area's place: a row per
+/// setting, the arrows to move, Enter or the space bar to change the row the
+/// cursor is on. It stays open until ctrl+t or esc, and what it changed
+/// holds for the requests sent after it, as a typed `set` line does.
 #[cfg(unix)]
 #[test]
-fn ctrl_r_in_a_session_started_with_export_does_not_ask() {
+fn the_settings_menu_changes_what_the_session_has_set() {
+    use pty::Prompt;
+
+    const COLS: usize = 100;
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    prepare(dir.path());
+    let mut prompt = Prompt::open_sized(api(server.port, dir.path()), COLS as u16);
+    prompt.wait_ready(Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(600));
+    let keys = |prompt: &mut Prompt, keys: &[u8]| {
+        prompt.send(keys);
+        prompt.pump(Duration::from_millis(400));
+        pty::rows(&prompt.screen, COLS)
+    };
+
+    let mut before = pty::rows(&prompt.screen, COLS);
+    let mut top = before.len() - 4;
+    assert!(before[top + 3].starts_with("  ctrl+h for shortcuts"), "{}", before.join("\n"));
+    const HINT: &str = "  ↑/↓ to move, enter to change, ctrl+t or esc to close";
+    // The menu as it stands under the rows of `before`: the row the cursor
+    // is on, and each value.
+    let menu = |now: &[String], before: &[String], cursor: usize, values: [&str; 7], said: &str, what: &str| {
+        let top = before.len() - 4;
+        let shown = now.join("\n");
+        assert_eq!(now[..=top], before[..=top], "{what}: the rows above changed\n{shown}");
+        assert_eq!(now.len(), top + 11, "{what}: not the menu's rows\n{shown}");
+        let labels = [
+            "Response streaming                  ",
+            "Export mode (responses as seed data)",
+            "Include nulls                       ",
+            "Fail fast                           ",
+            "NDJSON                              ",
+            "Raw JSON (no pretty printing)       ",
+            "Timeout                             ",
+        ];
+        let rows: Vec<String> = (0..7)
+            .map(|at| format!("{} {}  {}", if at == cursor { "›" } else { " " }, labels[at], values[at]))
+            .collect();
+        assert_eq!(now[top + 1], "", "{what}\n{shown}");
+        assert_eq!(now[top + 2..top + 9], rows[..], "{what}\n{shown}");
+        assert_eq!(now[top + 9], "", "{what}\n{shown}");
+        assert_eq!(now[top + 10], said, "{what}\n{shown}");
+        assert_eq!(ruler_rows(now), [top], "{what}: a ruler too many\n{shown}");
+    };
+    let closed = |now: &[String], before: &[String], hint: &str, what: &str| {
+        let top = before.len() - 4;
+        let shown = now.join("\n");
+        assert_eq!(now.len(), before.len(), "{what}: the command area moved\n{shown}");
+        assert_eq!(now[..top + 3], before[..top + 3], "{what}: not what it was\n{shown}");
+        assert_eq!(now[top + 3], hint, "{what}\n{shown}");
+        assert_eq!(ruler_rows(now), [top, top + 2], "{what}\n{shown}");
+    };
+    let off = ["off", "off", "off", "off", "off", "off", "600s"];
+
+    // Opened on its first row, whatever row it was left on.
+    let now = keys(&mut prompt, b"\x14");
+    menu(&now, &before, 0, off, HINT, "opened");
+    // The arrows go round.
+    let now = keys(&mut prompt, b"\x1b[A");
+    menu(&now, &before, 6, off, HINT, "up from the first row");
+    let now = keys(&mut prompt, b"\x1b[B");
+    menu(&now, &before, 0, off, HINT, "down from the last row");
+    let now = keys(&mut prompt, b"\x1b[B\x1b[B");
+    menu(&now, &before, 2, off, HINT, "two down");
+
+    // Enter changes the row and says so in the last row, where the hint is
+    // back once the notice has had its time. The menu stays open.
+    let now = keys(&mut prompt, b"\r");
+    menu(&now, &before, 2, ["off", "off", "on", "off", "off", "off", "600s"], "  include-nulls on", "nulls on");
+    // The space bar does what Enter does.
+    let now = keys(&mut prompt, b"\x1b[B ");
+    menu(&now, &before, 3, ["off", "off", "on", "on", "off", "off", "600s"], "  fail-fast on", "fail fast on");
+    prompt.pump(Duration::from_millis(3200));
+    menu(&pty::rows(&prompt.screen, COLS), &before, 3, ["off", "off", "on", "on", "off", "off", "600s"], HINT, "the notice has gone");
+
+    // ctrl+t closes it. The command area is back, with what is on marked
+    // at the right of the hint line.
+    let now = keys(&mut prompt, b"\x14");
+    closed(&now, &before, &format!("  ctrl+h for shortcuts{}nulls · fail-fast", " ".repeat(COLS - 22 - 17 - 2)), "closed");
+
+    // What it set is what the session has set: the next request has it, a
+    // block stops at its first failure, and a typed line changes it again.
+    let (sent, shown, accepts) = run_pasted_accepts(&mut prompt, &server, "GET /missing\nGET /never");
+    assert_eq!(sent, ["GET /missing"], "{shown}");
+    assert_eq!(accepts, ["application/json;skipNulls=false"]);
+    assert!(shown.contains("stopped at 404 (--fail-fast)"), "{shown}");
+    run_pasted(&mut prompt, &server, "set fail-fast off");
+    prompt.pump(Duration::from_millis(3200));
+    prompt.send(b"\x15");
+    prompt.pump(Duration::from_millis(200));
+    // The requests are in the scrollback now, and the command area under them.
+    before = pty::rows(&prompt.screen, COLS);
+    top = before.len() - 4;
+
+    // Opened again it is on its first row, and shows what a typed line did.
+    let now = keys(&mut prompt, b"\x14");
+    menu(&now, &before, 0, ["off", "off", "on", "off", "off", "off", "600s"], HINT, "opened again");
+    // esc closes it too.
+    let now = keys(&mut prompt, b"\x1b");
+    assert_eq!(now.len(), before.len(), "{}", now.join("\n"));
+    assert!(now[top + 3].ends_with("nulls"), "{:?}", now[top + 3]);
+
+    // The timeout is asked for in the command area, and the menu is back
+    // when it is answered. What is no number of seconds is refused there.
+    let now = keys(&mut prompt, b"\x14");
+    menu(&now, &before, 0, ["off", "off", "on", "off", "off", "off", "600s"], HINT, "opened for the timeout");
+    let now = keys(&mut prompt, b"\x1b[A\r");
+    assert_eq!(now.len(), before.len(), "{}", now.join("\n"));
+    assert_eq!(now[top + 1], "› Timeout in seconds:", "{}", now.join("\n"));
+    assert_eq!(now[top + 3], "  enter to set the timeout, esc to cancel", "{}", now.join("\n"));
+    let now = keys(&mut prompt, b"soon\r");
+    assert_eq!(now[top + 1], "› Timeout in seconds: soon", "{}", now.join("\n"));
+    assert_eq!(now[top + 3], "  a timeout is whole seconds, 0 for none", "{}", now.join("\n"));
+    let now = keys(&mut prompt, b"\x7f\x7f\x7f\x7f45\r");
+    menu(&now, &before, 6, ["off", "off", "on", "off", "off", "off", "45s"], "  timeout 45s", "a timeout");
+    let now = keys(&mut prompt, b"\r");
+    assert_eq!(now[top + 1], "› Timeout in seconds:", "{}", now.join("\n"));
+    let now = keys(&mut prompt, b"0\r");
+    menu(&now, &before, 6, ["off", "off", "on", "off", "off", "off", "no timeout"], "  no timeout", "no timeout");
+
+    // From the menu ctrl+h goes to the shortcuts and ctrl+t back, each
+    // clearing the other: one ruler above, none left behind.
+    let now = keys(&mut prompt, b"\x08");
+    assert_eq!(ruler_rows(&now), [top], "{}", now.join("\n"));
+    assert!(now.iter().any(|row| row.starts_with("  ctrl+t     Settings")), "{}", now.join("\n"));
+    assert!(!now.iter().any(|row| row.contains("Response streaming")), "{}", now.join("\n"));
+    let now = keys(&mut prompt, b"\x14");
+    // What the menu last said still has its time, and is said again.
+    menu(&now, &before, 0, ["off", "off", "on", "off", "off", "off", "no timeout"], "  no timeout", "back from the shortcuts");
+
+    // A key that is not the menu's closes it and does what it does at the
+    // prompt: here a letter, which is typed.
+    prompt.pump(Duration::from_millis(3200));
+    let now = keys(&mut prompt, b"x");
+    assert_eq!(now.len(), before.len(), "{}", now.join("\n"));
+    assert!(now[top + 1].ends_with('x'), "{:?}", now[top + 1]);
+    assert_eq!(ruler_rows(&now), [top, top + 2], "{}", now.join("\n"));
+    assert!(now[top + 3].ends_with("nulls · no timeout"), "{:?}", now[top + 3]);
+    assert_eq!(server.take(), Vec::<String>::new());
+}
+
+/// The menu keeps to the width of the terminal, and to its height: a row
+/// that wrapped, or one that scrolled off the top, could not be cleared
+/// again when the menu closes.
+#[cfg(unix)]
+#[test]
+fn the_settings_menu_keeps_to_a_small_terminal() {
+    use pty::Prompt;
+
+    for (cols, rows) in [(44u16, 40u16), (30, 40), (22, 40), (80, 12), (80, 8)] {
+        let server = RecordingServer::start();
+        let dir = tempfile::tempdir().unwrap();
+        prepare(dir.path());
+        let mut prompt = Prompt::open_with(api(server.port, dir.path()), cols, rows);
+        prompt.wait_ready(Duration::from_secs(15));
+        prompt.pump(Duration::from_millis(600));
+        let width = cols as usize;
+        let before = pty::rows(&prompt.screen, width);
+        let keys = |prompt: &mut Prompt, keys: &[u8]| {
+            prompt.send(keys);
+            prompt.pump(Duration::from_millis(400));
+            pty::rows(&prompt.screen, width)
+        };
+        for round in 0..3 {
+            let open = keys(&mut prompt, b"\x14");
+            let shown = open.join("\n");
+            assert!(open.iter().all(|row| row.chars().count() <= width), "{cols}x{rows}, {round}: a row is too wide\n{shown}");
+            assert!(open.len() > before.len(), "{cols}x{rows}, {round}:\n{shown}");
+            // The ruler and ten rows: a screen of twelve rows holds them.
+            if rows < 12 {
+                assert!(open.last().unwrap().contains("more rows"), "{cols}x{rows}, {round}:\n{shown}");
+            }
+            // A row changed, so the menu is drawn once more before it closes.
+            keys(&mut prompt, b"\x1b[B\x1b[B\r");
+            let closed = keys(&mut prompt, b"\x14");
+            let shown = closed.join("\n");
+            assert_eq!(closed.len(), before.len(), "{cols}x{rows}, {round}: the command area moved\n{shown}");
+            assert_eq!(closed[..closed.len() - 1], before[..before.len() - 1], "{cols}x{rows}, {round}:\n{shown}");
+            assert_eq!(ruler_rows(&closed).len(), ruler_rows(&before).len(), "{cols}x{rows}, {round}: a ruler was left\n{shown}");
+        }
+    }
+}
+
+/// A session started with `--export <name>` has its name: the export row
+/// turns export off and on again without asking.
+#[cfg(unix)]
+#[test]
+fn the_export_row_in_a_session_started_with_export_does_not_ask() {
     use pty::{plain, Prompt};
 
     let server = RecordingServer::start();
@@ -5591,24 +5828,27 @@ fn ctrl_r_in_a_session_started_with_export_does_not_ask() {
     let mut prompt = Prompt::open(cmd);
     prompt.wait_ready(Duration::from_secs(15));
 
-    let press = |prompt: &mut Prompt| {
+    let press = |prompt: &mut Prompt, keys: &[u8]| {
         let mark = prompt.screen.len();
-        prompt.send(b"\x12");
+        prompt.send(keys);
         prompt.pump(Duration::from_millis(500));
         plain(&prompt.screen[mark..])
     };
-    let shown = press(&mut prompt);
+    // The menu shows the name the session was started with.
+    let shown = press(&mut prompt, b"\x14");
+    assert!(shown.contains("Export mode (responses as seed data)  com.heads.seedID"), "{shown}");
+    let shown = press(&mut prompt, b"\x1b[B\r");
     assert!(shown.contains("export off"), "{shown}");
-    let shown = press(&mut prompt);
+    // It stays open: Enter on the row again turns it back on.
+    let shown = press(&mut prompt, b"\r");
     assert!(shown.contains("export on: com.heads.seedID"), "{shown}");
     assert!(!shown.contains("Export with external identifier"), "{shown}");
 
-    // The help lists the key.
-    let mark = prompt.screen.len();
-    prompt.send(b"\x08");
-    prompt.pump(Duration::from_millis(400));
-    let shown = plain(&prompt.screen[mark..]);
-    assert!(shown.contains("ctrl+r     Toggle export mode"), "{shown}");
+    // From the menu, ctrl+h goes to the shortcuts, which list the menu's key
+    // and no longer one for export.
+    let shown = press(&mut prompt, b"\x08");
+    assert!(shown.contains("ctrl+t     Settings"), "{shown}");
+    assert!(!shown.contains("ctrl+r"), "{shown}");
 }
 
 /// Paste a line or a block at the prompt and press Enter, as `run_pasted`
@@ -6663,9 +6903,12 @@ fn the_prompt_edits_its_line_with_the_usual_keys() {
     prompt.pump(Duration::from_millis(200));
     assert_eq!(entered(&mut prompt, &server), ["GET /helped"], "{}", screen_tail(&prompt));
 
-    // ctrl+t on a server that can't stream says so.
-    let shown = press(&mut prompt, &["\x14"]);
+    // Streaming, the first row of the settings menu, says on a server that
+    // can't stream that it can't, in the menu's last row.
+    let shown = press(&mut prompt, &["\x14", "\r"]);
     assert!(shown.contains("streaming not available on this server"), "{shown}");
+    assert!(shown.contains("› Response streaming                    off"), "{shown}");
+    press(&mut prompt, &["\x14"]);
     // One ctrl+c asks for another, and any other key takes the question back.
     let shown = press(&mut prompt, &["\x03"]);
     assert!(shown.contains("ctrl+c again to exit"), "{shown}");
@@ -7135,10 +7378,11 @@ fn one_shot_corners_of_the_command_line() {
     assert_eq!(server.take(), ["PUT /typed {\"a\":1}"], "{shown}");
 }
 
-/// ctrl+t turns streaming off and on again on a server that can stream.
+/// The first row of the settings menu turns streaming off and on again on a
+/// server that can stream.
 #[cfg(unix)]
 #[test]
-fn ctrl_t_toggles_streaming_on_a_server_that_streams() {
+fn the_streaming_row_toggles_streaming_on_a_server_that_streams() {
     let server = RecordingServer::start();
     let url = format!("http://127.0.0.1:{}", server.port);
     let dir = tempfile::tempdir().unwrap();
@@ -7148,10 +7392,16 @@ fn ctrl_t_toggles_streaming_on_a_server_that_streams() {
     prompt.wait_ready(Duration::from_secs(15));
     let on = |prompt: &pty::Prompt| pty::rows(&prompt.screen, 200).last().is_some_and(|row| row.trim_end().ends_with("streaming"));
     assert!(pump_until(&mut prompt, Duration::from_secs(5), |p| on(p)), "{}", screen_tail(&prompt));
-    prompt.send(b"\x14");
+    // Open the menu, change the row, close the menu.
+    prompt.send(b"\x14\r");
+    prompt.pump(Duration::from_millis(400));
+    assert!(screen_tail(&prompt).contains("streaming off"), "{}", screen_tail(&prompt));
+    prompt.send(CLOSE_MENU);
     prompt.pump(Duration::from_millis(400));
     assert!(!on(&prompt), "{}", screen_tail(&prompt));
-    prompt.send(b"\x14");
+    prompt.send(b"\x14\r");
+    prompt.pump(Duration::from_millis(400));
+    prompt.send(CLOSE_MENU);
     prompt.pump(Duration::from_millis(400));
     assert!(on(&prompt), "{}", screen_tail(&prompt));
 }
@@ -7181,6 +7431,15 @@ fn a_piped_body_that_cannot_be_read_sends_nothing() {
     assert!(stderr.contains("could not read the body from stdin"), "{stderr}");
     assert_eq!(server.take(), Vec::<String>::new());
 }
+
+/// What turns export mode on or off from the prompt: ctrl+t opens the
+/// settings menu, down goes to its export row, Enter changes it. The menu
+/// stays open; the first time a dialog asks for the name before it is back.
+#[cfg(unix)]
+const EXPORT_ROW: &[u8] = b"\x14\x1b[B\r";
+/// ctrl+t again closes the settings menu.
+#[cfg(unix)]
+const CLOSE_MENU: &[u8] = b"\x14";
 
 /// Paste a line or a block at the prompt, press Enter, and wait until the
 /// server has been quiet: what was sent, and what the screen showed.
@@ -8961,7 +9220,7 @@ fn a_dialog_is_never_seen_with_its_input_line_half_drawn() {
     let mut prompt = pty::Prompt::open_sized(api(server.port, dir.path()), COLS as u16);
     prompt.wait_ready(Duration::from_secs(15));
     let top = ruler_rows(&pty::rows(&prompt.screen, COLS))[0];
-    prompt.send(b"\x12");
+    prompt.send(EXPORT_ROW);
     prompt.wait_for("Export with external identifier", Duration::from_secs(5));
     // Refused: the notice is up for three seconds, and drawn all the while.
     prompt.send(b"seedID\r");
