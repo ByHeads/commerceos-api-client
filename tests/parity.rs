@@ -9870,3 +9870,21 @@ fn importing_is_said_only_for_an_import() {
     let (_, shown) = run_pasted(&mut prompt, &server, "import dir lib { \"path\": \"libdir\" }\rlib/d.api");
     assert!(shown.contains("importing…"), "{shown}");
 }
+
+/// A key typed in the body of a chain's second request is offered the keys
+/// of that request's URI, not of the first one's: the ghost while it is
+/// typed, as Tab has it.
+#[cfg(unix)]
+#[test]
+fn a_key_typed_in_a_chain_is_offered_the_keys_of_its_own_segment() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = open_completing(&server, dir.path(), &["-x"]);
+    // `/pets` has no keys to offer; a person has `givenName`.
+    let shown = press(&mut prompt, &["GET /people && PUT /pets {", "\"", "g"]);
+    assert!(!shown.contains("ivenName"), "{shown}");
+    let shown = press(&mut prompt, &["GET /pets && PUT /people {", "\"", "g"]);
+    assert!(shown.contains("ivenName"), "{shown}");
+    let shown = press(&mut prompt, &["GET /pets && PUT /people {", "\"", "g", "\t"]);
+    assert!(shown.contains("\"givenName\":"), "{shown}");
+}

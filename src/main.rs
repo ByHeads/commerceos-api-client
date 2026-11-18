@@ -11813,9 +11813,13 @@ fn handle_key_event(
                 // Auto-trigger JSON completion for ghost text when typing a key name
                 if state.config.experimental && inside_brackets {
                     // Only when in a key string: just opened, or being typed
-                    if json_context_at_cursor(state).is_some_and(|ctx| ctx.pos == JsonPos::Key && ctx.in_string) {
-                        handle_json_tab_completion(state, false, false);
-                    }
+                    // In the cursor's `&&` segment, as Tab reads it: the keys
+                    // are those of that segment's URI, not of the first.
+                    with_chain_segment_view(state, |state| {
+                        if json_context_at_cursor(state).is_some_and(|ctx| ctx.pos == JsonPos::Key && ctx.in_string) {
+                            handle_json_tab_completion(state, false, false);
+                        }
+                    });
                 }
             }
             // Typing a body promotes GET to PUT (a body implies a write).
@@ -16920,7 +16924,12 @@ fn close_pending_bracket(state: &mut AppState) -> bool {
 /// Shift+Tab: the previous completion of the list Tab is cycling through.
 /// Returns whether the prompt has to be drawn again.
 fn backtab_pressed(state: &mut AppState) -> bool {
-    if state.completions.is_empty() || cursor_behind_chain_segment(state) {
+    if state.completions.is_empty() || cursor_behind_chain_segment(state) || cursor_behind_file_path(state) {
+        return false;
+    }
+    // The list a ghost was read from is not one Tab has gone into: there is
+    // no completion to go back from, in a body as in a URI or a path.
+    if state.last_tab_input.starts_with("json_ghost:") {
         return false;
     }
     if cursor_in_file_path(state) {
@@ -16937,7 +16946,7 @@ fn backtab_pressed(state: &mut AppState) -> bool {
 /// URI. Returns whether the prompt has to be drawn again.
 fn tab_pressed(state: &mut AppState) -> bool {
     // Between a segment and its `&&` the cursor is in neither.
-    if cursor_behind_chain_segment(state) {
+    if cursor_behind_chain_segment(state) || cursor_behind_file_path(state) {
         return false;
     }
     // File completion (after > or @), with the cursor in the file path
@@ -16979,6 +16988,13 @@ fn tab_pressed(state: &mut AppState) -> bool {
         let had_completions = !state.completions.is_empty();
         let parts: Vec<&str> = state.input.split_whitespace().collect();
         let at = line_uri(&state.input);
+        // In the middle of a word of the URI there is nothing to complete:
+        // what is written there would be left behind what Tab wrote. The
+        // ghost shows nothing there either.
+        let in_a_word = |c: char| !(c.is_whitespace() || matches!(c, '/' | '~' | '(' | ')' | '?' | '&' | ',' | '='));
+        if cursor_byte < at.end && !had_completions && state.input[cursor_byte..].chars().next().is_some_and(in_a_word) {
+            return false;
+        }
         let uri = state.input[at.start..at.end].to_string();
 
         // Try body bracket completion first (e.g., Tab after "PUT /people ")
@@ -17042,6 +17058,11 @@ fn get_completion_ghost(state: &AppState) -> String {
         if ctx.is_include && could_become_a_keyword(partial) {
             return String::new();
         }
+        // Behind a blank that follows the path the cursor is not at its
+        // end: a ghost drawn there would not be what Tab writes.
+        if cursor_behind_file_path(state) {
+            return String::new();
+        }
         // Check for ~ operator on body file argument
         if let Some((_, after_tilde)) = body_file_operator(&ctx) {
             if after_tilde.starts_with("map(") {
@@ -17051,13 +17072,16 @@ fn get_completion_ghost(state: &AppState) -> String {
                     return String::new();
                 }
                 let inside = inside_raw.trim_end_matches(')');
-                for name in &state.mapped_types {
-                    if name.to_lowercase().starts_with(&inside.to_lowercase()) && name.len() > inside.len() {
+                // The first name that starts so, which is the one Tab
+                // writes: a name that is typed whole gets its `)`.
+                let first = state.mapped_types.iter().find(|name| name.to_lowercase().starts_with(&inside.to_lowercase()));
+                return match first {
+                    Some(name) => {
                         let ghost: String = name.chars().skip(inside.chars().count()).collect();
-                        return format!("{})", ghost);
+                        format!("{})", ghost)
                     }
-                }
-                return String::new();
+                    None => String::new(),
+                };
             }
             // Only complete map( on body file args
             if !after_tilde.contains('(') && "map(".starts_with(after_tilde) {
@@ -17220,7 +17244,7 @@ struct FilePathContext {
     is_include: bool,
 }
 
-const DIRECTIVES: [&str; 5] = ["sleep", "assert", "confirm", "url", "import"];
+const DIRECTIVES: [&str; 6] = ["sleep", "assert", "confirm", "url", "import", "export"];
 
 /// The include path being typed, when the line can only be one: a single line
 /// that is no chain and whose first word is no method, directive or `/path`.
@@ -17276,6 +17300,14 @@ fn body_file_operator(ctx: &FilePathContext) -> Option<(&str, &str)> {
     }
     let tilde = ctx.partial.rfind('~').filter(|&at| at > 0)?;
     Some((&ctx.partial[..tilde], &ctx.partial[tilde + 1..]))
+}
+
+/// Whether the cursor stands behind a blank that follows the file path of
+/// its segment (`GET /x > out ^`). The path ended at the blank: there is
+/// nothing to complete from there, for the ghost or for Tab.
+fn cursor_behind_file_path(state: &AppState) -> bool {
+    extract_file_path_context(&state.input, state.cursor_pos)
+        .is_some_and(|ctx| char_to_byte_idx(&state.input, state.cursor_pos) > ctx.path_end)
 }
 
 /// Whether the cursor is in the file path of its `&&` segment (an outfile,
@@ -29283,5 +29315,107 @@ mod tests {
             assert!(curl.contains(&format!(" {} ", sh_quote(&sent))), "{uri}: {curl}\nsent {sent}");
             assert!(!sent.contains(' ') && !sent.contains('\\'), "{sent}");
         }
+    }
+
+    #[test]
+    fn a_map_ghost_is_of_the_name_tab_writes() {
+        // One name is the start of another: typed whole, it is the one Tab
+        // takes, and the ghost is its `)`, not the end of the longer name.
+        for line in ["PUT /x @a.csv~map(com.heads.csv", "GET /about && PUT /x @a.csv~map(com.heads.csv", "PUT /x @a.csv~map(", "PUT /x @a.csv~map(com.heads.s"] {
+            let mut state = completing(line);
+            state.mapped_types = strings(&["com.heads.csv", "com.heads.csv-product", "com.heads.sql"]);
+            let before = state.input[..char_to_byte_idx(&state.input, state.cursor_pos)].to_string();
+            let ghost = render_input_content(&mut state, 200).2;
+            assert!(!ghost.is_empty(), "{line}");
+            tab_pressed(&mut state);
+            assert!(shown(&state).starts_with(&format!("{before}{ghost}^")), "{line}: ghost {ghost:?}, Tab wrote {}", shown(&state));
+        }
+        let mut state = completing("PUT /x @a.csv~map(com.heads.csv");
+        state.mapped_types = strings(&["com.heads.csv", "com.heads.csv-product", "com.heads.sql"]);
+        assert_eq!(render_input_content(&mut state, 200).2, ")");
+    }
+
+    #[test]
+    fn behind_a_blank_after_a_file_path_nothing_is_completed() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("seed.api"), "").unwrap();
+        let base = dir.path().display().to_string();
+        for line in [
+            "GET /x > clip ^".to_string(),
+            "GET /x > ~ ^".to_string(),
+            "GET /x >> clip  ^".to_string(),
+            "PUT /x @a.csv~ ^".to_string(),
+            "PUT /x @a.csv~ma ^".to_string(),
+            format!("PUT /x @{base}/se ^"),
+            "GET /x > clip ^ && GET /about".to_string(),
+        ] {
+            for experimental in [false, true] {
+                let (ghost, after) = ghost_then_tab(&line, experimental);
+                assert_eq!((ghost.as_str(), after.as_str()), ("", line.as_str()));
+                let mut state = completing(&line);
+                assert!(!backtab_pressed(&mut state));
+                assert_eq!(shown(&state), line);
+            }
+        }
+        // At the end of the path itself both still agree.
+        assert_eq!(ghost_then_tab("GET /x > clip^", false), ("board".to_string(), "GET /x > clipboard^".to_string()));
+        assert_eq!(ghost_then_tab("PUT /x @a.csv~^", false), ("map(".to_string(), "PUT /x @a.csv~map(^".to_string()));
+    }
+
+    #[test]
+    fn export_is_a_keyword_and_no_start_of_a_path() {
+        for typed in ["e", "ex", "exp", "export", "EXPORT"] {
+            assert!(could_become_a_keyword(typed), "{typed}");
+        }
+        assert!(!could_become_a_keyword("exports"));
+        // The line of a directive is not an include to complete.
+        assert!(include_path_context("export com.heads.seedID", 0, "export com.heads.seedID".len()).is_none());
+        assert!(include_path_context("export off", 0, "export off".len()).is_none());
+    }
+
+    #[test]
+    fn a_key_ghost_in_a_chain_is_of_the_segment_the_cursor_is_in() {
+        // As the key handler reads it while a key is typed in its quotes.
+        let typed = |marked: &str| {
+            let mut state = completing_body(marked);
+            with_chain_segment_view(&mut state, |state| {
+                if json_context_at_cursor(state).is_some_and(|ctx| ctx.pos == JsonPos::Key && ctx.in_string) {
+                    handle_json_tab_completion(state, false, false);
+                }
+            });
+            state
+        };
+        // `givenName` is a key of a person, not of what `/settings` takes.
+        let mut state = typed("GET /people && PUT /settings {\"g^");
+        let ghost = render_input_content(&mut state, 200).2;
+        assert!(!ghost.contains("ivenName"), "{ghost}");
+        let mut state = typed("GET /settings && PUT /people [{\"g^");
+        assert_eq!(render_input_content(&mut state, 200).2, "dprForgotten\":");
+    }
+
+    #[test]
+    fn shift_tab_before_any_tab_writes_nothing_in_a_body() {
+        let mut state = completing_body("PUT /people [{\"g^");
+        handle_json_tab_completion(&mut state, false, false);
+        assert!(!render_input_content(&mut state, 200).2.is_empty(), "a key is offered");
+        assert!(!backtab_pressed(&mut state));
+        assert_eq!(shown(&state), "PUT /people [{\"g^");
+        // Tab still writes what the ghost showed.
+        tab_pressed(&mut state);
+        assert_eq!(shown(&state), "PUT /people [{\"gdprForgotten\":^");
+    }
+
+    #[test]
+    fn tab_in_the_middle_of_a_uri_word_writes_nothing() {
+        for line in ["GET /pe^ople", "GET /peo^ple/find", "/pe^ople", "GET /about && GET /pe^ople", "GET /people~wh^ere(name=x)"] {
+            let mut state = completing(line);
+            assert_eq!(render_input_content(&mut state, 200).2, "", "{line}");
+            tab_pressed(&mut state);
+            assert_eq!(shown(&state), line);
+        }
+        // In front of what is no part of the word it completes, and what
+        // follows is kept.
+        assert_eq!(tabbed("GET /pe^~take(5)"), "GET /people^~take(5)");
+        assert_eq!(tabbed("GET /pe^/find"), "GET /people^/find");
     }
 }
