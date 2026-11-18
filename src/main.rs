@@ -809,6 +809,10 @@ struct Config {
     /// The body came from a piped stdin and is sent as it is: one that
     /// starts with `@` is that text, not the name of a file to send.
     body_verbatim: bool,
+    /// The describe block of the file a one-shot line names (`api -m
+    /// catalog.api`): what `-m` prints, once the run has got as far as a
+    /// `-ma` run gets before it prints one.
+    named_describe: Option<DescribeBlock>,
 }
 
 impl Default for Config {
@@ -838,6 +842,7 @@ impl Default for Config {
             expect_falsy: false,
             fail_fast: false,
             describe_first: false,
+            named_describe: None,
             export_id: None,
             given: Settings::default(),
             file: Settings::default(),
@@ -5182,11 +5187,10 @@ fn main() {
         }
         // The file named on the line is the file being run, so `-m` prints
         // its describe block, as `-ma` on the file would.
+        // It is printed where a `-ma` run prints one: when the file has been
+        // read, its imports are fetched and its `url` gate has passed.
         if config.describe_first {
-            config.describe_first = false;
-            if let Some(block) = describe_block_of_named_file(&line) {
-                print_describe_first(&block);
-            }
+            config.named_describe = describe_block_of_named_file(&line);
         }
         if let Some(selector) = &op_selector {
             match get_1password_credentials(selector) {
@@ -9232,11 +9236,20 @@ fn split_alias(spec: &str, backslash_separates: bool) -> Option<(&str, &str)> {
 /// leads to is known only by walking there, which a file of an import is
 /// not to make the client do: with `**` behind it, that walk is of a whole
 /// disk. It is refused by what it says, like a `..` that leads out.
+///
+/// So is a `..` behind a `**`. A `**` stands for any number of directories,
+/// none included, so the `..` behind it is not known to take back what the
+/// `**` went down: `a/**/b/../../..` reads as a place inside and is walked
+/// to a place outside.
 fn pattern_can_climb(raw: &str) -> bool {
-    raw.split(['/', '\\']).any(|part| {
+    let parts: Vec<&str> = raw.split(['/', '\\']).collect();
+    let matches_parent = |part: &str| {
         is_glob_pattern(part)
             && glob::Pattern::new(part).is_ok_and(|pattern| pattern.matches_with("..", glob_match_options()))
-    })
+    };
+    let any_depth = parts.iter().position(|part| *part == "**");
+    parts.iter().any(|part| matches_parent(part))
+        || any_depth.is_some_and(|at| parts[at..].contains(&".."))
 }
 
 fn ensure_include_names_inside(
@@ -10822,7 +10835,7 @@ fn run_bulk_program(config: &mut Config, contents: &str, base_dir: Option<&std::
     }
     // `-m`: say what the file is before the preview asks whether to run it.
     if config.describe_first {
-        if let Some(block) = &program.describe {
+        if let Some(block) = program.describe.as_ref().or(config.named_describe.as_ref()) {
             print_describe_first(block);
         }
     }
@@ -24430,10 +24443,10 @@ mod tests {
 
     #[test]
     fn a_pattern_that_the_directory_above_matches_can_climb() {
-        for climbs in [".*/x.api", "a/.?/x.api", ".[.]/x", "a/b/.*", r".*\x.api", ".*/.*/**/*.api", ".{/x"] {
+        for climbs in [".*/x.api", "a/.?/x.api", ".[.]/x", "a/b/.*", r".*\x.api", ".*/.*/**/*.api", "a/**/b/../x.api", "**/..", r"a\**\..\x", ".{/x"] {
             assert_eq!(pattern_can_climb(climbs), climbs != ".{/x", "{climbs}");
         }
-        for stays in ["*/x.api", "?/x.api", "a/**/x.api", ".hidden/x.api", "a/.b*/x.api", "../x.api", "[.]?/x", "..a*/x", ""] {
+        for stays in ["*/x.api", "?/x.api", "a/**/x.api", ".hidden/x.api", "a/.b*/x.api", "../x.api", "[.]?/x", "..a*/x", "../a/**/x.api", "a/../**/x", "a/*/../x", "a/**/..b/x", ""] {
             assert!(!pattern_can_climb(stays), "{stays}");
         }
     }
@@ -27439,6 +27452,8 @@ mod tests {
             ("up.api", "../../**/*.api\n"),
             ("home.api", "~/*.api\n"),
             ("through.api", "sub/*/../../../../*.api\n"),
+            ("deep.api", "sub/**/**/**/**/**/**/**/**/deeper/../../../../../../../../../**/*.api\n"),
+            ("sub/deeper/x.api", "GET /x\n"),
             ("sub/in.api", "../ok.api\n../s*/../ok.api\n"),
             ("ok.api", "GET /ok\n"),
         ]);
@@ -27449,6 +27464,7 @@ mod tests {
             ("up.api", "../../**/*.api"),
             ("home.api", "~/*.api"),
             ("through.api", "sub/*/../../../../*.api"),
+            ("deep.api", "sub/**/**/**/**/**/**/**/**/deeper/../../../../../../../../../**/*.api"),
         ] {
             let started = Instant::now();
             let err = split_bulk_requests(&format!("{import}cl/{file}\n"), Some(dir.path())).unwrap_err();

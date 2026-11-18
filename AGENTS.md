@@ -489,7 +489,9 @@ import archive cl {
   outside (`@/etc/hosts`, `@~/…`, `../../x.api`) is an error, by what the
   line says: it is refused before anything is looked up, whether a file is
   there or not (`include leaves the import: …`). So is a pattern that the
-  directory above matches (`.*/x.api`, `.?/data/*.json`). Its own
+  directory above matches (`.*/x.api`, `.?/data/*.json`), and a `..` behind
+  a `**` (`a/**/b/../../x.api`): a `**` stands for any number of
+  directories, so what the `..` leads to is not known from the line. Its own
   `import dir` may only name a directory inside the same import. Symlinks in
   a repository or an archive are not followed. In an `import dir`, whose
   files are used where they are, a link is followed only when it stays

@@ -12303,6 +12303,75 @@ fn describe_first_works_for_a_file_named_as_an_argument() {
     }
 }
 
+/// A run that stops at the `url` gate or at an import prints no block: `-m`
+/// says what is about to run, and that file is not.
+#[test]
+fn describe_first_prints_no_block_for_a_run_that_stops_before_it() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let block = "{ \"title\": { \"en-US\": \"Catalog\" } }\n";
+    std::fs::write(d.join("gated.api"), format!("url has prod.example\n{block}GET /products\n")).unwrap();
+    std::fs::write(d.join("lost.api"), format!("{block}import dir lib {{ \"path\": \"nowhere\" }}\nGET /products\n")).unwrap();
+    std::fs::write(d.join("open.api"), format!("{block}GET /products\nPUT /x {{\n")).unwrap();
+    std::fs::write(d.join("fine.api"), format!("url has 127.0.0.1\n{block}GET /products\n")).unwrap();
+    for file in ["gated.api", "lost.api", "open.api"] {
+        for args in [&["-m", file][..], &["-ma", file], &["-sma", file]] {
+            let got = run_in(&server, d, args);
+            assert_eq!((got.code, got.sent.len()), (Some(1), 0), "{args:?}: {}", got.stderr);
+            assert!(got.stderr.contains("error: "), "{args:?}: {}", got.stderr);
+            assert!(!got.stderr.contains("Catalog"), "{args:?}: a block for a file that did not run:\n{}", got.stderr);
+        }
+    }
+    // The gate that passes is passed first, and the block is then printed.
+    for args in [&["-m", "fine.api"][..], &["-ma", "fine.api"]] {
+        let got = run_in(&server, d, args);
+        assert_eq!((got.code, got.sent.len()), (Some(0), 1), "{args:?}: {}", got.stderr);
+        assert!(got.stderr.starts_with("Catalog\n"), "{args:?}: {}", got.stderr);
+    }
+}
+
+/// `-m` shows a text in the reader's locale, read from `LC_ALL`, else
+/// `LC_MESSAGES`, else `LANG` (`sv_SE.UTF-8` is `sv-SE`). `C` is no locale.
+#[test]
+fn describe_first_reads_the_locale_from_the_environment() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::write(
+        d.join("catalog.api"),
+        "{ \"title\": { \"de-DE\": \"Katalog DE\", \"en-US\": \"Catalog\", \"sv-SE\": \"Katalogen\" } }\nGET /products\n",
+    )
+    .unwrap();
+    for (lc_all, lc_messages, lang, title) in [
+        (None, None, Some("sv_SE.UTF-8"), "Katalogen"),
+        (None, None, Some("de_DE@euro"), "Katalog DE"),
+        (None, Some("sv_SE.UTF-8"), Some("de_DE.UTF-8"), "Katalogen"),
+        (Some("de_DE.UTF-8"), Some("sv_SE.UTF-8"), Some("en_US.UTF-8"), "Katalog DE"),
+        // An empty variable is one that is not set.
+        (Some(""), None, Some("sv_SE.UTF-8"), "Katalogen"),
+        // The same language in another region.
+        (None, None, Some("sv_FI.UTF-8"), "Katalogen"),
+        // No locale, or one the file has no text for: English.
+        (Some("C"), None, Some("sv_SE.UTF-8"), "Catalog"),
+        (None, None, Some("POSIX"), "Catalog"),
+        (None, None, Some("fr_FR.UTF-8"), "Catalog"),
+        (None, None, None, "Catalog"),
+    ] {
+        let mut cmd = api(server.port, d);
+        cmd.args(["-sma", "catalog.api"]);
+        for (name, value) in [("LC_ALL", lc_all), ("LC_MESSAGES", lc_messages), ("LANG", lang)] {
+            match value {
+                Some(value) => cmd.env(name, value),
+                None => cmd.env_remove(name),
+            };
+        }
+        let got = ran(&server, cmd);
+        assert_eq!(got.code, Some(0), "{}", got.stderr);
+        assert_eq!(got.stderr.lines().next(), Some(title), "LC_ALL={lc_all:?} LC_MESSAGES={lc_messages:?} LANG={lang:?}");
+    }
+}
+
 /// A file that can't be read as text, and a glob that is none, stop the
 /// batch before anything is sent, naming the file or the pattern.
 #[test]
