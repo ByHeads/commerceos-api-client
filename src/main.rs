@@ -16020,7 +16020,7 @@ fn render_input_content(state: &mut AppState, width: usize) -> (String, u16, Str
     let behind_segment = cursor_behind_chain_segment(state);
     let (ghost, param_hint) = with_chain_segment_view(state, |state| {
         let param_hint = if state.config.complete {
-            let at = line_uri(&state.input);
+            let at = line_uri_at(&state.input, char_to_byte_idx(&state.input, state.cursor_pos));
             get_param_hint(state, &state.input[at.start..at.end])
         } else {
             String::new()
@@ -16033,7 +16033,12 @@ fn render_input_content(state: &mut AppState, width: usize) -> (String, u16, Str
         }
         let in_file_mode = file_ctx.is_some();
         let at_segment_end = state.cursor_pos == char_len(&state.input);
-        let ghost = if at_segment_end
+        // At the end of a path that has something behind it (a body file
+        // in front of an outfile), Tab completes the path: so is it shown.
+        let at_path_end = file_ctx
+            .as_ref()
+            .is_some_and(|ctx| char_to_byte_idx(&state.input, state.cursor_pos) == ctx.path_end && !ctx.partial.is_empty());
+        let ghost = if at_path_end || at_segment_end
             && (in_file_mode || (state.config.complete && !state.endpoints.is_empty()))
         {
             get_completion_ghost(state)
@@ -17347,7 +17352,7 @@ struct JsonFrame {
 /// keys already there, and whether a key or a value is being typed.
 fn json_context_at_cursor(state: &AppState) -> Option<JsonContext> {
     let body_start = find_body_start(&state.input)?;
-    let at = line_uri(&state.input);
+    let at = line_uri_at(&state.input, char_to_byte_idx(&state.input, state.cursor_pos));
     let uri = &state.input[at.start..at.end];
 
     // The body describes one of what the URI holds (PUT /people takes a
@@ -17896,22 +17901,65 @@ struct LineUri<'a> {
     end: usize,
 }
 
-fn line_uri(input: &str) -> LineUri<'_> {
+fn line_uri_at(input: &str, cursor: usize) -> LineUri<'_> {
+    // Where the URI that starts at byte `from` ends, as the line reader has
+    // it (`uri_scan`): a blank in a quoted value or in the parentheses of an
+    // operator is part of it. A value or an operator that is still open is
+    // one being typed: the blanks typed into it so far are part of it, and
+    // it ends at the first blank behind the cursor (in front of a body or
+    // the rest of a chain that was there already).
+    let uri_len = |from: usize| {
+        let text = &input[from..];
+        match uri_scan(text) {
+            (end, false) => end,
+            (first_blank, true) => {
+                let typed = cursor.saturating_sub(from).min(text.len());
+                match text.get(typed..).and_then(|behind| behind.find(char::is_whitespace)) {
+                    Some(blank) => (typed + blank).max(first_blank).min(text.len()),
+                    None => text.trim_end().len().max(first_blank.min(text.trim_end().len())),
+                }
+            }
+        }
+    };
     let lead = input.len() - input.trim_start().len();
     let rest = &input[lead..];
     let first_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
     let first = &rest[..first_end];
     if first.is_empty() || first.starts_with('/') {
-        return LineUri { method: "", start: lead, end: lead + first_end };
+        return LineUri { method: "", start: lead, end: lead + uri_len(lead) };
     }
     let after = &rest[first_end..];
     let gap = after.len() - after.trim_start().len();
-    let uri_len = after[gap..].find(char::is_whitespace).unwrap_or(after.len() - gap);
+    let uri_len = uri_len(lead + first_end + gap);
     if uri_len == 0 {
         return LineUri { method: first, start: lead + first_end, end: lead + first_end };
     }
     let start = lead + first_end + gap;
     LineUri { method: first, start, end: start + uri_len }
+}
+
+/// The words of a line, its URI being one of them whatever blanks it holds.
+fn line_parts<'a>(input: &'a str, at: &LineUri<'a>) -> Vec<&'a str> {
+    [at.method, &input[at.start..at.end]]
+        .into_iter()
+        .chain(input[at.end..].split_whitespace())
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+/// The line with `completion` written in the place of the part of its URI
+/// in front of the cursor, and the cursor behind it. What stands in front
+/// of the URI stays as it is written: blanks ahead of the method, and more
+/// than one between the method and the URI.
+fn uri_completed(input: &str, at: &LineUri, completion: &str, uri_after: &str) -> (String, usize) {
+    let suffix = &input[at.end..];
+    if at.start == at.end {
+        // No URI yet (`GET ` with the cursor behind the blank).
+        let base = if at.method.is_empty() { completion.to_string() } else { format!("{} {}", at.method, completion) };
+        return (format!("{}{}{}", base, uri_after, suffix), char_len(&base));
+    }
+    let front = &input[..at.start];
+    (format!("{}{}{}{}", front, completion, uri_after, suffix), char_len(front) + char_len(completion))
 }
 
 /// Whether Tab is going through a list of URIs and `uri` is the one it wrote
@@ -17923,11 +17971,9 @@ fn cycling_uri(state: &AppState, uri: &str) -> bool {
 
 fn handle_tab_completion(state: &mut AppState) {
     // Format: [METHOD] URI [BODY] [> outfile]
-    let at = line_uri(&state.input);
+    let at = line_uri_at(&state.input, char_to_byte_idx(&state.input, state.cursor_pos));
     let method_part = at.method.to_string();
     let uri_full = state.input[at.start..at.end].to_string();
-    // Everything after the URI is the suffix (body, > outfile, etc.)
-    let suffix = state.input[at.end..].to_string();
     let uri_char_start = char_len(&state.input[..at.start]);
     let uri_chars: Vec<char> = uri_full.chars().collect();
 
@@ -17985,15 +18031,10 @@ fn handle_tab_completion(state: &mut AppState) {
     let uri_after = &state.completion_uri_suffix;
 
     if !state.completions.is_empty() {
-        let completion = &state.completions[state.completion_idx];
-        let new_base = if method_part.is_empty() {
-            completion.clone()
-        } else {
-            format!("{} {}", method_part, completion)
-        };
         // Preserve the uri text after cursor + original suffix (body and outfile)
-        state.input = format!("{}{}{}", new_base, uri_after, suffix);
-        state.cursor_pos = char_len(&new_base);
+        let (input, cursor) = uri_completed(&state.input, &at, &state.completions[state.completion_idx], uri_after);
+        state.input = input;
+        state.cursor_pos = cursor;
     }
 }
 
@@ -18004,9 +18045,7 @@ fn handle_tab_completion_reverse(state: &mut AppState) {
     }
 
     // The method, and the suffix after the URI (body/outfile, not including uri_after)
-    let at = line_uri(&state.input);
-    let method_part = at.method.to_string();
-    let suffix = state.input[at.end..].to_string();
+    let at = line_uri_at(&state.input, char_to_byte_idx(&state.input, state.cursor_pos));
 
     // Cycle backward
     if state.completion_idx == 0 {
@@ -18015,15 +18054,10 @@ fn handle_tab_completion_reverse(state: &mut AppState) {
         state.completion_idx -= 1;
     }
 
-    let uri_after = &state.completion_uri_suffix;
-    let completion = &state.completions[state.completion_idx];
-    let new_base = if method_part.is_empty() {
-        completion.clone()
-    } else {
-        format!("{} {}", method_part, completion)
-    };
-    state.input = format!("{}{}{}", new_base, uri_after, suffix);
-    state.cursor_pos = char_len(&new_base);
+    let (input, cursor) =
+        uri_completed(&state.input, &at, &state.completions[state.completion_idx], &state.completion_uri_suffix);
+    state.input = input;
+    state.cursor_pos = cursor;
 }
 
 /// Replace the file-path span `[path_start, path_end)` with `new_path`, keeping
@@ -18043,6 +18077,11 @@ fn handle_file_tab_completion(state: &mut AppState) {
         None => return,
     };
     let (path_start, path_end) = (ctx.path_start, ctx.path_end);
+    // In the middle of a path there is nothing to complete: what is written
+    // behind the cursor would be replaced with it. No ghost is shown there.
+    if char_to_byte_idx(&state.input, state.cursor_pos) < path_end && state.completions.is_empty() {
+        return;
+    }
 
     // Check for ~ operator on body file argument
     if let Some((file_part, after_tilde)) = body_file_operator(&ctx) {
@@ -18381,14 +18420,14 @@ fn tab_pressed(state: &mut AppState) -> bool {
             .map_or(false, |bs| state.input[bs..].trim().starts_with(|c: char| c == '[' || c == '{'));
         let cursor_byte = char_to_byte_idx(&state.input, state.cursor_pos);
         let at_line_end = cursor_byte == state.input.len();
-        if has_body_content && cursor_byte > line_uri(&state.input).end {
+        if has_body_content && cursor_byte > line_uri_at(&state.input, char_to_byte_idx(&state.input, state.cursor_pos)).end {
             // Tab behind a body — ignore. In the URI in front of one it
             // completes the URI, as the ghost there says.
             return false;
         }
         let had_completions = !state.completions.is_empty();
-        let parts: Vec<&str> = state.input.split_whitespace().collect();
-        let at = line_uri(&state.input);
+        let at = line_uri_at(&state.input, char_to_byte_idx(&state.input, state.cursor_pos));
+        let parts = line_parts(&state.input, &at);
         // In the middle of a word of the URI there is nothing to complete:
         // what is written there would be left behind what Tab wrote. The
         // ghost shows nothing there either.
@@ -18523,8 +18562,8 @@ fn get_completion_ghost(state: &AppState) -> String {
         return String::new();
     }
 
-    let parts: Vec<&str> = state.input.split_whitespace().collect();
-    let at = line_uri(&state.input);
+    let at = line_uri_at(&state.input, char_to_byte_idx(&state.input, state.cursor_pos));
+    let parts = line_parts(&state.input, &at);
     let uri = state.input[at.start..at.end].to_string();
     if uri.is_empty() {
         return String::new();
@@ -18563,6 +18602,11 @@ fn get_completion_ghost(state: &AppState) -> String {
 fn get_body_bracket_ghost(state: &AppState, parts: &[&str], uri: &str) -> String {
     // Only when input ends with trailing space after method+URI and no body yet
     if parts.len() != 2 || !state.input.ends_with(' ') {
+        return String::new();
+    }
+    // Nor behind a URI whose quoted value or operator is still open: the
+    // blank is part of what is being typed there.
+    if uri_scan(uri).1 {
         return String::new();
     }
     let method = parts[0].to_uppercase();
@@ -18605,7 +18649,7 @@ fn get_completion_ghost_at_cursor(state: &AppState) -> String {
 
     // Only with the cursor at the end of the URI: in the middle of it the
     // ghost would splice into the text, and anywhere else it is not in it.
-    let at = line_uri(&state.input);
+    let at = line_uri_at(&state.input, char_to_byte_idx(&state.input, state.cursor_pos));
     let uri = &state.input[at.start..at.end];
     if uri.is_empty() || state.cursor_pos != char_len(&state.input[..at.end]) {
         return String::new();
@@ -18623,8 +18667,16 @@ fn get_completion_ghost_at_cursor(state: &AppState) -> String {
 /// what is typed in case (`~map(COM` completes to `~map(com.heads.csv)`):
 /// Tab writes it, so its rest is shown, as for the name behind `@file~map(`.
 fn rest_behind<'a>(completion: &'a str, typed: &str) -> Option<&'a str> {
-    let head = completion.get(..typed.len())?;
-    head.eq_ignore_ascii_case(typed).then(|| &completion[typed.len()..])
+    // Character by character, in any case of any alphabet, as the names a
+    // completion is found by are compared: `ÄR` is the start of `ärende`.
+    let mut rest = completion.chars();
+    for typed in typed.chars() {
+        let written = rest.next()?;
+        if written != typed && !written.to_lowercase().eq(typed.to_lowercase()) {
+            return None;
+        }
+    }
+    Some(rest.as_str())
 }
 
 /// Extract the file path portion being typed after ">" or "@" in the input.
@@ -18761,6 +18813,11 @@ fn extract_file_path_context(input: &str, cursor_pos: usize) -> Option<FilePathC
 
     // ` >` (outfile, including ` >>` append) takes precedence over ` @`, as
     // before. Space before the marker required, optional space after.
+    // The path the cursor is in: the outfile from its marker on, and a body
+    // file in front of that (`PUT /x @da^ > out.json`).
+    let outfile_at = balanced_outfile_marker(segment).ok().flatten();
+    let before_outfile = &segment[..outfile_at.unwrap_or(segment.len())];
+    let in_outfile = outfile_at.is_some_and(|idx| cursor_byte - seg_start > idx) || body_file_marker(before_outfile).is_none();
     for is_outfile in [true, false] {
         // The outfile marker is found the way the parser finds it, so a `>`
         // inside a body is not taken for one. Nor is one in a body that is
@@ -18768,7 +18825,8 @@ fn extract_file_path_context(input: &str, cursor_pos: usize) -> Option<FilePathC
         // what is being typed there is the body.
         // A body file is found where the parser finds it too: an `@` that
         // starts the body. One inside a body (`{"mail": "a @b"}`) is text.
-        let at = if is_outfile { balanced_outfile_marker(segment).ok().flatten() } else { body_file_marker(segment) };
+        let at = if is_outfile { outfile_at.filter(|_| in_outfile) } else { body_file_marker(before_outfile) };
+        let segment = if is_outfile { segment } else { before_outfile };
         if let Some(idx) = at {
             let mut after = idx + 2;
             // ` >>` — the second `>` is part of the marker, not the path.
@@ -28118,8 +28176,10 @@ mod tests {
 
     #[test]
     fn the_uri_of_a_line_is_found_with_and_without_a_method() {
-        let found = |input: &str| {
-            let at = line_uri(input);
+        // With the cursor at `^`, or at the end.
+        let found = |marked: &str| {
+            let input = &marked.replace('^', "");
+            let at = line_uri_at(input, marked.find('^').unwrap_or(input.len()));
             (at.method.to_string(), input[at.start..at.end].to_string(), at.start)
         };
         assert_eq!(found(""), ("".to_string(), "".to_string(), 0));
@@ -28130,6 +28190,87 @@ mod tests {
         assert_eq!(found("GET  "), ("GET".to_string(), "".to_string(), 3));
         assert_eq!(found("put  /å/b  {\"a\": 1}"), ("put".to_string(), "/å/b".to_string(), 5));
         assert_eq!(found("GET people"), ("GET".to_string(), "people".to_string(), 4));
+
+        // A blank in a quoted value or in an operator's parentheses is part
+        // of the URI, as the line reader has it.
+        let uri = |marked: &str| found(marked).1;
+        assert_eq!(uri(r#"GET /p~where(name="James Bond")~wi"#), r#"/p~where(name="James Bond")~wi"#);
+        assert_eq!(uri(r#"PUT /p~where(a=1 or b=2) {"x": 1} > o.json"#), "/p~where(a=1 or b=2)");
+        assert_eq!(uri(r#"/p~where(name="a b") > o.json"#), r#"/p~where(name="a b")"#);
+        // One that is still open is being typed: it has the blanks typed so
+        // far, and ends in front of what stood behind the cursor already.
+        assert_eq!(uri(r#"POST /p~where(name="James "#), r#"/p~where(name="James"#);
+        assert_eq!(uri(r#"POST /p~where(name="James B"#), r#"/p~where(name="James B"#);
+        assert_eq!(uri(r#"PUT /p~where(a=1 or b^ {"x": 1}"#), "/p~where(a=1 or b");
+        assert_eq!(uri(r#"PUT /p~where(^ {"x": 1}"#), "/p~where(");
+        assert_eq!(uri(r#"PUT /p~wh^ere( {"x": 1}"#), "/p~where(");
+        assert_eq!(uri(r#"^PUT /p~where(a=1 {"x": 1}"#), "/p~where(a=1");
+        assert_eq!(uri("GET /p~where(n=é ö^ x"), "/p~where(n=é ö");
+    }
+
+    #[test]
+    fn a_blank_in_an_operator_does_not_end_the_uri_for_tab() {
+        // Behind a value with a blank in it the URI goes on, ghost and Tab.
+        for line in [r#"GET /people~where(name="James Bond")~wi^"#, r#"/people~where(name="a b")~wi^"#] {
+            let mut state = completing(line);
+            assert_eq!(render_input_content(&mut state, 200).2, "th(", "{line}");
+            assert!(tab_pressed(&mut state), "{line}");
+            assert_eq!(shown(&state), line.replace("~wi^", "~with(^"), "{line}");
+        }
+        // In front of a body that is there already.
+        let mut state = completing(r#"PUT /people~where(name="a b")~wi^ {"x": 1}"#);
+        assert!(tab_pressed(&mut state));
+        assert_eq!(shown(&state), r#"PUT /people~where(name="a b")~with(^ {"x": 1}"#);
+
+        // Inside a value that is still being typed nothing is offered: not
+        // the brackets of a body, which Tab would write into the value.
+        for line in [r#"POST /people~where(name="James ^"#, r#"PUT /people~where(name="James ^"#, r#"POST /people~where(a=1 ^"#] {
+            let mut state = completing_body(line);
+            assert_eq!(render_input_content(&mut state, 200).2, "", "{line}");
+            tab_pressed(&mut state);
+            assert_eq!(shown(&state), line, "{line}");
+        }
+        // Behind one that is closed, a body may start.
+        let mut state = completing_body(r#"POST /people~where(name="a b") ^"#);
+        assert_eq!(render_input_content(&mut state, 200).2, "{ ");
+    }
+
+    #[test]
+    fn tab_in_the_middle_of_a_file_path_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("outer")).unwrap();
+        fs::write(dir.path().join("out.json"), "{}").unwrap();
+        fs::write(dir.path().join("data.csv"), "a\n").unwrap();
+        let depth = std::env::current_dir().unwrap().components().count();
+        let rel = format!("{}{}", "../".repeat(depth), dir.path().display().to_string().trim_start_matches('/'));
+
+        for line in [format!("GET /x > {rel}/o^ut"), format!("PUT /x @{rel}/da^ta"), format!("GET /x > {rel}/^out.json")] {
+            let mut state = completing(&line);
+            assert_eq!(render_input_content(&mut state, 400).2, "", "{line}");
+            tab_pressed(&mut state);
+            assert_eq!(shown(&state), line, "{line}");
+        }
+        // At its end it is completed, as ever.
+        let mut state = completing(&format!("PUT /x @{rel}/da^"));
+        tab_pressed(&mut state);
+        assert_eq!(shown(&state), format!("PUT /x @{rel}/data.csv^"));
+
+        // A body file in front of an outfile is the path the cursor is in.
+        let line = format!("PUT /x @{rel}/da^ > {rel}/out.json");
+        let ctx = extract_file_path_context(&line.replace('^', ""), char_len(&line[..line.find('^').unwrap()])).unwrap();
+        assert!(!ctx.is_outfile && ctx.partial == format!("{rel}/da"), "{}", ctx.partial);
+        let mut state = completing(&line);
+        assert_eq!(render_input_content(&mut state, 400).2, "ta.csv");
+        tab_pressed(&mut state);
+        assert_eq!(shown(&state), format!("PUT /x @{rel}/data.csv^ > {rel}/out.json"));
+        // And the operator of a body file there.
+        let mut state = completing(&format!("PUT /x @{rel}/data.csv~m^ > {rel}/out.json"));
+        tab_pressed(&mut state);
+        assert_eq!(shown(&state), format!("PUT /x @{rel}/data.csv~map(^ > {rel}/out.json"));
+        // Behind the marker it is the outfile, as before.
+        let mut state = completing(&format!("PUT /x @{rel}/data.csv > {rel}/ou^"));
+        tab_pressed(&mut state);
+        assert!(shown(&state).starts_with(&format!("PUT /x @{rel}/data.csv > {rel}/out")), "{}", shown(&state));
     }
 
     #[test]
@@ -28149,7 +28290,16 @@ mod tests {
 
         // Without a method, and after one alone.
         assert_eq!(tabbed("/pe"), "/people^");
-        assert_eq!(tabbed("  /ab"), "/about^");
+        // What stands in front of the URI stays as it is written.
+        assert_eq!(tabbed("  /ab"), "  /about^");
+        assert_eq!(tabbed("  GET   /pe"), "  GET   /people^");
+        let mut state = completing("\tPUT  /pe^ {\"a\":1} > o.json");
+        assert!(tab_pressed(&mut state));
+        assert_eq!(shown(&state), "\tPUT  /people^ {\"a\":1} > o.json");
+        assert!(tab_pressed(&mut state));
+        assert_eq!(shown(&state), "\tPUT  /people/find^ {\"a\":1} > o.json");
+        assert!(backtab_pressed(&mut state));
+        assert_eq!(shown(&state), "\tPUT  /people^ {\"a\":1} > o.json");
         assert_eq!(tabbed("/people~wi"), "/people~with(^");
         assert_eq!(tabbed("DELETE /people/com"), "DELETE /people/com.mi6.id=^");
         // What stands after the cursor stays: the rest of the URI, a body, an outfile.
@@ -31720,6 +31870,9 @@ mod tests {
             ("GET /people~map(com.heads.S^", "ql)", "GET /people~map(com.heads.sql)^"),
             ("GET /people~map(com.heads.c^", "sv)", "GET /people~map(com.heads.csv)^"),
             ("PUT /people @rows.csv~map(COM^", ".heads.csv)", "PUT /people @rows.csv~map(com.heads.csv)^"),
+            // In any alphabet.
+            ("GET /people~map(ÄR^", "ende)", "GET /people~map(ärende)^"),
+            ("PUT /people @rows.csv~map(ÄR^", "ende)", "PUT /people @rows.csv~map(ärende)^"),
         ] {
             let mut state = completing(line);
             assert_eq!(render_input_content(&mut state, 200).2, ghost, "{line}");
@@ -31732,6 +31885,9 @@ mod tests {
         // Never cut inside a character.
         assert_eq!(rest_behind("/ärende", "/a"), None);
         assert_eq!(rest_behind("/ärende", "/ä"), Some("rende"));
+        assert_eq!(rest_behind("/ärende", "/ÄR"), Some("ende"));
+        assert_eq!(rest_behind("/ärende", "/är̈"), None);
+        assert_eq!(rest_behind("/ärende", ""), Some("/ärende"));
     }
 
     /// The top row of the splash is as wide as its box, whatever the
