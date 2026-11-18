@@ -10118,6 +10118,91 @@ fn an_option_given_twice_or_without_its_value_is_said_to_be_that() {
     }
 }
 
+/// What names no request, or no host to send one to, is refused with nothing
+/// sent: an empty method, a user and a password in a base URL, a saved URL
+/// without a host, and an empty `-b` beside `-c`.
+#[test]
+fn what_names_no_method_or_no_host_is_refused() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let host = format!("127.0.0.1:{}", server.port);
+    let url = format!("http://{host}");
+    write_credentials(
+        d,
+        &[
+            ("good", url.clone(), "key", "STOREDKEY", ""),
+            ("oauth", url.clone(), "oauth2", "secret", "id"),
+            ("held", format!("http://svc:hunter2@{host}"), "key", "STOREDKEY", ""),
+            ("empty", String::new(), "key", "STOREDKEY", ""),
+            ("bare", "http://".to_string(), "oauth2", "secret", "id"),
+        ],
+        "",
+    );
+    let refused = |args: &[&str], says: &str| {
+        let got = run_bare(&server, d, args);
+        assert_eq!((got.code, got.sent.len()), (Some(1), 0), "{args:?}: {} {:?}", got.stderr, got.sent);
+        assert_eq!(got.stderr.trim(), says, "{args:?}");
+        assert_eq!(got.stdout, "", "{args:?}");
+    };
+
+    // A method that is empty is not a GET.
+    let empty = "error: the method is empty: a request is METHOD URI [BODY]";
+    refused(&["-b", &url, "-k", "k", "", "/people/x", "{\"a\":1}"], empty);
+    refused(&["-b", &url, "-k", "k", " ", "/people/x"], empty);
+    refused(&["-b", &url, "-k", "k", "", "", "{\"a\":1}"], empty);
+
+    // A user and a password in a base URL: not sent, and not repeated.
+    let held = "a base URL holds no user or password (user@host)";
+    for base in [format!("http://svc:hunter2@{host}"), format!("svc:hunter2@{host}"), format!("https://svc@{host}/api/v1")] {
+        refused(&["-b", &base, "-k", "k", "GET", "/a"], &format!("error: invalid value for -b: {held}. Give the credential with -k or --token."));
+        refused(&["-c", "good", "-b", &base, "GET", "/a"], &format!("error: invalid value for -b: {held}. Give the credential with -k or --token."));
+    }
+    refused(&["-c", "held", "GET", "/a"], &format!("The connection \"held\" can't be used: {held}."));
+
+    // A saved URL that names no host is that connection's problem.
+    refused(&["-c", "empty", "GET", "/a"], "The connection \"empty\" can't be used: its URL names no host.");
+    refused(&["-c", "bare", "GET", "/a"], "The connection \"bare\" can't be used: its URL names no host.");
+
+    // An empty `-b` beside `-c` is no base URL: the connection's own is
+    // not used in its place, and no token is asked for.
+    let none = "Error: no base URL specified. Use -b <url> or -c <connection>.";
+    for name in ["good", "oauth"] {
+        refused(&["-c", name, "-b", "", "GET", "/a"], none);
+        refused(&["-c", name, "-b", "http://", "GET", "/a"], none);
+    }
+    // The same connections with their own URL still work.
+    let got = run_bare(&server, d, &["-c", "good", "GET", "/a"]);
+    assert_eq!((got.code, &got.sent[..]), (Some(0), &["GET /a".to_string()][..]), "{}", got.stderr);
+}
+
+/// A body that starts with `-` is a body, and an argument clap can't read is
+/// said as that, not as an option nobody gave.
+#[cfg(unix)]
+#[test]
+fn a_negative_number_is_a_body_and_a_broken_argument_is_named_as_one() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let got = run_in(&server, d, &["PUT", "/balance", "-5"]);
+    assert_eq!((got.code, &got.sent[..]), (Some(0), &["PUT /balance -5".to_string()][..]), "{}", got.stderr);
+    let got = run_in(&server, d, &["PUT", "/balance", "-0.5"]);
+    assert_eq!(got.sent, ["PUT /balance -0.5".to_string()], "{}", got.stderr);
+    // A word that is no number is still an option that is not known.
+    let got = run_in(&server, d, &["PUT", "/balance", "--nope"]);
+    assert_eq!((got.code, got.sent.len(), got.stderr.trim()), (Some(1), 0, "error: unexpected option --nope"));
+
+    let mut cmd = api(server.port, d);
+    cmd.arg("-a").arg(std::ffi::OsStr::from_bytes(b"caf\xe9.api"));
+    let got = ran(&server, cmd);
+    assert_eq!((got.code, got.sent.len()), (Some(1), 0), "{}", got.stderr);
+    assert!(got.stderr.starts_with("error: ") && got.stderr.to_lowercase().contains("utf-8"), "{}", got.stderr);
+    assert!(!got.stderr.contains("unexpected option") && !got.stderr.contains("error: error"), "{}", got.stderr);
+    assert_eq!(got.stderr.trim().lines().count(), 1, "{}", got.stderr);
+}
+
 /// A known `auth_type` is read in any case. One the client does not know is
 /// not sent as a key: the connection is not used, and that is said.
 #[test]

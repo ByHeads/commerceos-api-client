@@ -1607,6 +1607,8 @@ Run it: `api -sa workshop.api`.
 - **An archive URL without `sha256`** → downloaded again on every run, and whatever it serves that day is what runs. Add the `sha256` from the `import …` log line to pin it.
 - **`token_env` or another host in an imported file** → refused before anything is fetched. Import the second repository or archive from the file you run, next to the first.
 - **`-sa file.api GET /x`** → an error: `-a` runs the file, and the request beside it is neither dropped nor run after it. Give one of the two.
+- **`-b https://user:password@host`** → `error: invalid value for -b: a base URL holds no user or password (user@host). Give the credential with -k or --token.` The same URL in the credentials file makes that connection unusable. A saved `url` that names no host (`""`, `"http://"`) does too: `its URL names no host`.
+- **An empty method** → `api "$METHOD" /people/x '{…}'` with the variable not set is `error: the method is empty: a request is METHOD URI [BODY]`, not a `GET`.
 - **`-b ftp://host` or `-b http:/host`** → `error: invalid value for -b: … (a base URL starts with http:// or https://, not ftp://)`. A base URL is `http://` or `https://`, or a host with no scheme at all. The same URL in the credentials file makes that connection unusable, with the same reason.
 - **`"auth_type": "bearer"` in the credentials file** → `The connection "x" can't be used: its auth_type "bearer" is not "key", "token" or "oauth2".` A bearer token is `"token"`. The three names are read in any case.
 - **`url has localhost:5000/`** → matches nothing: `has` compares text with the base URL as the client has it, which ends at the host. `url is` reads its value as a base URL, so a trailing `/` or `/api/v1` there is fine.

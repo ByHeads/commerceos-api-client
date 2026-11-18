@@ -614,7 +614,7 @@ struct Args {
     uri: Option<String>,
 
     /// Request body (JSON); further words are joined into the .api line
-    #[arg(value_name = "BODY", num_args = 0..)]
+    #[arg(value_name = "BODY", num_args = 0.., allow_negative_numbers = true)]
     body: Vec<String>,
 
     /// Base URI
@@ -4377,12 +4377,26 @@ fn base_url_of(text: &str) -> (String, bool) {
     (format!("{}{}{}", scheme, host, kept), kept.len() != path.len())
 }
 
+/// Whether a base URL holds a user or a password in front of its host
+/// (`https://svc:secret@host`). The HTTP client would send those as a
+/// credential of their own, beside the one the client was given, and the
+/// URL is printed at the top of every log.
+fn base_url_has_userinfo(text: &str) -> bool {
+    let authority = text.split_once("://").map_or(text, |(_, rest)| rest);
+    authority.split(['/', '?', '#']).next().unwrap_or("").contains('@')
+}
+
+const USERINFO_REFUSED: &str = "a base URL holds no user or password (user@host)";
+
 /// Why what was given as a base URL can't be one, if it can't: it names a
 /// scheme that is not `http` or `https` (`ftp://host`), or its scheme is not
 /// written whole (`http:/host`). `base_url_of` would take either for a host
 /// without a scheme and put `http://` in front of it.
 fn base_url_problem(text: &str) -> Option<String> {
     let text = text.trim();
+    if base_url_has_userinfo(text) {
+        return Some(USERINFO_REFUSED.to_string());
+    }
     let (scheme, rest) = text.split_once(':')?;
     // A scheme, and not the host of `localhost:5000`: a word, then `:/`.
     let is_scheme = scheme.starts_with(|c: char| c.is_ascii_alphabetic())
@@ -4413,11 +4427,13 @@ fn known_auth_type(auth_type: &str) -> Option<&'static str> {
 /// connection is not used at all: its credential is not sent as a kind it
 /// was not saved as.
 fn connection_problem(env: &SavedConnection) -> Option<String> {
-    base_url_problem(&env.url).or_else(|| {
-        known_auth_type(&env.auth_type)
-            .is_none()
-            .then(|| format!("its auth_type \"{}\" is not \"key\", \"token\" or \"oauth2\"", env.auth_type))
-    })
+    base_url_problem(&env.url)
+        .or_else(|| normalize_base_uri(&env.url).is_empty().then(|| "its URL names no host".to_string()))
+        .or_else(|| {
+            known_auth_type(&env.auth_type)
+                .is_none()
+                .then(|| format!("its auth_type \"{}\" is not \"key\", \"token\" or \"oauth2\"", env.auth_type))
+        })
 }
 
 /// Whether a host written without a scheme is one to reach over plain
@@ -4597,11 +4613,18 @@ fn main() {
                     exit_process(1);
                 }
             }
-            // For unexpected arguments, print a simple message
-            if let Some(arg) = msg.split('\'').nth(1) {
+            // For unexpected arguments, print a simple message. Any other
+            // error is said as clap says it, in one line: the first quoted
+            // word of its text is then no option that was given (`--help`,
+            // from the line under an argument that is not UTF-8).
+            let unexpected = (e.kind() == clap::error::ErrorKind::UnknownArgument)
+                .then(|| msg.split('\'').nth(1))
+                .flatten();
+            if let Some(arg) = unexpected {
                 errln!("error: unexpected option {}", arg);
             } else {
-                errln!("error: {}", msg.lines().next().unwrap_or("invalid arguments"));
+                let said = msg.lines().next().unwrap_or("invalid arguments");
+                errln!("error: {}", said.strip_prefix("error: ").unwrap_or(said));
             }
             exit_process(1);
         }
@@ -4698,8 +4721,20 @@ fn main() {
 
     let mut config = Config::default();
 
+    // A method that is empty (`api "$METHOD" /people/x '{…}'` with the
+    // variable not set) is no request: it is not sent as a `GET`.
+    if args.method.as_deref().is_some_and(|m| m.trim().is_empty()) && (args.uri.is_some() || !args.body.is_empty()) {
+        errln!("error: the method is empty: a request is METHOD URI [BODY]");
+        exit_process(1);
+    }
+
     // Apply CLI args to config
     if let Some(ref uri) = args.base_uri {
+        // Not repeated: what was given holds a password.
+        if base_url_has_userinfo(uri) {
+            errln!("error: invalid value for -b: {}. Give the credential with -k or --token.", USERINFO_REFUSED);
+            exit_process(1);
+        }
         if let Some(problem) = base_url_problem(uri) {
             errln!("error: invalid value for -b: {} ({})", uri, problem);
             exit_process(1);
@@ -4920,6 +4955,12 @@ fn main() {
             exit_process(1);
         };
         loaded_connection_alias = env.name.clone();
+        // A `-b` that names no host is no base URL beside `-c` either:
+        // the connection's own is not used in its place, and no token is
+        // asked for from a host that is none.
+        if has_explicit_uri && config.base_uri.is_empty() {
+            require_base_uri(&config);
+        }
         // `-b`, `-k` and `--token` win over what the connection has stored.
         let env = override_connection(&env, base_arg, args.key.as_deref(), args.token.as_deref());
         config.connection_overridden = has_explicit_uri || args.key.is_some() || args.token.is_some();
@@ -31693,6 +31734,14 @@ mod tests {
         assert_eq!(base_url_problem("http:/h"), broken("http:/h"));
         assert_eq!(base_url_problem("HTTPS:/h/api"), broken("HTTPS:/h/api"));
         assert_eq!(base_url_problem("ftp:/h"), broken("ftp:/h"));
+        // A user or a password in front of the host, with a scheme or without.
+        for held in ["https://svc:pw@h", "http://svc@h:5000/api/v1", "svc:pw@h", "svc@localhost:5000", " HTTPS://a:b@h/x "] {
+            assert_eq!(base_url_problem(held), Some(USERINFO_REFUSED.to_string()), "{held}");
+            assert!(base_url_has_userinfo(held.trim()), "{held}");
+        }
+        for fine in ["https://h/people/a@b", "h/x@y", "http://h?mail=a@b", "h#a@b"] {
+            assert!(!base_url_has_userinfo(fine), "{fine}");
+        }
         // A host with a port, a path, or nothing at all is not a scheme.
         for fine in [
             "http://h",
