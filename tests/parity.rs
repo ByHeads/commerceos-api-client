@@ -1293,7 +1293,17 @@ fn an_interrupted_stream_leaves_no_partial_file() {
     assert_eq!(server.take(), ["GET /slow"]);
 
     std::fs::write(d.join("sleeps.api"), "GET /a > first.json\nsleep 30\nGET /never\n").unwrap();
-    let mut child = streamed(&["-sa", "sleeps.api"]).stdout(std::process::Stdio::null()).spawn().expect("spawn api");
+    let mut sleeping = streamed(&["-sa", "sleeps.api"]);
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        // Not whatever the test run itself was started with: a suite run as
+        // a background job has the interrupt ignored, and so would this.
+        sleeping.pre_exec(|| {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            Ok(())
+        });
+    }
+    let mut child = sleeping.stdout(std::process::Stdio::null()).spawn().expect("spawn api");
     let start = Instant::now();
     while !d.join("first.json").exists() && start.elapsed() < Duration::from_secs(10) {
         std::thread::sleep(Duration::from_millis(20));
