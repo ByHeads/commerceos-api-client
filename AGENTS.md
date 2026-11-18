@@ -1413,8 +1413,9 @@ The same is said when the file has no connections at all (`… is not among
 the saved connections (none)`).
 
 A connection that can't be used as it is written is named with the reason.
-As the default it is a warning and no saved connection is used; asked for
-with `-c` it ends the run with exit 1:
+As the default it is a warning and no saved connection is used (the
+interactive prompt then opens on the connection picker, as it does when
+there is no default); asked for with `-c` it ends the run with exit 1:
 
 ```
 WARNING: the default connection "local" can't be used: its auth_type "bearer" is not "key", "token" or "oauth2". No saved connection is used.

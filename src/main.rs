@@ -1521,6 +1521,8 @@ struct AppState {
     /// whether it was `>>`.
     prev_display_outfile: String,
     prev_outfile_append: bool,
+    /// The settings the last request was sent under.
+    prev_sent: SentUnder,
     display_outfile: String,  // Original outfile path (with ~ unexpanded) for display
     last_outfile: String,
     last_display_outfile: String,  // Display version of last outfile
@@ -1631,6 +1633,7 @@ impl AppState {
             prev_outfile: String::new(),
             prev_display_outfile: String::new(),
             prev_outfile_append: false,
+            prev_sent: SentUnder::default(),
             display_outfile: String::new(),
             last_outfile: String::new(),
             last_display_outfile: String::new(),
@@ -3227,14 +3230,13 @@ impl ConnectionFlow {
         } else {
             let title = "CommerceOS API Client";
             let version = format!("v{}", VERSION);
-            let title_len = title.len() + version.len() + 3;
-            let top_padding = box_width.saturating_sub(4 + title_len + 1);
+            let (heading, top_padding) = splash_heading(title, &version, box_width);
 
             execute!(stdout, Print("\r\n"))?;
             execute!(stdout, Print(format!("{}{}{}{}\r\n",
                 "╭───".dimmed(),
-                format!(" {} {} ", title.bold(), version.dimmed()),
-                "─".repeat(top_padding.max(1)).dimmed(),
+                heading,
+                "─".repeat(top_padding).dimmed(),
                 "╮".dimmed()
             )))?;
 
@@ -4085,14 +4087,19 @@ fn url_ghost(url: &str) -> String {
         && !url.starts_with("localhost") && !url.starts_with("127.0.0.1") && !url.starts_with("[::1]")
         && !url.contains(".app.heads.com")
     {
-        let mut ghost = suffix.to_string();
+        // A port or a path is the end of a host: nothing goes behind it.
+        if url.contains(':') || url.contains('/') {
+            return String::new();
+        }
+        // The rest of the suffix, where its start has been typed.
         for i in (1..=suffix.len()).rev() {
             if url.ends_with(&suffix[..i]) {
-                ghost = suffix[i..].to_string();
-                break;
+                return suffix[i..].to_string();
             }
         }
-        ghost
+        // A name alone gets the suffix; a host with a domain of its own
+        // (`cos.example.com`) has all it needs.
+        if url.contains('.') { String::new() } else { suffix.to_string() }
     } else {
         String::new()
     }
@@ -4763,6 +4770,9 @@ fn main() {
         }
 
         if !envs.is_empty() {
+            // Whether no saved connection is in use: none is the default,
+            // or the default names nothing that can be used.
+            let mut none_in_use = default_connection.is_none();
             // If there's a default connection, auto-load it
             if let Some(ref def) = default_connection {
                 if let Some(env) = load_connection(def) {
@@ -4778,6 +4788,7 @@ fn main() {
                             def,
                             problem
                         );
+                        none_in_use = true;
                     } else if has_explicit_auth {
                         // URL only. Deliberately not apply_connection_to_config:
                         // an oauth2 connection would exchange a token we'd throw
@@ -4799,9 +4810,11 @@ fn main() {
                         def,
                         envs.join(", ")
                     );
+                    none_in_use = true;
                 }
-            } else if !has_explicit_auth && wants_prompt && io::stdout().is_terminal() {
-                // No default set + interactive: show unified connection flow
+            }
+            if none_in_use && !has_explicit_auth && wants_prompt && io::stdout().is_terminal() {
+                // No default to use + interactive: show unified connection flow
                 let (term_width, _) = terminal::size().unwrap_or((80, 24));
                 let mut flow = ConnectionFlow::for_startup(&envs, term_width, true);
 
@@ -11698,13 +11711,7 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
                 // If from picker (is_connecting), show error message instead of exiting
                 if is_connecting {
                     if let Some(ref env_name) = state.loading_connection_name {
-                        if err.contains("401") {
-                            state.status_msg = format!("{}: {}", env_name, "unauthorized".red());
-                        } else if err.contains("403") {
-                            state.status_msg = format!("{}: {}", env_name, "forbidden".red());
-                        } else {
-                            state.status_msg = format!("{}: {}", env_name, "auth failed".red());
-                        }
+                        state.status_msg = format!("{}: {}", env_name, load_refusal(err).red());
                         state.status_msg_at = Some(Instant::now());
                     }
                     state.loading_connection_name = None;
@@ -13599,6 +13606,19 @@ fn classify_prompt_line(input: &str) -> PromptLine {
     if imports {
         return PromptLine::Program;
     }
+    // A line that names a file runs as the file, however little it holds: a
+    // file of one request is not that request typed. What was typed is a
+    // request (or a describe block and its request, pasted) from its first
+    // word.
+    let typed = input
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .and_then(|line| line.split_whitespace().next())
+        .is_some_and(|word| starts_a_request(word) || word.starts_with('{'));
+    if !typed {
+        return PromptLine::Program;
+    }
     match split_bulk_requests_with(input, None, &mut ImportAliases::new(), true) {
         Ok(mut program) if program.url_conditions.is_empty() && program.steps.len() == 1 => {
             match program.steps.pop() {
@@ -15272,9 +15292,6 @@ fn handle_switch_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io
     }
     match result {
         ConnectionFlowResult::Connected(env, preloaded, resolved_config) => {
-            // Clear the flow UI (use tracked lines from last render)
-            execute!(stdout, cursor::MoveUp(flow.last_rendered_lines), cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
-
             // Apply connection
             if env.name.is_empty() {
                 // From setup - new connection
@@ -15299,8 +15316,20 @@ fn handle_switch_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io
                 state.status_msg_at = Some(Instant::now());
             }
 
-            // Use preloaded result if available, otherwise load now
-            let result = preloaded.unwrap_or_else(|| background_load(&state.config, None));
+            // Use preloaded result if available, otherwise load now: behind
+            // the form, with its spinner turning and its keys read, as the
+            // form a session starts with does.
+            let result = match preloaded {
+                Some(result) => result,
+                None => load_behind_flow(&mut flow, stdout, &state.config),
+            };
+            // A server that let the form's own check in and not this.
+            if let Some(err) = &result.error {
+                state.status_msg = format!("{}: {}", state.config.base_uri, load_refusal(err).red());
+                state.status_msg_at = Some(Instant::now());
+            }
+            // Clear the flow UI (use tracked lines from last render)
+            execute!(stdout, cursor::MoveUp(flow.last_rendered_lines), cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
             apply_connection(state, result);
 
             // Full screen clear and fresh start for new connection. The last
@@ -15351,6 +15380,17 @@ fn sh_quote(word: &str) -> String {
     format!("'{}'", word.replace('\'', "'\\''"))
 }
 
+/// The settings a request was sent under that say what is sent and asked
+/// for. They are the request's own: a file's `set` lines end with the file,
+/// and the menu may have changed a setting since.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+struct SentUnder {
+    ndjson: bool,
+    /// Streamed, which a request is not while export is on.
+    streaming: bool,
+    include_nulls: bool,
+}
+
 /// The last request sent, as a curl command that sends the same thing: the
 /// same method, URL, authorization, headers and body. Every value is one
 /// quoted shell word, so a body with a `'`, or a URI with `$` or a backtick,
@@ -15363,10 +15403,11 @@ fn build_curl(state: &AppState) -> Option<String> {
         return None;
     }
     let config = &state.config;
+    let sent = state.prev_sent;
 
     let mut content_type = "application/json".to_string();
     let mut accept = "application/json".to_string();
-    if config.ndjson {
+    if sent.ndjson {
         content_type = "application/x-ndjson".to_string();
         accept = "application/x-ndjson".to_string();
     }
@@ -15394,12 +15435,11 @@ fn build_curl(state: &AppState) -> Option<String> {
     if let Some(asked) = to_file.then(|| accept_for_outfile(&state.prev_outfile)).flatten() {
         accept = asked.to_string();
     }
-    // As the request itself: export needs the whole body, so it is not streamed.
-    if config.streaming && config.export_id.is_none() {
+    if sent.streaming {
         content_type.push_str(";stream=true");
         accept.push_str(";stream=true");
     }
-    if config.include_nulls {
+    if sent.include_nulls {
         accept.push_str(";skipNulls=false");
     }
 
@@ -15459,6 +15499,12 @@ fn record_last_request(state: &mut AppState) {
     state.prev_outfile = state.config.outfile.clone();
     state.prev_display_outfile = state.display_outfile.clone();
     state.prev_outfile_append = state.config.outfile_append;
+    state.prev_sent = SentUnder {
+        ndjson: state.config.ndjson,
+        // Export needs the whole body, so the request is not streamed.
+        streaming: state.config.streaming && state.config.export_id.is_none(),
+        include_nulls: state.config.include_nulls,
+    };
 }
 
 /// Why the last request can't be written as a curl command, when it can't.
@@ -16126,17 +16172,10 @@ fn print_splash_with_width(config: &Config, term_width: u16) {
         term_w.max(min_width).min(full_width - hint_section_width + 2)
     };
 
-    let title_len = title.len() + version.len() + 3;
-    let top_padding = actual_width.saturating_sub(4 + title_len + 1);
+    let (heading, top_padding) = splash_heading(title, &version, actual_width);
 
     outln!();
-    outln!(
-        "{}{}{}{}",
-        "╭───".dimmed(),
-        format!(" {} {} ", title.bold(), version.dimmed()),
-        "─".repeat(top_padding.max(1)).dimmed(),
-        "╮".dimmed()
-    );
+    outln!("{}{}{}{}", "╭───".dimmed(), heading, "─".repeat(top_padding).dimmed(), "╮".dimmed());
 
     if show_hint {
         // Full width with hint
@@ -16172,6 +16211,21 @@ fn print_splash_with_width(config: &Config, term_width: u16) {
 /// How many lines `print_splash_with_width` prints at this width: the box
 /// with a blank line above and below, or just the blank line when the
 /// terminal is too narrow for the box.
+/// The title and version in the top row of a splash box `width` columns
+/// wide, and how many `─` fill the row behind them. A version that has no
+/// room (`v3.10.10` in the narrowest box) is left out: the row is as wide
+/// as the box whatever the version is.
+fn splash_heading(title: &str, version: &str, width: usize) -> (String, usize) {
+    // `╭───` in front and `╮` behind.
+    let room = width.saturating_sub(4 + 1);
+    let with_version = title.len() + version.len() + 3;
+    if with_version <= room {
+        (format!(" {} {} ", title.bold(), version.dimmed()), room - with_version)
+    } else {
+        (format!(" {} ", title.bold()), room.saturating_sub(title.len() + 2))
+    }
+}
+
 fn splash_line_count(term_width: u16) -> u16 {
     if (term_width as usize) < SPLASH_MIN_WIDTH { 1 } else { 5 }
 }
@@ -16215,6 +16269,17 @@ fn load_behind_flow(flow: &mut ConnectionFlow, stdout: &mut io::Stdout, config: 
             }
         }
         frame += 1;
+    }
+}
+
+/// What a connection that could not be loaded is said to be, in a word.
+fn load_refusal(error: &str) -> &'static str {
+    if error.contains("401") {
+        "unauthorized"
+    } else if error.contains("403") {
+        "forbidden"
+    } else {
+        "auth failed"
     }
 }
 
@@ -17284,9 +17349,14 @@ fn handle_json_tab_completion(state: &mut AppState, reverse: bool, apply: bool) 
         // Already applied once — cycle to next completion
         let step = if reverse { state.completions.len() - 1 } else { 1 };
         state.completion_idx = (state.completion_idx + step) % state.completions.len();
+    } else if reverse {
+        // Shift+Tab goes back in the list Tab is cycling through, and here
+        // there is none: behind the key Tab has just completed, the list
+        // would be a new one, of values, and its last would be written.
+        return;
     } else {
         state.completions = completions;
-        state.completion_idx = if reverse { state.completions.len() - 1 } else { 0 };
+        state.completion_idx = 0;
         // Use tab_key for applied completions so cycling works on subsequent Tab presses
         // Use "json_ghost:" prefix for preview-only so first Tab doesn't cycle
         state.last_tab_input = if apply { tab_key } else { format!("json_ghost:{}:{}", ctx.schema, kind) };
@@ -17989,7 +18059,7 @@ fn get_completion_ghost(state: &AppState) -> String {
 
     // The first completion, and what it would add to what is typed
     let completions = get_completions(state, &uri);
-    if let Some(ghost) = completions.first().and_then(|completion| completion.strip_prefix(uri.as_str())) {
+    if let Some(ghost) = completions.first().and_then(|completion| rest_behind(completion, &uri)) {
         if !ghost.is_empty() {
             return ghost.to_string();
         }
@@ -18055,11 +18125,15 @@ fn get_completion_ghost_at_cursor(state: &AppState) -> String {
         return String::new();
     }
 
-    get_completions(state, uri)
-        .first()
-        .and_then(|completion| completion.strip_prefix(uri))
-        .unwrap_or_default()
-        .to_string()
+    get_completions(state, uri).first().and_then(|completion| rest_behind(completion, uri)).unwrap_or_default().to_string()
+}
+
+/// What `completion` adds to what is typed. A completion may differ from
+/// what is typed in case (`~map(COM` completes to `~map(com.heads.csv)`):
+/// Tab writes it, so its rest is shown, as for the name behind `@file~map(`.
+fn rest_behind<'a>(completion: &'a str, typed: &str) -> Option<&'a str> {
+    let head = completion.get(..typed.len())?;
+    head.eq_ignore_ascii_case(typed).then(|| &completion[typed.len()..])
 }
 
 /// Extract the file path portion being typed after ">" or "@" in the input.
@@ -20460,8 +20534,13 @@ mod tests {
             steps("set include-nulls\nown.api", true),
             [typed, written(export("in.ner.id"), &[export("in.ner.id")]), get("/own"), scope(&[])]
         );
+        // A file runs as a file, however little it holds: its one request
+        // is not that request typed.
         let line = dir.path().join("plain.api").display().to_string();
-        assert!(matches!(classify_prompt_line(&line), PromptLine::Request(_)));
+        assert!(matches!(classify_prompt_line(&line), PromptLine::Program));
+        assert!(matches!(classify_prompt_line("GET /plain"), PromptLine::Request(_)));
+        assert!(matches!(classify_prompt_line("# said first\nGET /plain"), PromptLine::Request(_)));
+        assert!(matches!(classify_prompt_line("{\"title\":{}}\nGET /plain"), PromptLine::Request(_)));
         assert!(matches!(classify_prompt_line("set export a.b.c"), PromptLine::Program));
 
         // A `set` line is a line of its own.
@@ -21974,19 +22053,35 @@ mod tests {
 
         // Streaming is in the headers when the request was streamed, which
         // it is not under export. `-i` and `--ndjson` are there as sent.
-        state.prev_method = "GET".to_string();
-        state.prev_body.clear();
-        state.config.streaming = true;
-        assert_eq!(tail(&state), "application/json;stream=true'");
-        state.config.export_id = Some("com.heads.seedID".to_string());
-        assert_eq!(tail(&state), "application/json'");
-        state.config.export_id = None;
-        state.config.streaming = false;
+        // They are read when the request is sent, and are that request's:
+        // a setting changed since (in the menu, or by a file's `set` lines
+        // ending with the file) is not in the command.
+        let sent_under = |state: &mut AppState, change: &dyn Fn(&mut Config)| {
+            state.method = "GET".to_string();
+            state.uri = "/x".to_string();
+            state.body.clear();
+            let before = state.config.clone();
+            change(&mut state.config);
+            record_last_request(state);
+            state.config = before;
+            build_curl(state).unwrap().split(" -H 'Accept: ").nth(1).unwrap().to_string()
+        };
+        assert_eq!(sent_under(&mut state, &|c| c.streaming = true), "application/json;stream=true'");
+        assert_eq!(
+            sent_under(&mut state, &|c| {
+                c.streaming = true;
+                c.export_id = Some("com.heads.seedID".to_string());
+            }),
+            "application/json'"
+        );
+        assert_eq!(sent_under(&mut state, &|c| c.include_nulls = true), "application/json;skipNulls=false'");
+        assert_eq!(sent_under(&mut state, &|c| c.ndjson = true), "application/x-ndjson'");
+        assert_eq!(sent_under(&mut state, &|_| ()), "application/json'");
+        // Turned on after the request was sent: not what was sent.
         state.config.include_nulls = true;
-        assert_eq!(tail(&state), "application/json;skipNulls=false'");
-        state.config.include_nulls = false;
         state.config.ndjson = true;
-        assert_eq!(tail(&state), "application/x-ndjson'");
+        state.config.streaming = true;
+        assert_eq!(tail(&state), "application/json'");
     }
 
     #[test]
@@ -28283,6 +28378,15 @@ mod tests {
             ("acme.", "app.heads.com"),
             ("acme.app.h", "eads.com"),
             ("acme.app.heads.com", ""),
+            // A host with a domain of its own has all it needs, and so has
+            // one with a port or a path.
+            ("cos.example.com", ""),
+            ("cos.example", ""),
+            ("myhost:8080", ""),
+            ("acme:", ""),
+            ("acme/tenant", ""),
+            // …but one whose domain may still become the suffix is offered it.
+            ("cos.example.a", "pp.heads.com"),
             // An address is whole as it is.
             ("10.0.0.5", ""),
             ("127.0.0.1:5000", ""),
@@ -30941,5 +31045,90 @@ mod tests {
         });
         assert_eq!(written.recv_timeout(Duration::from_secs(10)), Ok(true), "the append never came back");
         assert_eq!(reader.join().unwrap(), "[1]");
+    }
+
+    /// Shift+Tab goes back in the list Tab is going through, and writes
+    /// nothing where there is none: behind a key Tab has just completed it
+    /// used to write the last value of a list of its own.
+    #[test]
+    fn shift_tab_in_a_body_goes_back_in_tabs_list_and_starts_none() {
+        let mut state = completing_body("PUT /people [{\"g^");
+        tab_pressed(&mut state);
+        assert_eq!(shown(&state), "PUT /people [{\"gdprForgotten\":^");
+        backtab_pressed(&mut state);
+        assert_eq!(shown(&state), "PUT /people [{\"gdprForgotten\":^");
+        backtab_pressed(&mut state);
+        assert_eq!(shown(&state), "PUT /people [{\"gdprForgotten\":^");
+
+        // Through the values Tab is cycling, and round.
+        tab_pressed(&mut state);
+        assert_eq!(shown(&state), "PUT /people [{\"gdprForgotten\": true^");
+        backtab_pressed(&mut state);
+        assert_eq!(shown(&state), "PUT /people [{\"gdprForgotten\": false^");
+        backtab_pressed(&mut state);
+        assert_eq!(shown(&state), "PUT /people [{\"gdprForgotten\": true^");
+        tab_pressed(&mut state);
+        assert_eq!(shown(&state), "PUT /people [{\"gdprForgotten\": false^");
+
+        // Through the subtypes of the `@type` Tab wrote: back from the
+        // first is the last, and Tab from there the first again.
+        let mut state = completing_body("POST /agents {\"@t^");
+        tab_pressed(&mut state);
+        let first = shown(&state);
+        assert_eq!(first, "POST /agents {\"@type\": \"person\"^");
+        tab_pressed(&mut state);
+        let second = shown(&state);
+        assert_ne!(second, first);
+        backtab_pressed(&mut state);
+        assert_eq!(shown(&state), first);
+        backtab_pressed(&mut state);
+        let last = shown(&state);
+        assert_ne!(last, first);
+        tab_pressed(&mut state);
+        assert_eq!(shown(&state), first);
+    }
+
+    /// The ghost is what Tab writes behind what is typed, in whatever case
+    /// that was typed: a mapped type's name is found in any case.
+    #[test]
+    fn a_ghost_is_shown_for_a_name_typed_in_another_case() {
+        for (line, ghost, written) in [
+            ("GET /people~map(COM^", ".heads.csv)", "GET /people~map(com.heads.csv)^"),
+            ("GET /people~map(com.heads.S^", "ql)", "GET /people~map(com.heads.sql)^"),
+            ("GET /people~map(com.heads.c^", "sv)", "GET /people~map(com.heads.csv)^"),
+            ("PUT /people @rows.csv~map(COM^", ".heads.csv)", "PUT /people @rows.csv~map(com.heads.csv)^"),
+        ] {
+            let mut state = completing(line);
+            assert_eq!(render_input_content(&mut state, 200).2, ghost, "{line}");
+            tab_pressed(&mut state);
+            assert_eq!(shown(&state), written, "{line}");
+        }
+        assert_eq!(rest_behind("/people", "/PEO"), Some("ple"));
+        assert_eq!(rest_behind("/people", "/pets"), None);
+        assert_eq!(rest_behind("/pe", "/people"), None);
+        // Never cut inside a character.
+        assert_eq!(rest_behind("/ärende", "/a"), None);
+        assert_eq!(rest_behind("/ärende", "/ä"), Some("rende"));
+    }
+
+    /// The top row of the splash is as wide as its box, whatever the
+    /// version: one that has no room is left out, not let run over.
+    #[test]
+    fn the_splash_heading_fits_its_box_for_any_version() {
+        let title = "CommerceOS API Client";
+        for version in ["v3.3.2", "v3.3.10", "v3.10.10", "v10.10.10-beta.1"] {
+            for width in [SPLASH_MIN_WIDTH, 37, 42, 59, 60] {
+                let (heading, padding) = splash_heading(title, version, width);
+                let heading = visible_text(&heading);
+                assert_eq!(4 + heading.chars().count() + padding + 1, width, "{version} at {width}: {heading:?}");
+                assert!(heading.starts_with(" CommerceOS API Client "), "{heading:?}");
+                // The version whole, or not at all.
+                assert!(heading.trim_end().ends_with(version) || heading == " CommerceOS API Client ", "{heading:?}");
+            }
+        }
+        // The version this build has is shown in the narrowest box.
+        let (heading, _) = splash_heading(title, &format!("v{}", VERSION), SPLASH_MIN_WIDTH);
+        assert!(visible_text(&heading).contains(VERSION), "{heading:?}");
+        assert!(visible_text(&splash_heading(title, "v3.3.10", SPLASH_MIN_WIDTH).0).contains("v3.3.10"));
     }
 }

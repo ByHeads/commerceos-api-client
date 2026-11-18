@@ -11531,3 +11531,118 @@ fn an_append_to_a_file_that_is_not_utf8_keeps_its_bytes() {
     let rows = std::fs::read(d.join("rows.ndjson")).unwrap();
     assert_eq!(rows, b"{\"n\":\"caf\xe9\"}\n{\"ok\":\"/api/v1/two\"}\n", "{}", String::from_utf8_lossy(&rows));
 }
+
+/// A file named at the prompt runs as a file, however little it holds: a
+/// file of one request is not that request typed. Its body-less `PUT` is
+/// sent as a batch sends it (the body editor is for a line that was typed),
+/// and what its describe block is warned for is said.
+#[cfg(unix)]
+#[test]
+fn a_file_of_one_request_runs_as_a_file_at_the_prompt() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::write(d.join("one.api"), "# one request\nPUT /bodyless\n").unwrap();
+    std::fs::write(d.join("told.api"), "{ \"title\": \"Katalog\" }\nGET /described\n").unwrap();
+    let mut prompt = pty::Prompt::open(api(server.port, d));
+    prompt.wait_ready(Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(600));
+
+    let (sent, shown) = run_pasted(&mut prompt, &server, "one.api");
+    assert_eq!(sent, ["PUT /bodyless"], "{shown}");
+    // No body editor was opened: the next line is a line.
+    let (sent, shown) = run_pasted(&mut prompt, &server, "GET /next");
+    assert_eq!(sent, ["GET /next"], "{shown}");
+
+    let (sent, shown) = run_pasted(&mut prompt, &server, "told.api");
+    assert_eq!(sent, ["GET /described"], "{shown}");
+    assert!(shown.contains("describe block in told.api: title is not an object of texts by locale"), "{shown}");
+
+    // The same request typed still opens the editor for its body.
+    let (sent, shown) = run_pasted(&mut prompt, &server, "PUT /bodyless");
+    assert_eq!(sent.len(), 0, "{shown}");
+    prompt.send(b"{\"a\":1}\x04");
+    pump_until(&mut prompt, Duration::from_secs(4), |_| server.seen() > 0);
+    assert_eq!(server.take(), ["PUT /bodyless {\"a\":1}"]);
+}
+
+/// A default connection that names nothing, or can't be used, is no
+/// connection: at a terminal the picker opens, as it does with no default,
+/// where the session used to end with `no base URL specified`.
+#[cfg(unix)]
+#[test]
+fn a_default_that_cannot_be_used_opens_the_picker_at_a_terminal() {
+    let server = RecordingServer::start();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    let cases: [(&[(&str, String, &str, &str, &str)], &str, &str); 2] = [
+        (&[("alpha", url.clone(), "key", "k1", "")], "locl", "the default connection \"locl\" is not among the saved connections (alpha)"),
+        (
+            &[("alpha", url.clone(), "key", "k1", ""), ("odd", url.clone(), "bearer", "t", "")],
+            "odd",
+            "the default connection \"odd\" can't be used: its auth_type \"bearer\"",
+        ),
+    ];
+    for (connections, default, warning) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        write_credentials(dir.path(), connections, default);
+        let mut prompt = pty::Prompt::open(api_bare(dir.path()));
+        prompt.wait_for("+ Add new connection", Duration::from_secs(15));
+        let shown = pty::plain(&prompt.screen);
+        assert!(shown.contains(warning), "{default}: {shown}");
+        assert!(!shown.contains("no base URL specified"), "{default}: {shown}");
+        prompt.pump(Duration::from_millis(400));
+        // The picker opens on the default, which is the one that can't be
+        // used: a connection that works is searched for.
+        prompt.send(b"alpha");
+        prompt.pump(Duration::from_millis(300));
+        prompt.send(b"\r");
+        prompt.wait_ready(Duration::from_secs(15));
+        prompt.pump(Duration::from_millis(600));
+        let (sent, shown) = run_pasted(&mut prompt, &server, "GET /picked");
+        assert_eq!(sent, ["GET /picked"], "{default}: {shown}");
+    }
+
+    // Without a terminal nothing is asked: the warning, and no connection.
+    let dir = tempfile::tempdir().unwrap();
+    write_credentials(dir.path(), cases[0].0, "locl");
+    let got = run_bare(&server, dir.path(), &["GET", "/x"]);
+    assert_eq!((got.code, got.sent.len()), (Some(1), 0), "{}", got.stderr);
+    assert!(got.stderr.contains("no base URL specified"), "{}", got.stderr);
+}
+
+/// A connection made in the form that ctrl+q opens is loaded behind the
+/// form, with its spinner turning, as the form a session starts with does:
+/// the session used to stand still, form and all, until the server answered.
+#[cfg(unix)]
+#[test]
+fn a_connection_added_in_a_session_loads_behind_its_form() {
+    let server = RecordingServer::start();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write_credentials(d, &[("alpha", url.clone(), "key", "k1", "")], "alpha");
+    let mut prompt = pty::Prompt::open(api_bare(d));
+    prompt.wait_ready(Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(500));
+    keys_then(&mut prompt, "\x11", "+ Add new connection");
+    keys_then(&mut prompt, "\x1b[B\r", "Type the API base URL");
+    prompt.paste(&url);
+    keys_then(&mut prompt, "\r", "Use ← → to choose auth method");
+    keys_then(&mut prompt, "\r", "Type your API key");
+    // A server that takes four seconds to answer `/about`.
+    prompt.paste("slowabout");
+    prompt.pump(Duration::from_millis(300));
+    let mark = prompt.screen.len();
+    prompt.send(b"\r");
+    let loading = pump_until(&mut prompt, Duration::from_secs(12), |p| pty::plain(&p.screen[mark..]).contains("loading..."));
+    assert!(loading, "no spinner while the connection loaded:\n{}", pty::plain(&prompt.screen[mark..]));
+    // Keys pressed meanwhile are read away, not typed into the prompt.
+    prompt.send(b"zzz");
+    let opened = pump_until(&mut prompt, Duration::from_secs(12), |p| pty::plain(&p.screen[mark..]).contains("ctrl+s to save this connection"));
+    assert!(opened, "{}", pty::plain(&prompt.screen[mark..]));
+    prompt.pump(Duration::from_millis(500));
+    server.take();
+    prompt.send(b"\r");
+    pump_until(&mut prompt, Duration::from_secs(4), |_| server.seen() > 0);
+    assert_eq!(server.take(), ["GET /"], "what was typed behind the form reached the prompt");
+}
