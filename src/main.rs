@@ -833,6 +833,63 @@ fn client_builder() -> reqwest::blocking::ClientBuilder {
     Client::builder().tls_backend_preconfigured(tls_config())
 }
 
+/// The URLs of the requests in flight that are not a `GET` or a `HEAD`, as a
+/// URL parser writes them. A redirect policy is not told the method of the
+/// request it is asked about, only where it was first sent: this is how
+/// `unfollowed_redirect` knows.
+fn writes_in_flight() -> std::sync::MutexGuard<'static, Vec<String>> {
+    static WRITES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    WRITES.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Holds a request's URL among the `writes_in_flight` until it is answered.
+struct WriteInFlight(Option<String>);
+
+impl WriteInFlight {
+    fn of(request: &reqwest::blocking::Request) -> Self {
+        if matches!(*request.method(), reqwest::Method::GET | reqwest::Method::HEAD) {
+            return WriteInFlight(None);
+        }
+        let url = request.url().as_str().to_string();
+        writes_in_flight().push(url.clone());
+        WriteInFlight(Some(url))
+    }
+}
+
+impl Drop for WriteInFlight {
+    fn drop(&mut self) {
+        if let Some(url) = self.0.take() {
+            let mut writes = writes_in_flight();
+            if let Some(at) = writes.iter().position(|held| *held == url) {
+                writes.swap_remove(at);
+            }
+        }
+    }
+}
+
+/// Whether a redirect is one the client does not follow: a `301`, `302` or
+/// `303` in answer to a request that is not a `GET` or a `HEAD`. Following
+/// one sends a `GET` without the body to the new place, and its `200` would
+/// be read as the write having been done. The redirect is the answer
+/// instead. A `307` and a `308` carry the request on as it is, and are
+/// followed.
+fn unfollowed_redirect(status: u16, first_url: Option<&str>) -> bool {
+    matches!(status, 301..=303) && first_url.is_some_and(|url| writes_in_flight().iter().any(|held| held == url))
+}
+
+fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let first = attempt.previous().first().map(|url| url.as_str().to_string());
+        if unfollowed_redirect(attempt.status().as_u16(), first.as_deref()) {
+            attempt.stop()
+        } else if attempt.previous().len() > 10 {
+            attempt.error("too many redirects")
+        } else {
+            attempt.follow()
+        }
+    })
+}
+
 /// How long a connection that is not in use is kept for the next request.
 /// Shorter than a server keeps its end open (COS: 5 seconds), so that a
 /// request is never written to a connection the server is just closing: a
@@ -879,6 +936,7 @@ fn http_client_for(timeout_secs: u64) -> Client {
                 // `None` also keeps reqwest's hidden 30s default away.
                 .timeout((timeout_secs != 0).then(|| Duration::from_secs(timeout_secs)))
                 .pool_idle_timeout(Duration::from_secs(IDLE_CONNECTION_SECS))
+                .redirect(redirect_policy())
                 .build()
                 .expect("could not set up the HTTP client")
         })
@@ -1239,9 +1297,24 @@ fn form_encode(value: &str) -> String {
 }
 
 // OAuth2 client credentials token exchange
+/// The client of the token exchange, which follows no redirect.
+fn token_client() -> Client {
+    static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            client_builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("could not set up the HTTP client")
+        })
+        .clone()
+}
+
 fn oauth2_token_exchange(base_uri: &str, client_id: &str, client_secret: &str) -> Result<(String, u64), String> {
     let token_url = format!("{}/oauth2/v1/token", base_uri.trim_end_matches('/'));
-    let resp = timed(http_client().post(&token_url), 10)
+    // Not through the client of the requests: the secret is in the body, and
+    // a `307` would carry it to wherever the answer points.
+    let resp = timed(token_client().post(&token_url), 10)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(format!(
             "grant_type=client_credentials&client_id={}&client_secret={}",
@@ -7116,8 +7189,10 @@ fn export_warning(exported: &ExportedBody) -> Option<String> {
 /// not `-f`'s to cut short; when one ends the run on a status that is never
 /// an answer, `exit_on_unjudged_check` prints the body for `-f`.
 fn fail_fast_trips(config: &Config, status: u16) -> bool {
+    // A 3xx that arrives as the answer is a redirect that was not followed
+    // (`unfollowed_redirect`): the request was not carried out.
     config.fail_fast
-        && status >= 400
+        && status >= 300
         && !config.quiet
         && !config.check_only
         && (!config.expect_falsy || status_is_error(status))
@@ -10993,13 +11068,17 @@ fn home_relative(path: &str, backslash_separates: bool) -> Option<&str> {
         .or_else(|| if backslash_separates { path.strip_prefix("~\\") } else { None })
 }
 
-/// A request path with each `\` of its path part written `%5C`. A URL parser
-/// reads a `\` in an `http` path as another `/`, so the escaped quote of
-/// `~where(name="a \" b")` would arrive as `/"`. Nothing else is touched: a
-/// query keeps its `\`, which is not rewritten there.
-fn backslashes_encoded(path: &str) -> String {
-    let end = path.find(['?', '#']).unwrap_or(path.len());
-    format!("{}{}", path[..end].replace('\\', "%5C"), &path[end..])
+/// A request path with what a URL parser would read as something else
+/// written out: each `\` of its path part as `%5C`, and each `#` as `%23`.
+/// A `\` in an `http` path is read as another `/`, so the escaped quote of
+/// `~where(name="a \" b")` would arrive as `/"`; a query keeps its `\`,
+/// which is not rewritten there. A `#` starts a fragment, which is never
+/// sent: `DELETE /people/com.x.id=A#1` would delete `com.x.id=A`. A request
+/// has no use for a fragment, so a `#` the line reader left in the URI is
+/// part of it, wherever it stands.
+fn uri_escaped(path: &str) -> String {
+    let end = path.find('?').unwrap_or(path.len());
+    format!("{}{}", path[..end].replace('\\', "%5C"), &path[end..]).replace('#', "%23")
 }
 
 /// A request ready to send, and the `Accept` it carries (which says how the
@@ -11015,7 +11094,7 @@ struct BuiltRequest {
 /// here. `Err` is an `@file` body that could not be read; nothing is sent.
 fn build_request(config: &Config, parts: &RequestParts) -> Result<BuiltRequest, String> {
     let client = http_client_for(config.timeout_secs);
-    let url = format!("{}{}", config.base_uri, backslashes_encoded(&resolve_request_path(&config.api_path, &parts.uri)));
+    let url = format!("{}{}", config.base_uri, uri_escaped(&resolve_request_path(&config.api_path, &parts.uri)));
 
     let mut request = match parts.method.as_str() {
         "GET" => client.get(&url),
@@ -11074,6 +11153,16 @@ fn build_request(config: &Config, parts: &RequestParts) -> Result<BuiltRequest, 
     Ok(BuiltRequest { request, accept })
 }
 
+/// Whether a request asks the server to stream its answer. Not one whose
+/// answer is read whole whatever was asked: `--export` rewrites the body, a
+/// `>>` splices it into what the file holds, the clipboard takes it in one
+/// piece, and an `assert` or a poll judges it. A streamed answer has its
+/// status before its body exists, so an error can arrive inside a `200`:
+/// read whole, an error is a status, which is what those four go by.
+fn asks_to_stream(config: &Config, append: bool, clipboard: bool) -> bool {
+    config.streaming && config.export_id.is_none() && !config.quiet && !config.check_only && !append && !clipboard
+}
+
 /// A response, and the token that was fetched to get it, if one was.
 struct Sent {
     response: reqwest::blocking::Response,
@@ -11081,12 +11170,21 @@ struct Sent {
     new_token: Option<String>,
 }
 
+/// Send a request, known as a write while it is in flight if it is one
+/// (`unfollowed_redirect`).
+fn send_built(built: BuiltRequest) -> Result<reqwest::blocking::Response, reqwest::Error> {
+    let (client, request) = built.request.build_split();
+    let request = request?;
+    let _in_flight = WriteInFlight::of(&request);
+    client.execute(request)
+}
+
 /// Send a built request. A 401 on a connection that has OAuth2 client
 /// credentials means the token ran out: a new one is fetched, once, and the
 /// same request (`parts`, built again with the new token) is sent again. The
 /// second answer is the answer, 401 or not.
 fn send_request(config: &Config, parts: &RequestParts, built: BuiltRequest) -> Result<Sent, reqwest::Error> {
-    let response = built.request.send()?;
+    let response = send_built(built)?;
     let renewable = response.status().as_u16() == 401
         && !config.oauth2_client_id.is_empty()
         && !config.oauth2_client_secret.is_empty();
@@ -11096,7 +11194,7 @@ fn send_request(config: &Config, parts: &RequestParts, built: BuiltRequest) -> R
             let mut renewed = config.clone();
             renewed.token = token.clone();
             if let Ok(again) = build_request(&renewed, parts) {
-                return Ok(Sent { response: again.request.send()?, new_token: Some(token) });
+                return Ok(Sent { response: send_built(again)?, new_token: Some(token) });
             }
         }
     }
@@ -11484,7 +11582,7 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
         uri: actual_uri.to_string(),
         body: body.to_string(),
         outfile: outfile.clone(),
-        streaming: config.streaming,
+        streaming: asks_to_stream(config, outfile_append, is_clipboard),
     };
     let built = match build_request(config, &parts) {
         Ok(built) => built,
@@ -13395,7 +13493,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     record_last_request(state);
 
     // `--export` rewrites the whole body, so it is read whole.
-    let streaming = state.config.streaming && state.config.export_id.is_none();
+    let streaming = asks_to_stream(&state.config, state.config.outfile_append, is_clipboard_target(&state.display_outfile));
     let parts = RequestParts {
         method: state.method.clone(),
         uri: state.uri.clone(),
@@ -15734,7 +15832,7 @@ fn build_curl(state: &AppState) -> Option<String> {
     // The URL as the request had it: a `\` as `%5C`, and a blank or a quote
     // encoded the way the client encodes it. curl takes a blank for the end
     // of the URL.
-    let url = format!("{}{}", config.base_uri, backslashes_encoded(&resolve_request_path(&config.api_path, &state.prev_uri)));
+    let url = format!("{}{}", config.base_uri, uri_escaped(&resolve_request_path(&config.api_path, &state.prev_uri)));
     let url = reqwest::Url::parse(&url).map(String::from).unwrap_or(url);
     let has_body = is_file_body || !state.prev_body.is_empty();
     // curl's HEAD is `-I`: after `-X HEAD` it waits for a body that never
@@ -19010,7 +19108,9 @@ fn resolve_at_file_body(path_raw: &str) -> Result<AtFileResult, String> {
     let expanded = expand_home(path_raw);
 
     // A path the client built for an imported file is that file.
-    let is_glob = is_glob_pattern(&expanded) && !is_literal_body(path_raw);
+    // And so is a name that holds `[`, `?` or `*` and names a file as it is
+    // (`export[1].json`): the file that is there is the one that was meant.
+    let is_glob = is_glob_pattern(&expanded) && !is_literal_body(path_raw) && !std::path::Path::new(&expanded).is_file();
 
     if !is_glob {
         // Single file — preserve existing behavior
@@ -19031,7 +19131,8 @@ fn resolve_at_file_body(path_raw: &str) -> Result<AtFileResult, String> {
                     accept_type,
                 })
             }
-            Err(_) => Err(format!("File not found: {}", path_raw)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Err(format!("File not found: {}", path_raw)),
+            Err(e) => Err(format!("could not read {}: {}", path_raw, e)),
         }
     } else {
         // Glob — expand and combine
@@ -19083,8 +19184,10 @@ fn resolve_at_file_body(path_raw: &str) -> Result<AtFileResult, String> {
                 .map_err(|e| format!("could not serialize combined JSON: {}", e))?;
             Ok(AtFileResult {
                 contents: body_bytes,
+                // Only what is sent is JSON for certain: what is asked for
+                // stays what the run asked for (`--ndjson`).
                 content_type: Some("application/json".to_string()),
-                accept_type: Some("application/json".to_string()),
+                accept_type: None,
             })
         }
     }
@@ -26337,12 +26440,46 @@ mod tests {
     }
 
     #[test]
+    fn only_a_request_that_may_be_streamed_asks_for_a_stream() {
+        let on = Config { streaming: true, ..Config::default() };
+        assert!(asks_to_stream(&on, false, false));
+        assert!(!asks_to_stream(&on, true, false), ">>");
+        assert!(!asks_to_stream(&on, false, true), "> clipboard");
+        assert!(!asks_to_stream(&Config { quiet: true, ..on.clone() }, false, false), "a poll");
+        assert!(!asks_to_stream(&Config { check_only: true, ..on.clone() }, false, false), "an assert");
+        assert!(!asks_to_stream(&Config { export_id: Some("a.b.c".to_string()), ..on.clone() }, false, false), "an export");
+        assert!(!asks_to_stream(&Config::default(), false, false));
+    }
+
+    #[test]
+    fn a_redirect_that_would_turn_a_write_into_a_get_is_not_followed() {
+        let url = "http://unit.invalid/api/v1/unfollowed";
+        let client = client_builder().build().unwrap();
+        let request = |method: reqwest::Method| client.request(method, url).build().unwrap();
+        {
+            let _write = WriteInFlight::of(&request(reqwest::Method::PUT));
+            for status in [301, 302, 303] {
+                assert!(unfollowed_redirect(status, Some(url)), "{status}");
+                assert!(!unfollowed_redirect(status, Some("http://unit.invalid/api/v1/other")), "{status}");
+            }
+            // These carry the request on as it is.
+            assert!(!unfollowed_redirect(307, Some(url)));
+            assert!(!unfollowed_redirect(308, Some(url)));
+        }
+        // Answered, it is no longer held; and a read never is.
+        assert!(!unfollowed_redirect(301, Some(url)));
+        let _read = WriteInFlight::of(&request(reqwest::Method::GET));
+        let _head = WriteInFlight::of(&request(reqwest::Method::HEAD));
+        assert!(!unfollowed_redirect(301, Some(url)));
+    }
+
+    #[test]
     fn fail_fast_trips_on_any_error_status_except_an_answer_to_a_question() {
         let plain = Config { fail_fast: true, ..Config::default() };
-        for status in [400, 401, 404, 409, 422, 429, 500, 503] {
+        for status in [301, 302, 303, 400, 401, 404, 409, 422, 429, 500, 503] {
             assert!(fail_fast_trips(&plain, status), "{status}");
         }
-        for status in [200, 201, 204, 301, 304, 399] {
+        for status in [200, 201, 204, 299] {
             assert!(!fail_fast_trips(&plain, status), "{status}");
         }
         // Off unless asked for.
@@ -29667,8 +29804,12 @@ mod tests {
         assert_eq!(sent("body.json"), r#"{"name":"Ann"}"#);
         assert_eq!(sent("rows/*.json"), r#"[{"a":1}]"#);
         assert_eq!(sent("rows/?.json"), r#"[{"a":1}]"#);
-        // The same path from a line of the batch's own is a pattern, as ever.
+        // The same characters on a line of the batch's own name the file
+        // that is there, and are a pattern where no file has that name.
         let typed = dir.path().canonicalize().unwrap().join("lib?/rows/a.json");
+        let named = String::from_utf8(resolve_at_file_body(typed.to_str().unwrap()).unwrap().contents).unwrap();
+        assert_eq!(named, r#"{"a":1}"#);
+        let typed = dir.path().canonicalize().unwrap().join("lib?/rows/?.json");
         let both = String::from_utf8(resolve_at_file_body(typed.to_str().unwrap()).unwrap().contents).unwrap();
         assert_eq!(both, r#"[{"a":1},{"z":9}]"#);
     }
@@ -30705,14 +30846,19 @@ mod tests {
     }
 
     #[test]
-    fn a_backslash_in_the_path_of_a_request_is_percent_encoded() {
-        assert_eq!(backslashes_encoded(r#"/api/v1/a~where(n="a \" b")"#), r#"/api/v1/a~where(n="a %5C" b")"#);
-        assert_eq!(backslashes_encoded(r"/a\b\c"), "/a%5Cb%5Cc");
+    fn a_backslash_and_a_hash_in_a_request_uri_are_percent_encoded() {
+        assert_eq!(uri_escaped(r#"/api/v1/a~where(n="a \" b")"#), r#"/api/v1/a~where(n="a %5C" b")"#);
+        assert_eq!(uri_escaped(r"/a\b\c"), "/a%5Cb%5Cc");
         // Only the path, and nothing else of it.
-        assert_eq!(backslashes_encoded(r"/a\b?x=c\d"), r"/a%5Cb?x=c\d");
-        assert_eq!(backslashes_encoded(r"/a#x\y"), r"/a#x\y");
-        assert_eq!(backslashes_encoded("/a%5Cb/c d/å~where(x=1)"), "/a%5Cb/c d/å~where(x=1)");
-        assert_eq!(backslashes_encoded(""), "");
+        assert_eq!(uri_escaped(r"/a\b?x=c\d"), r"/a%5Cb?x=c\d");
+        // A `#` is part of the URI and no fragment, in the path and behind it.
+        assert_eq!(uri_escaped(r"/a#x\y"), "/a%23x%5Cy");
+        assert_eq!(uri_escaped("/people/com.x.id=A#1"), "/people/com.x.id=A%231");
+        assert_eq!(uri_escaped(r#"/a~where(n="x #y")"#), r#"/a~where(n="x %23y")"#);
+        assert_eq!(uri_escaped("/a?x=1#2"), "/a?x=1%232");
+        assert_eq!(uri_escaped("/a%23b"), "/a%23b");
+        assert_eq!(uri_escaped("/a%5Cb/c d/å~where(x=1)"), "/a%5Cb/c d/å~where(x=1)");
+        assert_eq!(uri_escaped(""), "");
     }
 
     #[test]

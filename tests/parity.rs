@@ -213,6 +213,17 @@ fn answer(
         let _ = stream.flush();
         return;
     }
+    if let Some(status) = ["301 Moved Permanently", "302 Found", "303 See Other"]
+        .into_iter()
+        .find(|status| path.contains(&format!("/old{}", &status[..3])))
+    {
+        // `/old301`, `/old302` and `/old303` are sent on to `/landed` the old way.
+        let _ = stream.write_all(
+            format!("HTTP/1.1 {status}\r\nLocation: /api/v1/landed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes(),
+        );
+        let _ = stream.flush();
+        return;
+    }
     if path.contains("/notutf8") {
         // A JSON string with one byte that is Latin-1, not UTF-8.
         let body = b"\"caf\xe9 x\"";
@@ -228,6 +239,15 @@ fn answer(
         let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{rest}").as_bytes());
         let _ = stream.flush();
         std::thread::sleep(hold);
+        return;
+    }
+
+    if path.contains("/oauth2/v1/token") && body.contains("client_id=moved") {
+        // A token endpoint that sends the request, and the secret in it, on.
+        let _ = stream.write_all(
+            b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /api/v1/landed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let _ = stream.flush();
         return;
     }
 
@@ -639,6 +659,14 @@ fn cases(dir: &Path) -> Vec<Case> {
             &[],
         )
         .fails("needs a path"),
+        // A `#` in a URI is part of it, not a fragment that is never sent.
+        case("a # in a path", "DELETE /people/com.x.id=A#1", Some(&["DELETE", "/people/com.x.id=A#1"]), &["DELETE /people/com.x.id=A%231"]),
+        case(
+            "a # in a quoted value",
+            r#"GET /a~where(n="x #y")"#,
+            Some(&["GET", r#"/a~where(n="x #y")"#]),
+            &["GET /a~where(n=%22x%20%23y%22)"],
+        ),
         // Chains
         case("&& chain", "GET /a && GET /b", Some(&["GET", "/a", "&&", "GET", "/b"]), &["GET /a", "GET /b"]),
         case("|| chain", "GET /missing || GET /b", Some(&["GET", "/missing", "||", "GET", "/b"]), &["GET /missing", "GET /b"]),
@@ -1019,6 +1047,11 @@ fn header_rows() -> Vec<HeaderRow> {
         (&[], "PUT /h @UP.CSV", JSON, "text/csv", "-"),
         (&[], "PUT /h @UP.CSV~map(com.heads.t)", JSON, "text/csv", "com.heads.t"),
         (&[], "PUT /h @streams/*", NDJSON, NDJSON, "-"),
+        // Files put together as one JSON array are sent as JSON, and what is
+        // asked for stays what the run asked for.
+        (&[], "PUT /h @parts/*.json", JSON, JSON, "-"),
+        (&["--ndjson"], "PUT /h @parts/*.json", NDJSON, JSON, "-"),
+        (&["--ndjson"], "PUT /h @data.csv", NDJSON, "text/csv", "-"),
         (&[], r#"PUT /h {"x":1}"#, JSON, JSON, "-"),
     ]
 }
@@ -1034,6 +1067,9 @@ fn header_fixtures(dir: &Path) {
     std::fs::create_dir_all(dir.join("streams")).unwrap();
     std::fs::write(dir.join("streams/a.NDJSON"), "{\"a\":1}\n").unwrap();
     std::fs::write(dir.join("streams/b.njson"), "{\"a\":2}\n").unwrap();
+    std::fs::create_dir_all(dir.join("parts")).unwrap();
+    std::fs::write(dir.join("parts/a.json"), "{\"a\":1}").unwrap();
+    std::fs::write(dir.join("parts/b.json"), "[{\"a\":2}]").unwrap();
 }
 
 #[cfg(unix)]
@@ -3027,6 +3063,21 @@ fn a_failed_token_exchange_does_not_end_the_prompt() {
     prompt.send(b"\r");
     prompt.wait_for("200 OK", Duration::from_secs(6));
     assert_eq!(server.log.lock().unwrap().clone(), ["GET /still-here"]);
+}
+
+/// The token exchange follows no redirect: the client secret is in its body,
+/// and a 307 would carry it to wherever the answer points.
+#[test]
+fn the_client_secret_does_not_follow_a_redirect() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write_credentials(d, &[("c", format!("http://127.0.0.1:{}", server.port), "oauth2", "s3cret", "moved")], "c");
+    let got = run_bare(&server, d, &["GET", "/a"]);
+    assert_eq!(got.code, Some(1), "{}", got.stdout);
+    assert!(got.stderr.contains("OAuth2 token exchange failed") && got.stderr.contains("307"), "{}", got.stderr);
+    // Sent once, to the token endpoint, and nothing after it.
+    assert_eq!(got.sent, ["POST /oauth2/v1/token grant_type=client_credentials&client_id=moved&client_secret=s3cret"]);
 }
 
 /// The same when the connection is the default one, or is named with `-c`
@@ -10589,6 +10640,97 @@ fn a_redirected_request_keeps_its_method_body_and_authorization() {
     let got = run_in(&server, d, &["PATCH", "/moved", "{\"y\":2}"]);
     assert_eq!(got.sent, ["PATCH /moved {\"y\":2}", "PATCH /landed {\"y\":2}"]);
     assert!(got.stdout.contains("/api/v1/landed"), "{}", got.stdout);
+}
+
+/// A write that is answered with a 301, a 302 or a 303 is not sent on: what
+/// would arrive is a `GET` without the body, and its 200 would stand under
+/// the write in the log. The redirect is the answer, and `-f` stops at it.
+/// A `GET` is sent on as before.
+#[test]
+fn a_write_is_not_sent_on_by_a_redirect_that_would_make_it_a_get() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    for status in ["301", "302", "303"] {
+        for method in ["POST", "PUT", "PATCH", "DELETE"] {
+            let write = format!("{method} /old{status} {{\"x\":1}}");
+            std::fs::write(d.join("r.api"), format!("{write}\nGET /after\n")).unwrap();
+            let got = run_in(&server, d, &["-sa", "r.api"]);
+            assert_eq!(got.code, Some(0), "{write}: {}", got.stderr);
+            assert_eq!(got.sent, [write.as_str(), "GET /after"], "{write}");
+            assert!(got.stdout.contains(&format!("HTTP/1.1 {status} ")), "{write}: {}", got.stdout);
+
+            let got = run_in(&server, d, &["-sfa", "r.api"]);
+            assert_eq!(got.code, Some(1), "{write}: {}", got.stdout);
+            assert_eq!(got.sent, [write.as_str()], "{write}");
+        }
+        let got = run_in(&server, d, &["-f", "PUT", &format!("/old{status}"), "{\"x\":1}"]);
+        assert_eq!((got.code, got.sent.len()), (Some(1), 1), "{status}: {}", got.stderr);
+        // A read is carried on, and is the answer it gets there.
+        for method in ["GET", "HEAD"] {
+            let got = run_in(&server, d, &["-f", method, &format!("/old{status}")]);
+            assert_eq!(got.code, Some(0), "{method} {status}: {}", got.stderr);
+            assert_eq!(got.sent, [format!("{method} /old{status}"), format!("{method} /landed")], "{status}");
+        }
+    }
+    // In a chain a redirect that was not followed is a "no", as a 404 is.
+    let got = run_in(&server, d, &[r#"PUT /old301 {"x":1} || GET /else"#]);
+    assert_eq!(got.sent, [r#"PUT /old301 {"x":1}"#, "GET /else"], "{}", got.stderr);
+}
+
+/// A request whose answer is read whole does not ask for it to be streamed:
+/// a streamed answer can hold an error behind a 200, which a `>>` would
+/// then add to its file and an `assert` take for a yes.
+#[test]
+fn a_request_that_is_read_whole_does_not_ask_for_a_stream() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::write(
+        d.join("s.api"),
+        "GET /a >> all.json\nassert GET /b\nsleep 100ms while not GET /c\nGET /d > one.json\nGET /e\n",
+    )
+    .unwrap();
+    let got = run_in(&server, d, &["--stream", "-sa", "s.api"]);
+    assert_eq!((got.code, got.sent.len()), (Some(0), 5), "{}", got.stderr);
+    let json = "application/json";
+    let streamed = "application/json;stream=true";
+    assert_eq!(accepts_of(&server), [json, json, json, streamed, streamed]);
+    // One request, the same.
+    for (args, asked) in [(&["GET", "/a", ">>", "all.json"][..], json), (&["GET", "/a", ">", "one.json"], streamed), (&["assert GET /a"], json)] {
+        let mut with = vec!["--stream"];
+        with.extend_from_slice(args);
+        let got = run_in(&server, d, &with);
+        assert_eq!(got.code, Some(0), "{args:?}: {}", got.stderr);
+        assert_eq!(accepts_of(&server), [asked], "{args:?}");
+    }
+}
+
+/// A file body is the file that is named when there is one, whatever its
+/// name holds, and a file that can't be read is said to be that.
+#[test]
+fn a_file_body_named_like_a_pattern_is_that_file_and_a_directory_is_no_missing_file() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::write(d.join("export[1].json"), r#"{"n":1}"#).unwrap();
+    std::fs::write(d.join("export1.json"), r#"{"n":"other"}"#).unwrap();
+    std::fs::write(d.join("what?.json"), r#"{"n":2}"#).unwrap();
+    std::fs::create_dir_all(d.join("folder")).unwrap();
+
+    let got = run_in(&server, d, &["PUT", "/x", "@export[1].json"]);
+    assert_eq!((got.code, got.sent), (Some(0), vec![r#"PUT /x {"n":1}"#.to_string()]), "{}", got.stderr);
+    let got = run_in(&server, d, &["PUT", "/x", "@what?.json"]);
+    assert_eq!((got.code, got.sent), (Some(0), vec![r#"PUT /x {"n":2}"#.to_string()]), "{}", got.stderr);
+    // With no file of that name it is the pattern it also is.
+    std::fs::remove_file(d.join("export[1].json")).unwrap();
+    let got = run_in(&server, d, &["PUT", "/x", "@export[1].json"]);
+    assert_eq!((got.code, got.sent), (Some(0), vec![r#"PUT /x [{"n":"other"}]"#.to_string()]), "{}", got.stderr);
+
+    let got = run_in(&server, d, &["PUT", "/x", "@folder"]);
+    assert_eq!((got.code, got.sent.len()), (Some(1), 0), "{}", got.stderr);
+    assert!(got.stderr.contains("could not read folder: "), "{}", got.stderr);
+    assert!(!got.stderr.contains("File not found"), "{}", got.stderr);
 }
 
 /// A body piped on stdin is sent as it is, trimmed and nothing else: it is

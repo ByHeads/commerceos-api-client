@@ -45,12 +45,13 @@ JSON string, brackets and the parentheses of a URI operator, like ` >`:
 GET /people > /tmp/people.json   # a comment
 shared/checks.api                # a comment
 sleep 2                          # a comment
-GET /people#x                    # the `#x` is no comment: no blank in front
+GET /people/com.x.id=A#1         # the `#1` is no comment: no blank in front
 PUT /x {"note":"a # b"}          # the string is sent whole
 ```
 
-The `#x` of `GET /people#x` stays in the URI, where it is a fragment, and a
-fragment is not sent to a server: what arrives is `GET /people`.
+A `#` that is no comment is part of the URI and is sent as `%23`: the line
+above deletes `com.x.id=A#1`, and `GET /x~where(ref="a #1")` asks for that
+text. A request has no fragment.
 
 A `confirm` line has none: all of it is the question.
 
@@ -151,6 +152,10 @@ PUT /sync-webhooks @data.csv~map(com.heads.csv-product)
 `~map(type)` is the only function an `@file` body takes. Any other
 (`@backup~old(1)`) is an error and the request is not sent: `unknown body
 function ~old(1)`.
+
+A name that holds `*`, `?` or `[` is a glob, unless a file has exactly that
+name: `@export[1].json` is that file when it is there. A file that is there
+and can't be read (a directory, no permission) is `could not read <path>: …`.
 
 Globs are processed in **sorted order** and skip OS junk (`.DS_Store`,
 `Thumbs.db`, `desktop.ini`, `._*`). `.njson` counts as NDJSON too, and the
@@ -253,6 +258,9 @@ api --stream -sa export.api
 - A streaming response sends its status line before the body exists, so a `200`
   can still carry an error inside the payload. Check the content.
 - `>> file`, `> clipboard`, and any non-2xx response buffer even with `--stream`.
+  A request whose answer is read whole whatever happens does not ask the
+  server to stream at all: a `>> file`, a `> clipboard`, an `assert` and a
+  `sleep while` poll. An error then arrives as a status and not inside a `200`.
 - A streamed outfile gets its name only when the body has ended. A transfer
   that fails partway leaves the target as it was (the bytes went to
   `<file>.<pid>.part` beside it, which is removed), and ends the run with
@@ -1083,7 +1091,8 @@ so is one with no value behind it (`--export needs a value`).
 
 Without `-f` a batch carries on past a request that fails: a 404, a 409 or a
 500 on a plain request line prints its status and the next line runs, and the
-exit code is 0. With `-f` the first response of **400 or above** ends the run:
+exit code is 0. With `-f` the first response of **400 or above** ends the run,
+and so does a redirect that was not followed (below):
 
 ```sh
 api -sfa seed.api
@@ -1155,6 +1164,12 @@ PUT /assert {"api/v1/people~count":{"is":3}}
   never an answer (401/403/408/429/5xx) ends the run from anywhere.
 - An error is not written to a `> outfile`: under `-f` the file is left
   alone and the body goes to stdout.
+- **A write is not sent on by a `301`, a `302` or a `303`.** Followed, such a
+  redirect turns a `POST`, `PUT`, `PATCH` or `DELETE` into a `GET` without
+  its body, and the `200` of that `GET` would stand under the write. The
+  redirect is the answer: its status is printed, a chain reads it as a "no",
+  and `-f` stops at it. A `GET` and a `HEAD` are sent on, and a `307` or a
+  `308` sends any request on as it is.
 - It works for one request too: `api -f PUT /assert '{…}'` exits 1 on a 4xx
   or 5xx where it otherwise exits 0. At the interactive prompt, `api -f` makes a
   pasted block or a `seed.api` run stop at the failing request and says
@@ -1599,7 +1614,9 @@ Run it: `api -sa workshop.api`.
 - **A slashless URI on its own line in a `.api` file** → `api/v1/people` alone is read as an *include* path and fails with `include not found: api/v1/people`. Write `GET api/v1/people`, or lead with the slash: `/api/v1/people`.
 - **`sleep while` that never ends** → `[]` and `{}` are truthy, so `sleep while GET /people~where(x)` loops forever once the list is merely empty. Poll a `~count` (or a single scalar field) instead, so the answer can become `0`/`null`.
 - **`https://` to a server with a self-signed or private certificate** → `The certificate of <host> is not trusted: it is not signed by a public certificate authority.` The client trusts the public authorities compiled into it and nothing from the machine, so such a certificate can't be made to pass; use `http://` for a local server. `Is COS running on <host>?` is kept for a host that did not answer at all.
-- **A server that redirects a request round in circles** → `Too many redirects from <host>: the request was never answered.`, exit 1, in a batch as at the prompt. A redirect that ends is followed: a 307 or 308 arrives as the request it was, with its method, body and `Authorization`.
+- **A server that redirects a request round in circles** → `Too many redirects from <host>: the request was never answered.`, exit 1, in a batch as at the prompt. A redirect that ends is followed: a 307 or 308 arrives as the request it was, with its method, body and `Authorization`. A 301, 302 or 303 is followed for a `GET` or a `HEAD` only.
+- **A `PUT` logged with `301 Moved Permanently`** → the write was not done: the server (or a proxy in front of it) wants it somewhere else, often `https://` or without a trailing `/`. Send it to the address in the answer's `Location`. Run with `-f` to have a batch stop there.
+- **A `#` in an identifier** → `DELETE /people/com.x.id=A#1` deletes `A#1`: the `#` is sent as `%23`. With a blank in front it is a comment (`DELETE /people/com.x.id=A #1` deletes `A`).
 - **A response with bytes that are not of its charset** → the text shown and written has U+FFFD (`�`) in their place, and stderr says so once for that response: `WARNING: the response held bytes that are not valid UTF-8: each is now U+FFFD (�)`. It is said with `-s` and in `-sa` too, since it is about the data; not for an `assert` or a poll, whose body goes nowhere, nor for a `-sa` line without an outfile. At the prompt it shows in the hint line. `--stream` to a file writes the bytes as they came, so nothing is replaced there.
 - **`API_CREDENTIALS_FILE` without `--no-keychain`** → the variable is ignored and the keychain is read instead. A path that names no file fails as silently: no warning, just `Error: no base URL specified`. A file that is there but malformed is reported (`WARNING: could not read …`).
 
