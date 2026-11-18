@@ -1259,6 +1259,46 @@ fn a_timeout_is_for_silence_not_for_the_whole_transfer() {
     }
 }
 
+/// What sends nothing is not passed off as a run. A `set` line alone is an
+/// error with a comment behind it as without one, and a document option
+/// (`--imports`, `--describe`, `--assert`) does not drop the file or the
+/// request that stands beside it without a word.
+#[test]
+fn what_would_send_nothing_or_drop_a_request_is_an_error() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::write(d.join("a.api"), "GET /a\n").unwrap();
+
+    for line in ["set include-nulls", "set include-nulls # note", "set timeout 5   # five", "set export a.b.c # as seed data"] {
+        let got = run_in(&server, d, &[line]);
+        assert_eq!((got.code, got.sent.len(), got.stdout.as_str()), (Some(1), 0, ""), "{line}: {}", got.stderr);
+        assert!(got.stderr.contains("`set` alone sends nothing"), "{line}: {}", got.stderr);
+    }
+    // With a request under it, the line is a line of a program.
+    let got = run_in(&server, d, &["set include-nulls # note\nGET /a"]);
+    assert_eq!((got.code, &got.sent[..]), (Some(0), &["GET /a".to_string()][..]), "{}", got.stderr);
+
+    for option in ["--imports", "--describe", "--assert"] {
+        let got = run_in(&server, d, &[option, "a.api", "GET", "/people"]);
+        assert_eq!((got.code, got.sent.len(), got.stdout.as_str()), (Some(1), 0, ""), "{option}: {}", got.stderr);
+        assert_eq!(
+            got.stderr.trim_end(),
+            format!("error: {option} a.api prints a document and GET /people is a request: give one of the two")
+        );
+        let got = run_in(&server, d, &[option, "a.api", "-sa", "a.api"]);
+        assert_eq!((got.code, got.sent.len(), got.stdout.as_str()), (Some(1), 0, ""), "{option}: {}", got.stderr);
+        assert_eq!(
+            got.stderr.trim_end(),
+            format!("error: {option} a.api prints a document and -a a.api runs a file: give one of the two")
+        );
+        // Alone, and with an option that is about how it prints, it prints.
+        let got = run_in(&server, d, &["-r", option, "a.api"]);
+        let document = if option == "--describe" { "null" } else { "[]" };
+        assert_eq!((got.code, got.sent.len(), got.stdout.trim_end()), (Some(0), 0, document), "{option}: {}", got.stderr);
+    }
+}
+
 /// With `--stream` a body that fails partway leaves the outfile as it was:
 /// no partial file that looks complete, and no `.part` file.
 #[test]
@@ -5835,7 +5875,7 @@ fn the_settings_menu_changes_what_the_session_has_set() {
 fn the_settings_menu_keeps_to_a_small_terminal() {
     use pty::Prompt;
 
-    for (cols, rows) in [(44u16, 40u16), (30, 40), (22, 40), (80, 12), (80, 8)] {
+    for (cols, rows) in [(44u16, 40u16), (30, 40), (22, 40), (80, 12), (80, 8), (40, 10), (30, 8)] {
         let server = RecordingServer::start();
         let dir = tempfile::tempdir().unwrap();
         prepare(dir.path());
@@ -5854,9 +5894,27 @@ fn the_settings_menu_keeps_to_a_small_terminal() {
             let shown = open.join("\n");
             assert!(open.iter().all(|row| row.chars().count() <= width), "{cols}x{rows}, {round}: a row is too wide\n{shown}");
             assert!(open.len() > before.len(), "{cols}x{rows}, {round}:\n{shown}");
-            // The ruler and ten rows: a screen of twelve rows holds them.
-            if rows < 12 {
-                assert!(open.last().unwrap().contains("more rows"), "{cols}x{rows}, {round}:\n{shown}");
+            // The ruler and ten rows: a screen of twelve rows holds them. A
+            // shorter one shows the settings it has rows for, the one the
+            // cursor is on among them, and still says how to close it.
+            let tall = |now: &[String]| now.len() - ruler_rows(now).last().copied().unwrap_or(0);
+            assert!(tall(&open) < rows as usize, "{cols}x{rows}, {round}: taller than the screen\n{shown}");
+            assert!(!shown.contains("more rows"), "{cols}x{rows}, {round}:\n{shown}");
+            assert_eq!(open.iter().filter(|row| row.starts_with("› ")).count(), 1, "{cols}x{rows}, {round}:\n{shown}");
+            // (Later rounds open on what the last one changed, still said.)
+            let said = if round == 0 { "  ↑/↓ to move" } else { "  include-nulls o" };
+            assert!(open.last().unwrap().starts_with(&said[..said.len().min(cols as usize - 2)]), "{cols}x{rows}, {round}:\n{shown}");
+            // A row of the menu ends in its value, however narrow it is.
+            if cols >= 30 {
+                let streaming = open.iter().find(|row| row.starts_with("› ")).unwrap();
+                assert!(streaming.ends_with("  off"), "{cols}x{rows}, {round}:\n{shown}");
+            }
+            // The cursor stays in sight on its way down and round.
+            for _ in 0..(if round == 0 { 7 } else { 0 }) {
+                let moved = keys(&mut prompt, b"\x1b[B");
+                let shown = moved.join("\n");
+                assert!(tall(&moved) < rows as usize, "{cols}x{rows}, {round}:\n{shown}");
+                assert_eq!(moved.iter().filter(|row| row.starts_with("› ")).count(), 1, "{cols}x{rows}, {round}:\n{shown}");
             }
             // A row changed, so the menu is drawn once more before it closes.
             keys(&mut prompt, b"\x1b[B\x1b[B\r");
@@ -5867,6 +5925,106 @@ fn the_settings_menu_keeps_to_a_small_terminal() {
             assert_eq!(ruler_rows(&closed).len(), ruler_rows(&before).len(), "{cols}x{rows}, {round}: a ruler was left\n{shown}");
         }
     }
+}
+
+/// A key of the menu between two ctrl+c takes the question back, as a key
+/// at the prompt does: the second ctrl+c asks again and does not leave.
+#[cfg(unix)]
+#[test]
+fn a_menu_key_takes_ctrl_c_back_in_the_settings_menu() {
+    use pty::Prompt;
+
+    const COLS: usize = 100;
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    prepare(dir.path());
+    let mut prompt = Prompt::open_sized(api(server.port, dir.path()), COLS as u16);
+    prompt.wait_ready(Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(600));
+    let mut keys = |prompt: &mut Prompt, keys: &[u8]| {
+        prompt.send(keys);
+        prompt.pump(Duration::from_millis(400));
+        pty::rows(&prompt.screen, COLS).last().unwrap().clone()
+    };
+    const ASKED: &str = "  ctrl+c again to exit";
+
+    // The question is asked in the menu's last row.
+    keys(&mut prompt, b"\x14");
+    assert_eq!(keys(&mut prompt, b"\x03"), ASKED);
+    // An arrow takes it back, and the row says how the menu works again.
+    assert_eq!(keys(&mut prompt, b"\x1b[B\x1b[B"), "  ↑/↓ to move, enter to change, ctrl+t or esc to close");
+    assert_eq!(keys(&mut prompt, b"\x03"), ASKED);
+    assert_eq!(prompt.exited(), None, "an arrow between two ctrl+c");
+    // So does Enter, which changes the row.
+    assert_eq!(keys(&mut prompt, b"\r"), "  include-nulls on");
+    assert_eq!(keys(&mut prompt, b"\x03"), ASKED);
+    assert_eq!(prompt.exited(), None, "Enter between two ctrl+c");
+    // And the space bar.
+    assert_eq!(keys(&mut prompt, b" "), "  include-nulls off");
+    assert_eq!(keys(&mut prompt, b"\x03"), ASKED);
+    assert_eq!(prompt.exited(), None, "the space bar between two ctrl+c");
+    // Twice in a row still leaves.
+    prompt.send(b"\x03");
+    let start = Instant::now();
+    while prompt.exited().is_none() && start.elapsed() < Duration::from_secs(5) {
+        prompt.pump(Duration::from_millis(100));
+    }
+    assert!(prompt.exited().is_some(), "ctrl+c twice did not leave:\n{}", screen_tail(&prompt));
+}
+
+/// `--no-streaming` keeps streaming off for the session too. The menu's row
+/// and a typed `set stream` say that, not that streaming is on, and a file's
+/// `set stream` is passed over by the option's name: the session set nothing.
+#[cfg(unix)]
+#[test]
+fn a_session_started_with_no_streaming_says_that_streaming_stays_off() {
+    use pty::Prompt;
+
+    const COLS: usize = 100;
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    prepare(dir.path());
+    std::fs::write(dir.path().join("stream.api"), "set stream\nGET /keyed > from-file.json\n").unwrap();
+    let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("api"));
+    cmd.args(["--no-keychain", "-b", &format!("http://127.0.0.1:{}", server.port), "-k", "streamer", "--no-streaming"])
+        .current_dir(dir.path())
+        .env("NO_COLOR", "1")
+        .env("HOME", dir.path())
+        .env_remove("API_STREAMING")
+        .env_remove("API_CREDENTIALS_FILE");
+    let mut prompt = Prompt::open_sized(cmd, COLS as u16);
+    prompt.wait_ready(Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(600));
+    const REFUSED: &str = "streaming is off: the session was started with --no-streaming";
+
+    // The first row of the menu: refused in its last row, and still `off`.
+    prompt.send(b"\x14");
+    prompt.pump(Duration::from_millis(400));
+    prompt.send(b"\r");
+    prompt.pump(Duration::from_millis(400));
+    let rows = pty::rows(&prompt.screen, COLS);
+    let shown = rows.join("\n");
+    assert_eq!(rows.last().unwrap(), &format!("  {REFUSED}"), "{shown}");
+    let row = rows.iter().find(|row| row.starts_with("› Response streaming")).unwrap_or_else(|| panic!("{shown}"));
+    assert!(row.ends_with("  off"), "{shown}");
+    prompt.send(CLOSE_MENU);
+    prompt.pump(Duration::from_millis(400));
+    let rows = pty::rows(&prompt.screen, COLS);
+    assert!(!rows.last().unwrap().trim_end().ends_with(" streaming"), "a marker for what is off:\n{}", rows.join("\n"));
+
+    // Typed, it is the same line.
+    let (sent, shown) = run_pasted(&mut prompt, &server, "set stream");
+    assert!(sent.is_empty() && shown.contains(REFUSED), "{shown}");
+    // A request is not asked to stream.
+    let (_, _, accepts) = run_pasted_accepts(&mut prompt, &server, "GET /keyed > typed.json");
+    assert_eq!(accepts, ["application/json"]);
+
+    // A file's line is kept off by the option, and the log names it.
+    let (sent, shown, accepts) = run_pasted_accepts(&mut prompt, &server, "stream.api");
+    assert_eq!(sent, ["GET /keyed"], "{shown}");
+    assert_eq!(accepts, ["application/json"]);
+    assert!(shown.contains("↳ ignored: --no-streaming is set"), "{shown}");
+    assert!(!shown.contains("the session has"), "{shown}");
 }
 
 /// A session started with `--export <name>` has its name: the export row

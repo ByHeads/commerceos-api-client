@@ -1012,6 +1012,11 @@ file, or through something that strips them before the pipe.
 (`api -sa seed.api GET /people`) is an error, before anything is sent:
 `-a seed.api runs a file and GET /people is a request: give one of the two`.
 
+`--describe`, `--assert` and `--imports` each print a document about a file
+and send nothing. A file to run or a request beside one of them is an error
+too: `--imports a.api prints a document and GET /people is a request: give
+one of the two`.
+
 An option given twice (`-k a -k b`) is an error (`--key was given twice`), and
 so is one with no value behind it (`--export needs a value`).
 
@@ -1264,7 +1269,15 @@ the way `ctrl+h` opens the shortcuts:
 - What was changed is said in the menu's last row, in the place of the hint,
   as the hint line of the prompt says it: `include-nulls on`, `export on:
   com.heads.seedID`, `timeout 45s`. On a server that does not stream, the
-  first row says `streaming not available on this server` and stays off.
+  first row says `streaming not available on this server` and stays off. In
+  a session started with `--no-streaming` it says `streaming is off: the
+  session was started with --no-streaming`, and so does a typed `set stream`.
+- **A small terminal gets a smaller menu, not a broken one.** On a narrow
+  one a label is cut and the value stays: a row always ends in what the
+  setting is at. On one too short for every row the blank rows go first,
+  then the settings are shown as many as there is room for, moved along
+  with the cursor. The row the cursor is on and the last row are always
+  there.
 - **What is on is marked at the right of the hint line**, one word each:
   `nulls · fail-fast · ndjson · raw · timeout 45s`, and last `export` or
   `streaming`. On a line too narrow for all of them the ones on the left go

@@ -386,10 +386,13 @@ const HELP_LINES: [&str; 23] = [
 ///   could not be reached to clear them and would be left behind, so on a
 ///   terminal too short for all of it the last row says how much is missing.
 fn help_rows(state: &AppState) -> Vec<String> {
-    let settings = state.settings_open;
-    let mut rows: Vec<String> = if settings {
-        settings_rows(state)
-    } else {
+    // The ruler above and these rows have to fit on the screen with the
+    // cursor's row under them. A height of 0 is a terminal that gave none.
+    let fits = if state.height > 0 { (state.height as usize).saturating_sub(2).max(2) } else { usize::MAX };
+    if state.settings_open {
+        return settings_rows(state, fits);
+    }
+    let mut rows: Vec<String> = {
         let mut rows = vec![String::new()];
         rows.extend(HELP_LINES.iter().map(|line| line.to_string()));
         rows.push("  ctrl+h or esc to close".to_string());
@@ -401,14 +404,11 @@ fn help_rows(state: &AppState) -> Vec<String> {
         }
         rows
     };
-    // The ruler above and these rows have to fit on the screen with the
-    // cursor's row under them. A height of 0 is a terminal that gave none.
-    let fits = (state.height as usize).saturating_sub(2).max(2);
-    if state.height > 0 && rows.len() > fits {
+    if rows.len() > fits {
         let hidden = rows.len() - (fits - 1);
         rows.truncate(fits - 1);
-        let key = if settings { "ctrl+t" } else { "ctrl+h" };
-        rows.push(format!("  … {} more rows: enlarge the window. {} or esc to close", hidden, key));
+        let more = format!("  … {} more rows: enlarge the window. ctrl+h or esc to close", hidden);
+        rows.push(fit_to_width(&more, (state.width as usize).max(1).saturating_sub(1)));
     }
     rows
 }
@@ -447,28 +447,62 @@ fn settings_menu(state: &AppState) -> Vec<(&'static str, String, Setting)> {
 /// row, one row per setting with the one the cursor is on marked, a blank
 /// row, and the row that says how to use it. That last row is the menu's
 /// hint line: what the prompt has to say (`status_msg`) is said there, as
-/// the hint line of the command area says it. No row is wider than the
-/// terminal, so none can wrap.
-fn settings_rows(state: &AppState) -> Vec<String> {
+/// the hint line of the command area says it.
+///
+/// The menu is something to act in, so it keeps what is acted on in sight:
+///
+/// - No row is wider than the terminal, so none can wrap, and on a narrow
+///   one it is the label that gives way: a row always ends in its value.
+/// - No more than `fits` rows are made, so none scrolls off the top. A
+///   terminal too short for all of them loses the blank rows first, and
+///   then shows as many settings as it has rows for, moved along with the
+///   cursor: the row the cursor is on and the hint row are always there.
+fn settings_rows(state: &AppState, fits: usize) -> Vec<String> {
     let menu = settings_menu(state);
-    let width = (state.width as usize).max(1);
-    let label_width = menu.iter().map(|(label, _, _)| str_width(label)).max().unwrap_or(0);
-    let mut rows = vec![String::new()];
-    for (at, (label, value, _)) in menu.iter().enumerate() {
-        let chosen = at == state.settings_row.min(menu.len() - 1);
-        let row = format!("{} {}  {}", if chosen { "›" } else { " " }, pad_to_width(label, label_width), value);
-        let row = fit_to_width(&row, width.saturating_sub(1));
-        rows.push(if chosen { row } else { row.dimmed().to_string() });
-    }
-    rows.push(String::new());
-    let room = width.saturating_sub(3);
-    rows.push(if state.status_msg.is_empty() {
+    let width = (state.width as usize).max(1).saturating_sub(1);
+    let chosen = state.settings_row.min(menu.len() - 1);
+    // `› label  value`: two columns in front of the label, two behind it.
+    let longest = |of: fn(&(&'static str, String, Setting)) -> usize| menu.iter().map(of).max().unwrap_or(0);
+    let label_width = longest(|(label, _, _)| str_width(label));
+    let value_width = longest(|(_, value, _)| str_width(value));
+    let label_width = label_width.min(width.saturating_sub(4 + value_width).max(SETTINGS_LABEL_MIN));
+    let setting_rows: Vec<String> = menu
+        .iter()
+        .enumerate()
+        .map(|(at, (label, value, _))| {
+            let label = pad_to_width(&fit_to_width(label, label_width), label_width);
+            let row = format!("{} {}  {}", if at == chosen { "›" } else { " " }, label, value);
+            let row = fit_to_width(&row, width);
+            if at == chosen { row } else { row.dimmed().to_string() }
+        })
+        .collect();
+    let room = width.saturating_sub(2);
+    let hint = if state.status_msg.is_empty() {
         format!("  {}", fit_to_width(SETTINGS_HINT, room).dimmed())
     } else {
         format!("  {}", status_msg_styled(&fit_to_width(&visible_text(&state.status_msg), room), state.status_msg_at))
-    });
+    };
+
+    let count = setting_rows.len();
+    // Which blank rows there is room for, and how many of the settings.
+    let (blank_above, blank_between) = (fits >= count + 2, fits >= count + 3);
+    let shown = count.min(fits.saturating_sub(1).max(1));
+    let first = (chosen + 1).saturating_sub(shown);
+    let mut rows = Vec::new();
+    if blank_above {
+        rows.push(String::new());
+    }
+    rows.extend(setting_rows.into_iter().skip(first).take(shown));
+    if blank_between {
+        rows.push(String::new());
+    }
+    rows.push(hint);
     rows
 }
+
+/// The fewest columns a label of the settings menu is cut to: under that a
+/// row is its marker and what is left of the terminal.
+const SETTINGS_LABEL_MIN: usize = 4;
 
 /// Rows from the ctrl+h panel's ruler down to the cursor under its last
 /// row: the ruler and the rows of `help_rows`. It is how far up the clear
@@ -4317,6 +4351,25 @@ fn main() {
         errln!("error: {} and {} each print a document of their own: use one", rest.join(", "), last);
         exit_process(1);
     }
+    // Each of the three prints a document about a file and sends nothing. A
+    // file to run or a request beside one is not dropped without a word, as
+    // a request beside `-a` is not, below.
+    let document = [("--imports", &args.imports), ("--describe", &args.describe), ("--assert", &args.assert)]
+        .into_iter()
+        .find_map(|(option, file)| file.as_ref().map(|file| format!("{} {}", option, file)));
+    if let Some(document) = document {
+        let request: Vec<&str> =
+            [&args.method, &args.uri].into_iter().flatten().chain(args.body.iter()).map(String::as_str).collect();
+        let beside = match &args.all {
+            Some(file) => Some(format!("-a {} runs a file", file)),
+            None if !request.is_empty() => Some(format!("{} is a request", request.join(" "))),
+            None => None,
+        };
+        if let Some(beside) = beside {
+            errln!("error: {} prints a document and {}: give one of the two", document, beside);
+            exit_process(1);
+        }
+    }
     if let Some(file) = &args.imports {
         exit_process(print_imports(file, args.raw));
     }
@@ -4852,7 +4905,7 @@ fn main() {
         let (first_word, rest) = split_first_word(line.trim());
         let alone = line.lines().filter(|l| !l.trim().is_empty()).count() == 1
             && first_word.eq_ignore_ascii_case("set")
-            && parse_set_line(rest).is_ok();
+            && parse_set_line(without_trailing_comment(rest)).is_ok();
         if alone {
             errln!("error: `set` alone sends nothing. Give the setting as an option with a request (`-i`, `--export <name>`), or put the line in a .api file.");
             exit_process(1);
@@ -11740,6 +11793,19 @@ fn handle_key_event(
     // open. Any other key does what it does at the prompt.
     if state.show_help && state.settings_open {
         let rows = settings_menu(state).len();
+        // A key of the menu between two ctrl+c takes the question back, as
+        // any key at the prompt does (`reset_for_input`, which these keys
+        // return ahead of).
+        let menu_key = matches!(
+            (key.modifiers, key.code),
+            (_, KeyCode::Up) | (_, KeyCode::Down) | (KeyModifiers::NONE, KeyCode::Enter) | (KeyModifiers::NONE, KeyCode::Char(' '))
+        );
+        if menu_key && state.ctrl_c_pending {
+            state.ctrl_c_pending = false;
+            state.ctrl_c_at = None;
+            state.status_msg.clear();
+            state.status_msg_at = None;
+        }
         match (key.modifiers, key.code) {
             (_, KeyCode::Up) => {
                 state.settings_row = state.settings_row.checked_sub(1).unwrap_or(rows - 1);
@@ -13706,11 +13772,17 @@ fn run_program_steps(
             // own setting holds where it is on.
             BulkStep::Set { written, file, .. } => {
                 let held = written.as_ref().map(|setting| state.config.given.get(setting));
-                let overridden = apply_set_step(&mut state.config, written, file).is_some();
+                let overridden = apply_set_step(&mut state.config, written, file);
                 if let Some(setting) = written {
                     log_directive_line(state, stdout, setting.line().dimmed().to_string())?;
-                    if let Some(held) = held.filter(|_| overridden) {
-                        let note = format!("↳ ignored: the session has {}", held.line());
+                    if let (Some(held), Some(option)) = (held, overridden) {
+                        // What the session has set is what holds, but for
+                        // `--no-streaming`, which it was started with and
+                        // which no `set` line of its own is behind.
+                        let note = match option.as_str() {
+                            "--no-streaming" => "↳ ignored: --no-streaming is set".to_string(),
+                            _ => format!("↳ ignored: the session has {}", held.line()),
+                        };
                         log_directive_line(state, stdout, note.dimmed().to_string())?;
                     }
                 }
@@ -14780,6 +14852,11 @@ struct ValueDialog {
 fn set_for_session(state: &mut AppState, setting: &Setting) -> String {
     if matches!(setting, Setting::Stream(true)) && !state.config.server_streaming {
         return "streaming not available on this server".to_string();
+    }
+    // `--no-streaming` is the one option that keeps a setting off, for the
+    // session as for a run: saying `on` here would be saying what is not so.
+    if matches!(setting, Setting::Stream(true)) && state.config.no_streaming {
+        return "streaming is off: the session was started with --no-streaming".to_string();
     }
     state.config.given.put(setting);
     state.config.apply_settings();
@@ -25424,18 +25501,123 @@ mod tests {
                 assert!(str_width(&row) < width as usize, "{width}: {row:?}");
             }
         }
-        // Too short for all of it: the last row says so, and how to close it.
+        // The shortcuts are what the panel holds otherwise. Too short for
+        // all of them, the last row says so, and how to close it.
         state.width = 80;
         state.height = 6;
-        let short = rows(&state);
-        assert_eq!(short.len(), 4);
-        assert!(short.last().unwrap().ends_with("more rows: enlarge the window. ctrl+t or esc to close"), "{short:?}");
-        // The shortcuts are what the panel holds otherwise, and say ctrl+h.
         state.settings_open = false;
-        assert!(rows(&state).last().unwrap().ends_with("ctrl+h or esc to close"));
+        assert!(rows(&state).last().unwrap().ends_with("more rows: enlarge the window. ctrl+h or esc to close"));
+        // That row is cut to the terminal too.
+        state.width = 30;
+        assert!(str_width(rows(&state).last().unwrap()) < 30, "{:?}", rows(&state));
+        state.width = 80;
         state.height = 60;
         assert!(rows(&state).iter().any(|row| row.contains("ctrl+t     Settings")));
         assert!(!rows(&state).iter().any(|row| row.contains("ctrl+r")));
+    }
+
+    /// The menu is acted in, so a row is its value before it is its label:
+    /// on a terminal too narrow for both, the label is what is cut.
+    #[test]
+    fn a_narrow_settings_menu_cuts_the_label_and_keeps_the_value() {
+        let mut state = test_state();
+        state.height = 40;
+        state.settings_open = true;
+        state.config.given = Settings { export: Some(SEED.to_string()), include_nulls: true, ..Settings::default() };
+        state.config.apply_settings();
+        let values: Vec<String> = settings_menu(&state).into_iter().map(|(_, value, _)| value).collect();
+        assert_eq!(values, ["off", SEED, "on", "off", "off", "off", "600s"]);
+        for width in [26u16, 30, 40, 42, 43, 57, 58, 80] {
+            state.width = width;
+            let rows: Vec<String> = help_rows(&state).iter().map(|row| visible_text(row)).collect();
+            for (row, value) in rows[1..=values.len()].iter().zip(&values) {
+                assert!(row.ends_with(&format!("  {value}")), "{width}: {row:?} has lost {value:?}");
+                assert!(str_width(row) < width as usize, "{width}: {row:?}");
+            }
+            // The values stand in one column.
+            let starts: Vec<usize> = rows[1..=values.len()].iter().zip(&values).map(|(row, value)| str_width(row) - str_width(value)).collect();
+            assert!(starts.windows(2).all(|pair| pair[0] == pair[1]), "{width}: {rows:?}");
+        }
+        // Wide enough for all of it, a label is whole.
+        state.width = 58;
+        assert_eq!(visible_text(&help_rows(&state)[2]), format!("  Export mode (responses as seed data)  {SEED}"));
+        state.width = 40;
+        assert_eq!(visible_text(&help_rows(&state)[2]), format!("  Export mode (respo…  {SEED}"));
+        // A value wider than the terminal is the one thing that is cut.
+        state.config.given.export = Some(format!("com.heads.{}", "x".repeat(118)));
+        state.width = 40;
+        for row in help_rows(&state) {
+            assert!(str_width(&visible_text(&row)) < 40, "{row:?}");
+        }
+    }
+
+    /// A terminal too short for the whole menu still shows the row the
+    /// cursor is on and the row that says what was changed: Enter never
+    /// changes a setting that is out of sight.
+    #[test]
+    fn a_short_settings_menu_follows_the_cursor_and_keeps_its_hint_row() {
+        let mut state = test_state();
+        state.width = 80;
+        state.settings_open = true;
+        let count = SETTING_NAMES.len();
+        let plain = |state: &AppState| -> Vec<String> { help_rows(state).iter().map(|row| visible_text(row)).collect() };
+        // The ruler, the rows and the cursor's row are the screen at most.
+        for height in 1u16..=14 {
+            state.height = height;
+            let fits = (height as usize).saturating_sub(2).max(2);
+            for at in 0..count {
+                state.settings_row = at;
+                state.status_msg.clear();
+                let rows = plain(&state);
+                assert!(rows.len() <= fits, "height {height}, row {at}: {rows:?}");
+                assert_eq!(help_line_count(&state), 1 + rows.len() as u16);
+                let label = settings_menu(&state)[at].0;
+                assert_eq!(rows.iter().filter(|row| row.starts_with('›')).count(), 1, "height {height}, row {at}: {rows:?}");
+                assert!(rows.iter().any(|row| row.starts_with(&format!("› {label}"))), "height {height}, row {at}: {rows:?}");
+                assert_eq!(rows.last().unwrap(), &format!("  {SETTINGS_HINT}"));
+                assert!(!rows.iter().any(|row| row.contains("more rows")), "{rows:?}");
+                state.status_msg = "ctrl+c again to exit".to_string();
+                assert_eq!(plain(&state).last().unwrap(), "  ctrl+c again to exit");
+            }
+        }
+        // The blank rows go first: all seven settings show on eight rows.
+        state.status_msg.clear();
+        state.settings_row = 0;
+        state.height = 12;
+        assert_eq!(plain(&state).len(), count + 3);
+        state.height = 11;
+        assert_eq!((plain(&state).len(), plain(&state)[0].as_str()), (count + 2, ""));
+        state.height = 10;
+        assert_eq!(plain(&state).len(), count + 1);
+        assert!(plain(&state)[0].starts_with("› Response streaming"));
+        // Fewer than that, and the rows move with the cursor.
+        state.height = 8;
+        assert_eq!(plain(&state).len(), 6);
+        assert!(plain(&state)[4].starts_with("  NDJSON"));
+        state.settings_row = 6;
+        let rows = plain(&state);
+        assert!(rows[0].starts_with("  Include nulls") && rows[4].starts_with("› Timeout"), "{rows:?}");
+    }
+
+    /// `--no-streaming` keeps streaming off for the session it started, and
+    /// the menu's row and a typed `set stream` say so and not that it is on.
+    #[test]
+    fn streaming_is_not_said_to_be_on_in_a_session_started_without_it() {
+        let mut state = test_state();
+        state.config.server_streaming = true;
+        state.config.no_streaming = true;
+        state.config.apply_settings();
+        let said = set_for_session(&mut state, &Setting::Stream(true));
+        assert_eq!(said, "streaming is off: the session was started with --no-streaming");
+        assert!(!state.config.given.stream && !state.config.streaming && !state.config.stream_requested);
+        assert_eq!(settings_menu(&state)[0].1, "off");
+        assert!(state.streaming_flash_at.is_none());
+        // Off is what it is, and may be said.
+        assert_eq!(set_for_session(&mut state, &Setting::Stream(false)), "streaming off");
+        // Without the option the same line turns it on.
+        state.config.no_streaming = false;
+        assert_eq!(set_for_session(&mut state, &Setting::Stream(true)), STREAMING_INFO_MSG);
+        assert!(state.config.streaming);
     }
 
     #[test]
