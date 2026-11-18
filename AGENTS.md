@@ -190,7 +190,10 @@ GET /people > clipboard                  # system clipboard, case-insensitive
 - `>> file` appends by content: JSON is spliced into one array, `.ndjson`/`.njson`
   targets get one compact object per line, `.csv` appends drop the duplicate
   header row, anything else is text-appended. `>> clipboard` is rejected
-  when the line is read, before anything is sent.
+  when the line is read, before anything is sent. A target that is not UTF-8
+  (a CSV saved as Latin-1) keeps its bytes and gets the addition behind them,
+  and one that is not a regular file (a fifo, `/dev/stdout`) is written to
+  as `>` writes to it.
 - **An error is written by `>` and never appended by `>>`.** Without `-f`, a
   `> file` holds whatever was answered, a 404's body too, so check the status
   (or run with `-f`) before trusting the file. A `>> file` collects answers,
@@ -365,8 +368,8 @@ import git cl @cloddy.json
 - A remote that goes quiet does not hang the batch: a transfer of less than a
   byte a second for a minute, an ssh connection that is not made in 30
   seconds, or any one git command that takes more than five minutes, is given
-  up on. (An ssh command of your own, in `GIT_SSH_COMMAND` or `GIT_SSH`, is
-  used as it is.)
+  up on. (An ssh command of your own, in `GIT_SSH_COMMAND`, `GIT_SSH` or
+  git's `core.sshCommand`, is used as it is.)
 - A `\` in a `url` is refused, here and for an archive: it is a `/` to one
   URL parser and part of the host to another.
 - A commit SHA already in the cache needs no network. A tag or a branch costs
@@ -791,7 +794,8 @@ PUT /people [ … ]
 - Truthiness is the chain rule again, so `assert GET /companies/…` fails on a
   404 and `assert not GET /…~count` fails once the count is non-zero.
 - The request follows the `sleep while` rules: one line, implied `GET` allowed,
-  no `&&`/`||`, no `> outfile`.
+  no `&&`/`||`, no `> outfile`. Its body is read as a plain line's is:
+  comments are stripped and a raw tab in a string is escaped.
 - The status line is printed like any request's; the body never is, so an
   assert can't pollute a batch's stdout.
 - A status the line was prepared for prints orange instead of red: the 404

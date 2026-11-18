@@ -4494,6 +4494,12 @@ fn main() {
 
     // Handle 1Password integration
     let op_selector = args.one_password;
+    // A saved connection may hold a token, and 1Password names a host of its
+    // own: the one is not sent to the other.
+    if op_selector.is_some() && args.connection.is_some() {
+        errln!("error: -c names a saved connection and --1p one in 1Password: give one of the two");
+        exit_process(1);
+    }
     if op_selector.is_none() {
         // Set auth from args (only when not using 1Password)
         if let Some(key) = args.key.clone() {
@@ -4543,6 +4549,12 @@ fn main() {
             Some(i) => (uri[..i].trim().to_string(), uri[i..].to_string()),
             None => (uri, String::new()),
         };
+        // An empty URI argument (`api PUT "$URI" '{…}'` with the variable not
+        // set) is no URI: the body behind it must not be read as one.
+        if uri.trim().is_empty() && !body.trim().is_empty() && starts_a_request(&method) {
+            errln!("error: {} needs a URI: `{} /people`", method, method);
+            exit_process(1);
+        }
         let joined = format!("{} {} {}{}", method, uri, body, redirect);
         // A request that can't be sent is refused before anything else
         // happens (`>> clipboard`, a `>` with no path), as a line of a file is.
@@ -6360,10 +6372,21 @@ fn write_outfile(path: &str, content: &str) -> io::Result<u64> {
 /// No path ever rewrites existing content bytes. An unparseable target is
 /// always text-appended — appending must never destroy what's already there.
 fn append_to_outfile(path: &str, new_content: &str) -> io::Result<()> {
-    let existing = match fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+    // A target that is no regular file (a fifo, `/dev/stdout`) holds nothing
+    // to read and add to: reading it would wait for a writer that is this
+    // process. It is written as it stands, as a `>` writes it.
+    let target = resolve_link(std::path::Path::new(path));
+    if fs::metadata(&target).is_ok_and(|meta| !meta.is_file()) {
+        return write_outfile(path, new_content).map(|_| ());
+    }
+    let existing = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(e),
+    };
+    let existing = match String::from_utf8(existing) {
+        Ok(text) => text,
+        Err(not_text) => return append_to_bytes(path, not_text.as_bytes(), new_content),
     };
     if existing.trim().is_empty() {
         // The first append is a plain write, in the shape the target takes.
@@ -6442,6 +6465,31 @@ fn append_to_outfile(path: &str, new_content: &str) -> io::Result<()> {
     };
 
     replace_outfile(path, &merged)
+}
+
+/// Append to a target that is not UTF-8 (a CSV another program saved as
+/// Latin-1): its bytes are left as they are and the addition is written
+/// behind them, in the shape the target's name asks for. Such a target is
+/// never JSON to splice into.
+fn append_to_bytes(path: &str, existing: &[u8], new_content: &str) -> io::Result<()> {
+    let lines = if is_ndjson_path(path) { ndjson_lines(new_content) } else { None };
+    let addition = match &lines {
+        Some(lines) => lines.as_str(),
+        None if path.to_lowercase().ends_with(".csv") => match new_content.split_once('\n') {
+            Some((_header, rest)) => rest,
+            None => "",
+        },
+        None => new_content,
+    };
+    if addition.trim().is_empty() {
+        return Ok(());
+    }
+    let mut file = fs::OpenOptions::new().append(true).open(path)?;
+    if !existing.ends_with(b"\n") {
+        file.write_all(b"\n")?;
+    }
+    file.write_all(addition.as_bytes())?;
+    file.flush()
 }
 
 /// Put `content` in the place of what the outfile at `path` holds, in one
@@ -7428,10 +7476,15 @@ fn parse_condition(condition: &str, what: &str, usage: &str) -> Result<(bool, St
     if request.is_empty() {
         return Err(format!("{} requires a request — {}", what, usage));
     }
-    let (_, depth) = strip_body_comments_and_count(request);
+    let (cleaned, depth) = strip_body_comments_and_count(request);
     if depth != 0 {
         return Err(format!("{} condition must fit on one line: `{}`", what, request));
     }
+    // Read as a plain line is read: a comment in the body is not sent, and
+    // a raw tab in a string is escaped. A body the server can't read would
+    // be answered 400, and a 400 is a "no" to a check.
+    let request = escape_newlines_in_strings(&cleaned);
+    let request = request.trim();
     // A separator with nothing on one side is the mistake it is on a plain
     // line, and is not sent as a body.
     if chain_is_incomplete(request) {
@@ -8006,7 +8059,7 @@ fn import_cache_key(name: &str) -> String {
 /// are checked out as plain files, so a repository can't point at a file
 /// outside itself. Its messages are in English whatever the locale, since
 /// `git_remote_did_not_answer` reads them.
-fn git_command(dir: Option<&std::path::Path>) -> Command {
+fn git_base(dir: Option<&std::path::Path>) -> Command {
     let mut cmd = Command::new("git");
     if let Some(dir) = dir {
         cmd.arg("-C").arg(dir);
@@ -8020,7 +8073,33 @@ fn git_command(dir: Option<&std::path::Path>) -> Command {
         .env("LC_ALL", "C")
         .env("LANG", "C")
         .stdin(std::process::Stdio::null());
-    if std::env::var_os("GIT_SSH_COMMAND").is_none() && std::env::var_os("GIT_SSH").is_none() {
+    cmd
+}
+
+/// Whether git's own configuration names an ssh command (`core.sshCommand`:
+/// a key of its own, an agent's wrapper). Asked once per run.
+fn git_config_has_ssh_command() -> bool {
+    static FOUND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FOUND.get_or_init(|| {
+        git_base(None)
+            .args(["config", "--get", "core.sshCommand"])
+            .stderr(std::process::Stdio::null())
+            .output()
+            .is_ok_and(|out| out.status.success() && out.stdout.iter().any(|b| !b.is_ascii_whitespace()))
+    })
+}
+
+/// `git_base` with an ssh that never stops to ask and gives up on a remote
+/// that does not answer. An ssh command of the user's own is used as it is,
+/// from the environment or from git's configuration: `GIT_SSH_COMMAND` set
+/// here would win over a `core.sshCommand`, and a fetch that works by hand
+/// would be refused for want of the key that command names.
+fn git_command(dir: Option<&std::path::Path>) -> Command {
+    let mut cmd = git_base(dir);
+    let own = std::env::var_os("GIT_SSH_COMMAND").is_some()
+        || std::env::var_os("GIT_SSH").is_some()
+        || git_config_has_ssh_command();
+    if !own {
         cmd.env(
             "GIT_SSH_COMMAND",
             "ssh -oBatchMode=yes -oConnectTimeout=30 -oServerAliveInterval=15 -oServerAliveCountMax=4",
@@ -30816,5 +30895,51 @@ mod tests {
         fs::write(dir.path().join("c.ndjson"), "{\"c\":1}\n{\"c\":2}\n").unwrap();
         let err = resolve_at_file_body(&format!("{d}/*")).err().expect("a mixed glob");
         assert!(err.contains("invalid JSON in") && err.contains("c.ndjson"), "{err}");
+    }
+
+    /// `>>` leaves the bytes of a target that is not UTF-8 as they are and
+    /// writes behind them, in the shape the target's name asks for.
+    #[test]
+    fn an_append_keeps_the_bytes_of_a_target_that_is_not_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let at = |name: &str| dir.path().join(name).to_str().unwrap().to_string();
+
+        // CSV: the payload's header row is dropped, as for a text target.
+        fs::write(at("rows.csv"), b"name\ncaf\xe9").unwrap();
+        append_to_outfile(&at("rows.csv"), "name\nAnn\n").unwrap();
+        assert_eq!(fs::read(at("rows.csv")).unwrap(), b"name\ncaf\xe9\nAnn\n");
+        // A payload of a header alone adds nothing.
+        append_to_outfile(&at("rows.csv"), "name").unwrap();
+        append_to_outfile(&at("rows.csv"), "name\n").unwrap();
+        assert_eq!(fs::read(at("rows.csv")).unwrap(), b"name\ncaf\xe9\nAnn\n");
+
+        // NDJSON: a list is one line per element, an empty one nothing.
+        fs::write(at("rows.ndjson"), b"\"caf\xe9\"\n").unwrap();
+        append_to_outfile(&at("rows.ndjson"), "[{\"a\": 1}, 2]").unwrap();
+        append_to_outfile(&at("rows.ndjson"), "[]").unwrap();
+        assert_eq!(fs::read(at("rows.ndjson")).unwrap(), b"\"caf\xe9\"\n{\"a\":1}\n2\n");
+
+        // Anything else, a `.json` too: such a target is no JSON to splice into.
+        fs::write(at("out.json"), b"[\"caf\xe9\"]").unwrap();
+        append_to_outfile(&at("out.json"), "[1]").unwrap();
+        assert_eq!(fs::read(at("out.json")).unwrap(), b"[\"caf\xe9\"]\n[1]");
+    }
+
+    /// A fifo holds nothing to read and add to: `>>` writes to it as `>`
+    /// does, where it used to wait for a writer that was itself.
+    #[cfg(unix)]
+    #[test]
+    fn an_append_to_a_fifo_writes_to_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe.json");
+        assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let (reader_path, writer_path) = (fifo.clone(), fifo.to_str().unwrap().to_string());
+        let reader = thread::spawn(move || fs::read_to_string(reader_path).unwrap());
+        let (done, written) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = done.send(append_to_outfile(&writer_path, "[1]").is_ok());
+        });
+        assert_eq!(written.recv_timeout(Duration::from_secs(10)), Ok(true), "the append never came back");
+        assert_eq!(reader.join().unwrap(), "[1]");
     }
 }

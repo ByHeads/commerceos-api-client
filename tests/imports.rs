@@ -1706,15 +1706,18 @@ fn a_run_asks_the_remote_about_a_branch_once_however_often_it_is_imported() {
     assert_eq!(asked("ls-remote"), 1, "one lookup for the whole run");
 
     // A one-shot line is parsed twice on its way to being run. Everything is
-    // cached by now, so the lookup is all git is asked for.
+    // cached by now, so the lookup is all git is asked for, with the one
+    // question about its own configuration (`core.sshCommand`) before it.
     let mut cmd = api(&dir, server.port);
     cmd.env("PATH", &path).arg(format!("{import}lib/step.api"));
     let ran = finish(cmd, "");
     assert!(ran.ok, "{}", ran.stderr);
     assert_eq!(server.sent(), vec!["GET /step"]);
     let text = std::fs::read_to_string(&log).unwrap_or_default();
-    assert_eq!(text.lines().count(), 1, "{text}");
-    assert!(text.contains("ls-remote"), "{text}");
+    let asked: Vec<&str> = text.lines().filter(|line| !line.contains("config --get core.sshCommand")).collect();
+    assert_eq!(asked.len(), 1, "{text}");
+    assert!(asked[0].contains("ls-remote"), "{text}");
+    assert_eq!(text.lines().count(), 2, "{text}");
 }
 
 // ----- this client's own repository, over the network -----
@@ -2298,6 +2301,8 @@ fn api_with_telling_git(dir: &Path, port: u16, log: &Path) -> Command {
     let path = format!("{}:{}", telling_git(dir, log).display(), std::env::var("PATH").unwrap());
     let mut cmd = api(dir, port);
     cmd.env("PATH", path).env_remove("GIT_SSH_COMMAND").env_remove("GIT_SSH").env_remove("FAKE_GIT_SAYS");
+    // What the machine's own git configuration says is not the test's.
+    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1");
     cmd
 }
 
@@ -2323,7 +2328,9 @@ fn git_is_run_so_that_it_never_stops_to_ask() {
     for command in ["ls-remote", " init ", " fetch ", "rev-parse", " checkout "] {
         assert!(told.lines().any(|line| line.contains(command)), "{command}: {told}");
     }
-    for line in told.lines() {
+    // One question to git's own configuration, and no ssh command there.
+    assert_eq!(told.lines().filter(|line| line.contains("config --get core.sshCommand")).count(), 1, "{told}");
+    for line in told.lines().filter(|line| !line.contains("config --get")) {
         assert!(line.starts_with("prompt=0 ssh=[ssh -oBatchMode=yes "), "{line}");
         // It gives up on a remote that does not answer, over ssh and https.
         assert!(line.contains("-oConnectTimeout=30 -oServerAliveInterval=15"), "{line}");
@@ -2343,6 +2350,21 @@ fn git_is_run_so_that_it_never_stops_to_ask() {
     assert!(told.lines().count() >= 5, "{told}");
     for line in told.lines() {
         assert!(line.starts_with("prompt=0 ssh=[ssh -i my-key] "), "{line}");
+    }
+
+    // So is one in git's configuration (`core.sshCommand`), which a
+    // `GIT_SSH_COMMAND` of the client's would win over.
+    std::fs::remove_file(&log).unwrap();
+    std::fs::remove_dir_all(dir.join(".import-cache")).unwrap();
+    std::fs::write(dir.join("with-ssh.gitconfig"), "[core]\n\tsshCommand = ssh -i configured-key\n").unwrap();
+    let mut cmd = api_with_telling_git(&dir, server.port, &log);
+    cmd.args(["-sa", "batch.api"]).env("GIT_CONFIG_GLOBAL", dir.join("with-ssh.gitconfig"));
+    let ran = finish(cmd, "");
+    assert!(ran.ok, "{}", ran.stderr);
+    let told = std::fs::read_to_string(&log).unwrap();
+    assert!(told.lines().count() >= 6, "{told}");
+    for line in told.lines() {
+        assert!(line.starts_with("prompt=0 ssh=[] "), "{line}");
     }
 }
 

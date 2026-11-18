@@ -10713,6 +10713,10 @@ fn a_command_line_that_cannot_be_run_sends_nothing() {
         (&["set", "include-nulls"], "`set` alone sends nothing"),
         (&["set include-nulls off"], "`set` alone sends nothing"),
         (&["DELETE"], "DELETE needs a URI"),
+        // A URI from a variable that is not set: the body is not the URI.
+        (&["PUT", "", "{\"a\":1}"], "PUT needs a URI"),
+        (&["delete", " ", "[1]"], "DELETE needs a URI"),
+        (&["-c", "saved", "--1p", "vault/item", "GET", "/x"], "-c names a saved connection and --1p one in 1Password: give one of the two"),
     ] {
         let got = run_in(&server, dir.path(), args);
         assert_eq!((got.code, got.sent.len()), (Some(1), 0), "{args:?}: {}", got.stderr);
@@ -11469,4 +11473,61 @@ fn a_file_at_the_prompt_neither_overrides_the_session_nor_leaves_its_settings_be
         assert_eq!(sent, ["GET /missing", "GET /after"], "{file}: fail-fast was left on\n{shown}");
         assert_eq!(accepts, ["application/json", "application/json"], "{file}: include-nulls was left on");
     }
+}
+
+/// The request of an `assert` and of a `sleep while` is read as a plain line
+/// is: a comment in its body is not sent and a raw tab in a string is
+/// escaped. Sent as written, the server could not read the body, and its 400
+/// would be the "no" that lets an `assert not` pass.
+#[test]
+fn the_request_of_a_check_is_sent_as_a_plain_line_sends_it() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let body = "{\"q\": 1 /* active only */, \"t\": \"a\tb\" // tail\n}";
+    let one_line = "{\"q\": 1 /* active only */, \"t\": \"a\tb\"}";
+    std::fs::write(
+        d.join("checks.api"),
+        format!("PUT /plain {body}\nassert PUT /checked {one_line}\nassert not PUT /missing {one_line}\nsleep while not PUT /polled {one_line}\n"),
+    )
+    .unwrap();
+    let got = run_in(&server, d, &["-sa", "checks.api"]);
+    assert_eq!(got.code, Some(0), "{}{}", got.stdout, got.stderr);
+    assert_eq!(got.sent.len(), 4, "{:?}", got.sent);
+    // What arrived, as the JSON it is: the two bodies differ in blanks only.
+    let sent_body = |line: &str| -> serde_json::Value {
+        let body = line.splitn(3, ' ').nth(2).unwrap();
+        serde_json::from_str(body).unwrap_or_else(|e| panic!("{body}: {e}"))
+    };
+    let plain = sent_body(&got.sent[0]);
+    assert_eq!(plain, serde_json::json!({"q": 1, "t": "a\tb"}));
+    for line in &got.sent[1..] {
+        assert_eq!(sent_body(line), plain, "{line}");
+    }
+
+    // As an argument and from stdin too.
+    let got = run_in(&server, d, &[&format!("assert PUT /checked {one_line}")]);
+    assert_eq!(got.code, Some(0), "{}", got.stderr);
+    assert_eq!(got.sent.iter().map(|l| sent_body(l)).collect::<Vec<_>>(), [plain.clone()]);
+}
+
+/// `>>` adds to what its target holds without reading it as text first: a
+/// file that is not UTF-8 keeps its bytes and gets the addition behind them.
+#[test]
+fn an_append_to_a_file_that_is_not_utf8_keeps_its_bytes() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::write(d.join("notes.txt"), b"caf\xe9").unwrap();
+    std::fs::write(d.join("rows.ndjson"), b"{\"n\":\"caf\xe9\"}\n").unwrap();
+    std::fs::write(d.join("add.api"), "GET /one >> notes.txt\nGET /two >> rows.ndjson\nGET /after\n").unwrap();
+    let got = run_in(&server, d, &["-sfa", "add.api"]);
+    assert_eq!(got.code, Some(0), "{}{}", got.stdout, got.stderr);
+    assert!(!got.stderr.contains("Error writing"), "{}", got.stderr);
+    assert_eq!(got.sent, ["GET /one", "GET /two", "GET /after"]);
+    let notes = std::fs::read(d.join("notes.txt")).unwrap();
+    assert!(notes.starts_with(b"caf\xe9\n"), "{notes:?}");
+    assert!(String::from_utf8_lossy(&notes).contains("/one"), "{notes:?}");
+    let rows = std::fs::read(d.join("rows.ndjson")).unwrap();
+    assert_eq!(rows, b"{\"n\":\"caf\xe9\"}\n{\"ok\":\"/api/v1/two\"}\n", "{}", String::from_utf8_lossy(&rows));
 }
