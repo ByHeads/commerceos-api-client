@@ -975,7 +975,7 @@ fn a_request_carries_the_same_headers_from_every_entry_point() {
         let mut cmd = api(server.port, dir.path());
         cmd.args(flags);
         let mut prompt = Prompt::open(cmd);
-        prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+        prompt.wait_ready(Duration::from_secs(15));
         prompt.pump(Duration::from_millis(400));
         for row in header_rows().into_iter().filter(|row| row.0 == flags) {
             let line = row.1.replace("{d}", &d);
@@ -1734,7 +1734,7 @@ fn a_token_that_ran_out_is_renewed_and_the_same_request_sent_again() {
     let mut cmd = api_bare(d);
     cmd.arg("-i");
     let mut prompt = Prompt::open(cmd);
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
     prompt.pump(Duration::from_millis(500));
     prompt.send(b"\x15");
     prompt.pump(Duration::from_millis(60));
@@ -1822,7 +1822,7 @@ fn a_renewed_token_is_kept_for_the_session() {
     let url = format!("http://127.0.0.1:{}", server.port);
     write_credentials(d, &[("o", url, "oauth2", "secret", "id")], "o");
     let mut prompt = pty::Prompt::open(api_bare(d));
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
     prompt.pump(Duration::from_millis(500));
 
     for (line, expired_requests) in [("GET /expired/x", 2), ("GET /expired/y", 1)] {
@@ -1865,7 +1865,7 @@ fn the_prompt_writes_an_outfile_as_a_batch_does() {
     let mut cmd = api(server.port, d);
     cmd.arg("-f");
     let mut prompt = Prompt::open(cmd);
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
     prompt.pump(Duration::from_millis(500));
     let mut enter = |prompt: &mut Prompt, line: &str, wait_for: &str| {
         prompt.send(b"\x15");
@@ -1939,7 +1939,7 @@ fn the_prompt_streams_an_outfile_as_a_batch_does() {
     let mut cmd = api_bare(d);
     cmd.args(["-b", &url, "-k", "streamer", "--stream"]);
     let mut prompt = pty::Prompt::open(cmd);
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
     prompt.pump(Duration::from_millis(500));
     assert!(pty::rows(&prompt.screen, 200).last().unwrap().ends_with("streaming"), "{}", screen_tail(&prompt));
 
@@ -1980,7 +1980,7 @@ fn an_aborted_stream_at_the_prompt_is_given_up() {
         let mut cmd = api_bare(d);
         cmd.args(["-b", &url, "-k", "streamer", "--stream"]);
         let mut prompt = pty::Prompt::open(cmd);
-        prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+        prompt.wait_ready(Duration::from_secs(15));
         prompt.pump(Duration::from_millis(500));
         prompt
     };
@@ -2535,7 +2535,7 @@ fn a_malformed_credentials_file_is_reported_and_left_alone() {
 
     // At the prompt, saving the connection in use does not replace the file.
     let mut prompt = Prompt::open(api(server.port, d));
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
     prompt.pump(Duration::from_millis(500));
     prompt.send(b"\x13");
     prompt.pump(Duration::from_millis(400));
@@ -2558,7 +2558,7 @@ fn a_malformed_credentials_file_is_reported_and_left_alone() {
     // A good file is still saved to, and what was in it is kept.
     write_credentials(d, &[("keep", "http://x".to_string(), "key", "SECRET", "")], "keep");
     let mut prompt = Prompt::open(api(server.port, d));
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
     prompt.pump(Duration::from_millis(500));
     prompt.send(b"\x13");
     prompt.pump(Duration::from_millis(400));
@@ -2588,7 +2588,7 @@ fn switching_connection_at_the_prompt_keeps_the_flags() {
     let mut cmd = api(server.port, d);
     cmd.args(["-i", "-f"]);
     let mut prompt = Prompt::open(cmd);
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
     prompt.pump(Duration::from_millis(500));
     let mut get = |prompt: &mut Prompt, line: &str| {
         prompt.send(b"\x15");
@@ -2684,7 +2684,7 @@ fn saving_under_a_new_name_renames_the_connection_unless_a_flag_overrides_it() {
         let mut cmd = api_bare(d);
         cmd.args(args);
         let mut prompt = Prompt::open(cmd);
-        prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+        prompt.wait_ready(Duration::from_secs(15));
         prompt.pump(Duration::from_millis(500));
         prompt
     };
@@ -2802,7 +2802,7 @@ fn a_failed_token_exchange_does_not_end_the_prompt() {
     assert!(batch.stderr.contains("OAuth2 token exchange failed"), "{}", batch.stderr);
 
     let mut prompt = Prompt::open(api(server.port, d));
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
     prompt.pump(Duration::from_millis(500));
     prompt.send(b"\x11");
     prompt.wait_for("gone", Duration::from_secs(5));
@@ -2936,7 +2936,7 @@ fn the_history_file_keeps_a_multi_line_entry_on_one_line() {
     let history = d.join(".api_history");
     {
         let mut prompt = Prompt::open(api(server.port, d));
-        prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+        prompt.wait_ready(Duration::from_secs(15));
         prompt.pump(Duration::from_millis(500));
         for line in ["GET /one", "PUT /two {\r  \"a\": 1\r}"] {
             prompt.send(b"\x15");
@@ -2962,7 +2962,7 @@ fn the_history_file_keeps_a_multi_line_entry_on_one_line() {
     // The next session has both, the second one whole: Up brings it back
     // and Enter sends it again.
     let mut prompt = Prompt::open(api(server.port, d));
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
     prompt.pump(Duration::from_millis(500));
     server.take();
     prompt.send(b"\x1b[A");
@@ -4036,12 +4036,39 @@ mod pty {
 
         /// Collect output for `d`, answering the cursor-position query the
         /// client sends when it starts.
+        ///
+        /// It never stops in the middle of a frame. The client draws its
+        /// command area in several writes, between switching auto-wrap off
+        /// and on again, and while a notice is up it draws ten times a
+        /// second: a screen looked at after a fixed time could be one with
+        /// half a command area on it. So while a frame is open the reading
+        /// goes on until it is closed (or, for a client that is gone or
+        /// stuck, two seconds have passed).
         pub fn pump(&mut self, d: Duration) {
-            let end = Instant::now() + d;
+            if !self.read_until(Instant::now() + d) {
+                return;
+            }
+            let limit = Instant::now() + Duration::from_secs(2);
+            while self.frame_is_open() && Instant::now() < limit {
+                if !self.read_until(Instant::now() + Duration::from_millis(5)) {
+                    return;
+                }
+            }
+        }
+
+        /// Whether the client is in the middle of drawing: auto-wrap is
+        /// off, or a character has arrived in part.
+        fn frame_is_open(&self) -> bool {
+            let last = |mode: &str| self.screen.rfind(mode);
+            !self.partial.is_empty() || last("\x1b[?7l") > last("\x1b[?7h")
+        }
+
+        /// Read what arrives until `end`. False when the terminal is closed.
+        fn read_until(&mut self, end: Instant) -> bool {
             loop {
                 let left = end.saturating_duration_since(Instant::now());
                 if left.is_zero() {
-                    return;
+                    return true;
                 }
                 let mut pfd = libc::pollfd { fd: self.master, events: libc::POLLIN, revents: 0 };
                 let rc = unsafe { libc::poll(&mut pfd, 1, left.as_millis().min(50) as i32) };
@@ -4049,12 +4076,12 @@ mod pty {
                     continue;
                 }
                 if pfd.revents & libc::POLLIN == 0 {
-                    return;
+                    return false;
                 }
                 let mut buf = [0u8; 65536];
                 let n = unsafe { libc::read(self.master, buf.as_mut_ptr() as *mut _, buf.len()) };
                 if n <= 0 {
-                    return;
+                    return false;
                 }
                 let chunk = &buf[..n as usize];
                 if chunk.windows(4).any(|w| w == b"\x1b[6n") {
@@ -4108,6 +4135,17 @@ mod pty {
                 self.pump(Duration::from_millis(100));
             }
         }
+
+        /// Wait until the prompt takes what is typed. The hint line alone
+        /// does not say so: with `-c` the command area is drawn while the
+        /// connection is still being loaded, with a spinner where the input
+        /// line goes, and until that has ended every key and paste is
+        /// dropped. The input line with its cursor block is drawn when the
+        /// wait is over, so that is what is waited for, not a length of time.
+        pub fn wait_ready(&mut self, timeout: Duration) {
+            self.wait_for("ctrl+h for shortcuts", timeout);
+            self.wait_for("GET /\x1b[48;5;24", timeout);
+        }
     }
 
     impl Drop for Prompt {
@@ -4141,14 +4179,39 @@ mod pty {
         }
     }
 
+    /// The columns a character takes on a terminal: two for a wide one (CJK,
+    /// emoji), none for a combining mark. A table of the test's own, so that
+    /// the screen is not measured with the function the client lays out by.
+    pub fn columns(c: char) -> usize {
+        match c as u32 {
+            0x0300..=0x036F | 0x200B..=0x200F | 0xFE00..=0xFE0F => 0,
+            0x1100..=0x115F
+            | 0x2E80..=0xA4CF
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE30..=0xFE4F
+            | 0xFF00..=0xFF60
+            | 0xFFE0..=0xFFE6
+            | 0x1F300..=0x1F64F
+            | 0x1F900..=0x1F9FF
+            | 0x20000..=0x3FFFD => 2,
+            _ => 1,
+        }
+    }
+
     /// What a terminal `cols` wide shows after `output`: one string per row,
     /// without trailing blanks. `plain` gives the text that was written;
     /// this gives where it ended up, which is what a layout has to be judged
     /// on. It is as much of a terminal as the client uses: text, CR and LF,
     /// relative cursor moves, erase in line and in display, saved cursor
     /// positions, and auto-wrap switched on and off. Colours are dropped.
+    ///
+    /// A cell is a column. A wide character takes two (with auto-wrap on it
+    /// goes to the next row whole when one is left; with it off it is not
+    /// drawn there), a combining mark joins the cell before it, and a tab
+    /// moves to the next multiple of eight without drawing anything.
     pub fn rows(output: &str, cols: usize) -> Vec<String> {
-        let mut grid: Vec<Vec<char>> = vec![Vec::new()];
+        let mut grid: Vec<Vec<String>> = vec![Vec::new()];
         let (mut row, mut col) = (0usize, 0usize);
         let mut saved = (0usize, 0usize);
         let mut wrap = true;
@@ -4198,12 +4261,24 @@ mod pty {
                 },
                 '\r' => col = 0,
                 '\n' => row += 1,
+                '\t' => col = ((col / 8 + 1) * 8).min(cols.saturating_sub(1)),
                 c if c.is_control() => {}
+                c if columns(c) == 0 => {
+                    // Joins what stands before the cursor, if anything does.
+                    if let Some(cell) = col.checked_sub(1).and_then(|at| grid.get_mut(row)?.get_mut(at)) {
+                        cell.push(c);
+                    }
+                }
                 c => {
-                    if col >= cols {
+                    let wide = columns(c);
+                    let mut draw = true;
+                    if col + wide > cols {
                         if wrap {
                             row += 1;
                             col = 0;
+                        } else if wide > 1 {
+                            // No room for it at the margin, and no wrapping.
+                            draw = false;
                         } else {
                             col = cols.saturating_sub(1);
                         }
@@ -4211,23 +4286,24 @@ mod pty {
                     while grid.len() <= row {
                         grid.push(Vec::new());
                     }
-                    while grid[row].len() < col {
-                        grid[row].push(' ');
+                    if draw {
+                        while grid[row].len() < col + wide {
+                            grid[row].push(" ".to_string());
+                        }
+                        grid[row][col] = c.to_string();
+                        // The second column of a wide character holds nothing of its own.
+                        for cell in &mut grid[row][col + 1..col + wide] {
+                            cell.clear();
+                        }
+                        col += wide;
                     }
-                    if col < grid[row].len() {
-                        grid[row][col] = c;
-                    } else {
-                        grid[row].push(c);
-                    }
-                    col += 1;
                 }
             }
             while grid.len() <= row {
                 grid.push(Vec::new());
             }
         }
-        let mut rows: Vec<String> =
-            grid.iter().map(|cells| cells.iter().collect::<String>().trim_end().to_string()).collect();
+        let mut rows: Vec<String> = grid.iter().map(|cells| cells.concat().trim_end().to_string()).collect();
         while rows.last().is_some_and(|last| last.is_empty()) {
             rows.pop();
         }
@@ -4267,7 +4343,7 @@ fn the_prompt_reads_the_same_lines() {
     prepare(dir.path());
 
     let mut prompt = Prompt::open(api(server.port, dir.path()));
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
 
     let mut extra = cases(dir.path());
     extra.push(case("confirm, answered yes", "confirm Go on", None, &[]).says("Go on?"));
@@ -4376,7 +4452,7 @@ fn export_at_the_prompt_shows_the_seed_data() {
     let mut cmd = api(server.port, dir.path());
     cmd.args(["--export", "com.heads.seedID"]);
     let mut prompt = Prompt::open(cmd);
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
 
     let mut run = |paste: &str| {
         prompt.send(b"\x15");
@@ -4432,7 +4508,7 @@ fn ctrl_r_toggles_export_at_the_prompt_and_asks_for_the_name_once() {
     prepare(dir.path());
     // Started without `--export`.
     let mut prompt = Prompt::open(api(server.port, dir.path()));
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
 
     // Type `keys` (ctrl+r is \x12), and give the screen what it showed.
     fn keys(prompt: &mut pty::Prompt, keys: &[u8]) -> String {
@@ -4531,7 +4607,7 @@ fn the_export_name_dialog_stays_in_the_command_area_at_any_width() {
         let dir = tempfile::tempdir().unwrap();
         prepare(dir.path());
         let mut prompt = Prompt::open_sized(api(server.port, dir.path()), cols);
-        prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+        prompt.wait_ready(Duration::from_secs(15));
         prompt.pump(Duration::from_millis(600));
 
         const HINT: &str = "  enter to turn export on, esc to cancel";
@@ -4654,7 +4730,7 @@ fn ctrl_c_in_a_name_dialog_leaves_what_quitting_at_the_prompt_leaves() {
     ];
     for (way, keys, used) in ways {
         let mut prompt = Prompt::open_sized(api(server.port, dir.path()), COLS as u16);
-        prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+        prompt.wait_ready(Duration::from_secs(15));
         prompt.pump(Duration::from_millis(600));
         if used {
             prompt.send(b"\x15");
@@ -4721,7 +4797,7 @@ fn ctrl_c_in_the_connection_dialog_restores_the_terminal() {
     )
     .unwrap();
     let mut prompt = Prompt::open_sized(api(server.port, dir.path()), 84);
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
     prompt.pump(Duration::from_millis(600));
     assert!(!prompt.is_cooked(), "a prompt reads keys, not lines");
     prompt.send(b"\x11");
@@ -4754,7 +4830,7 @@ fn up_and_down_over_multi_byte_text_keep_the_session() {
     let dir = tempfile::tempdir().unwrap();
     prepare(dir.path());
     let mut prompt = Prompt::open(api(server.port, dir.path()));
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
     prompt.pump(Duration::from_millis(600));
     prompt.send(b"\x15");
     prompt.pump(Duration::from_millis(60));
@@ -4779,7 +4855,7 @@ fn the_body_editor_sends_what_was_typed_or_pasted() {
     let server = RecordingServer::start();
     let dir = tempfile::tempdir().unwrap();
     let mut prompt = Prompt::open(api(server.port, dir.path()));
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
     prompt.pump(Duration::from_millis(500));
 
     let mut edit = |prompt: &mut Prompt, line: &str, body: &[&[u8]], end: &[u8]| -> Vec<String> {
@@ -4885,7 +4961,7 @@ fn ctrl_g_gets_the_uri_on_the_line() {
     let server = RecordingServer::start();
     let dir = tempfile::tempdir().unwrap();
     let mut prompt = Prompt::open(api(server.port, dir.path()));
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
     prompt.pump(Duration::from_millis(500));
 
     let mut on_line = |prompt: &mut Prompt, line: &str, key: &[u8]| -> (Vec<String>, String) {
@@ -4934,7 +5010,7 @@ fn a_paste_fills_a_name_dialog() {
     let server = RecordingServer::start();
     let dir = tempfile::tempdir().unwrap();
     let mut prompt = Prompt::open(api(server.port, dir.path()));
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
     prompt.pump(Duration::from_millis(500));
 
     prompt.send(b"\x13");
@@ -4965,7 +5041,7 @@ fn open_prompt(server: &RecordingServer, dir: &Path, args: &[&str]) -> pty::Prom
     let mut cmd = api(server.port, dir);
     cmd.args(args);
     let mut prompt = pty::Prompt::open(cmd);
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
     prompt.pump(Duration::from_millis(500));
     prompt
 }
@@ -5131,7 +5207,7 @@ fn a_spec_that_cannot_be_read_is_said_with_b_and_with_c() {
         let mut cmd = api_bare(d);
         cmd.args(args);
         let mut prompt = pty::Prompt::open(cmd);
-        prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+        prompt.wait_ready(Duration::from_secs(15));
         let seen = pump_until(&mut prompt, Duration::from_secs(4), |p| pty::plain(&p.screen).contains(notice));
         assert_eq!(seen, said, "{args:?}: {}", pty::plain(&prompt.screen));
     }
@@ -5150,7 +5226,7 @@ fn a_save_keeps_what_was_saved_from_outside_in_the_meantime() {
     let mut cmd = api_bare(d);
     cmd.args(["-c", "a"]);
     let mut prompt = pty::Prompt::open(cmd);
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
     prompt.pump(Duration::from_millis(500));
 
     write_credentials(
@@ -5228,7 +5304,7 @@ fn a_resize_during_a_wait_or_a_dialog_is_drawn_when_it_ends() {
     let mut cmd = api_bare(d);
     cmd.args(["-c", "a"]);
     let mut prompt = Prompt::open_with(cmd, 100, 40);
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
     prompt.pump(Duration::from_millis(500));
     assert_eq!(last_ruler(&prompt.screen), 100);
 
@@ -5384,7 +5460,7 @@ fn ctrl_r_in_a_session_started_with_export_does_not_ask() {
     let mut cmd = api(server.port, dir.path());
     cmd.args(["--export", "com.heads.seedID"]);
     let mut prompt = Prompt::open(cmd);
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
 
     let press = |prompt: &mut Prompt| {
         let mark = prompt.screen.len();
@@ -5420,7 +5496,7 @@ fn an_export_line_at_the_prompt_holds_for_the_lines_typed_after_it() {
     std::fs::write(dir.path().join("plain.api"), "GET /keyed > from-file.json\n").unwrap();
     std::fs::write(dir.path().join("own.api"), "export other.name.id\nGET /keyed > from-own.json\n").unwrap();
     let mut prompt = Prompt::open(api(server.port, dir.path()));
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
 
     let mut run = |paste: &str| {
         prompt.send(b"\x15");
@@ -5512,7 +5588,7 @@ fn an_export_line_does_not_change_a_sessions_own_export_mode() {
     let mut cmd = api(server.port, dir.path());
     cmd.args(["--export", "com.heads.seedID"]);
     let mut prompt = Prompt::open(cmd);
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
 
     let run = |prompt: &mut Prompt, paste: &str| {
         prompt.send(b"\x15");
@@ -5629,7 +5705,7 @@ fn fail_fast_at_the_prompt_stops_a_pasted_block_and_keeps_the_session() {
     let mut cmd = api(server.port, dir.path());
     cmd.arg("-f");
     let mut prompt = Prompt::open(cmd);
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
 
     let mut run = |paste: &str| {
         prompt.send(b"\x15");
@@ -5732,7 +5808,7 @@ fn a_pasted_block_with_carriage_returns_runs_line_by_line() {
     prepare(dir.path());
 
     let mut prompt = Prompt::open(api(server.port, dir.path()));
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
 
     // No ctrl+u: the default `GET /` is on the line, as it is for a user who
     // pastes right after starting the client.
@@ -5765,7 +5841,7 @@ fn a_failed_assert_at_the_prompt_is_logged_as_one() {
     prepare(dir.path());
 
     let mut prompt = Prompt::open(api(server.port, dir.path()));
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
 
     let lines: [(&str, &str, &[&str]); 3] = [
         ("assert /zero", "↳ assertion failed (0)", &["assert GET /zero"]),
@@ -5814,7 +5890,7 @@ fn tab_completes_an_include_at_the_prompt() {
     prepare(dir.path());
 
     let mut prompt = Prompt::open(api(server.port, dir.path()));
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
 
     // Each entry is typed key by key; `\t` is Tab. `body.json` also starts
     // with a letter of its own but is never offered, not being a `.api` file.
@@ -5888,7 +5964,7 @@ fn closing_an_unused_prompt_clears_the_splash() {
     prepare(dir.path());
 
     let mut prompt = Prompt::open(api(server.port, dir.path()));
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
     assert!(prompt.screen.contains("CommerceOS API Client"), "no splash:\n{}", prompt.screen);
 
     quit(&mut prompt);
@@ -5908,7 +5984,7 @@ fn closing_a_used_prompt_keeps_its_history() {
     prepare(dir.path());
 
     let mut prompt = Prompt::open(api(server.port, dir.path()));
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
 
     prompt.send(b"\x15");
     prompt.pump(Duration::from_millis(60));
@@ -5934,7 +6010,7 @@ fn open_completing(server: &RecordingServer, dir: &Path, flags: &[&str]) -> pty:
     let mut cmd = api_bare(dir);
     cmd.args(["-b", &url, "-k", "spec"]).args(flags);
     let mut prompt = pty::Prompt::open(cmd);
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
     let start = Instant::now();
     loop {
         let mark = prompt.screen.len();
@@ -6651,7 +6727,7 @@ fn a_session_that_cannot_connect_says_why() {
     assert_eq!(ended, Some(false));
     for (name, said) in [("down", "down: connection failed"), ("refused", "refused: unauthorized"), ("good", "connected to: good")] {
         let mut prompt = pty::Prompt::open(with(&["-c", name]));
-        prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+        prompt.wait_ready(Duration::from_secs(15));
         let seen = pump_until(&mut prompt, Duration::from_secs(8), |p| pty::plain(&p.screen).contains(said));
         assert!(seen, "{name}: {}", pty::plain(&prompt.screen));
         assert_eq!(prompt.exited(), None, "{name}");
@@ -6797,7 +6873,7 @@ fn ctrl_t_toggles_streaming_on_a_server_that_streams() {
     let mut cmd = api_bare(dir.path());
     cmd.args(["-b", &url, "-k", "streamer", "--stream"]);
     let mut prompt = pty::Prompt::open(cmd);
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
     let on = |prompt: &pty::Prompt| pty::rows(&prompt.screen, 200).last().is_some_and(|row| row.trim_end().ends_with("streaming"));
     assert!(pump_until(&mut prompt, Duration::from_secs(5), |p| on(p)), "{}", screen_tail(&prompt));
     prompt.send(b"\x14");
@@ -6867,7 +6943,7 @@ fn a_file_that_stops_at_the_prompt_leaves_the_export_mode_as_it_was() {
     std::fs::write(dir.path().join("own.api"), "export other.name.id\nassert GET /missing\nGET /never\n").unwrap();
     std::fs::write(dir.path().join("plain.api"), "assert GET /missing\nGET /never\n").unwrap();
     let mut prompt = Prompt::open(api(server.port, dir.path()));
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
 
     let exported = |file: &str| -> Option<String> {
         let text = std::fs::read_to_string(dir.path().join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
@@ -6904,7 +6980,7 @@ fn a_block_at_the_prompt_runs_on_past_an_error_status() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("failing.api"), "GET /boom\nGET /b\n").unwrap();
     let mut prompt = Prompt::open(api(server.port, dir.path()));
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
 
     let (sent, shown) = run_pasted(&mut prompt, &server, "GET /boom\rGET /denied\rGET /missing\rGET /b\r");
     assert_eq!(sent, ["GET /boom", "GET /denied", "GET /missing", "GET /b"], "{shown}");
@@ -6975,7 +7051,7 @@ fn a_key_beside_an_oauth2_connection_is_not_renewed_with_the_stored_secret() {
     let mut cmd = api_bare(d);
     cmd.args(["-c", "o", "-k", "CLIKEY"]);
     let mut prompt = pty::Prompt::open(cmd);
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
     // With `-c` the prompt is drawn while the connection is still being
     // loaded, and until that has ended it takes no key and no paste.
     prompt.wait_for("connected to: o", Duration::from_secs(15));
@@ -7048,7 +7124,7 @@ fn clearing_a_body_and_cycling_a_method_leave_the_rest_of_the_line() {
     let server = RecordingServer::start();
     let dir = tempfile::tempdir().unwrap();
     let mut prompt = pty::Prompt::open(api(server.port, dir.path()));
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
 
     // The outfile stays. A PUT without a body asks for one, and sent with
     // none from there the request goes out and the file is written.
@@ -7111,7 +7187,7 @@ fn the_overwrite_question_keeps_the_command_area_in_place() {
         let mut cmd = api_bare(d);
         cmd.args(["-c", "a"]);
         let mut prompt = pty::Prompt::open_with(cmd, cols, 40);
-        prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+        prompt.wait_ready(Duration::from_secs(15));
         prompt.pump(Duration::from_millis(500));
         let before = ruler_rows(&pty::rows(&prompt.screen, cols as usize));
         assert_eq!(before.len(), 2, "{cols}:\n{}", pty::rows(&prompt.screen, cols as usize).join("\n"));
@@ -7148,7 +7224,7 @@ fn a_resize_with_the_shortcuts_open_keeps_the_output() {
     let server = RecordingServer::start();
     let dir = tempfile::tempdir().unwrap();
     let mut prompt = pty::Prompt::open_with(api(server.port, dir.path()), 100, 60);
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
     press(&mut prompt, &["GET /kept"]);
     assert_eq!(entered(&mut prompt, &server), ["GET /kept"]);
 
@@ -7183,7 +7259,7 @@ fn a_long_confirm_at_the_prompt_stays_on_its_row() {
     let server = RecordingServer::start();
     let dir = tempfile::tempdir().unwrap();
     let mut prompt = pty::Prompt::open_sized(api(server.port, dir.path()), COLS as u16);
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
     prompt.pump(Duration::from_millis(600));
     std::fs::write(
         dir.path().join("gate.api"),
@@ -7226,7 +7302,7 @@ fn esc_ends_a_wait_at_the_prompt_and_what_follows_it() {
     let server = RecordingServer::start();
     let dir = tempfile::tempdir().unwrap();
     let mut prompt = pty::Prompt::open(api(server.port, dir.path()));
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
 
     for (block, polls, says) in [
         ("sleep 30\rGET /never\r", 0, "sleeping cancelled"),
@@ -7303,7 +7379,7 @@ fn a_line_as_wide_as_the_terminal_takes_one_row() {
     let server = RecordingServer::start();
     let dir = tempfile::tempdir().unwrap();
     let mut prompt = pty::Prompt::open_with(api(server.port, dir.path()), COLS as u16, 40);
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
     prompt.pump(Duration::from_millis(500));
 
     // A first line of 40 columns, and one of 39 with the cursor at its end.
@@ -7358,7 +7434,7 @@ fn a_line_taller_than_the_terminal_is_shown_around_the_cursor() {
     let server = RecordingServer::start();
     let dir = tempfile::tempdir().unwrap();
     let mut prompt = pty::Prompt::open_with(api(server.port, dir.path()), COLS as u16, ROWS as u16);
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
     prompt.pump(Duration::from_millis(500));
 
     let members: Vec<String> = (0..150).map(|i| format!("\"key{i:03}\":{i}")).collect();
@@ -7488,7 +7564,7 @@ fn a_paste_fills_the_field_of_the_connection_dialog() {
         "alpha",
     );
     let mut prompt = pty::Prompt::open(api_bare(d));
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
     prompt.pump(Duration::from_millis(500));
     keys_then(&mut prompt, "\x11", "+ Add new connection");
     prompt.paste("zet\ralpha\r");
@@ -7651,7 +7727,7 @@ fn the_connection_picker_keeps_to_a_narrow_terminal() {
     let mut cmd = api_bare(d);
     cmd.args(["-c", "second-with-a-long-name"]);
     let mut prompt = pty::Prompt::open_sized(cmd, 60);
-    prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
     prompt.pump(Duration::from_millis(600));
     keys_then(&mut prompt, "\x11", "+ Add new connection");
     let mark = prompt.screen.len();
@@ -7773,7 +7849,7 @@ fn an_empty_base_url_is_no_base_url() {
         let mut cmd = api_bare(d);
         cmd.args(["-b", empty]);
         let mut prompt = pty::Prompt::open(cmd);
-        prompt.wait_for("ctrl+h for shortcuts", Duration::from_secs(15));
+        prompt.wait_ready(Duration::from_secs(15));
         prompt.pump(Duration::from_millis(500));
         press(&mut prompt, &["GET /home"]);
         assert_eq!(entered(&mut prompt, &server), ["GET /home"], "{empty:?}");
@@ -8418,4 +8494,229 @@ fn a_check_that_gets_no_answer_at_the_prompt_stops_the_block() {
     }
     press(&mut prompt, &["GET /after"]);
     assert_eq!(entered(&mut prompt, &server), ["GET /after"]);
+}
+
+/// The command area as the screen has it: its rows between the two rulers.
+/// There are exactly two rulers, the top one on row `top`, the hint row is
+/// the last row of the screen, and what is above the top ruler is `above`.
+#[cfg(unix)]
+fn input_rows_at(prompt: &pty::Prompt, cols: usize, top: usize, above: &[String], what: &str) -> Vec<String> {
+    let rows = pty::rows(&prompt.screen, cols);
+    let shown = rows.join("\n");
+    let rulers = ruler_rows(&rows);
+    assert_eq!(rulers.len(), 2, "{what}: not two rulers\n{shown}");
+    assert_eq!(rulers[0], top, "{what}: the top ruler moved\n{shown}");
+    assert_eq!(&rows[..top], above, "{what}: the rows above changed\n{shown}");
+    assert!(rows.len() <= rulers[1] + 2, "{what}: rows under the hint line\n{shown}");
+    for row in &rows[top..] {
+        let columns: usize = row.chars().map(pty::columns).sum();
+        assert!(columns <= cols, "{what}: a row of {columns} columns\n{shown}");
+    }
+    rows[top + 1..rulers[1]].to_vec()
+}
+
+/// A line of wide characters takes two columns a character: it is wrapped
+/// where the row is full, a character that would straddle the margin goes
+/// to the next row whole, and the rows drawn are the rows the next redraw
+/// moves up by, so no key leaves a ruler or a row behind.
+#[cfg(unix)]
+#[test]
+fn a_line_of_wide_characters_is_wrapped_by_the_columns_it_takes() {
+    const COLS: usize = 40;
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = pty::Prompt::open_sized(api(server.port, dir.path()), COLS as u16);
+    prompt.wait_ready(Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(300));
+    let before = pty::rows(&prompt.screen, COLS);
+    let top = ruler_rows(&before)[0];
+    let above = before[..top].to_vec();
+
+    let wide = |count: usize| "日".repeat(count);
+    for (count, expected) in [
+        // `GET /` and 17 of them are 39 columns: with the cursor the row is full.
+        (17, vec![format!("GET /{}", wide(17))]),
+        // One more has a single column left, and takes the next row.
+        (18, vec![format!("GET /{}", wide(17)), wide(1)]),
+        // A full row of them in the middle.
+        (40, vec![format!("GET /{}", wide(17)), wide(20), wide(3)]),
+        // The last row is full: the cursor is on a row of its own.
+        (37, vec![format!("GET /{}", wide(17)), wide(20), String::new()]),
+    ] {
+        let what = format!("{count} wide characters");
+        prompt.send(b"\x15");
+        prompt.pump(Duration::from_millis(80));
+        prompt.paste(&format!("GET /{}", wide(count)));
+        prompt.pump(Duration::from_millis(300));
+        assert_eq!(input_rows_at(&prompt, COLS, top, &above, &what), expected, "{what}");
+        // Moving in the line, typing into it and taking that back again.
+        for (key, name) in [
+            (&b"\x1b[D"[..], "left"),
+            (b"\x1b[D", "left"),
+            (b"x", "a character"),
+            (b"\x7f", "backspace"),
+            (b"\x01", "home"),
+            (b"\x1b[C", "right"),
+            (b"\x05", "end"),
+        ] {
+            prompt.send(key);
+            prompt.pump(Duration::from_millis(150));
+            input_rows_at(&prompt, COLS, top, &above, &format!("{what}, after {name}"));
+        }
+        assert_eq!(input_rows_at(&prompt, COLS, top, &above, &what), expected, "{what}, after the keys");
+    }
+    // The line is sent as it was written.
+    prompt.send(b"\x15");
+    prompt.pump(Duration::from_millis(80));
+    let (sent, shown) = run_pasted(&mut prompt, &server, "GET /日本");
+    assert_eq!(sent, ["GET /%E6%97%A5%E6%9C%AC"], "{shown}");
+}
+
+/// A tab in a pasted body is drawn as the blanks to the next tab stop, and
+/// counted as them: a tab-indented line is wrapped where the row is full,
+/// nothing is drawn over, and no key leaves a row behind. The text keeps
+/// its tabs: what is sent is what was pasted.
+#[cfg(unix)]
+#[test]
+fn a_tab_indented_body_is_drawn_by_the_columns_it_takes() {
+    const COLS: usize = 30;
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = pty::Prompt::open_sized(api(server.port, dir.path()), COLS as u16);
+    prompt.wait_ready(Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(300));
+    let before = pty::rows(&prompt.screen, COLS);
+    let top = ruler_rows(&before)[0];
+    let above = before[..top].to_vec();
+
+    // A terminal sends the line breaks of a paste as carriage returns.
+    let body = "{\r\t\"name\": \"Alec Trevelyan\",\r\t\t\"n\": 1\r}";
+    let expected = [
+        "PUT /x {",
+        // Eight columns of tab and 22 of text fill the row.
+        "        \"name\": \"Alec Trevelya",
+        "n\",",
+        "                \"n\": 1",
+        "}",
+    ];
+    prompt.send(b"\x15");
+    prompt.pump(Duration::from_millis(80));
+    prompt.paste(&format!("PUT /x {body}"));
+    prompt.pump(Duration::from_millis(300));
+    assert_eq!(input_rows_at(&prompt, COLS, top, &above, "pasted"), expected);
+    for (key, name) in [
+        (&b"\x1b[D"[..], "left"),
+        (b"\x1b[D", "left"),
+        (b"\x1b[D", "left"),
+        (b" ", "a blank"),
+        (b"\x7f", "backspace"),
+        (b"\x01", "home"),
+        (b"\x1b[C", "right"),
+        (b"\x05", "end"),
+    ] {
+        prompt.send(key);
+        prompt.pump(Duration::from_millis(150));
+        input_rows_at(&prompt, COLS, top, &above, &format!("after {name}"));
+    }
+    assert_eq!(input_rows_at(&prompt, COLS, top, &above, "after the keys"), expected);
+
+    // Sent with its tabs.
+    server.take();
+    prompt.send(b"\r");
+    pump_until(&mut prompt, Duration::from_secs(4), |_| server.seen() > 0);
+    prompt.pump(Duration::from_millis(250));
+    assert_eq!(server.take(), ["PUT /x {\n\t\"name\": \"Alec Trevelyan\",\n\t\t\"n\": 1\n}"]);
+
+    // The same in the body editor, under its two heading rows.
+    let rows = pty::rows(&prompt.screen, COLS);
+    let top = ruler_rows(&rows)[0];
+    let above = rows[..top].to_vec();
+    prompt.send(b"\x15");
+    prompt.pump(Duration::from_millis(80));
+    prompt.paste("PUT /y");
+    prompt.send(b"\r");
+    prompt.wait_for("Enter body", Duration::from_secs(3));
+    prompt.paste(body);
+    prompt.pump(Duration::from_millis(300));
+    let editor = input_rows_at(&prompt, COLS, top, &above, "the body editor");
+    assert_eq!(editor[0], "PUT /y", "{editor:?}");
+    assert_eq!(editor[editor.len() - 5..], ["{", expected[1], expected[2], expected[3], "}"], "{editor:?}");
+    for round in 0..3 {
+        prompt.send(b"x");
+        prompt.pump(Duration::from_millis(120));
+        prompt.send(b"\x7f");
+        prompt.pump(Duration::from_millis(120));
+        input_rows_at(&prompt, COLS, top, &above, &format!("the body editor, round {round}"));
+    }
+    server.take();
+    prompt.send(b"\x04");
+    pump_until(&mut prompt, Duration::from_secs(4), |_| server.seen() > 0);
+    prompt.pump(Duration::from_millis(250));
+    assert_eq!(server.take(), ["PUT /y {\n\t\"name\": \"Alec Trevelyan\",\n\t\t\"n\": 1\n}"]);
+}
+
+/// A dialog's input line is drawn in one write. While a notice stands in
+/// its hint line the dialog draws thirty times a second, and a line that was
+/// cleared in one write and filled in the next could be read between the
+/// two with nothing on it: by a terminal as a flicker, and by a test that
+/// looks at the screen after a fixed wait as a prompt that is gone.
+#[cfg(unix)]
+#[test]
+fn a_dialog_is_never_seen_with_its_input_line_half_drawn() {
+    const COLS: usize = 84;
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = pty::Prompt::open_sized(api(server.port, dir.path()), COLS as u16);
+    prompt.wait_ready(Duration::from_secs(15));
+    let top = ruler_rows(&pty::rows(&prompt.screen, COLS))[0];
+    prompt.send(b"\x12");
+    prompt.wait_for("Export with external identifier", Duration::from_secs(5));
+    // Refused: the notice is up for three seconds, and drawn all the while.
+    prompt.send(b"seedID\r");
+    prompt.wait_for("export needs a namespaced key", Duration::from_secs(5));
+    prompt.pump(Duration::from_millis(200));
+    let start = Instant::now();
+    let mut frames = 0;
+    while start.elapsed() < Duration::from_millis(2000) {
+        let seen = prompt.screen.len();
+        // As short as a read: whatever one write brought is looked at.
+        prompt.pump(Duration::from_micros(200));
+        if prompt.screen.len() == seen {
+            continue;
+        }
+        frames += 1;
+        let rows = pty::rows(&prompt.screen, COLS);
+        assert_eq!(rows[top + 1], "› Export with external identifier: seedID", "frame {frames}:\n{}", rows.join("\n"));
+    }
+    assert!(frames > 20, "the dialog was not drawing: {frames} frames");
+}
+
+/// With `-c` the connection is loaded while the command area is up, and
+/// until it is loaded no key and no paste is taken. So the input line is
+/// not drawn before that: a line that is shown takes what is typed, at once.
+#[cfg(unix)]
+#[test]
+fn the_input_line_of_a_saved_connection_is_drawn_when_it_takes_keys() {
+    let server = RecordingServer::start();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write_credentials(d, &[("a", url, "key", "k", "")], "a");
+    for round in 0..3 {
+        let mut cmd = api_bare(d);
+        cmd.args(["-c", "a"]);
+        let mut prompt = pty::Prompt::open(cmd);
+        prompt.wait_ready(Duration::from_secs(15));
+        // No pause: what is typed the moment the line is there is taken.
+        server.take();
+        prompt.paste("GET /at-once");
+        prompt.send(b"\r");
+        let sent = pump_until(&mut prompt, Duration::from_secs(4), |_| server.seen() > 0);
+        assert!(sent, "round {round}: nothing was sent\n{}", screen_tail(&prompt));
+        assert_eq!(server.take(), ["GET /at-once"], "round {round}");
+        // The first frame, up to its hint line, had the spinner in its place.
+        let first = &prompt.screen[..prompt.screen.find("ctrl+h for shortcuts").unwrap()];
+        assert!(first.contains("Connecting to a") || first.contains("from a"), "round {round}: {first:?}");
+        assert!(!first.contains("GET /"), "round {round}: an input line that takes no key\n{first:?}");
+    }
 }

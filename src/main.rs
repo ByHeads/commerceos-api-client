@@ -24,6 +24,7 @@ use crossterm::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use unicode_width::UnicodeWidthChar;
 
 /// Set once a write to stdout has failed because its reader has gone away
 /// (`api -sa seed.api | head -2`). Nothing more is written there.
@@ -1969,6 +1970,65 @@ fn char_len(s: &str) -> usize {
     s.chars().count()
 }
 
+/// What a tab is counted as where its place on the row is not known: the
+/// most columns it can take. The input area never draws one: see `expand_tabs`.
+const TAB_WIDTH: usize = 8;
+
+/// The terminal columns a character takes: two for a wide one (CJK, most
+/// emoji), none for a combining mark or a control character.
+fn char_width(c: char) -> usize {
+    if c == '\t' {
+        TAB_WIDTH
+    } else {
+        UnicodeWidthChar::width(c).unwrap_or(0)
+    }
+}
+
+/// The terminal columns `s` takes on one row. Layout counts these; a
+/// position in text that is edited is still a character index (`char_len`).
+fn str_width(s: &str) -> usize {
+    s.chars().map(char_width).sum()
+}
+
+/// `text` followed by the blanks that make it `width` columns wide.
+fn pad_to_width(text: &str, width: usize) -> String {
+    format!("{}{}", text, " ".repeat(width.saturating_sub(str_width(text))))
+}
+
+/// `s` with every tab drawn as the blanks up to the next multiple of eight
+/// columns from the start of its line. Only what is drawn is changed: the
+/// text keeps its tabs, so what is sent is what was pasted. A terminal moves
+/// to a tab stop without the layout knowing where that is, which is why a
+/// tab is never printed in the input area. Colour codes are passed through.
+fn expand_tabs(s: &str) -> String {
+    if !s.contains('\t') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + TAB_WIDTH);
+    let mut col = 0usize;
+    let mut in_escape = false;
+    for c in s.chars() {
+        if in_escape {
+            out.push(c);
+            in_escape = c != 'm';
+        } else if c == '\x1b' {
+            in_escape = true;
+            out.push(c);
+        } else if c == '\n' {
+            out.push(c);
+            col = 0;
+        } else if c == '\t' {
+            let blanks = TAB_WIDTH - col % TAB_WIDTH;
+            out.push_str(&" ".repeat(blanks));
+            col += blanks;
+        } else {
+            out.push(c);
+            col += char_width(c);
+        }
+    }
+    out
+}
+
 /// Narrowest body worth echoing on the request line. Below this the body is
 /// dropped entirely rather than rendered as a stub like `{…`.
 const MIN_INLINE_BODY_CHARS: usize = 8;
@@ -2025,56 +2085,63 @@ fn collapse_newlines_for_log(body: &str) -> String {
 /// Fit a body onto the request line: collapsed to one line, then cut to `budget`
 /// visible columns with an ellipsis. The `…` is counted inside the budget, so the
 /// result never exceeds it and the line lands at the terminal edge rather than
-/// wrapping. Counts chars rather than bytes, so multibyte input (`Möör`) is
-/// neither over-counted nor split mid-codepoint.
+/// wrapping. Counts columns rather than bytes or characters, so multibyte input
+/// (`Möör`) is not over-counted, a wide character is counted as the two columns
+/// it takes, and neither is split.
 fn fit_body_to_width(body: &str, budget: usize) -> String {
     fit_to_width(&collapse_newlines_for_log(body), budget)
 }
 
-/// The first `count` characters of `text`, or all of it. Cut on a character,
-/// never inside one, so a non-ASCII host or URL is as safe to cut as any.
+/// The start of `text` that fits in `count` columns, or all of it. Cut on a
+/// character, never inside one, and a wide character is kept whole or left out.
 fn head_chars(text: &str, count: usize) -> &str {
-    match text.char_indices().nth(count) {
-        Some((i, _)) => &text[..i],
-        None => text,
+    let mut used = 0usize;
+    for (i, c) in text.char_indices() {
+        used += char_width(c);
+        if used > count {
+            return &text[..i];
+        }
     }
+    text
 }
 
-/// The last `count` characters of `text`, or all of it.
+/// The end of `text` that fits in `count` columns, or all of it.
 fn tail_chars(text: &str, count: usize) -> &str {
-    let len = char_len(text);
-    if len <= count {
-        return text;
+    let mut used = 0usize;
+    let mut start = text.len();
+    for (i, c) in text.char_indices().rev() {
+        used += char_width(c);
+        if used > count {
+            break;
+        }
+        start = i;
     }
-    &text[char_to_byte_idx(text, len - count)..]
+    &text[start..]
 }
 
 /// Cut `text` to `budget` visible columns, keeping its start: the end gives
 /// way to an ellipsis, which is counted inside the budget.
 fn fit_to_width(text: &str, budget: usize) -> String {
-    if char_len(text) <= budget {
+    if str_width(text) <= budget {
         return text.to_string();
     }
     if budget == 0 {
         return String::new();
     }
     // Reserve one column for the ellipsis itself.
-    let head: String = text.chars().take(budget - 1).collect();
-    format!("{}…", head)
+    format!("{}…", head_chars(text, budget - 1))
 }
 
 /// Cut `text` to `budget` visible columns, keeping its end: for a value
 /// being typed, where the end is what the next key adds to.
 fn fit_tail_to_width(text: &str, budget: usize) -> String {
-    let len = char_len(text);
-    if len <= budget {
+    if str_width(text) <= budget {
         return text.to_string();
     }
     if budget == 0 {
         return String::new();
     }
-    let tail: String = text.chars().skip(len - (budget - 1)).collect();
-    format!("…{}", tail)
+    format!("…{}", tail_chars(text, budget - 1))
 }
 
 /// `s` without its ANSI colour codes: what `visible_len` counts.
@@ -2093,7 +2160,7 @@ fn visible_text(s: &str) -> String {
     out
 }
 
-// Strip ANSI escape codes and return visible character count
+// Strip ANSI escape codes and return the visible width in terminal columns
 fn visible_len(s: &str) -> usize {
     let mut count = 0;
     let mut in_escape = false;
@@ -2105,10 +2172,55 @@ fn visible_len(s: &str) -> usize {
         } else if c == '\x1b' {
             in_escape = true;
         } else {
-            count += 1;
+            count += char_width(c);
         }
     }
     count
+}
+
+/// One step of wrapping a row at `width` columns: `col` is how much of the
+/// row is taken, `c` the next visible character. Says whether `c` starts a
+/// new row, and moves `col` behind it. A character that would straddle the
+/// right margin goes to the next row whole, and one that takes no column (a
+/// combining mark, the `\r` of a `\r\n`) stays on the row of what it follows.
+/// `hard_wrap_ansi` breaks rows with it and `line_rows` counts them with it,
+/// so the rows drawn are the rows counted.
+fn wrap_step(col: &mut usize, c: char, width: usize) -> bool {
+    let w = char_width(c);
+    let wraps = w > 0 && *col > 0 && *col + w > width;
+    if wraps {
+        *col = 0;
+    }
+    *col += w;
+    wraps
+}
+
+/// The row each visible character of `line` lands on when the line is
+/// wrapped at `width`, by `wrap_step`. Colour codes are given to `escape`.
+fn walk_rows(line: &str, width: usize, mut escape: impl FnMut(char), mut visible: impl FnMut(char, usize)) -> usize {
+    let mut col = 0usize;
+    let mut row = 0usize;
+    let mut in_escape = false;
+    for c in line.chars() {
+        if in_escape {
+            escape(c);
+            in_escape = c != 'm';
+        } else if c == '\x1b' {
+            in_escape = true;
+            escape(c);
+        } else {
+            if width > 0 && wrap_step(&mut col, c, width) {
+                row += 1;
+            }
+            visible(c, row);
+        }
+    }
+    row + 1
+}
+
+/// The rows one line (no `\n` in it) takes at `width`: at least one.
+fn line_rows(line: &str, width: usize) -> usize {
+    walk_rows(line, width, |_| {}, |_, _| {})
 }
 
 // Calculate visual line count accounting for terminal width wrapping
@@ -2116,19 +2228,10 @@ fn visual_line_count(rendered: &str, width: usize) -> u16 {
     if width == 0 {
         return 1;
     }
-    let mut total_lines: u16 = 0;
-    for line in rendered.split('\n') {
-        let visible = visible_len(line);
-        // Each logical line takes at least 1 visual line
-        // Additional visual lines if it wraps
-        let lines_for_this = if visible == 0 {
-            1
-        } else {
-            ((visible + width - 1) / width) as u16 // ceiling division
-        };
-        total_lines += lines_for_this;
-    }
-    total_lines
+    // Summed wide and cut once: an input of more rows than a `u16` holds
+    // must not wrap round to a small number.
+    let total: usize = rendered.split('\n').map(|line| line_rows(line, width)).sum();
+    total.min(u16::MAX as usize) as u16
 }
 
 /// Clamp a rendered multi-line input to a viewport of at most `max_lines` visual
@@ -2138,7 +2241,8 @@ fn visual_line_count(rendered: &str, width: usize) -> u16 {
 ///
 /// A cursor line that is taller than the viewport on its own (a compact body
 /// pasted as one line) is shown by its visual rows around `cursor_col`, the
-/// cursor's column in that line, with the same markers for the rows left out.
+/// columns in front of the cursor in that line, with the same markers for the
+/// rows left out.
 ///
 /// This keeps the printed input block from ever exceeding the screen, which would
 /// otherwise scroll the terminal and desync `render()`'s relative cursor math —
@@ -2154,10 +2258,7 @@ fn clamp_input_viewport(rendered: &str, width: usize, max_lines: u16, cursor_lin
     if n == 0 {
         return (rendered.to_string(), total);
     }
-    let line_h = |l: &str| -> u16 {
-        let v = visible_len(l);
-        if width == 0 || v == 0 { 1 } else { ((v + width - 1) / width) as u16 }
-    };
+    let line_h = |l: &str| -> u16 { line_rows(l, width).min(u16::MAX as usize) as u16 };
 
     let cursor_line = cursor_line.min(n - 1);
     let marker = "\x1b[38;5;240m⋯\x1b[0m";
@@ -2166,10 +2267,10 @@ fn clamp_input_viewport(rendered: &str, width: usize, max_lines: u16, cursor_lin
     // its rows, grown from the cursor's row like the window of lines below.
     let rows = line_h(logical[cursor_line]);
     let (lines_above, lines_below) = (cursor_line > 0, cursor_line + 1 < n);
-    if width > 0 && rows + lines_above as u16 + lines_below as u16 > max_lines {
-        let cursor_row = ((cursor_col / width) as u16).min(rows - 1);
+    if width > 0 && rows.saturating_add(lines_above as u16 + lines_below as u16) > max_lines {
+        let cursor_row = (row_of_column(logical[cursor_line], width, cursor_col).min(u16::MAX as usize) as u16).min(rows - 1);
         let fits = |first: u16, end: u16| {
-            (end - first) + (lines_above || first > 0) as u16 + (lines_below || end < rows) as u16 <= max_lines
+            (end - first).saturating_add((lines_above || first > 0) as u16 + (lines_below || end < rows) as u16) <= max_lines
         };
         let (mut first, mut end) = (cursor_row, cursor_row + 1); // end exclusive
         loop {
@@ -2191,7 +2292,7 @@ fn clamp_input_viewport(rendered: &str, width: usize, max_lines: u16, cursor_lin
             out.push('\n');
             count += 1;
         }
-        out.push_str(&visible_columns(logical[cursor_line], first as usize * width, end as usize * width));
+        out.push_str(&visible_rows(logical[cursor_line], width, first as usize, end as usize));
         if lines_below || end < rows {
             out.push('\n');
             out.push_str(marker);
@@ -2211,7 +2312,7 @@ fn clamp_input_viewport(rendered: &str, width: usize, max_lines: u16, cursor_lin
         if end < n {
             let h = line_h(logical[end]);
             let markers_after = (start > 0) as u16 + ((end + 1) < n) as u16;
-            if used + h + markers_after <= max_lines {
+            if used.saturating_add(h).saturating_add(markers_after) <= max_lines {
                 used += h;
                 end += 1;
                 grew = true;
@@ -2220,7 +2321,7 @@ fn clamp_input_viewport(rendered: &str, width: usize, max_lines: u16, cursor_lin
         if start > 0 {
             let h = line_h(logical[start - 1]);
             let markers_after = ((start - 1) > 0) as u16 + (end < n) as u16;
-            if used + h + markers_after <= max_lines {
+            if used.saturating_add(h).saturating_add(markers_after) <= max_lines {
                 used += h;
                 start -= 1;
                 grew = true;
@@ -2253,28 +2354,39 @@ fn clamp_input_viewport(rendered: &str, width: usize, max_lines: u16, cursor_lin
     (out, count)
 }
 
-/// The visible columns `from..to` of a line that may hold ANSI colour codes.
-/// Every code is kept, also those of the part left out, so what is shown has
-/// the colours it had in the whole line and ends with them switched off.
-fn visible_columns(line: &str, from: usize, to: usize) -> String {
-    let mut out = String::new();
-    let mut col = 0usize;
-    let mut in_escape = false;
-    for c in line.chars() {
-        if in_escape {
-            out.push(c);
-            in_escape = c != 'm';
-        } else if c == '\x1b' {
-            in_escape = true;
-            out.push(c);
-        } else {
-            if col >= from && col < to {
-                out.push(c);
-            }
-            col += 1;
+/// The row, of `line` wrapped at `width`, that holds the cell `column`
+/// columns into the line: where the cursor is drawn.
+fn row_of_column(line: &str, width: usize, column: usize) -> usize {
+    let mut seen = 0usize;
+    let mut found = None;
+    let rows = walk_rows(line, width, |_| {}, |c, row| {
+        let w = char_width(c);
+        if found.is_none() && w > 0 && seen >= column {
+            found = Some(row);
         }
-    }
-    out
+        seen += w;
+    });
+    found.unwrap_or(rows - 1)
+}
+
+/// The rows `first..end` of a line wrapped at `width`, which may hold ANSI
+/// colour codes. Every code is kept, also those of the part left out, so
+/// what is shown has the colours it had in the whole line and ends with them
+/// switched off. It starts at a row's start, so wrapped again it takes the
+/// rows it had.
+fn visible_rows(line: &str, width: usize, first: usize, end: usize) -> String {
+    let out = std::cell::RefCell::new(String::new());
+    walk_rows(
+        line,
+        width,
+        |c| out.borrow_mut().push(c),
+        |c, row| {
+            if row >= first && row < end {
+                out.borrow_mut().push(c);
+            }
+        },
+    );
+    out.into_inner()
 }
 
 /// Hard-wrap a possibly-ANSI string to `width` visible columns, inserting `\r\n`
@@ -2308,18 +2420,13 @@ fn hard_wrap_ansi(s: &str, width: usize) -> String {
             col = 0;
             continue;
         }
-        // The `\r` of a `\r\n` takes no column: counted as one, a line
-        // exactly as wide as the terminal got a blank row after it.
-        if c == '\r' {
-            out.push(c);
-            continue;
-        }
-        if col == width {
+        // Columns, not characters: see `wrap_step`. The `\r` of a `\r\n`
+        // takes none, so a line exactly as wide as the terminal gets no
+        // blank row after it.
+        if wrap_step(&mut col, c, width) {
             out.push_str("\r\n");
-            col = 0;
         }
         out.push(c);
-        col += 1;
     }
     out
 }
@@ -2456,7 +2563,7 @@ impl PickerState {
         let mut max_alias_len = 0usize;
         for name in envs {
             if let Some(env) = load_connection(name) {
-                max_alias_len = max_alias_len.max(char_len(&env.name));
+                max_alias_len = max_alias_len.max(str_width(&env.name));
                 saved_connections.push(Some(env));
             }
         }
@@ -2466,7 +2573,7 @@ impl PickerState {
             if let Some(env) = env_opt {
                 let is_default = default_name.as_deref() == Some(env.name.as_str());
                 let suffix = if is_default { " ♥" } else { "  " };
-                let padding = max_alias_len.saturating_sub(char_len(&env.name)) + 3;
+                let padding = max_alias_len.saturating_sub(str_width(&env.name)) + 3;
                 items.push(format!("{}{}{}{}", env.name, suffix, " ".repeat(padding), env.url));
             }
         }
@@ -2560,12 +2667,12 @@ impl PickerState {
     }
 
     fn rebuild_items(&mut self) {
-        self.max_alias_len = self.saved_connections.iter().flatten().map(|env| char_len(&env.name)).max().unwrap_or(0);
+        self.max_alias_len = self.saved_connections.iter().flatten().map(|env| str_width(&env.name)).max().unwrap_or(0);
         for (i, env_opt) in self.saved_connections.iter().enumerate() {
             if let Some(env) = env_opt {
                 let is_default = self.default_name.as_deref() == Some(env.name.as_str());
                 let suffix = if is_default { " ♥" } else { "  " };
-                let padding = self.max_alias_len.saturating_sub(char_len(&env.name)) + 3;
+                let padding = self.max_alias_len.saturating_sub(str_width(&env.name)) + 3;
                 self.items[i] = format!("{}{}{}{}", env.name, suffix, " ".repeat(padding), env.url);
             }
         }
@@ -2880,22 +2987,20 @@ impl ConnectionFlow {
             if box_width > hint_section {
                 let host_space = box_width - hint_section;
                 let host_display = tail_chars(display_url, host_space);
-                execute!(stdout, Print(format!("{}{:width$}{}{}{}\r\n",
+                execute!(stdout, Print(format!("{}{}{}{}{}\r\n",
                     "│ ".dimmed(),
-                    host_display.dimmed(),
+                    pad_to_width(host_display, host_space).dimmed(),
                     " │ ".dimmed(),
                     hint_text.dimmed(),
                     " │".dimmed(),
-                    width = host_space
                 )))?;
             } else {
                 let host_space = box_width.saturating_sub(4);
                 let host_display = tail_chars(display_url, host_space);
-                execute!(stdout, Print(format!("{}{:width$}{}\r\n",
+                execute!(stdout, Print(format!("{}{}{}\r\n",
                     "│ ".dimmed(),
-                    host_display.dimmed(),
+                    pad_to_width(host_display, host_space).dimmed(),
                     " │".dimmed(),
-                    width = host_space
                 )))?;
             }
             execute!(stdout, Print(format!("{}\r\n", format!("╰{}╯", "─".repeat(box_width.saturating_sub(2))).dimmed())))?;
@@ -2910,7 +3015,7 @@ impl ConnectionFlow {
 
         // Top ruler with embedded title (always "Choose a connection")
         let title = fit_to_width("  Choose a connection  ", w);
-        let title_len = char_len(&title);
+        let title_len = str_width(&title);
         let (left, right) = if w < 37 {
             // Centered for narrow terminals
             let total = w.saturating_sub(title_len);
@@ -2936,7 +3041,7 @@ impl ConnectionFlow {
         let max_env_len = self.picker.filtered_indices.iter()
             .filter_map(|&i| {
                 if self.picker.saved_connections.get(i).map(|e| e.is_some()).unwrap_or(false) {
-                    Some(self.picker.items[i].chars().count())
+                    Some(str_width(&self.picker.items[i]))
                 } else {
                     None
                 }
@@ -2967,7 +3072,7 @@ impl ConnectionFlow {
                 if let Some(Some(env)) = self.picker.saved_connections.get(i) {
                     let is_default = self.picker.default_name.as_deref() == Some(env.name.as_str());
                     let suffix = if is_default { " ♥" } else { "  " };
-                    let padding = self.picker.max_alias_len.saturating_sub(char_len(&env.name)) + 3;
+                    let padding = self.picker.max_alias_len.saturating_sub(str_width(&env.name)) + 3;
                     // The question is kept whole; the name gives way to it.
                     let question = "Delete? y/n";
                     let name = fit_to_width(&format!("{}{}{}", env.name, suffix, " ".repeat(padding)), row_width.saturating_sub(question.len()));
@@ -3004,7 +3109,7 @@ impl ConnectionFlow {
         if !self.picker.search_query.is_empty() {
             // What is typed last is what is shown of a long search.
             let label = fit_to_width("search:", row_width);
-            let query = fit_tail_to_width(&self.picker.search_query, row_width.saturating_sub(label.len() + 1));
+            let query = fit_tail_to_width(&self.picker.search_query, row_width.saturating_sub(str_width(&label) + 1));
             execute!(stdout, Print(format!("    {} {}\r\n", label.dimmed(), query)))?;
         } else {
             // Find and render the "+ Add new" item
@@ -3048,7 +3153,7 @@ impl ConnectionFlow {
 
         // Top ruler with embedded title
         let title = fit_to_width("  New connection  ", w);
-        let title_len = char_len(&title);
+        let title_len = str_width(&title);
         let (left, right) = if w < 37 {
             // Centered for narrow terminals
             let total = w.saturating_sub(title_len);
@@ -3123,7 +3228,7 @@ impl ConnectionFlow {
 
         if is_active {
             let display_url = tail_chars(url, max_url_len);
-            let ghost_budget = max_url_len.saturating_sub(char_len(display_url));
+            let ghost_budget = max_url_len.saturating_sub(str_width(display_url));
             let display_ghost = head_chars(&ghost, ghost_budget);
             execute!(stdout, Print(format!("{}{:<14}{}\x1b[2m{}\x1b[0m\x1b[48;5;247m\x1b[38;5;0m \x1b[0m\r\n",
                 prefix, "URL:".dimmed(), display_url, display_ghost)))?;
@@ -3167,14 +3272,8 @@ impl ConnectionFlow {
         let prefix = if is_active { "  › " } else { "    " };
         // Truncate display value to fit terminal width (prefix=4 + label=14 + cursor=1 + margin=1)
         let max_val_len = (self.width as usize).saturating_sub(20);
-        let char_count = display_val.chars().count();
-        let display_val = if char_count > max_val_len {
-            // Show the rightmost portion so the user sees what they just typed
-            let skip = char_count - max_val_len;
-            display_val.chars().skip(skip).collect::<String>()
-        } else {
-            display_val
-        };
+        // Show the rightmost portion so the user sees what they just typed
+        let display_val = tail_chars(&display_val, max_val_len);
 
         if is_active {
             execute!(stdout, Print(format!("{}{:<14}{}\x1b[48;5;247m\x1b[38;5;0m \x1b[0m\r\n", prefix, label.dimmed(), display_val)))?;
@@ -8418,14 +8517,14 @@ fn localized_text<'a>(texts: Option<&'a serde_json::Value>, locale: Option<&str>
     exact.or(same_language).or(english).or(texts.first()).map(|(_, text)| *text)
 }
 
-/// Break `text` into lines of at most `width` characters at its spaces,
+/// Break `text` into lines of at most `width` columns at its spaces,
 /// keeping the line breaks it has.
 fn wrap_words(text: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     for paragraph in text.lines() {
         let mut line = String::new();
         for word in paragraph.split_whitespace() {
-            if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+            if !line.is_empty() && str_width(&line) + 1 + str_width(word) > width {
                 lines.push(std::mem::take(&mut line));
             }
             if !line.is_empty() {
@@ -8915,8 +9014,8 @@ fn format_request_log_line(
         // space separating the body are accounted for. Saturating throughout, so
         // a URI already wider than the terminal just drops the body.
         let budget = width
-            .saturating_sub(char_len(&line))
-            .saturating_sub(char_len(&suffix))
+            .saturating_sub(str_width(&line))
+            .saturating_sub(str_width(&suffix))
             .saturating_sub(1);
         if budget >= MIN_INLINE_BODY_CHARS {
             line.push(' ');
@@ -8982,7 +9081,7 @@ impl OutputBlock {
                     &self.body,
                     &self.display_outfile,
                     self.outfile_append,
-                    width.saturating_sub(char_len(&self.prefix)),
+                    width.saturating_sub(str_width(&self.prefix)),
                 )
             ),
         };
@@ -9062,7 +9161,7 @@ fn print_above_input(
     // Raw mode needs \r\n line endings.
     let raw_output = display_output.replace('\n', "\r\n");
     queue!(stdout, Print(&raw_output))?;
-    let input_lines = visual_line_count(&state.input, state.width as usize);
+    let input_lines = visual_line_count(&expand_tabs(&state.input), state.width as usize);
     for _ in 0..(2 + input_lines) {
         queue!(stdout, Print("\r\n"))?;
     }
@@ -10521,14 +10620,22 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
     // Print initial placeholder lines so first render can move up
     execute!(stdout, Print("\r\n\r\n\r\n"))?;
 
+    // While a connection is being loaded no key and no paste is taken. The
+    // first frame says so too: an input line drawn before the spinner would
+    // be one that drops what is typed on it.
+    if is_1p || is_connecting {
+        state.loading = true;
+        state.loading_connection_name = connecting_to.clone().or(op_selector.clone());
+        // What the load starts with, as `background_load` will say itself.
+        load_phase::set(if op_selector.is_some() { load_phase::RESOLVING_1P } else { load_phase::CONNECTING });
+    }
+
     // Initial render
     render(&mut stdout, &mut state)?;
 
     // For 1P or connecting from picker: start background loading
     let mut bg_rx: Option<std::sync::mpsc::Receiver<BackgroundLoadResult>> = None;
     if is_1p || is_connecting {
-        state.loading = true;
-        state.loading_connection_name = connecting_to.clone().or(op_selector.clone());
         let bg_config = config.clone();
         let (tx, rx) = std::sync::mpsc::channel::<BackgroundLoadResult>();
         bg_rx = Some(rx);
@@ -10654,12 +10761,12 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
                     let hint = "ctrl+b for docs";
                     let host_space = actual_width - 7 - hint.len();
                     let host_display = head_chars(host, host_space);
-                    let host_padded = format!("{:width$}", host_display, width = host_space);
+                    let host_padded = pad_to_width(host_display, host_space);
                     format!("{}{}{}{}{}", "│ ".dimmed(), host_padded.dimmed(), " │ ".dimmed(), hint.dimmed(), " │".dimmed())
                 } else {
                     let host_space = actual_width.saturating_sub(4);
                     let host_display = head_chars(host, host_space);
-                    let host_padded = format!("{:width$}", host_display, width = host_space);
+                    let host_padded = pad_to_width(host_display, host_space);
                     format!("{}{}{}", "│ ".dimmed(), host_padded.dimmed(), " │".dimmed())
                 };
                 execute!(
@@ -13565,7 +13672,7 @@ fn inline_input_line(prompt: &str, value: &str, cols: Option<usize>) -> (String,
     };
     let budget = cols.saturating_sub(2);
     let prompt = fit_to_width(prompt, budget);
-    let value = fit_tail_to_width(value, budget - char_len(&prompt));
+    let value = fit_tail_to_width(value, budget - str_width(&prompt));
     (prompt, value)
 }
 
@@ -13595,10 +13702,17 @@ fn read_inline_input_within(
         let value = if mask && !buf.is_empty() { "•".repeat(char_len(buf)) } else { buf.to_string() };
         inline_input_line(prompt, &value, cols.get())
     };
+    // One write for the line: cleared in one and filled in the next, it
+    // could be seen empty in between, on every one of the frames a dialog
+    // with a notice draws.
     let render_line = |stdout: &mut io::Stdout, buf: &str| -> io::Result<()> {
-        execute!(stdout, cursor::MoveToColumn(0), Clear(ClearType::CurrentLine))?;
         let (prompt, value) = shown(buf);
-        execute!(stdout, Print(format!("{}{}\x1b[48;5;247m\x1b[38;5;0m \x1b[0m", prompt, value)))?;
+        queue!(
+            stdout,
+            cursor::MoveToColumn(0),
+            Clear(ClearType::CurrentLine),
+            Print(format!("{}{}\x1b[48;5;247m\x1b[38;5;0m \x1b[0m", prompt, value))
+        )?;
         stdout.flush()?;
         Ok(())
     };
@@ -13636,9 +13750,13 @@ fn read_inline_input_within(
                 }
                 match key.code {
                     KeyCode::Enter => {
-                        execute!(stdout, cursor::MoveToColumn(0), Clear(ClearType::CurrentLine))?;
                         let (prompt, value) = shown(&buf);
-                        execute!(stdout, Print(format!("{}{}\r\n", prompt, value)))?;
+                        execute!(
+                            stdout,
+                            cursor::MoveToColumn(0),
+                            Clear(ClearType::CurrentLine),
+                            Print(format!("{}{}\r\n", prompt, value))
+                        )?;
                         return Ok(InlineInput::Entered(buf));
                     }
                     KeyCode::Char(c) if types_a_character(key.modifiers) => { buf.push(c); }
@@ -13771,7 +13889,7 @@ fn ask_export_name(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
         Print("\x1b[?7l"),
         Print("\r\n"),
         Print(format!("{}\r\n", ruler_line)),
-        Print(format!("  {}", hint.chars().take(width.saturating_sub(2)).collect::<String>().dimmed())),
+        Print(format!("  {}", head_chars(hint, width.saturating_sub(2)).dimmed())),
         Print("\x1b[?7h"),
         cursor::MoveUp(2),
         cursor::MoveToColumn(0)
@@ -13787,7 +13905,7 @@ fn ask_export_name(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
         // Cut at the margin: with auto-wrap off a terminal would otherwise
         // pile the rest of the text onto its last column.
         let width = resized.get().map_or(width, |(w, _)| w as usize);
-        let fits = |text: &str| -> String { text.chars().take(width.saturating_sub(2)).collect() };
+        let fits = |text: &str| -> String { head_chars(text, width.saturating_sub(2)).to_string() };
         let line = match active {
             Some(at) => status_msg_styled(&fits(EXPORT_NAME_REFUSED), Some(at)),
             None if notice_shown => fits(hint).dimmed().to_string(),
@@ -13876,7 +13994,7 @@ fn handle_save_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io::
     // Nothing here may wrap: a row more than was counted would put every
     // redraw a row too low. So the hint is cut to the width and drawn with
     // auto-wrap off, and the input keeps to the width, as in `ask_export_name`.
-    let hint: String = "enter to save, esc to cancel".chars().take(width.saturating_sub(2)).collect();
+    let hint = head_chars("enter to save, esc to cancel", width.saturating_sub(2));
     execute!(stdout, Print("\x1b[?7l"))?;
     execute!(stdout, Print("\r\n"))?; // placeholder for prompt line
     execute!(stdout, Print(format!("{}\r\n", ruler_line)))?; // bottom ruler
@@ -14337,7 +14455,10 @@ fn render_input_content(state: &mut AppState, width: usize) -> (String, u16, Str
     // some output above.
     let cursor_line = state.input[..cursor_byte].matches('\n').count();
     let max_input_lines = state.height.saturating_sub(5).max(3);
-    let cursor_col = char_len(before_cursor.rsplit('\n').next().unwrap_or(""));
+    // A tab is drawn as the blanks it stands for, and the cursor's column is
+    // counted in what is drawn.
+    let rendered = expand_tabs(&rendered);
+    let cursor_col = str_width(&expand_tabs(before_cursor.rsplit('\n').next().unwrap_or("")));
     let (rendered, input_line_count) = clamp_input_viewport(&rendered, width, max_input_lines, cursor_line, cursor_col);
 
     // Build the final output lines with hints appended to the last line
@@ -14352,10 +14473,10 @@ fn render_input_content(state: &mut AppState, width: usize) -> (String, u16, Str
     let mut final_line = last_line.to_string();
 
     let last_input_line = state.input.split('\n').last().unwrap_or("");
-    let last_line_len = char_len(last_input_line) + char_len(&ghost) + 1;
+    let last_line_len = str_width(&expand_tabs(last_input_line)) + str_width(&ghost) + 1;
 
     if !param_hint.is_empty() {
-        let padding = width.saturating_sub(last_line_len).saturating_sub(param_hint.len());
+        let padding = width.saturating_sub(last_line_len).saturating_sub(str_width(&param_hint));
         if padding > 0 {
             final_line.push_str(&" ".repeat(padding));
             final_line.push_str(&format!("\x1b[38;5;240m{}\x1b[0m", param_hint));
@@ -14502,7 +14623,7 @@ impl StreamPulse {
 fn transient_hint_line(state: &AppState, text: &str, pulse: Option<Duration>) -> String {
     let text = &fit_to_width(text, (state.width as usize).saturating_sub(3));
     let mut line = format!("  {}", text.dimmed());
-    if let (Some(pad), Some(label)) = (streaming_indicator_pad(state, text.chars().count()), footer_indicator(state)) {
+    if let (Some(pad), Some(label)) = (streaming_indicator_pad(state, str_width(text)), footer_indicator(state)) {
         line.push_str(&" ".repeat(pad));
         match pulse {
             Some(since) => line.push_str(&format!(
@@ -14534,7 +14655,7 @@ fn clear_streaming_info(state: &mut AppState) {
 }
 
 fn flash_rulers<W: Write>(stdout: &mut W, state: &mut AppState, color: &str, ms: u64) -> io::Result<()> {
-    // The host is counted in characters, as `render` counts it.
+    // The host is counted in columns, as `render` counts it.
     let w = state.width as usize;
     let up = 2 + state.prev_input_lines;
     let r = "\x1b[0m";
@@ -14549,8 +14670,8 @@ fn flash_rulers<W: Write>(stdout: &mut W, state: &mut AppState, color: &str, ms:
     )?;
 
     // Top ruler in color
-    if !state.config.base_uri.is_empty() && char_len(&state.config.base_uri) + 11 <= w {
-        let host_len = char_len(&state.config.base_uri) + 2;
+    if !state.config.base_uri.is_empty() && str_width(&state.config.base_uri) + 11 <= w {
+        let host_len = str_width(&state.config.base_uri) + 2;
         let right = 7;
         let left = w.saturating_sub(host_len).saturating_sub(right);
         queue!(stdout, Print(format!(
@@ -14586,8 +14707,8 @@ fn flash_rulers<W: Write>(stdout: &mut W, state: &mut AppState, color: &str, ms:
         cursor::MoveToColumn(0),
         Clear(ClearType::CurrentLine),
     )?;
-    if !state.config.base_uri.is_empty() && char_len(&state.config.base_uri) + 11 <= w {
-        let host_len = char_len(&state.config.base_uri) + 2;
+    if !state.config.base_uri.is_empty() && str_width(&state.config.base_uri) + 11 <= w {
+        let host_len = str_width(&state.config.base_uri) + 2;
         let right = 7;
         let left = w.saturating_sub(host_len).saturating_sub(right);
         queue!(stdout, Print(format!(
@@ -14691,10 +14812,10 @@ fn render<W: Write>(stdout: &mut W, state: &mut AppState) -> io::Result<()> {
 
     // Top ruler
     let ruler_line = format!("\x1b[38;5;239m{}\x1b[0m", "─".repeat(width));
-    if !state.config.base_uri.is_empty() && char_len(&state.config.base_uri) + 11 <= width {
+    if !state.config.base_uri.is_empty() && str_width(&state.config.base_uri) + 11 <= width {
         let host_text = &state.config.base_uri;
         let host = format!(" {} ", host_text);
-        let host_len = char_len(&host);
+        let host_len = str_width(&host);
         let right = 7;
         let left = width.saturating_sub(host_len).saturating_sub(right);
         let d = "\x1b[38;5;239m";
@@ -14754,8 +14875,9 @@ fn render<W: Write>(stdout: &mut W, state: &mut AppState) -> io::Result<()> {
         // shows its last lines: printed whole it would scroll the terminal,
         // and every redraw after that would leave a copy above.
         let last_idx = buf_lines.len() - 1;
-        let mut shown: Vec<String> = buf_lines.iter().map(|line| line.to_string()).collect();
-        let cursor_col = char_len(&shown[last_idx]);
+        // A tab is drawn as the blanks it stands for: see `expand_tabs`.
+        let mut shown: Vec<String> = buf_lines.iter().map(|line| expand_tabs(line)).collect();
+        let cursor_col = str_width(&shown[last_idx]);
         shown[last_idx].push_str("\x1b[48;5;247m\x1b[38;5;0m \x1b[0m");
         let budget = state.height.saturating_sub(5 + header_lines + prompt_lines).max(3);
         let (visible, total_buf_visual_lines) = clamp_input_viewport(&shown.join("\n"), width, budget, last_idx, cursor_col);
@@ -14847,7 +14969,7 @@ fn print_splash_with_width(config: &Config, term_width: u16) {
         // Full width with hint
         let host_space = actual_width - 7 - hint.len();
         let host_display = head_chars(host, host_space);
-        let host_padded = format!("{:width$}", host_display, width = host_space);
+        let host_padded = pad_to_width(host_display, host_space);
         // Use \x1b[K to clear to end of line (prevents artifacts from previous content)
         outln!(
             "{}{}{}{}{}\x1b[K",
@@ -14861,7 +14983,7 @@ fn print_splash_with_width(config: &Config, term_width: u16) {
         // Truncated - no hint section
         let host_space = actual_width.saturating_sub(4);
         let host_display = head_chars(host, host_space);
-        let host_padded = format!("{:width$}", host_display, width = host_space);
+        let host_padded = pad_to_width(host_display, host_space);
         outln!(
             "{}{}{}",
             "│ ".dimmed(),
@@ -26782,6 +26904,195 @@ mod tests {
         let drawn = String::from_utf8(drawn).unwrap();
         assert!(drawn.contains("{\r\n  \"a\": 1\x1b[48;5;247m"), "{drawn:?}");
         assert_eq!(state.prev_input_lines, 4);
+    }
+
+    /// The columns a character of the width tests takes on a terminal, from
+    /// a table of its own: not the function under test.
+    fn columns_on_a_terminal(c: char) -> usize {
+        match c {
+            '\u{301}' | '\u{308}' => 0,
+            '日' | '本' | '語' | '漢' | '字' | '名' | '前' | '👍' | '🎉' => 2,
+            _ => 1,
+        }
+    }
+
+    /// What `render` wrote, as the rows it drew: escape sequences taken out,
+    /// split where it ended a row.
+    fn drawn_rows(drawn: &[u8]) -> Vec<String> {
+        let text = String::from_utf8(drawn.to_vec()).unwrap();
+        let mut plain = String::new();
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                // CSI: up to and including its final byte.
+                assert_eq!(chars.next(), Some('['), "{text:?}");
+                for c in chars.by_ref() {
+                    if ('\x40'..='\x7e').contains(&c) {
+                        break;
+                    }
+                }
+            } else {
+                plain.push(c);
+            }
+        }
+        plain.split("\r\n").map(str::to_string).collect()
+    }
+
+    /// Texts with characters of every width: one column, two, none, and tabs.
+    const WIDTH_TEXTS: &[&str] = &[
+        "GET /people",
+        "GET /日本語/漢字/日本語/漢字/日本語",
+        "PUT /x {\"a\":\"👍🎉👍🎉👍🎉👍🎉👍🎉\"}",
+        "GET /cafe\u{301}/e\u{301}e\u{301}e\u{301}/u\u{308}u\u{308}",
+        "PUT /x {\t\"a\":\t1,\t\t\"b\": 2}",
+        "a日b本c語👍\te\u{301}日本",
+        "PUT /x {\n\t\"名前\": \"日本語日本語日本語\",\n\t\"e\": \"👍e\u{301}\"\n}",
+        "PUT /x {\n  \"a\": 1,\n\n\t\t\"b\": \"漢字\"\n}\n",
+    ];
+
+    /// `render` draws the rows it says it drew, and none wider than the
+    /// terminal: what the next redraw moves up by depends on it.
+    fn assert_render_rows(state: &mut AppState, what: &str) {
+        let mut drawn = Vec::new();
+        render(&mut drawn, state).unwrap();
+        let rows = drawn_rows(&drawn);
+        assert_eq!(rows.len(), 3 + state.prev_input_lines as usize, "{what}: {rows:?}");
+        let width = state.width as usize;
+        for row in &rows {
+            assert!(!row.contains('\t'), "{what}: a tab is drawn in {row:?}");
+            let columns: usize = row.chars().map(columns_on_a_terminal).sum();
+            // On a terminal one column wide a wide character has a row to itself.
+            let alone = row.chars().filter(|&c| columns_on_a_terminal(c) > 0).count() == 1;
+            assert!(columns <= width || alone, "{what}: {columns} columns in {row:?}");
+        }
+    }
+
+    #[test]
+    fn render_draws_the_rows_it_counts_at_every_width() {
+        let long = "日本語👍e\u{301}\t".repeat(60);
+        let texts: Vec<&str> = WIDTH_TEXTS.iter().copied().chain([long.as_str()]).collect();
+        for width in 1..=60u16 {
+            for height in [24u16, 8] {
+                for text in &texts {
+                    let len = char_len(text);
+                    for experimental in [false, true] {
+                        for cursor in [0, len / 2, len] {
+                            let mut state = test_state();
+                            state.config.experimental = experimental;
+                            state.width = width;
+                            state.height = height;
+                            state.input = text.to_string();
+                            state.cursor_pos = cursor;
+                            let what = format!("{width}x{height}, -x {experimental}, cursor {cursor} of {text:?}");
+                            assert_render_rows(&mut state, &what);
+                            // The input is never taller than what the screen leaves it.
+                            assert!(state.prev_input_lines <= height.saturating_sub(5).max(3), "{what}");
+                            // A second draw moves up by what the first drew, and draws the same.
+                            let first = state.prev_input_lines;
+                            assert_render_rows(&mut state, &what);
+                            assert_eq!(state.prev_input_lines, first, "{what}");
+                        }
+                    }
+                    // The body editor, where the cursor is at the end.
+                    let mut state = test_state();
+                    state.width = width;
+                    state.height = height;
+                    state.body_input_mode = true;
+                    state.body_input_method = "PUT".to_string();
+                    state.body_input_uri = "/日本語".to_string();
+                    state.body_input_buffer = text.to_string();
+                    assert_render_rows(&mut state, &format!("{width}x{height}, the body editor with {text:?}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn width_is_counted_in_columns() {
+        assert_eq!(str_width("abc"), 3);
+        assert_eq!(str_width("日本語"), 6);
+        assert_eq!(str_width("👍"), 2);
+        assert_eq!(str_width("e\u{301}"), 1);
+        assert_eq!(visible_len("\x1b[38;5;240m日本\x1b[0m!"), 5);
+        // A cut never splits a wide character and never goes over the budget.
+        assert_eq!(fit_to_width("日本語", 6), "日本語");
+        assert_eq!(fit_to_width("日本語", 5), "日本…");
+        assert_eq!(fit_to_width("日本語", 4), "日…");
+        assert_eq!(fit_tail_to_width("日本語", 5), "…本語");
+        assert_eq!(fit_tail_to_width("日本語", 4), "…語");
+        assert_eq!(head_chars("日本語", 3), "日");
+        assert_eq!(tail_chars("日本語", 3), "語");
+        // A combining mark stays with its letter.
+        assert_eq!(fit_to_width("ae\u{301}bc", 3), "ae\u{301}…");
+        for budget in 0..12 {
+            for text in ["日本語👍e\u{301}x", "a日b本c", "👍👍👍👍"] {
+                assert!(str_width(&fit_to_width(text, budget)) <= budget, "{text} in {budget}");
+                assert!(str_width(&fit_tail_to_width(text, budget)) <= budget, "{text} in {budget}");
+            }
+        }
+        assert_eq!(pad_to_width("日本", 6), "日本  ");
+        assert_eq!(inline_input_line("名前: ", "日本語日本語", Some(12)), ("名前: ".to_string(), "…語".to_string()));
+    }
+
+    #[test]
+    fn a_wide_character_at_the_margin_wraps_whole() {
+        // Five columns: two wide characters, and the third would straddle.
+        assert_eq!(hard_wrap_ansi("日本語漢字", 5), "日本\r\n語漢\r\n字");
+        assert_eq!(visual_line_count("日本語漢字", 5), 3);
+        assert_eq!(hard_wrap_ansi("a日本語", 5), "a日本\r\n語");
+        // A combining mark takes no column and starts no row.
+        assert_eq!(hard_wrap_ansi("abcde\u{301}f", 5), "abcde\u{301}\r\nf");
+        assert_eq!(visual_line_count("abcde\u{301}", 5), 1);
+        // Rows counted are rows drawn, whatever the mix.
+        for width in 1..30 {
+            for text in WIDTH_TEXTS {
+                let text = expand_tabs(text);
+                let wrapped = hard_wrap_ansi(&text.replace('\n', "\r\n"), width);
+                assert_eq!(wrapped.split('\n').count(), visual_line_count(&text, width) as usize, "{text:?} at {width}");
+            }
+        }
+        // A window of a tall line is cut at its rows, not through a character.
+        let line = "日本語".repeat(40);
+        for cursor_col in [0, 7, 120, 240] {
+            let (out, count) = clamp_input_viewport(&line, 7, 5, 0, cursor_col);
+            assert!(count <= 5 && count == visual_line_count(&out, 7), "cursor at {cursor_col}: {count}\n{out}");
+            let rows: Vec<&str> = out.split('\n').collect();
+            assert!(rows.iter().any(|row| row.contains('日')), "{out}");
+        }
+    }
+
+    #[test]
+    fn a_tab_is_drawn_as_blanks_to_the_next_stop_and_kept_in_the_text() {
+        assert_eq!(expand_tabs("\ta"), "        a");
+        assert_eq!(expand_tabs("ab\tc"), "ab      c");
+        assert_eq!(expand_tabs("12345678\tc"), "12345678        c");
+        assert_eq!(expand_tabs("日\tc"), "日      c");
+        assert_eq!(expand_tabs("a\n\tb"), "a\n        b");
+        assert_eq!(expand_tabs("\x1b[1m\t\x1b[0mx"), "\x1b[1m        \x1b[0mx");
+        assert_eq!(expand_tabs("no tab"), "no tab");
+        // A paste keeps its tabs: what is sent is what was pasted.
+        let mut state = test_state();
+        state.input = "PUT /x ".to_string();
+        state.cursor_pos = 7;
+        handle_paste(&mut state, "{\n\t\"a\":\t\"b\tc\"\n}", &mut sink()).unwrap();
+        assert_eq!(state.input, "PUT /x {\n\t\"a\":\t\"b\tc\"\n}");
+        let mut state = test_state();
+        state.body_input_mode = true;
+        handle_paste(&mut state, "a\tb", &mut sink()).unwrap();
+        assert_eq!(state.body_input_buffer, "a\tb");
+    }
+
+    #[test]
+    fn rows_are_counted_without_overflow_for_a_very_long_input() {
+        // More rows than a `u16` holds: the most it can say, not a wrapped sum.
+        let lines = "a\n".repeat(70_000);
+        assert_eq!(visual_line_count(&lines, 80), u16::MAX);
+        let one = "a".repeat(80 * 70_000);
+        assert_eq!(visual_line_count(&one, 80), u16::MAX);
+        for (text, cursor_line, cursor_col) in [(&lines, 35_000, 0), (&one, 0, 80 * 35_000), (&one, 0, 80 * 70_000)] {
+            let (out, count) = clamp_input_viewport(text, 80, 19, cursor_line, cursor_col);
+            assert!(count <= 19 && count == visual_line_count(&out, 80), "{count}");
+        }
     }
 
     #[test]

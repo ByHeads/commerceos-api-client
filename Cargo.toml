@@ -38,6 +38,10 @@ serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision
 # Terminal handling
 crossterm = "0.27"
 
+# Display width of a character in terminal columns (CJK and most emoji take
+# two, a combining mark none), for everything the prompt lays out. Pure Rust.
+unicode-width = "0.2"
+
 # Base64 encoding for Basic auth
 base64 = "0.21"
 
