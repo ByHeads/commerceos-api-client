@@ -2792,3 +2792,185 @@ fn a_pattern_that_matches_the_directory_above_does_not_leave_the_import() {
         }
     }
 }
+
+// ----- --imports and the cache -----
+
+/// A checkout that `--imports` lists counts as used: a tool that reads the
+/// files of an import where the listing says they are does not have them
+/// cleared out by the next fetch. Without the listing the same checkout,
+/// unused for longer than a month, is pruned.
+#[test]
+fn imports_marks_a_listed_checkout_used_so_the_next_fetch_does_not_clear_it_out() {
+    for listed_first in [true, false] {
+        let (_guard, dir) = temp();
+        let server = Server::start("1", Vec::new());
+        let repo = dir.join("repos/moving");
+        let first = commit(&repo, &[("step.api", b"GET /first\n")], Some("1.0"));
+        let on_main = format!("{}lib/step.api\n", import_git("lib", &repo_url(&repo), "main"));
+
+        let ran = run_batch(&dir, server.port, "-sa", &on_main);
+        assert!(ran.ok, "{}", ran.stderr);
+        let repo_cache = std::fs::read_dir(dir.join(".import-cache")).unwrap().flatten().next().unwrap().path();
+        let (checkout, used) = (repo_cache.join(&first), repo_cache.join(format!("{first}.used")));
+        assert!(checkout.is_dir() && used.is_file());
+
+        age(&used, 45);
+        if listed_first {
+            let ran = list_imports(&dir, server.port, &[], &import_git("lib", &repo_url(&repo), "1.0"));
+            let entries = listed(&ran);
+            assert_eq!(member(&entries[0], "directory"), checkout.display().to_string(), "{}", ran.stdout);
+            let idle = std::fs::metadata(&used).unwrap().modified().unwrap().elapsed().unwrap();
+            assert!(idle < Duration::from_secs(3600), "listing a checkout should mark it used: {idle:?}");
+        }
+
+        // The branch moves on: the run that fetches the new commit prunes.
+        let second = commit(&repo, &[("step.api", b"GET /second\n")], None);
+        let ran = run_batch(&dir, server.port, "-sa", &on_main);
+        assert!(ran.ok, "{}", ran.stderr);
+        assert_eq!(server.sent(), vec!["GET /first", "GET /second"]);
+        assert!(repo_cache.join(&second).is_dir());
+        match listed_first {
+            true => assert!(checkout.is_dir() && used.is_file(), "the listed checkout should have been kept"),
+            false => assert!(!checkout.exists() && !used.exists(), "the unused checkout should have been pruned"),
+        }
+    }
+}
+
+/// A pinned archive that is in the cache is listed without the network and
+/// without its token: nothing listens at the url any more and the variable
+/// is not set. The hash is the pin, and the copy is not a stale one.
+#[test]
+fn imports_lists_a_pinned_archive_in_the_cache_without_the_network_or_its_token() {
+    use sha2::Digest;
+    let (_guard, dir) = temp();
+    let archive = fixture_archive();
+    let sha: String = sha2::Sha256::digest(&archive).iter().map(|b| format!("{b:02x}")).collect();
+    let mut served = format!("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n", archive.len()).into_bytes();
+    served.extend_from_slice(&archive);
+    let (port, answering) = answers_in_turn(vec![served]);
+    let url = format!("http://127.0.0.1:{port}/lib.tar.gz");
+    let batch =
+        format!("import archive lib {{ \"url\": \"{url}\", \"sha256\": \"{sha}\", \"token_env\": \"IMPORT_TEST_TOKEN\" }}\n");
+    std::fs::write(dir.join("batch.api"), batch).unwrap();
+    let list = |token: Option<&str>| {
+        let mut cmd = api(&dir, port);
+        cmd.args(["--imports", "batch.api"]).env_remove("IMPORT_TEST_TOKEN");
+        if let Some(token) = token {
+            cmd.env("IMPORT_TEST_TOKEN", token);
+        }
+        finish(cmd, "")
+    };
+
+    let ran = list(Some("s3cret-token"));
+    let fresh = listed(&ran);
+    assert_eq!(member(&fresh[0], "sha256"), sha, "{}", ran.stdout);
+
+    // Nothing listens there any more, and there is no token to send.
+    answering.join().unwrap();
+    let ran = list(None);
+    let cached = listed(&ran);
+    assert_eq!(cached.len(), 1, "{}", ran.stdout);
+    assert_eq!(member_names(&cached[0]), ["file", "alias", "kind", "directory", "url", "sha256"], "{}", ran.stdout);
+    assert_eq!(member(&cached[0], "sha256"), sha, "{}", ran.stdout);
+    assert_eq!(member(&cached[0], "url"), url);
+    assert_eq!(member(&cached[0], "directory"), member(&fresh[0], "directory"));
+    assert!(Path::new(member(&cached[0], "directory")).join("seed.api").is_file(), "{}", ran.stdout);
+    assert_eq!(ran.stderr, "");
+}
+
+/// An archive url without a pin is asked on every run. When nothing answers
+/// there, the copy it served last is listed, and marked as one.
+#[test]
+fn imports_marks_a_cached_archive_that_stood_in_for_its_url() {
+    let (_guard, dir) = temp();
+    let archive = fixture_archive();
+    let mut served = format!("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n", archive.len()).into_bytes();
+    served.extend_from_slice(&archive);
+    let (port, answering) = answers_in_turn(vec![served]);
+    let batch = format!("import archive lib {{ \"url\": \"http://127.0.0.1:{port}/lib.tar.gz\" }}\n");
+
+    let fresh = listed(&list_imports(&dir, port, &[], &batch));
+    assert!(fresh[0].get("stale").is_none(), "{}", fresh[0]);
+    // Nothing listens there any more: no answer, and the copy is used.
+    answering.join().unwrap();
+    let cached = listed(&list_imports(&dir, port, &[], &batch));
+    assert_eq!(cached[0]["stale"], serde_json::Value::Bool(true), "{}", cached[0]);
+    assert_eq!(member(&cached[0], "sha256"), member(&fresh[0], "sha256"));
+    assert_eq!(member(&cached[0], "directory"), member(&fresh[0], "directory"));
+}
+
+/// A relative `path` of an `import dir` is relative to the file that
+/// declares it, not to the working directory. The listing prints it as it
+/// is written, beside the absolute directory it names and the absolute path
+/// of the declaring file.
+#[test]
+fn imports_prints_a_relative_directory_path_as_written_beside_where_it_leads() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", Vec::new());
+    std::fs::create_dir_all(dir.join("lib")).unwrap();
+    std::fs::create_dir_all(dir.join("work")).unwrap();
+    std::fs::write(dir.join("lib/step.api"), "GET /step\n").unwrap();
+    std::fs::write(dir.join("work/batch.api"), "import dir lib { \"path\": \"../lib\" }\nlib/step.api\n").unwrap();
+
+    let mut cmd = api(&dir, server.port);
+    cmd.args(["--imports", "work/batch.api"]);
+    let ran = finish(cmd, "");
+    let entries = listed(&ran);
+    assert_eq!(entries.len(), 1, "{}", ran.stdout);
+    assert_eq!(member_names(&entries[0]), ["file", "alias", "kind", "directory", "path"], "{}", ran.stdout);
+    assert_eq!(member(&entries[0], "path"), "../lib", "{}", ran.stdout);
+    assert_eq!(member(&entries[0], "directory"), dir.join("lib").display().to_string(), "{}", ran.stdout);
+    assert_eq!(member(&entries[0], "file"), dir.join("work/batch.api").display().to_string(), "{}", ran.stdout);
+    assert_eq!(server.sent(), Vec::<String>::new());
+}
+
+/// `--imports` sends nothing and so needs no connection: with no base URL,
+/// no key and no credentials file it lists the imports and exits 0.
+#[test]
+fn imports_needs_no_connection() {
+    let (_guard, dir) = temp();
+    let (repo, sha) = fixture_repository(&dir.join("fixture-repo"));
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let batch = format!("import dir here {{ \"path\": \"{}\" }}\n{}", fixture().display(), import_git("lib", &repo, "1.0"));
+    std::fs::write(dir.join("batch.api"), batch).unwrap();
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin("api"));
+    cmd.args(["--no-keychain", "--imports", "batch.api"])
+        .current_dir(&dir)
+        .env("NO_COLOR", "1")
+        .env("HOME", &home)
+        .env("API_IMPORT_CACHE", dir.join(".import-cache"))
+        .env_remove("API_CREDENTIALS_FILE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let ran = finish(cmd, "");
+    assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);
+    let entries = listed(&ran);
+    let seen: Vec<(&str, &str)> = entries.iter().map(|e| (member(e, "alias"), member(e, "kind"))).collect();
+    assert_eq!(seen, [("here", "dir"), ("lib", "git")], "{}", ran.stdout);
+    assert_eq!(member(&entries[1], "commit"), sha, "{}", ran.stdout);
+    assert!(Path::new(member(&entries[1], "directory")).join("seed.api").is_file(), "{}", ran.stdout);
+    assert_eq!(ran.stderr, "");
+    assert!(!dir.join(".api-credentials.json").exists());
+}
+
+/// `--describe` and `--imports` each print a document of their own: both on
+/// one command line is an error, and neither is printed.
+#[test]
+fn describe_and_imports_on_one_command_line_are_refused() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", Vec::new());
+    let batch = format!("{{ \"title\": {{ \"en-US\": \"Seed\" }} }}\nimport dir lib {{ \"path\": \"{}\" }}\n", fixture().display());
+    std::fs::write(dir.join("batch.api"), batch).unwrap();
+    for args in [["--describe", "batch.api", "--imports", "batch.api"], ["--imports", "batch.api", "--describe", "batch.api"]] {
+        let mut cmd = api(&dir, server.port);
+        cmd.args(args);
+        let ran = finish(cmd, "");
+        assert!(!ran.ok, "{args:?}: {}", ran.stdout);
+        assert_eq!(ran.stdout, "", "{args:?}");
+        assert_eq!(ran.stderr, "error: --describe and --imports each print a document of their own: use one\n", "{args:?}");
+    }
+    assert_eq!(server.sent(), Vec::<String>::new());
+}

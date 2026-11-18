@@ -6051,12 +6051,24 @@ fn the_export_row_in_a_session_started_with_export_does_not_ask() {
     // The menu shows the name the session was started with.
     let shown = press(&mut prompt, b"\x14");
     assert!(shown.contains("Export mode (responses as seed data)  com.heads.seedID"), "{shown}");
+    // What the screen holds now, not what went past: the row the cursor is
+    // on and the menu's last row.
+    let stands = |prompt: &Prompt| {
+        let rows = pty::rows(&prompt.screen, 200);
+        let chosen = rows.iter().find(|row| row.starts_with("› ")).unwrap_or_else(|| panic!("{}", rows.join("\n"))).clone();
+        (chosen, rows.last().unwrap().clone())
+    };
     let shown = press(&mut prompt, b"\x1b[B\r");
     assert!(shown.contains("export off"), "{shown}");
+    assert_eq!(stands(&prompt), ("› Export mode (responses as seed data)  off".to_string(), "  export off".to_string()));
     // It stays open: Enter on the row again turns it back on.
     let shown = press(&mut prompt, b"\r");
     assert!(shown.contains("export on: com.heads.seedID"), "{shown}");
     assert!(!shown.contains("Export with external identifier"), "{shown}");
+    assert_eq!(
+        stands(&prompt),
+        ("› Export mode (responses as seed data)  com.heads.seedID".to_string(), "  export on: com.heads.seedID".to_string())
+    );
 
     // From the menu, ctrl+h goes to the shortcuts, which list the menu's key
     // and no longer one for export.
@@ -7122,6 +7134,11 @@ fn the_prompt_edits_its_line_with_the_usual_keys() {
     let shown = press(&mut prompt, &["\x14", "\r"]);
     assert!(shown.contains("streaming not available on this server"), "{shown}");
     assert!(shown.contains("› Response streaming                    off"), "{shown}");
+    // On the screen as it stands: the row still off, the notice in the
+    // menu's last row.
+    let rows = pty::rows(&prompt.screen, 200);
+    assert_eq!(rows.last().unwrap(), "  streaming not available on this server", "{}", rows.join("\n"));
+    assert!(rows.contains(&"› Response streaming                    off".to_string()), "{}", rows.join("\n"));
     press(&mut prompt, &["\x14"]);
     // One ctrl+c asks for another, and any other key takes the question back.
     let shown = press(&mut prompt, &["\x03"]);
@@ -7610,11 +7627,16 @@ fn the_streaming_row_toggles_streaming_on_a_server_that_streams() {
     prompt.send(b"\x14\r");
     prompt.pump(Duration::from_millis(400));
     assert!(screen_tail(&prompt).contains("streaming off"), "{}", screen_tail(&prompt));
+    let rows = pty::rows(&prompt.screen, 200);
+    assert_eq!(rows.last().unwrap(), "  streaming off", "{}", rows.join("\n"));
+    assert!(rows.contains(&"› Response streaming                    off".to_string()), "{}", rows.join("\n"));
     prompt.send(CLOSE_MENU);
     prompt.pump(Duration::from_millis(400));
     assert!(!on(&prompt), "{}", screen_tail(&prompt));
     prompt.send(b"\x14\r");
     prompt.pump(Duration::from_millis(400));
+    let rows = pty::rows(&prompt.screen, 200);
+    assert!(rows.contains(&"› Response streaming                    on".to_string()), "{}", rows.join("\n"));
     prompt.send(CLOSE_MENU);
     prompt.pump(Duration::from_millis(400));
     assert!(on(&prompt), "{}", screen_tail(&prompt));
@@ -10800,4 +10822,651 @@ fn the_store_dialogs_say_what_they_could_not_do() {
     prompt.send(b"\x03");
     assert_eq!(ended(&mut prompt), Some(true));
     assert_eq!(stored(d), before);
+}
+
+// ----- What the 2026-11-18 review found no test for: `set` lines, the
+// closing line of an export, and the one HTTP client -----
+
+/// Which requests of a run asked for what: the `accept` of each, in order.
+fn accepts_of(server: &RecordingServer) -> Vec<String> {
+    let header = |head: &str, name: &str| head.split(&format!("{name}=")).nth(1).unwrap().split("; ").next().unwrap().to_string();
+    server.heads().iter().map(|head| header(head, "accept")).collect()
+}
+
+/// A batch whose export left masked data out says so once more where it
+/// ends, wherever that is: at its last line, at a failed `assert`, at a
+/// `confirm` that was declined or not answered, at a response that broke
+/// off, at a chain that could not be judged and at a `-f` stop. Once, and
+/// counting the responses.
+#[test]
+fn the_closing_line_of_an_export_is_said_once_wherever_the_batch_ends() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    const EACH: &str = "warning: response had masked data, left out at secret";
+    const TOTAL: &str = "warning: 2 responses had masked data left out of the export; read those members out with ~just or ~without";
+    let endings: [(&str, &[&str], Option<&str>, i32, usize); 8] = [
+        ("GET /after", &["-sa", "e.api"], None, 0, 3),
+        ("assert GET /missing\nGET /never", &["-sa", "e.api"], None, 1, 3),
+        ("assert not GET /a\nGET /never", &["-sa", "e.api"], None, 1, 3),
+        ("confirm Go on?\nGET /never", &["-sa", "e.api"], Some("n\n"), 0, 2),
+        ("confirm Go on?\nGET /never", &["-sa", "e.api"], Some(""), 1, 2),
+        ("GET /trunc\nGET /never", &["-sa", "e.api"], None, 1, 3),
+        ("GET /boom && GET /never\nGET /never", &["-sa", "e.api"], None, 1, 3),
+        ("GET /conflict\nGET /never", &["-sfa", "e.api"], None, 1, 3),
+    ];
+    for (ending, args, stdin, code, sent) in endings {
+        std::fs::write(d.join("e.api"), format!("set export a.b.c\nGET /keyed > k1.json\nGET /keyed > k2.json\n{ending}\n")).unwrap();
+        let got = ask(&server, d, args, stdin);
+        let what = format!("{ending:?} {args:?}:\n{}", got.stderr);
+        assert_eq!((got.code, got.sent.len()), (Some(code), sent), "{what}");
+        assert_eq!(got.stderr.matches(EACH).count(), 2, "{what}");
+        assert_eq!(got.stderr.matches("masked data left out of the export").count(), 1, "{what}");
+        assert_eq!(got.stderr.lines().last(), Some(TOTAL), "{what}");
+    }
+
+    // A chain and a file given as the arguments are a batch too. One request
+    // is not, and has said it already.
+    for args in [&["--export", "a.b.c", "GET /keyed > k1.json && GET /keyed > k2.json"][..], &["--export", "a.b.c", "two.api"]] {
+        std::fs::write(d.join("two.api"), "GET /keyed > k1.json\nGET /keyed > k2.json\n").unwrap();
+        let got = run_in(&server, d, args);
+        assert_eq!((got.code, got.sent.len()), (Some(0), 2), "{args:?}: {}", got.stderr);
+        assert_eq!(got.stderr.lines().last(), Some(TOTAL), "{args:?}: {}", got.stderr);
+        assert_eq!(got.stderr.matches("masked data left out of the export").count(), 1, "{args:?}: {}", got.stderr);
+    }
+    let one = run_in(&server, d, &["--export", "a.b.c", "GET", "/keyed", ">", "k1.json"]);
+    assert_eq!(one.stderr.matches("masked data").count(), 1, "{}", one.stderr);
+    assert!(one.stderr.contains(EACH), "{}", one.stderr);
+}
+
+/// A `set` line is its file's own in both directions and for every way a
+/// file is brought in: an included file's line ends with that file, each
+/// file of a glob starts with nothing set, and so does a file of an import.
+#[test]
+fn a_set_line_reaches_no_other_file_whichever_way_that_file_is_brought_in() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let file = |name: &str, text: &str| {
+        std::fs::create_dir_all(d.join(name).parent().unwrap()).unwrap();
+        std::fs::write(d.join(name), text).unwrap();
+    };
+    let exported = |name: &str| exported_under(d, name);
+    let all = |sent: &[&str]| sent.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+    // An included file's `set fail-fast` does not stop the file that
+    // included it, though it stops its own.
+    file("inc.api", "set fail-fast\nGET /in-inc\n");
+    file("s.api", "inc.api\nGET /missing\nGET /after\n");
+    let got = run_in(&server, d, &["-sa", "s.api"]);
+    assert_eq!((got.code, got.sent), (Some(0), all(&["GET /in-inc", "GET /missing", "GET /after"])), "{}", got.stderr);
+    file("inc.api", "set fail-fast\nGET /missing\nGET /never\n");
+    let got = run_in(&server, d, &["-sa", "s.api"]);
+    assert_eq!((got.code, got.sent), (Some(1), all(&["GET /missing"])), "{}", got.stderr);
+
+    // A glob: the first file's line is not the second's, the including
+    // file's is neither's, and it is back when the glob is done.
+    file("parts/a.api", "set export a.b.c\nGET /keyed > a.json\n");
+    file("parts/b.api", "GET /keyed > b.json\n");
+    file("s.api", "set include-nulls\nparts/*.api\nGET /keyed > main.json\n");
+    let got = run_in(&server, d, &["-sa", "s.api"]);
+    assert_eq!((got.code, got.sent.len()), (Some(0), 3), "{}", got.stderr);
+    assert_eq!(accepts_of(&server), ["application/json", "application/json", "application/json;skipNulls=false"]);
+    assert_eq!((exported("a.json"), exported("b.json"), exported("main.json")), (Some("a.b.c".to_string()), None, None));
+
+    // A file of an import has lines of its own, which hold in it and end
+    // with it.
+    file("lib/s.api", "set export x.y.z\nset fail-fast\nGET /keyed > imp.json\n");
+    file("s.api", "import dir cl { \"path\": \"lib\" }\ncl/s.api\nGET /keyed > after.json\nGET /missing\nGET /after\n");
+    let got = run_in(&server, d, &["-sa", "s.api"]);
+    assert_eq!((got.code, got.sent.len()), (Some(0), 4), "{}", got.stderr);
+    assert_eq!((exported("imp.json"), exported("after.json")), (Some("x.y.z".to_string()), None));
+    file("lib/s.api", "set fail-fast\nGET /missing\nGET /never\n");
+    let got = run_in(&server, d, &["-sa", "s.api"]);
+    assert_eq!((got.code, got.sent), (Some(1), all(&["GET /missing"])), "{}", got.stderr);
+
+    // The preview lists an included file's own line where it stands, and
+    // nothing for the settings put aside around it.
+    file("inc.api", "set raw\nGET /in-inc\n");
+    file("s.api", "set include-nulls\ninc.api\nGET /after\n");
+    let got = ask(&server, d, &["-spa", "s.api"], Some("n\n"));
+    assert_eq!((got.code, got.sent.len()), (Some(0), 0), "{}", got.stderr);
+    let listed: Vec<&str> = got.stderr.lines().map(str::trim).filter(|line| line.starts_with("set ") || line.starts_with("GET ")).collect();
+    assert_eq!(listed, ["set include-nulls", "set raw", "GET /in-inc", "GET /after"], "{}", got.stderr);
+    assert!(got.stderr.contains("Preview — 2 requests"), "{}", got.stderr);
+}
+
+/// `set fail-fast` is `-f` for the lines under it in everything `-f` does:
+/// a check that could not be judged ends the run with its body, an error is
+/// kept out of an outfile, and a question may still be answered "no".
+#[test]
+fn set_fail_fast_does_all_that_the_option_does() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let run = |text: &str, args: &[&str]| {
+        std::fs::write(d.join("s.api"), text).unwrap();
+        run_in(&server, d, args)
+    };
+    let all = |sent: &[&str]| sent.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    const BARRED: &str = r#"{"error":"barred"}"#;
+
+    // An `assert` and a poll that got no answer to judge: the body is last.
+    for check in ["assert GET /barred", "sleep 1 while GET /barred"] {
+        let got = run(&format!("set fail-fast\n{check}\nGET /never\n"), &["-sa", "s.api"]);
+        assert_eq!((got.code, got.sent), (Some(1), all(&["GET /barred"])), "{check}: {}", got.stderr);
+        assert!(got.stdout.trim_end().ends_with(BARRED), "{check}: {}", got.stdout);
+        // Without the line there is no body.
+        let got = run(&format!("{check}\nGET /never\n"), &["-sa", "s.api"]);
+        assert_eq!(got.code, Some(1), "{check}: {}", got.stderr);
+        assert!(!got.stdout.contains(BARRED), "{check}: {}", got.stdout);
+    }
+
+    // An error is not written to the outfile, and goes to stdout.
+    let got = run("set fail-fast\nGET /gone > g.json\nGET /never\n", &["-sa", "s.api"]);
+    assert_eq!((got.code, got.sent), (Some(1), all(&["GET /gone"])), "{}", got.stderr);
+    assert!(!d.join("g.json").exists());
+    assert!(got.stdout.trim_end().ends_with(GONE.trim_end()), "{}", got.stdout);
+    // Above the line it is written, as without `-f`.
+    let got = run("GET /gone > g.json\nset fail-fast\nGET /after\n", &["-sa", "s.api"]);
+    assert_eq!((got.code, got.sent.len()), (Some(0), 2), "{}", got.stderr);
+    assert_eq!(std::fs::read_to_string(d.join("g.json")).unwrap().trim_end(), GONE_INDENTED);
+
+    // A "no" that was asked for passes; the last request of a chain is a
+    // plain request and does not.
+    let got = run("set fail-fast\nGET /missing || GET /a\nassert not GET /missing\nGET /b\n", &["-sa", "s.api"]);
+    assert_eq!((got.code, got.sent.len()), (Some(0), 4), "{}", got.stderr);
+    let got = run("set fail-fast\nGET /missing || GET /conflict\nGET /never\n", &["-sa", "s.api"]);
+    assert_eq!((got.code, got.sent), (Some(1), all(&["GET /missing", "GET /conflict"])), "{}", got.stderr);
+
+    // An outfile that can't be written ends the run under the line.
+    let got = run("set fail-fast\nGET /a > no/such/dir/a.json\nGET /never\n", &["-sa", "s.api"]);
+    assert_eq!((got.code, got.sent), (Some(1), all(&["GET /a"])), "{}", got.stderr);
+    assert!(got.stderr.contains("Error writing to no/such/dir/a.json"), "{}", got.stderr);
+
+    // The options hold over a line that says `off`, and the log says so.
+    let got = run("set fail-fast off\nGET /missing\nGET /never\n", &["-sfa", "s.api"]);
+    assert_eq!((got.code, got.sent), (Some(1), all(&["GET /missing"])), "{}", got.stderr);
+    assert!(got.stdout.contains("set fail-fast off\n↳ ignored: -f is set"), "{}", got.stdout);
+    let got = run("set raw off\nGET /a > r.json\n", &["-r", "-sa", "s.api"]);
+    assert_eq!(got.code, Some(0), "{}", got.stderr);
+    assert!(got.stdout.contains("set raw off\n↳ ignored: -r is set"), "{}", got.stdout);
+    assert_eq!(std::fs::read_to_string(d.join("r.json")).unwrap().trim_end(), r#"{"ok":"/api/v1/a"}"#);
+}
+
+/// What `set raw`, `set ndjson`, `set include-nulls` and `set stream` do to
+/// a request and to what is printed, alone and together.
+#[test]
+fn set_lines_change_what_is_sent_asked_for_and_printed() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let run = |text: &str, args: &[&str]| {
+        std::fs::write(d.join("s.api"), text).unwrap();
+        run_in(&server, d, args)
+    };
+    let content_types = |server: &RecordingServer| -> Vec<String> {
+        server.heads().iter().map(|head| head.split("content-type=").nth(1).unwrap().split(';').next().unwrap().to_string()).collect()
+    };
+
+    // raw: an export is laid out on stdout, and on one line under the line.
+    // (A body that is not rewritten goes to a pipe as it came either way.)
+    let got = run("set export a.b.c\nGET /keyed\nset raw\nGET /keyed\nset raw off\nGET /keyed\n", &["-a", "s.api"]);
+    assert_eq!(got.code, Some(0), "{}", got.stderr);
+    const LAID_OUT: &str = "{\n  \"identifiers\": {\n    \"key?\": \"k1\",\n    \"a.b.c\": \"k1\"\n  },\n  \"name\": \"Ann\"\n}";
+    assert_eq!(got.stdout.matches(LAID_OUT).count(), 2, "{}", got.stdout);
+    assert_eq!(got.stdout.matches(r#"{"identifiers":{"key?":"k1","a.b.c":"k1"},"name":"Ann"}"#).count(), 1, "{}", got.stdout);
+
+    // ndjson: sent as NDJSON and asked for, until `off`.
+    let got = run("set ndjson\nPUT /x {\"a\":1}\nset ndjson off\nPUT /y {\"a\":1}\n", &["-sa", "s.api"]);
+    assert_eq!((got.code, got.sent.len()), (Some(0), 2), "{}", got.stderr);
+    assert_eq!(content_types(&server), ["application/x-ndjson", "application/json"]);
+    assert_eq!(accepts_of(&server), ["application/x-ndjson", "application/json"]);
+
+    // What a file has set is put together in one `Accept`, with the format
+    // of the outfile.
+    let got = run("set include-nulls\nset stream\nGET /a > x.csv\nGET /b > x.json\nset stream off\nGET /c > y.csv\n", &["-sa", "s.api"]);
+    assert_eq!((got.code, got.sent.len()), (Some(0), 3), "{}", got.stderr);
+    assert_eq!(
+        accepts_of(&server),
+        ["text/csv;stream=true;skipNulls=false", "application/json;stream=true;skipNulls=false", "text/csv;skipNulls=false"]
+    );
+
+    // `set export` under `set stream`: the whole body is needed, so the
+    // request is not streamed, and is again once export is off.
+    let got = run("set stream\nGET /keyed > s1.json\nset export a.b.c\nGET /keyed > s2.json\nset export off\nGET /keyed > s3.json\n", &["-sa", "s.api"]);
+    assert_eq!((got.code, got.sent.len()), (Some(0), 3), "{}", got.stderr);
+    assert_eq!(accepts_of(&server), ["application/json;stream=true", "application/json", "application/json;stream=true"]);
+    assert_eq!((exported_under(d, "s1.json"), exported_under(d, "s2.json"), exported_under(d, "s3.json")), (None, Some("a.b.c".to_string()), None));
+    // A streamed outfile holds the server's bytes, a buffered one is laid out.
+    assert!(!std::fs::read_to_string(d.join("s1.json")).unwrap().contains('\n'));
+    assert!(std::fs::read_to_string(d.join("s2.json")).unwrap().contains("\n  "));
+
+    // `--no-streaming` keeps the line off: the file is written buffered.
+    let got = run("set stream\nGET /keyed > n.json\n", &["--no-streaming", "-sa", "s.api"]);
+    assert_eq!(accepts_of(&server), ["application/json"], "{}", got.stderr);
+    assert!(std::fs::read_to_string(d.join("n.json")).unwrap().contains("\n  "));
+    assert!(got.stdout.contains("↳ ignored: --no-streaming is set"), "{}", got.stdout);
+}
+
+/// `--assert` reads a file with `set` lines as a run does: the lines are no
+/// assertions and are passed over, and a line that would stop a run stops
+/// the listing.
+#[test]
+fn assert_lists_a_file_with_set_lines_and_refuses_one_that_would_not_run() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::write(d.join("a.api"), "set fail-fast\nPUT /assert {\"api/v1/x\":{\"is\":1}}\nset fail-fast off\nPUT v1/assert {\"api/v1/y\":{\"is not\":null}}\n").unwrap();
+    let got = run_in(&server, d, &["-r", "--assert", "a.api"]);
+    assert_eq!((got.code, got.sent.len()), (Some(0), 0), "{}", got.stderr);
+    assert_eq!(got.stdout.trim_end(), r#"[{"api/v1/x":{"is":1}},{"api/v1/y":{"is not":null}}]"#);
+
+    std::fs::write(d.join("a.api"), "set nulls\nPUT /assert {\"api/v1/x\":{\"is\":1}}\n").unwrap();
+    for option in ["--assert", "--imports"] {
+        let got = run_in(&server, d, &[option, "a.api"]);
+        assert_eq!((got.code, got.sent.len(), got.stdout.as_str()), (Some(1), 0, ""), "{option}: {}", got.stderr);
+        assert!(got.stderr.starts_with("error: ") && got.stderr.contains("unknown setting `nulls`"), "{option}: {}", got.stderr);
+    }
+}
+
+/// A response that is not JSON is left as it came by `--export`, with a
+/// warning, wherever it goes: stdout, a `.sql` file, a file of no format.
+#[test]
+fn an_export_leaves_what_is_not_json_unchanged_and_says_so() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    const WARNING: &str = "WARNING: --export left a response that is not JSON unchanged";
+
+    let got = run_in(&server, d, &["-s", "--export", "a.b.c", "GET", "/zero/select%201"]);
+    assert_eq!((got.code, got.stdout.trim_end()), (Some(0), "select%201"), "{}", got.stderr);
+    assert_eq!(got.stderr.matches(WARNING).count(), 1, "{}", got.stderr);
+    for name in ["out.sql", "out.txt"] {
+        let got = run_in(&server, d, &["--export", "a.b.c", "GET", "/zero/insert", ">", name]);
+        assert_eq!(got.code, Some(0), "{name}: {}", got.stderr);
+        assert_eq!(std::fs::read_to_string(d.join(name)).unwrap().trim_end(), "insert", "{name}");
+        assert_eq!(got.stderr.matches(WARNING).count(), 1, "{name}: {}", got.stderr);
+    }
+    // JSON gets no such warning.
+    let got = run_in(&server, d, &["--export", "a.b.c", "GET", "/a", ">", "out.json"]);
+    assert!(!got.stderr.contains("WARNING"), "{}", got.stderr);
+}
+
+/// A server that keeps a connection open between requests, as COS does, and
+/// counts the connections it was given. One left alone for `idle` is closed.
+/// `/hop` is sent on to `onward` as the request it was (307).
+struct KeepAliveServer {
+    port: u16,
+    connections: Arc<std::sync::atomic::AtomicUsize>,
+    requests: Arc<Mutex<Vec<String>>>,
+}
+
+impl KeepAliveServer {
+    fn start(idle: Duration, onward: Option<String>) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (counted, logged) = (Arc::clone(&connections), Arc::clone(&requests));
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                counted.fetch_add(1, Ordering::SeqCst);
+                let (logged, onward) = (Arc::clone(&logged), onward.clone());
+                std::thread::spawn(move || {
+                    stream.set_nonblocking(false).unwrap();
+                    stream.set_read_timeout(Some(idle)).unwrap();
+                    let mut data: Vec<u8> = Vec::new();
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        // One request: its head, and the body it says it has.
+                        let head_end = loop {
+                            if let Some(at) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break at + 4;
+                            }
+                            match stream.read(&mut buf) {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => data.extend_from_slice(&buf[..n]),
+                            }
+                        };
+                        let head = String::from_utf8_lossy(&data[..head_end]).to_string();
+                        let length: usize = head
+                            .lines()
+                            .find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap()))
+                            .unwrap_or(0);
+                        while data.len() < head_end + length {
+                            match stream.read(&mut buf) {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => data.extend_from_slice(&buf[..n]),
+                            }
+                        }
+                        data.drain(..head_end + length);
+                        let mut words = head.split_whitespace();
+                        let (method, path) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
+                        let path = path.strip_prefix("/api/v1").unwrap_or(path);
+                        logged.lock().unwrap().push(format!("{method} {path}"));
+                        let answer = match &onward {
+                            Some(to) if path.contains("/hop") => {
+                                format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: {to}\r\nContent-Length: 0\r\n\r\n")
+                            }
+                            _ => "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}".to_string(),
+                        };
+                        if stream.write_all(answer.as_bytes()).and_then(|()| stream.flush()).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        KeepAliveServer { port, connections, requests }
+    }
+
+    fn api(&self, dir: &Path) -> std::process::Command {
+        let mut cmd = api_bare(dir);
+        cmd.args(["-b", &format!("http://127.0.0.1:{}", self.port), "-k", "k"]);
+        cmd
+    }
+
+    fn seen(&self) -> (usize, Vec<String>) {
+        (self.connections.load(Ordering::SeqCst), self.requests.lock().unwrap().clone())
+    }
+}
+
+/// The requests of a run go through one client, so a line that follows
+/// another is sent on the connection that is already open: no handshake per
+/// line. A connection left alone for longer than the client keeps one is not
+/// written to again, so a request after a pause is never lost to a server
+/// that was just closing its end.
+#[test]
+fn the_lines_of_a_batch_share_a_connection_and_a_pause_gets_a_new_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+
+    let server = KeepAliveServer::start(Duration::from_secs(30), None);
+    std::fs::write(d.join("b.api"), "GET /a\nPUT /b {\"x\":1}\nassert GET /c\nGET /d > d.json\n").unwrap();
+    let out = server.api(d).args(["-sa", "b.api"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(server.seen(), (1, ["GET /a", "PUT /b", "GET /c", "GET /d"].map(String::from).to_vec()));
+
+    // The server closes a connection it has not heard from for 3.5 seconds;
+    // the client gives its own up before that. Every request arrives, once.
+    let server = KeepAliveServer::start(Duration::from_millis(3500), None);
+    std::fs::write(d.join("b.api"), "GET /a\nGET /b\nsleep 4\nPUT /c {\"x\":1}\nGET /d\n").unwrap();
+    let out = server.api(d).args(["-sa", "b.api"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(server.seen(), (2, ["GET /a", "GET /b", "PUT /c", "GET /d"].map(String::from).to_vec()));
+}
+
+/// A redirect to another host is followed as the request it was, without
+/// the credential: the key was given for the host it was sent to.
+#[test]
+fn a_redirect_to_another_host_does_not_take_the_credential_along() {
+    let other = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let onward = format!("http://127.0.0.1:{}/api/v1/landed", other.port);
+    let server = KeepAliveServer::start(Duration::from_secs(30), Some(onward));
+
+    other.take();
+    let out = server.api(dir.path()).args(["PUT", "/hop", r#"{"x":1}"#]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    other.settle(Duration::from_millis(150), Duration::from_secs(3));
+    assert_eq!(server.seen().1, ["PUT /hop"]);
+    assert_eq!(other.log.lock().unwrap().clone(), [r#"PUT /landed {"x":1}"#]);
+    assert_eq!(authorization(&other), "-");
+    // Sent straight there, the same request carries it.
+    let direct = run_in(&other, dir.path(), &["PUT", "/landed", r#"{"x":1}"#]);
+    assert_eq!(direct.code, Some(0), "{}", direct.stderr);
+    assert!(authorization(&other).starts_with("Basic "), "{:?}", other.heads());
+}
+
+/// The settings menu through what a window and a clipboard do to it: a
+/// resize while it is open redraws it once, under the output; a paste closes
+/// it and lands on the input line; and the timeout's dialog leaves the
+/// timeout as it was when it is left with esc or with nothing typed.
+#[cfg(unix)]
+#[test]
+fn the_settings_menu_takes_a_resize_a_paste_and_an_unanswered_dialog() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = pty::Prompt::open_with(api(server.port, dir.path()), 100, 60);
+    prompt.wait_ready(Duration::from_secs(15));
+    press(&mut prompt, &["GET /kept"]);
+    assert_eq!(entered(&mut prompt, &server), ["GET /kept"]);
+    let menu_rows = |rows: &[String]| rows.iter().filter(|row| row.contains("Response streaming")).count();
+
+    // Resized while open: one menu, one ruler above it, the output kept.
+    prompt.send(b"\x14");
+    prompt.wait_for("Response streaming", Duration::from_secs(5));
+    prompt.pump(Duration::from_millis(200));
+    let mark = prompt.screen.len();
+    for cols in [90u16] {
+        prompt.resize(cols, 60);
+        prompt.pump(Duration::from_millis(700));
+        let rows = pty::rows(&prompt.screen[mark..], cols as usize);
+        let shown = rows.join("\n");
+        assert!(rows.iter().any(|row| row.contains("/api/v1/kept")), "{cols}:\n{shown}");
+        assert_eq!(menu_rows(&rows), 1, "{cols}:\n{shown}");
+        assert_eq!(ruler_rows(&rows).len(), 1, "{cols}:\n{shown}");
+        assert_eq!(rows.last().unwrap(), "  ↑/↓ to move, enter to change, ctrl+t or esc to close", "{cols}:\n{shown}");
+        assert_eq!(rows.len(), ruler_rows(&rows)[0] + 11, "{cols}:\n{shown}");
+    }
+    // Closed, the command area is right under the output.
+    prompt.send(b"\x1b");
+    prompt.pump(Duration::from_millis(500));
+    let rows = pty::rows(&prompt.screen[mark..], 90);
+    let shown = rows.join("\n");
+    let rulers = ruler_rows(&rows);
+    let answered = rows.iter().rposition(|row| row.contains("/api/v1/kept")).expect("the response is still there");
+    assert_eq!((rulers.len(), menu_rows(&rows)), (2, 0), "{shown}");
+    assert!(rulers[0] > answered && rulers[0] <= answered + 3, "{shown}");
+    assert_eq!(rows.len(), rulers[1] + 2, "{shown}");
+
+    // A paste is "any other key": it closes the menu and is the line.
+    prompt.send(b"\x15\x14");
+    prompt.wait_for("Response streaming", Duration::from_secs(5));
+    prompt.pump(Duration::from_millis(200));
+    prompt.paste("GET /pasted");
+    prompt.pump(Duration::from_millis(500));
+    let rows = pty::rows(&prompt.screen[mark..], 90);
+    let shown = rows.join("\n");
+    let rulers = ruler_rows(&rows);
+    assert_eq!((rulers.len(), menu_rows(&rows)), (2, 0), "{shown}");
+    assert_eq!(rows[rulers[0] + 1], "GET /pasted", "{shown}");
+    assert_eq!(entered(&mut prompt, &server), ["GET /pasted"]);
+
+    // The timeout's dialog: esc and an empty answer leave it at 600s, with
+    // the menu back and saying so; a pasted number is an answer.
+    let timeout_row = |prompt: &pty::Prompt| {
+        let rows = pty::rows(&prompt.screen[mark..], 90);
+        let row = rows.iter().find(|row| row.contains("Timeout  ")).unwrap_or_else(|| panic!("no menu:\n{}", rows.join("\n")));
+        (row.clone(), rows.last().unwrap().clone())
+    };
+    let dialog = |prompt: &mut pty::Prompt| {
+        prompt.send(b"\r");
+        prompt.wait_for("Timeout in seconds", Duration::from_secs(5));
+        prompt.pump(Duration::from_millis(300));
+    };
+    prompt.send(b"\x14");
+    prompt.pump(Duration::from_millis(400));
+    prompt.send(b"\x1b[A");
+    prompt.pump(Duration::from_millis(300));
+    for leave in [&b"\x1b"[..], b"\r"] {
+        dialog(&mut prompt);
+        prompt.send(leave);
+        prompt.pump(Duration::from_millis(500));
+        let (row, said) = timeout_row(&prompt);
+        assert!(row.starts_with("› Timeout") && row.ends_with("  600s"), "{leave:?}: {row:?}");
+        assert_eq!(said, "  cancelled", "{leave:?}");
+    }
+    dialog(&mut prompt);
+    prompt.paste("45");
+    prompt.pump(Duration::from_millis(300));
+    prompt.send(b"\r");
+    prompt.pump(Duration::from_millis(500));
+    let (row, said) = timeout_row(&prompt);
+    assert!(row.ends_with("  45s"), "{row:?}");
+    assert_eq!(said, "  timeout 45s");
+    // ctrl+c in the dialog leaves the client, and the terminal as it was.
+    dialog(&mut prompt);
+    prompt.send(b"\x03");
+    let start = Instant::now();
+    while prompt.exited().is_none() && start.elapsed() < Duration::from_secs(5) {
+        prompt.pump(Duration::from_millis(100));
+    }
+    assert!(prompt.exited().is_some(), "{}", screen_tail(&prompt));
+    let rows = pty::rows(&prompt.screen[mark..], 90);
+    assert!(!rows.iter().any(|row| row.contains("Timeout in seconds")), "{}", rows.join("\n"));
+}
+
+/// `set stream` typed at the prompt is the menu's first row: on a server
+/// that streams it turns streaming on and marks it, `off` turns it off, and
+/// while export is on a `> file` is not streamed, whatever the line said. On
+/// a server that does not stream it is refused.
+#[cfg(unix)]
+#[test]
+fn set_stream_typed_at_the_prompt_is_the_menus_first_row() {
+    const COLS: usize = 120;
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    let last_row = |prompt: &pty::Prompt| pty::rows(&prompt.screen, COLS).last().unwrap().trim_end().to_string();
+
+    let mut cmd = api_bare(d);
+    cmd.args(["-b", &url, "-k", "streamer"]);
+    let mut prompt = pty::Prompt::open_sized(cmd, COLS as u16);
+    prompt.wait_ready(Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(600));
+    assert!(!last_row(&prompt).ends_with("streaming"), "{}", last_row(&prompt));
+
+    let (sent, shown) = run_pasted(&mut prompt, &server, "set stream");
+    assert!(sent.is_empty() && shown.contains("streamed bodies may encode errors"), "{shown}");
+    assert!(last_row(&prompt).ends_with(" streaming"), "{}", last_row(&prompt));
+    let (_, _, accepts) = run_pasted_accepts(&mut prompt, &server, "GET /keyed > streamed.json");
+    assert_eq!(accepts, ["application/json;stream=true"]);
+    assert!(!std::fs::read_to_string(d.join("streamed.json")).unwrap().contains('\n'));
+
+    // Export needs the whole body: its marker takes the place of the other,
+    // and the file holds seed data.
+    run_pasted(&mut prompt, &server, "set export a.b.c");
+    assert!(last_row(&prompt).ends_with(" export"), "{}", last_row(&prompt));
+    let (_, _, accepts) = run_pasted_accepts(&mut prompt, &server, "GET /keyed > exported.json");
+    assert_eq!(accepts, ["application/json"]);
+    assert_eq!(exported_under(d, "exported.json"), Some("a.b.c".to_string()));
+    run_pasted(&mut prompt, &server, "set export off");
+    assert!(last_row(&prompt).ends_with(" streaming"), "{}", last_row(&prompt));
+
+    let (_, shown) = run_pasted(&mut prompt, &server, "set stream off");
+    assert!(shown.contains("streaming off"), "{shown}");
+    prompt.pump(Duration::from_millis(300));
+    assert!(!last_row(&prompt).ends_with("streaming"), "{}", last_row(&prompt));
+    let (_, _, accepts) = run_pasted_accepts(&mut prompt, &server, "GET /keyed > buffered.json");
+    assert_eq!(accepts, ["application/json"]);
+    drop(prompt);
+
+    // A server that does not stream.
+    let mut prompt = pty::Prompt::open_sized(api(server.port, d), COLS as u16);
+    prompt.wait_ready(Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(600));
+    let (sent, shown) = run_pasted(&mut prompt, &server, "set stream");
+    assert!(sent.is_empty() && shown.contains("streaming not available on this server"), "{shown}");
+    let (_, _, accepts) = run_pasted_accepts(&mut prompt, &server, "GET /keyed > plain.json");
+    assert_eq!(accepts, ["application/json"]);
+}
+
+/// On a hint line too narrow for every marker the ones on the left go
+/// first, and what the prompt has to say (here the warning of an export) is
+/// said on that one row too: nothing wraps, at 60 columns.
+#[cfg(unix)]
+#[test]
+fn a_narrow_hint_row_keeps_the_last_markers_and_the_warning_to_one_row() {
+    const COLS: usize = 60;
+    const ALL: &str = "nulls · fail-fast · ndjson · raw · timeout 45s · export";
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut cmd = api(server.port, dir.path());
+    cmd.args(["-i", "-f", "--ndjson", "-r", "--timeout", "45", "--export", "a.b.c"]);
+    let mut prompt = pty::Prompt::open_sized(cmd, COLS as u16);
+    prompt.wait_ready(Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(800));
+
+    let rows = pty::rows(&prompt.screen, COLS);
+    let hint = rows.last().unwrap();
+    let shown = rows.join("\n");
+    assert!(hint.chars().count() <= COLS, "{shown}");
+    let markers = hint.strip_prefix("  ctrl+h for shortcuts ").unwrap_or_else(|| panic!("{shown}")).trim();
+    // Whole markers, the last ones, ending where the row ends.
+    assert!(ALL.ends_with(markers) && markers.ends_with("export") && markers != ALL, "{markers:?}\n{shown}");
+    assert!(markers.starts_with(|c: char| c.is_ascii_alphabetic()), "a marker cut in two: {markers:?}");
+    assert!(hint.ends_with("export"), "{shown}");
+    let before = rows.len();
+
+    // The warning is the hint row's.
+    let (sent, _) = run_pasted(&mut prompt, &server, "GET /keyed > k.ndjson");
+    assert_eq!(sent, ["GET /keyed"]);
+    let rows = pty::rows(&prompt.screen, COLS);
+    let hint = rows.last().unwrap();
+    let shown = rows.join("\n");
+    // It leaves no room for a marker, and none is squeezed in or cut.
+    assert_eq!(hint, "  warning: response had masked data, left out at secret", "{shown}");
+    assert_eq!(rows.iter().filter(|row| row.contains("masked data")).count(), 1, "{shown}");
+    assert_eq!(ruler_rows(&rows[before - 4..]).len(), 2, "{shown}");
+    // When it has been said, the markers are back.
+    let back = pump_until(&mut prompt, Duration::from_secs(6), |p| {
+        pty::rows(&p.screen, COLS).last().is_some_and(|row| row.ends_with("timeout 45s · export"))
+    });
+    assert!(back, "{}", pty::rows(&prompt.screen, COLS).join("\n"));
+}
+
+/// A file run from the prompt is told which of its lines the session
+/// overrides, for every setting the session has on, and a file that stops
+/// (a declined `confirm`, esc in a `sleep`, fail-fast) leaves the session
+/// with what it had before the file set its own.
+#[cfg(unix)]
+#[test]
+fn a_file_at_the_prompt_neither_overrides_the_session_nor_leaves_its_settings_behind() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    std::fs::write(d.join("own.api"), "set timeout 5\nset fail-fast off\nset stream off\nset raw off\nset ndjson off\nGET /a > a.json\n").unwrap();
+    std::fs::write(d.join("declined.api"), "set include-nulls\nGET /first\nconfirm Go on?\nGET /never\n").unwrap();
+    std::fs::write(d.join("slept.api"), "set include-nulls\nGET /first\nsleep 30\nGET /never\n").unwrap();
+    std::fs::write(d.join("tripped.api"), "set include-nulls\nset fail-fast\nGET /missing\nGET /never\n").unwrap();
+
+    // Every setting the session has on is named under the line it overrides.
+    let mut cmd = api_bare(d);
+    cmd.args(["-b", &url, "-k", "streamer", "--timeout", "45", "-f", "--stream", "-r", "--ndjson"]);
+    let mut prompt = pty::Prompt::open(cmd);
+    prompt.wait_ready(Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(600));
+    let (sent, shown, accepts) = run_pasted_accepts(&mut prompt, &server, "own.api");
+    assert_eq!(sent, ["GET /a"], "{shown}");
+    for held in ["set timeout 45", "set fail-fast", "set stream", "set raw", "set ndjson"] {
+        assert!(shown.contains(&format!("↳ ignored: the session has {held}")), "{held}: {shown}");
+    }
+    assert_eq!(shown.matches("↳ ignored").count(), 5, "{shown}");
+    assert_eq!(accepts, ["application/x-ndjson;stream=true"]);
+    drop(prompt);
+
+    // A file that stops: its `set include-nulls` is not the session's.
+    let mut prompt = pty::Prompt::open(api(server.port, d));
+    prompt.wait_ready(Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(600));
+    let stops: [(&str, &[u8], &[&str]); 3] = [
+        ("declined.api", b"n", &["GET /first"]),
+        ("slept.api", b"\x1b", &["GET /first"]),
+        ("tripped.api", b"", &["GET /missing"]),
+    ];
+    for (file, key, sends) in stops {
+        let (sent, shown, accepts) = run_pasted_accepts(&mut prompt, &server, file);
+        assert_eq!(sent, sends, "{file}: {shown}");
+        assert_eq!(accepts, ["application/json;skipNulls=false"], "{file}: the file's own line holds in it");
+        prompt.send(key);
+        prompt.pump(Duration::from_millis(700));
+        let (sent, shown, accepts) = run_pasted_accepts(&mut prompt, &server, "GET /missing\rGET /after");
+        assert_eq!(sent, ["GET /missing", "GET /after"], "{file}: fail-fast was left on\n{shown}");
+        assert_eq!(accepts, ["application/json", "application/json"], "{file}: include-nulls was left on");
+    }
 }

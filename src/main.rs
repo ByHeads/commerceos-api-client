@@ -26317,12 +26317,12 @@ mod tests {
 
     #[test]
     fn only_a_remote_that_gave_no_answer_is_one_a_cached_copy_stands_in_for() {
-        // Nothing listens: no answer.
-        let closed = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            format!("http://127.0.0.1:{}/lib.tar.gz", listener.local_addr().unwrap().port())
-        };
-        let err = download_archive(&closed, None).err().unwrap();
+        // Nothing listens: no answer. Port 1 is one no test can be given: a
+        // port that was bound and let go is handed to the next `serve_once`
+        // of a test running beside this one, which then answers here (and
+        // made this test fail once in some twenty runs).
+        let closed = "http://127.0.0.1:1/lib.tar.gz";
+        let err = download_archive(closed, None).err().unwrap();
         assert!(err.unanswered, "{}", err.reason);
         // A status is an answer.
         for status in ["404 Not Found", "401 Unauthorized", "500 Internal Server Error"] {
