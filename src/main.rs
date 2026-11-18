@@ -13215,34 +13215,7 @@ fn handle_key_event(
         (modifiers, KeyCode::Char(c)) if types_a_character(modifiers) => {
             // Smart closing bracket: remove trailing comma and fix indentation
             if (c == '}' || c == ']') && state.config.experimental && cursor_inside_brackets(&state.input, state.cursor_pos) {
-                let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
-                let before = &state.input[..byte_idx];
-
-                // Find and remove trailing comma before this closing bracket
-                // Look backwards past whitespace for a comma
-                let trimmed = before.trim_end();
-                let has_trailing_comma = trimmed.ends_with(',');
-                let mut new_before = if has_trailing_comma {
-                    let comma_pos = trimmed.len() - 1;
-                    format!("{}{}", &before[..comma_pos], &before[trimmed.len()..])
-                } else {
-                    before.to_string()
-                };
-
-                // Fix indentation: remove whitespace on current line, replace with proper indent
-                // Find the start of the current line
-                let line_start = new_before.rfind('\n').map(|p| p + 1).unwrap_or(0);
-                let line_content = &new_before[line_start..];
-                if line_content.chars().all(|ch| ch == ' ' || ch == '\t') {
-                    // Current line is only whitespace — replace with proper dedented indent
-                    let depth_after = bracket_depth_at(&new_before, char_len(&new_before)).saturating_sub(1) as usize;
-                    let indent = "  ".repeat(depth_after);
-                    new_before = format!("{}{}", &new_before[..line_start], indent);
-                }
-
-                let after = &state.input[byte_idx..];
-                state.input = format!("{}{}{}", new_before, c, after);
-                state.cursor_pos = char_len(&new_before) + 1;
+                close_bracket_typed(state, c);
             } else {
                 let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
                 let inside_brackets = cursor_inside_brackets(&state.input, state.cursor_pos);
@@ -14543,6 +14516,41 @@ fn show_program_status(state: &mut AppState, stdout: &mut io::Stdout, msg: Strin
     state.status_msg = msg;
     state.status_msg_at = Some(Instant::now());
     render(stdout, state)
+}
+
+/// A `}` or `]` typed inside a body under `-x`: written at the cursor, with
+/// the comma in front of it taken away and a line of its own indented to the
+/// level it closes.
+fn close_bracket_typed(state: &mut AppState, c: char) {
+    let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
+    let before = &state.input[..byte_idx];
+
+    // Find and remove trailing comma before this closing bracket
+    // Look backwards past whitespace for a comma
+    let trimmed = before.trim_end();
+    let has_trailing_comma = trimmed.ends_with(',');
+    let mut new_before = if has_trailing_comma {
+        let comma_pos = trimmed.len() - 1;
+        format!("{}{}", &before[..comma_pos], &before[trimmed.len()..])
+    } else {
+        before.to_string()
+    };
+
+    // Fix indentation: remove whitespace on current line, replace with proper indent
+    // Find the start of the current line
+    let line_start = new_before.rfind('\n').map(|p| p + 1).unwrap_or(0);
+    let line_content = &new_before[line_start..];
+    if line_content.chars().all(|ch| ch == ' ' || ch == '\t') {
+        // Current line is only whitespace — replace with proper dedented indent.
+        // A closer in a comment closes nothing, so the depth is the body's.
+        let depth_after = body_depth_at(&new_before, char_len(&new_before)).saturating_sub(1);
+        let indent = "  ".repeat(depth_after);
+        new_before = format!("{}{}", &new_before[..line_start], indent);
+    }
+
+    let after = &state.input[byte_idx..];
+    state.input = format!("{}{}{}", new_before, c, after);
+    state.cursor_pos = char_len(&new_before) + 1;
 }
 
 /// Enter with the cursor inside the brackets of a body, under `-x`: a body on
@@ -28500,6 +28508,25 @@ mod tests {
         let mut state = completing(marked);
         state.config.experimental = true;
         state
+    }
+
+    #[test]
+    fn a_closer_typed_under_a_commented_closer_closes_the_body() {
+        // The `}` of the comment closes nothing: the one typed is the body's
+        // own, at the level of the request. It took the session down.
+        for (marked, c, after) in [
+            ("PUT /x {\n// }\n^", '}', "PUT /x {\n// }\n}^"),
+            ("PUT /x {\n  \"a\": 1\n  // }\n  ^", '}', "PUT /x {\n  \"a\": 1\n  // }\n}^"),
+            ("PUT /x [\n  # ] ]\n  ^", ']', "PUT /x [\n  # ] ]\n]^"),
+            ("PUT /x {\n  \"a\": [\n    /* ] } */\n    ^", ']', "PUT /x {\n  \"a\": [\n    /* ] } */\n  ]^"),
+            // Without a comment, as before.
+            ("PUT /x {\n  \"a\": 1,\n  ^", '}', "PUT /x {\n  \"a\": 1\n}^"),
+        ] {
+            let mut state = completing_body(marked);
+            assert!(cursor_inside_brackets(&state.input, state.cursor_pos), "{marked}");
+            close_bracket_typed(&mut state, c);
+            assert_eq!(shown(&state), after, "{marked}");
+        }
     }
 
     /// The line with a `^` where the cursor is.
