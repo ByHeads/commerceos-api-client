@@ -376,7 +376,8 @@ import git cl @cloddy.json
 - A remote that goes quiet does not hang the batch: a transfer of less than a
   byte a second for a minute, an ssh connection that is not made in 30
   seconds, or any one git command that takes more than five minutes, is given
-  up on. (An ssh command of your own, in `GIT_SSH_COMMAND`, `GIT_SSH` or
+  up on. A git command that has ended is not waited for because something
+  it started still runs (an ssh connection kept open for the next one). (An ssh command of your own, in `GIT_SSH_COMMAND`, `GIT_SSH` or
   git's `core.sshCommand`, is used as it is.)
 - A `\` in a `url` is refused, here and for an archive: it is a `/` to one
   URL parser and part of the host to another.
@@ -485,7 +486,8 @@ import archive cl {
   bodies resolve relative to the imported file itself, and one that points
   outside (`@/etc/hosts`, `@~/…`, `../../x.api`) is an error, by what the
   line says: it is refused before anything is looked up, whether a file is
-  there or not (`include leaves the import: …`). Its own
+  there or not (`include leaves the import: …`). So is a pattern that the
+  directory above matches (`.*/x.api`, `.?/data/*.json`). Its own
   `import dir` may only name a directory inside the same import. Symlinks in
   a repository or an archive are not followed. In an `import dir`, whose
   files are used where they are, a link is followed only when it stays

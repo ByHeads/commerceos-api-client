@@ -5352,33 +5352,46 @@ const OP_TIMEOUT_SECS: u64 = 30;
 fn output_with_timeout(cmd: &mut Command, timeout: Duration) -> io::Result<Option<std::process::Output>> {
     use std::process::Stdio;
 
+    // What a pipe has given so far, read on a thread of its own, which
+    // says when the pipe has ended.
+    type Read = Arc<std::sync::Mutex<Vec<u8>>>;
+    fn drain(pipe: Option<impl io::Read + Send + 'static>, ended: std::sync::mpsc::Sender<()>) -> Read {
+        let read: Read = Arc::default();
+        let into = Arc::clone(&read);
+        thread::spawn(move || {
+            let mut chunk = [0u8; 8192];
+            let mut pipe = pipe;
+            while let Some(Ok(n @ 1..)) = pipe.as_mut().map(|p| p.read(&mut chunk)) {
+                into.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).extend_from_slice(&chunk[..n]);
+            }
+            let _ = ended.send(());
+        });
+        read
+    }
+
     let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
-    let mut child_stdout = child.stdout.take();
-    let mut child_stderr = child.stderr.take();
-    let stdout_handle = thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(p) = child_stdout.as_mut() {
-            let _ = p.read_to_end(&mut buf);
-        }
-        buf
-    });
-    let stderr_handle = thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(p) = child_stderr.as_mut() {
-            let _ = p.read_to_end(&mut buf);
-        }
-        buf
-    });
+    let (ended, pipes_ended) = std::sync::mpsc::channel();
+    let stdout_read = drain(child.stdout.take(), ended.clone());
+    let stderr_read = drain(child.stderr.take(), ended);
 
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait()? {
             Some(status) => {
-                return Ok(Some(std::process::Output {
-                    status,
-                    stdout: stdout_handle.join().unwrap_or_default(),
-                    stderr: stderr_handle.join().unwrap_or_default(),
-                }));
+                // What the command wrote is in its pipes by now and is read
+                // within the moment. The pipes themselves end only when
+                // every process that holds them has: one the command left
+                // behind (an ssh that stays for the next connection, a
+                // credential helper) can keep them open long after. So they
+                // are not waited for beyond a moment: the command is done.
+                let patience = Instant::now() + Duration::from_secs(1);
+                for _ in 0..2 {
+                    if pipes_ended.recv_timeout(patience.saturating_duration_since(Instant::now())).is_err() {
+                        break;
+                    }
+                }
+                let taken = |read: &Read| std::mem::take(&mut *read.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+                return Ok(Some(std::process::Output { status, stdout: taken(&stdout_read), stderr: taken(&stderr_read) }));
             }
             None => {
                 if Instant::now() >= deadline {
@@ -8993,7 +9006,7 @@ fn rebase_import_path(
     repo: &ImportedRepo,
 ) -> Result<String, String> {
     let outside = || format!("import {}: `@{}` must be a relative path inside the import", repo.alias, raw);
-    if raw.starts_with('~') || std::path::Path::new(raw).is_absolute() {
+    if raw.starts_with('~') || std::path::Path::new(raw).is_absolute() || pattern_can_climb(raw) {
         return Err(outside());
     }
     let resolved = normalize_path_lexically(&file_dir.unwrap_or(&repo.root).join(raw));
@@ -9168,6 +9181,18 @@ fn split_alias(spec: &str, backslash_separates: bool) -> Option<(&str, &str)> {
 /// place outside its repository, going by the line alone. This comes before
 /// the line is looked up, so nothing outside is walked for a pattern, and a
 /// file that is there is refused exactly as one that is not.
+/// Whether a part of a path is a pattern that the directory above matches:
+/// `.*` and `.?` match `..`. Such a path can lead anywhere, and what it
+/// leads to is known only by walking there, which a file of an import is
+/// not to make the client do: with `**` behind it, that walk is of a whole
+/// disk. It is refused by what it says, like a `..` that leads out.
+fn pattern_can_climb(raw: &str) -> bool {
+    raw.split(['/', '\\']).any(|part| {
+        is_glob_pattern(part)
+            && glob::Pattern::new(part).is_ok_and(|pattern| pattern.matches_with("..", glob_match_options()))
+    })
+}
+
 fn ensure_include_names_inside(
     raw: &str,
     base: &std::path::Path,
@@ -9176,6 +9201,7 @@ fn ensure_include_names_inside(
 ) -> Result<(), String> {
     let inside = !raw.starts_with('~')
         && !std::path::Path::new(raw).is_absolute()
+        && !pattern_can_climb(raw)
         && normalize_path_lexically(&base.join(raw)).starts_with(&repo.checkout);
     if inside {
         Ok(())
@@ -24298,6 +24324,30 @@ mod tests {
             .expect("should finish, not deadlock against the pipe buffer");
         assert!(out.status.success());
         assert_eq!(out.stdout.len(), 400_000);
+    }
+
+    #[test]
+    fn a_pattern_that_the_directory_above_matches_can_climb() {
+        for climbs in [".*/x.api", "a/.?/x.api", ".[.]/x", "a/b/.*", r".*\x.api", ".*/.*/**/*.api", ".{/x"] {
+            assert_eq!(pattern_can_climb(climbs), climbs != ".{/x", "{climbs}");
+        }
+        for stays in ["*/x.api", "?/x.api", "a/**/x.api", ".hidden/x.api", "a/.b*/x.api", "../x.api", "[.]?/x", "..a*/x", ""] {
+            assert!(!pattern_can_climb(stays), "{stays}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_with_timeout_does_not_wait_for_a_process_the_command_left_behind() {
+        // The command ends at once; a process it started holds its pipes
+        // for half a minute more. The output is what the command wrote.
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf done; printf said >&2; sleep 30 & exit 0"]);
+        let start = Instant::now();
+        let out = output_with_timeout(&mut cmd, Duration::from_secs(20)).expect("spawn").expect("the command ended");
+        assert!(start.elapsed() < Duration::from_secs(5), "took {:?}", start.elapsed());
+        assert!(out.status.success());
+        assert_eq!((out.stdout.as_slice(), out.stderr.as_slice()), (&b"done"[..], &b"said"[..]));
     }
 
     #[test]

@@ -2830,6 +2830,8 @@ fn a_pattern_that_matches_the_directory_above_does_not_leave_the_import() {
         ("deep/body.api", "PUT /x @.?/.?/secret.json\n"),
         ("deep/star.api", "PUT /x @.*/.*/secret.json\n"),
         ("deep/include.api", ".?/.?/outside.api\n"),
+        // From the root of the disk down, were it walked.
+        ("deep/walk.api", ".*/.*/.*/.*/.*/.*/.*/.*/.*/.*/.*/.*/**/*.api\n"),
         ("deep/ok.api", "GET /ok\n"),
     ];
     let import = own_import(&dir, &files);
@@ -2858,11 +2860,16 @@ fn a_pattern_that_matches_the_directory_above_does_not_leave_the_import() {
             ("body", "`@.?/.?/secret.json` must be a relative path inside the import"),
             ("star", "`@.*/.*/secret.json` must be a relative path inside the import"),
             ("include", "include leaves the import: .?/.?/outside.api"),
+            ("walk", "include leaves the import: .*/.*/.*/.*/.*/.*/.*/.*/.*/.*/.*/.*/**/*.api"),
         ] {
+            let asked = std::time::Instant::now();
             let ran = run(file);
             assert!(!ran.ok, "{kind} {file}");
             assert!(ran.stderr.contains(says), "{kind} {file}: {}", ran.stderr);
             assert_eq!(server.sent(), Vec::<String>::new(), "{kind} {file}");
+            // Refused by what the line says: nothing above the import is
+            // walked to find out what the pattern matches.
+            assert!(asked.elapsed() < std::time::Duration::from_secs(10), "{kind} {file}: {:?}", asked.elapsed());
         }
     }
 }
