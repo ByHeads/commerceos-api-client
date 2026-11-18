@@ -70,11 +70,17 @@ npx -p vscode-tmgrammar-test vscode-tmgrammar-snap \
 
 Add `-u` to write the snapshot again after a change that was meant, and read
 its diff. `cargo test --test editors` fails when the snapshot is of another
-`sample.api` than the one that is there, and when the two grammars mark
-different text as an error.
+`sample.api` than the one that is there, when the two grammars mark
+different text as an error, and when the grammar has changed since the
+snapshot was written: `sample.api.snap.sha256` holds the SHA-256 of the
+grammar the snapshot is of, so put the new one there after writing it again
+(`shasum -a 256 editors/vscode/syntaxes/api.tmLanguage.json`).
 
-For the Vim syntax, open `sample.api` and look, or ask for the group under the
-cursor: `:echo synIDattr(synID(line('.'), col('.'), 1), 'name')`.
+The Vim syntax is held to `sample.api` too: where there is a `vim` on the
+`PATH` the tests ask it for the group of each construct, and everywhere they
+check that every group the file names is one it defines. To look yourself,
+open `sample.api`, or ask for the group under the cursor:
+`:echo synIDattr(synID(line('.'), col('.'), 1), 'name')`.
 
 ## The extension outside the client
 

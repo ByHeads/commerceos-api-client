@@ -158,6 +158,15 @@ fn the_sublime_syntax_scopes_each_construct_of_the_sample() {
         ("} || POST /things [1, 2]", "||", "keyword.operator.logical.api"),
         ("} || POST /things [1, 2]", "POST", "keyword.control.http.write.api"),
         ("DELETE /people/com.mi6.id=006", "DELETE", "keyword.control.http.delete.api"),
+        ("url is https://cos.example.com", "is", "keyword.operator.api"),
+        ("  \"token_env\": \"AR_TOKEN\",", "token_env", "support.type.property-name.import.api"),
+        ("  \"description\": { \"sv-SE\": \"Ett exempel\" },", "description", "support.type.property-name.describe.api"),
+        ("set ndjson", "ndjson", "variable.parameter.setting.api"),
+        ("set stream on", "on", "constant.language.api"),
+        ("sleep 1.5s", "1.5s", "constant.numeric.api"),
+        ("HEAD /people", "HEAD", "keyword.control.http.read.api"),
+        ("OPTIONS /people", "OPTIONS", "keyword.control.http.read.api"),
+        ("  # shell-style line comment", "# shell-style line comment", "comment.line.number-sign.json"),
     ];
     for (line, stretch, scope) in expected {
         let number = sample.lines().position(|l| l == line).unwrap_or_else(|| panic!("no line `{}`", line)) + 1;
@@ -253,6 +262,23 @@ fn the_grammar_files_are_json_and_name_each_other() {
     }
 }
 
+/// The snapshot is of the grammar as it stands. An edit to the grammar that
+/// still compiles changes what an editor shows and passes every test that
+/// reads the snapshot, until the snapshot is written again: the hash beside
+/// it is of the grammar it was written from.
+#[test]
+fn the_textmate_snapshot_is_of_the_grammar_as_it_stands() {
+    use sha2::{Digest, Sha256};
+    let grammar = fs::read(repo().join("editors/vscode/syntaxes/api.tmLanguage.json")).unwrap();
+    let now: String = Sha256::digest(&grammar).iter().map(|byte| format!("{:02x}", byte)).collect();
+    assert_eq!(
+        read("editors/sample.api.snap.sha256").trim(),
+        now,
+        "the TextMate grammar has changed since editors/sample.api.snap was written: write the snapshot again \
+         (see the top of this file), read its diff, and put the grammar's SHA-256 in editors/sample.api.snap.sha256"
+    );
+}
+
 /// Every pattern of the TextMate grammar is a pattern. The snapshot holds
 /// the grammar to the sample only as it was when the snapshot was made: a
 /// later edit that no editor could read would pass every other test here.
@@ -304,6 +330,176 @@ fn the_vim_syntax_syncs_from_the_start_of_the_file() {
     assert!(syntax.lines().any(|line| line.trim() == "syn sync fromstart"), "no `syn sync fromstart`");
     let sync = syntax.find("syn sync fromstart").unwrap();
     assert!(sync < syntax.find("b:current_syntax = 'api'").unwrap());
+}
+
+/// Every group the Vim syntax names is one it defines: a group that follows
+/// another (`nextgroup=`), one that is contained (`contains=`) and one that
+/// is given a colour. A name that is misspelt, or left behind when its rule
+/// was taken out, is no error to Vim: the text is simply not coloured.
+#[test]
+fn every_group_the_vim_syntax_names_is_defined() {
+    let syntax = read("editors/vim/syntax/api.vim");
+    let rules: Vec<&str> = syntax.lines().map(str::trim).filter(|line| line.starts_with("syn ")).collect();
+    let mut defined = BTreeSet::new();
+    for rule in &rules {
+        let mut words = rule.split_whitespace().skip(1);
+        match (words.next(), words.next()) {
+            (Some("match" | "region"), Some(name)) => defined.insert(name.to_string()),
+            (Some("cluster"), Some(name)) => defined.insert(format!("@{name}")),
+            _ => false,
+        };
+    }
+    for rule in &rules {
+        for word in rule.split_whitespace() {
+            // A pattern may hold the text `contains=`: only a word of names.
+            let Some(names) = word.strip_prefix("nextgroup=").or_else(|| word.strip_prefix("contains=")) else { continue };
+            if !names.chars().all(|c| c.is_ascii_alphanumeric() || c == ',' || c == '@') {
+                continue;
+            }
+            for name in names.split(',') {
+                assert!(defined.contains(name), "`{name}` is named and not defined: {rule}");
+            }
+        }
+    }
+    // What `matchgroup=` names is a group too.
+    defined.insert("apiBrace".to_string());
+    let mut coloured = BTreeSet::new();
+    for line in syntax.lines().filter(|line| line.starts_with("hi def link ")) {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        assert!(defined.contains(words[3]), "a colour for `{}`, which no rule defines", words[3]);
+        assert!(!words[4].starts_with("api") || defined.contains(words[4]), "`{}` is linked to `{}`, which no rule defines", words[3], words[4]);
+        coloured.insert(words[3].to_string());
+    }
+    // A region that only holds others has no colour of its own.
+    let plain = ["apiJsonObject", "apiJsonArray", "apiBodyObject", "apiBodyArray", "apiDescribe", "apiUri", "apiImpliedUri"];
+    for name in defined.iter().filter(|name| !name.starts_with('@')) {
+        assert!(coloured.contains(name) || plain.contains(&name.as_str()), "`{name}` is defined and has no colour");
+    }
+}
+
+/// The group Vim gives each character of the sample, by line (from 0) and
+/// byte column. `None` where there is no `vim` to ask: the test that needs
+/// it says so and holds nothing.
+#[cfg(unix)]
+fn vim_groups() -> Option<Vec<Vec<String>>> {
+    let home = tempdir().unwrap();
+    let script = home.path().join("dump.vim");
+    let dumped = home.path().join("groups.txt");
+    // Vim's own fallback syntax is cleared first: the file under test
+    // leaves a buffer alone that has a syntax already.
+    fs::write(
+        &script,
+        "syntax on\nsyntax clear\nunlet! b:current_syntax\nexecute 'source ' . fnameescape(g:api_syntax)\n\
+         let s:rows = []\n\
+         for s:lnum in range(1, line('$'))\n\
+         \x20 let s:row = []\n\
+         \x20 for s:col in range(1, col([s:lnum, '$']) - 1)\n\
+         \x20   call add(s:row, synIDattr(synID(s:lnum, s:col, 1), 'name'))\n\
+         \x20 endfor\n\
+         \x20 call add(s:rows, join(s:row, ','))\n\
+         endfor\n\
+         call writefile(s:rows, g:api_dump)\nqa!\n",
+    )
+    .unwrap();
+    let mut vim = std::process::Command::new("vim");
+    vim.args(["-e", "-s", "-u", "NONE", "-i", "NONE", "-N"])
+        .arg("--cmd")
+        .arg(format!("let g:api_syntax='{}'", repo().join("editors/vim/syntax/api.vim").display()))
+        .arg("--cmd")
+        .arg(format!("let g:api_dump='{}'", dumped.display()))
+        .arg("-S")
+        .arg(&script)
+        .arg(repo().join("editors/sample.api"))
+        .env("HOME", home.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = vim.spawn().ok()?;
+    let started = std::time::Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if started.elapsed() > std::time::Duration::from_secs(30) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("vim did not end");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let rows = fs::read_to_string(&dumped).expect("vim wrote no groups: the syntax file did not load");
+    Some(rows.lines().map(|row| row.split(',').map(str::to_string).collect()).collect())
+}
+
+/// The Vim syntax colours each construct of the sample as what it is, in
+/// Vim itself: a rule that is taken out, or a pattern Vim can't read, fails
+/// here. Holds nothing on a machine without `vim`.
+#[cfg(unix)]
+#[test]
+fn the_vim_syntax_gives_each_construct_of_the_sample_its_group() {
+    let Some(groups) = vim_groups() else {
+        eprintln!("skipped: no vim on the PATH");
+        return;
+    };
+    let sample = read("editors/sample.api");
+    // (the line, a stretch of it, the group its first character has)
+    let expected = [
+        ("# Sample exercising every construct of the proposed syntax", "# Sample", "apiComment"),
+        ("url has localhost:5000   # gate", "url", "apiDirective"),
+        ("url has localhost:5000   # gate", "has", "apiUrlOp"),
+        ("url has localhost:5000   # gate", "localhost:5000", "apiValue"),
+        ("url has localhost:5000   # gate", "# gate", "apiTrailComment"),
+        ("url is https://cos.example.com", "is", "apiUrlOp"),
+        ("  \"docsLink\": \"https://link-to-docs.com\",", "\"docsLink\"", "apiJsonKey"),
+        ("  \"docsLink\": \"https://link-to-docs.com\",", "\"https", "apiJsonString"),
+        ("import dir p @parts.json   # from a file", "import", "apiImport"),
+        ("import dir p @parts.json   # from a file", "dir", "apiImportKind"),
+        ("import dir p @parts.json   # from a file", "p ", "apiAlias"),
+        ("import dir p @parts.json   # from a file", "@", "apiInfileOp"),
+        ("import archive ar {", "archive", "apiImportKind"),
+        ("  \"token_env\": \"AR_TOKEN\",", "\"token_env\"", "apiJsonKey"),
+        ("cl/seeds/*.api     # glob include", "cl/", "apiInclude"),
+        ("cl/seeds/*.api     # glob include", "*", "apiWildcard"),
+        ("/tmp/seed.api", "/tmp", "apiInclude"),
+        ("set export com.heads.seedID", "set", "apiDirective"),
+        ("set export com.heads.seedID", "export", "apiSetting"),
+        ("set export com.heads.seedID", "com.heads.seedID", "apiValue"),
+        ("set fail-fast off   # back off", "off", "apiOnOff"),
+        ("set timeout 30", "30", "apiSetNumber"),
+        ("set ndjson", "ndjson", "apiSetting"),
+        ("set stream on", "on", "apiOnOff"),
+        ("assert GET /companies/com.heads.seedID=ours", "assert", "apiDirective"),
+        ("assert GET /companies/com.heads.seedID=ours", "GET", "apiSegRead"),
+        ("assert not /people~where(givenName=Test)~count   # implied GET", "not", "apiNot"),
+        ("sleep 500ms", "500ms", "apiDuration"),
+        ("sleep 1.5s", "1.5s", "apiDuration"),
+        ("sleep while not GET /people~count", "while", "apiWhile"),
+        ("sleep while not GET /people~count", "not", "apiNot"),
+        ("sleep while not GET /people~count", "GET", "apiSegRead"),
+        ("confirm Seed a && b? # all of it is the question", "Seed", "apiMessage"),
+        ("confirm Seed a && b? # all of it is the question", "# all", "apiMessage"),
+        ("/people~take(5)", "people", "apiImpliedUri"),
+        ("HEAD /people", "HEAD", "apiMethodRead"),
+        ("get /people#x                    # the #x is no comment", "get", "apiMethodRead"),
+        ("get /people#x                    # the #x is no comment", "#x", "apiUriPunct"),
+        ("get /people#x                    # the #x is no comment", "# the", "apiTrailComment"),
+        ("GET /x~where(name=\"a > b # c\") >> people.json", "\"a > b", "apiUriString"),
+        ("GET /x~where(name=\"a > b # c\") >> people.json", ">>", "apiRedirect"),
+        ("GET /x~where(name=\"a > b # c\") >> people.json", "people.json", "apiOutfile"),
+        ("GET /people > clipboard", "clipboard", "apiClipboard"),
+        ("PUT /sync-webhooks @data.csv~map(com.heads.csv-product) > /tmp/r.json", "PUT", "apiMethodWrite"),
+        ("PUT /sync-webhooks @data.csv~map(com.heads.csv-product) > /tmp/r.json", "~map", "apiMap"),
+        ("  // JS-style line comment", "// JS", "apiJsonComment"),
+        ("  # shell-style line comment", "# shell", "apiJsonComment"),
+        ("     spanning lines */", "spanning", "apiJsonComment"),
+        ("  \"n\": 1.5, \"ok\": true", "1.5", "apiJsonNumber"),
+        ("  \"n\": 1.5, \"ok\": true", "true", "apiJsonConst"),
+        ("} || POST /things [1, 2]", "||", "apiChain"),
+        ("} || POST /things [1, 2]", "POST", "apiSegWrite"),
+        ("DELETE /people/com.mi6.id=006", "DELETE", "apiMethodDelete"),
+    ];
+    for (line, stretch, group) in expected {
+        let number = sample.lines().position(|l| l == line).unwrap_or_else(|| panic!("no line `{}`", line));
+        let column = line.find(stretch).unwrap_or_else(|| panic!("no `{}` in `{}`", stretch, line));
+        assert_eq!(groups[number][column], group, "`{}` in `{}`: {:?}", stretch, line, groups[number]);
+    }
 }
 
 // ------------------------------------------------------------ --install-syntax

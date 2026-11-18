@@ -2829,6 +2829,8 @@ fn a_pattern_that_matches_the_directory_above_does_not_leave_the_import() {
     let files = [
         ("deep/body.api", "PUT /x @.?/.?/secret.json\n"),
         ("deep/star.api", "PUT /x @.*/.*/secret.json\n"),
+        // A `..` behind a `**`, which stands for no directory too.
+        ("deep/climb.api", "PUT /x @sub/**/../../../secret.json\n"),
         ("deep/include.api", ".?/.?/outside.api\n"),
         // From the root of the disk down, were it walked.
         ("deep/walk.api", ".*/.*/.*/.*/.*/.*/.*/.*/.*/.*/.*/.*/**/*.api\n"),
@@ -2859,6 +2861,7 @@ fn a_pattern_that_matches_the_directory_above_does_not_leave_the_import() {
         for (file, says) in [
             ("body", "`@.?/.?/secret.json` must be a relative path inside the import"),
             ("star", "`@.*/.*/secret.json` must be a relative path inside the import"),
+            ("climb", "`@sub/**/../../../secret.json` must be a relative path inside the import"),
             ("include", "include leaves the import: .?/.?/outside.api"),
             ("walk", "include leaves the import: .*/.*/.*/.*/.*/.*/.*/.*/.*/.*/.*/.*/**/*.api"),
         ] {

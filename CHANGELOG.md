@@ -78,6 +78,10 @@
 - **The `(1/2)` counter counts only a list Tab walks.** In a body under `-x` it stood beside a key Tab had written whole, and beside a value in its quotes, where the next Tab closes the bracket and never reaches the second of the list.
 - **Tab completes a link to a directory as a directory.** `shared -> ../common/shared` completed to `shared` with no `/`, where a second Tab did nothing, and was not offered for an include at all.
 - **A long export name no longer takes the settings menu's labels.** With `set export` at a name of the 128 characters one may have, every row of the `ctrl+t` menu was cut to `Res…  off` and the name itself lost its end. A value gets the room the labels leave and is cut in front, so a row still ends in what the setting is at.
+- **Tests for what the sixth whole-app review found unheld.**
+  - `tests/editors.rs`: the Vim syntax had no test but that it holds one line. It is now asked, in Vim itself where there is one, for the group of each construct of `editors/sample.api`, and every group it names has to be one it defines. The TextMate snapshot is tied to the grammar it was written from (`editors/sample.api.snap.sha256`), so an edit to the grammar that still compiles fails until the snapshot is written again. `sample.api` gained the constructs it lacked: `url is`, `set ndjson`, `set stream on`, `set raw`, `sleep 1.5s`, `HEAD`, `OPTIONS`, `#` and `/* */` comments in a body, the `sha256`, `token_env` and `path` of an import, and a `description`.
+  - `tests/parity.rs`: a `>>` typed in front of the body editor still appends (the test passed for an overwrite, its file not being there beforehand); ctrl+c answers a `confirm` at the prompt with no; the `.csv` warning shows in the hint line and as a note in a block; esc before a streamed answer has begun leaves no file; `CLICOLOR=0` at a terminal and `CLICOLOR_FORCE` into a file.
+  - Tests that could not fail now can: Tab on a server without a spec is told from its ghost, the splash names its host on seven and eight rows, the `--timeout` and `DELETE` tests of `tests/cli.rs` check the answer, and an `@file` with a `..` behind a `**` is run through an import.
 
 ## 3.3.1
 

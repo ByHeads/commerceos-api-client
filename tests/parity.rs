@@ -1723,6 +1723,37 @@ fn a_csv_append_that_is_not_under_the_files_header_is_said() {
     }
 }
 
+/// At the prompt the same is said in the hint line, and for a request of a
+/// block also as a note under it, since the next request has the hint line
+/// at once. An answer that adds nothing says nothing.
+#[cfg(unix)]
+#[test]
+fn a_csv_append_that_is_not_under_the_files_header_is_said_at_the_prompt() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let note = "the first line of the response is not the header row of rows.csv: it was appended too";
+    let mut prompt = open_prompt(&server, d, &[]);
+
+    std::fs::write(d.join("rows.csv"), "id,name\n1,Ann\n").unwrap();
+    let (sent, shown) = run_pasted(&mut prompt, &server, "GET /zero/7 >> rows.csv");
+    assert_eq!(sent, ["GET /zero/7"]);
+    assert!(shown.contains(note) && !shown.contains("↳"), "{shown}");
+    assert_eq!(std::fs::read_to_string(d.join("rows.csv")).unwrap(), "id,name\n1,Ann\n7");
+    prompt.pump(Duration::from_millis(3300));
+
+    std::fs::write(d.join("rows.csv"), "id,name\n1,Ann\n").unwrap();
+    let (sent, shown) = run_pasted(&mut prompt, &server, "GET /zero/7 >> rows.csv\rGET /after");
+    assert_eq!(sent, ["GET /zero/7", "GET /after"]);
+    assert!(shown.contains(&format!("↳ {note}")), "{shown}");
+    prompt.pump(Duration::from_millis(3300));
+
+    // The header alone adds nothing, and there is nothing to say of it.
+    let (sent, shown) = run_pasted(&mut prompt, &server, "GET /zero/id,name >> rows.csv");
+    assert_eq!(sent, ["GET /zero/id,name"]);
+    assert!(!shown.contains("header row"), "{shown}");
+}
+
 /// A `sleep while` waits its interval between two checks, five seconds when
 /// none is given, and carries on when the answer has flipped. Without the
 /// wait it would ask as fast as the server answers.
@@ -2287,6 +2318,51 @@ fn the_prompt_streams_an_outfile_as_a_batch_does() {
     left.retain(|name| !name.starts_with('.'));
     left.sort();
     assert_eq!(left, ["kept.json", "s.json"]);
+}
+
+/// esc before the answer to a streamed `> file` has begun gives it up too:
+/// when the head arrives after all, no file is made of it.
+#[cfg(unix)]
+#[test]
+fn a_stream_aborted_before_its_answer_begins_writes_nothing() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    std::fs::write(d.join("kept.json"), "[\"before\"]").unwrap();
+    let mut cmd = api_bare(d);
+    cmd.args(["-b", &url, "-k", "streamer", "--stream"]);
+    let mut prompt = pty::Prompt::open(cmd);
+    prompt.wait_ready(Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(500));
+    for (line, file) in [("GET /late > new.json", "new.json"), ("GET /late > kept.json", "kept.json")] {
+        prompt.send(b"\x15");
+        prompt.pump(Duration::from_millis(60));
+        server.take();
+        let mark = prompt.screen.len();
+        prompt.paste(line);
+        prompt.pump(Duration::from_millis(60));
+        prompt.send(b"\r");
+        // `/late` says nothing for two seconds: the request is there, its
+        // answer is not.
+        assert!(pump_until(&mut prompt, Duration::from_secs(4), |_| server.seen() > 0), "{line}: {}", screen_tail(&prompt));
+        prompt.pump(Duration::from_millis(300));
+        prompt.send(b"\x1b");
+        assert!(
+            pump_until(&mut prompt, Duration::from_secs(3), |p| pty::plain(&p.screen[mark..]).contains("request aborted")),
+            "{line}: {}",
+            screen_tail(&prompt)
+        );
+        // Past the time the answer takes to come.
+        prompt.pump(Duration::from_millis(2600));
+        let left = left_in(d);
+        assert!(!left.iter().any(|name| name.ends_with(".part")), "{line}: {left:?}");
+        match file {
+            "kept.json" => assert_eq!(std::fs::read_to_string(d.join(file)).unwrap(), "[\"before\"]", "{line}"),
+            _ => assert!(!d.join(file).exists(), "{line}: {left:?}"),
+        }
+    }
+    assert_eq!(prompt.exited(), None);
 }
 
 /// esc during a request says `request aborted` and the session goes on. A
@@ -4338,14 +4414,28 @@ fn a_stream_is_coloured_by_what_it_is_itself() {
     let screen = run(&["-sa", "p.api"], "2> err.log");
     assert!(screen.contains("\x1b[32m200 OK"), "no colour at the terminal:\n{screen:?}");
 
-    // `NO_COLOR` at a terminal: the same lines, and no colour in them.
-    for args in [&["-sa", "p.api"][..], &["-a", "p.api"], &["-spa", "p.api"]] {
-        let screen = run(args, "NO_COLOR=1; export NO_COLOR;");
-        assert!(pty::plain(&screen).contains("HTTP/1.1 200 OK"), "{args:?}:\n{screen}");
-        for code in ["\x1b[32m", "\x1b[31m", "\x1b[2m", "\x1b[1m", "\x1b[38;5;208m"] {
-            assert!(!screen.contains(code), "{args:?}: {code:?} under NO_COLOR:\n{screen:?}");
+    // `NO_COLOR` at a terminal: the same lines, and no colour in them. So
+    // with `CLICOLOR=0`, which the colour crate follows for stdout.
+    for setup in ["NO_COLOR=1; export NO_COLOR;", "CLICOLOR=0; export CLICOLOR;"] {
+        for args in [&["-sa", "p.api"][..], &["-a", "p.api"], &["-spa", "p.api"]] {
+            let screen = run(args, setup);
+            assert!(pty::plain(&screen).contains("HTTP/1.1 200 OK"), "{args:?}:\n{screen}");
+            for code in ["\x1b[32m", "\x1b[31m", "\x1b[2m", "\x1b[1m", "\x1b[38;5;208m"] {
+                assert!(!screen.contains(code), "{args:?}: {code:?} under {setup}\n{screen:?}");
+            }
         }
     }
+
+    // `CLICOLOR_FORCE` colours a stream that is a file, stderr as stdout.
+    let force = "CLICOLOR_FORCE=1; export CLICOLOR_FORCE;";
+    let _ = std::fs::remove_file(dir.path().join("err.log"));
+    run(&["-a", "p.api"], &format!("{force} 2> err.log"));
+    let log = std::fs::read_to_string(dir.path().join("err.log")).unwrap();
+    assert!(log.contains("\x1b[32m200 OK"), "no colour in a forced stderr:\n{log:?}");
+    let _ = std::fs::remove_file(dir.path().join("out.log"));
+    run(&["-sa", "p.api"], &format!("{force} > out.log"));
+    let log = std::fs::read_to_string(dir.path().join("out.log")).unwrap();
+    assert!(log.contains("\x1b[32m200 OK"), "no colour in a forced stdout:\n{log:?}");
 }
 
 /// The terminal is asked even when stdin is the program: with a terminal a
@@ -5703,8 +5793,10 @@ fn a_spec_that_cannot_be_read_is_said_with_b_and_with_c() {
         // Without a spec Tab still writes what the ghost has shown from
         // the start. It used to go quiet once the 404 had arrived.
         if args.contains(&"nospec") {
-            let shown = press(&mut prompt, &["GET /", "\t"]);
-            assert!(shown.contains("GET /about"), "{shown}");
+            // (The ghost alone shows `GET /about` too: what is typed
+            // behind it tells whether Tab wrote it.)
+            let shown = press(&mut prompt, &["GET /", "\t", "~"]);
+            assert!(shown.contains("GET /about~"), "{shown}");
         }
     }
 }
@@ -8202,7 +8294,7 @@ fn the_splash_is_told_its_host_only_where_its_line_still_shows() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
     write_credentials(d, &[("a", url.clone(), "key", "k", "")], "a");
-    for rows in [24u16, 10, 9, 8, 6, 5] {
+    for rows in [24u16, 10, 9, 8, 7, 6, 5] {
         let mut cmd = api_bare(d);
         cmd.args(["-c", "a"]);
         let mut prompt = pty::Prompt::open_with(cmd, 80, rows);
@@ -8217,7 +8309,7 @@ fn the_splash_is_told_its_host_only_where_its_line_still_shows() {
         assert_eq!(drawn.iter().filter(|row| row.contains('│')).count(), 1, "{rows} rows:\n{shown}");
         assert_eq!(drawn[top + 3], "", "{rows} rows: the row under the box was written over\n{shown}");
         // Where its line is still on the screen, it names the host.
-        if rows >= 9 {
+        if rows >= 7 {
             assert!(drawn[top + 1].contains(&format!("127.0.0.1:{}", server.port)), "{rows} rows:\n{shown}");
         }
     }
@@ -9434,6 +9526,8 @@ fn a_write_with_an_outfile_and_no_body_opens_the_body_editor() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
     std::fs::write(d.join("body.json"), r#"{"f":1}"#).unwrap();
+    // What a `>>` adds to, and what a `>` would have written over.
+    std::fs::write(d.join("patch.json"), r#"[{"old":1}]"#).unwrap();
     let mut prompt = open_prompt(&server, d, &[]);
 
     for (line, file) in [("PUT /x > put.json", "put.json"), ("POST /y > post.json", "post.json"), ("PATCH /z >> patch.json", "patch.json")] {
@@ -9443,7 +9537,7 @@ fn a_write_with_an_outfile_and_no_body_opens_the_body_editor() {
         let opened = pump_until(&mut prompt, Duration::from_secs(3), |p| screen_tail(p).contains("Enter body"));
         assert!(opened, "{line}: {}", screen_tail(&prompt));
         assert_eq!(server.seen(), 0, "{line}: sent before a body was given");
-        assert!(!d.join(file).exists(), "{line}");
+        assert_eq!(d.join(file).exists(), line.contains(">>"), "{line}");
         prompt.send(br#"{"a":1}"#);
         prompt.pump(Duration::from_millis(150));
         prompt.send(b"\x04");
@@ -9453,6 +9547,8 @@ fn a_write_with_an_outfile_and_no_body_opens_the_body_editor() {
         assert_eq!(server.take(), [format!("{request} {{\"a\":1}}")], "{}", screen_tail(&prompt));
         let written = std::fs::read_to_string(d.join(file)).unwrap_or_else(|_| panic!("{line}: {file} not written"));
         assert!(written.contains(&request[request.find('/').unwrap()..]), "{line}: {written}");
+        // A `>>` is still one after the editor: what the file held is there.
+        assert_eq!(written.contains("\"old\""), line.contains(">>"), "{line}: {written}");
         // The line is back as it was sent, redirect and all.
         assert!(screen_tail(&prompt).contains(&format!("{request} {{\"a\":1}} >")), "{}", screen_tail(&prompt));
     }
@@ -11259,7 +11355,7 @@ fn a_confirm_at_the_prompt_takes_enter_for_yes_and_esc_for_no() {
     let server = RecordingServer::start();
     let dir = tempfile::tempdir().unwrap();
     let mut prompt = open_prompt(&server, dir.path(), &[]);
-    for (key, sent) in [(&b"\r"[..], &["GET /before", "GET /after"][..]), (b"\x1b", &["GET /before"]), (b"y", &["GET /before", "GET /after"]), (b"n", &["GET /before"])] {
+    for (key, sent) in [(&b"\r"[..], &["GET /before", "GET /after"][..]), (b"\x1b", &["GET /before"]), (b"y", &["GET /before", "GET /after"]), (b"n", &["GET /before"]), (b"\x03", &["GET /before"])] {
         prompt.send(b"\x15");
         prompt.pump(Duration::from_millis(60));
         server.take();

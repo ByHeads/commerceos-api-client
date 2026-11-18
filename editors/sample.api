@@ -1,7 +1,9 @@
 # Sample exercising every construct of the proposed syntax
 url has localhost:5000   # gate
+url is https://cos.example.com
 {
   "title": { "en-US": "Sample" },
+  "description": { "sv-SE": "Ett exempel" },
   "docsLink": "https://link-to-docs.com",
   "owner": "unknown member"
 }
@@ -11,6 +13,12 @@ import git cl {
   "ref": "2.1.0"
 }
 import dir p @parts.json   # from a file
+import archive ar {
+  "url": "https://example.com/releases/a.tar.gz",
+  "sha256": "9f2c",
+  "token_env": "AR_TOKEN",
+  "path": "seeds"
+}
 import archive get { "url": "x" }
 import svn cl2 { "url": "x" }
 
@@ -23,17 +31,23 @@ set export com.heads.seedID
 set include-nulls
 set fail-fast off   # back off
 set timeout 30
+set ndjson
+set stream on
+set raw
 set nulls
 set raw maybe
 
 assert GET /companies/com.heads.seedID=ours
 assert not /people~where(givenName=Test)~count   # implied GET
 sleep 500ms
+sleep 1.5s
 sleep 20 while GET /imports~where(state=running)~count
 sleep while not GET /people~count
 confirm Seed a && b? # all of it is the question
 
 /people~take(5)
+HEAD /people
+OPTIONS /people
 get /people#x                    # the #x is no comment
 GET /x~where(a=1||b=2) > out.json   # one request
 GET /x~where(name="a > b # c") >> people.json
@@ -45,6 +59,9 @@ PUT /x @backup~old(1)
 PUT /people/com.mi6.id=007 { "name": "James Bond" } > /tmp/bond.json  # tail
 PUT /things {
   // JS-style line comment
+  # shell-style line comment
+  /* block comment
+     spanning lines */
   "note": "a # b",
   "line2": "
     raw newline

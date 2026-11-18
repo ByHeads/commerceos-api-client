@@ -157,10 +157,10 @@ fn post_inline_body_echoes_back() {
 fn delete_returns_response() {
     require_local_cos();
     api()
-        .args(["DELETE", "/echo-all"])
+        .args(["-f", "DELETE", "/echo-all"])
         .assert()
         .success()
-        .stderr(predicate::str::contains("HTTP/1.1"));
+        .stderr(predicate::str::contains("HTTP/1.1 200 OK"));
 }
 
 #[test]
@@ -1743,9 +1743,10 @@ fn timeout_flag_appears_in_help() {
 fn timeout_flag_accepts_seconds_value() {
     require_local_cos();
     api()
-        .args(["GET", "/echo-all", "--timeout", "30", "--silent"])
+        .args(["-f", "PUT", "/echo-all", "{\"a\":1}", "--timeout", "30", "--silent"])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains("\"a\""));
 }
 
 #[test]
@@ -1765,9 +1766,10 @@ fn timeout_help_states_the_default_and_the_disable_value() {
 fn timeout_zero_disables_the_timeout() {
     require_local_cos();
     api()
-        .args(["GET", "/echo-all", "--timeout", "0", "--silent"])
+        .args(["-f", "PUT", "/echo-all", "{\"a\":1}", "--timeout", "0", "--silent"])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains("\"a\""));
 }
 
 #[test]
