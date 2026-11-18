@@ -3132,6 +3132,9 @@ struct ConnectionFlow {
     // Configuration
     show_splash: bool,
     width: u16,
+    /// The rows of the terminal: the picker shows as many connections as
+    /// fit on them, moved along with the selection.
+    height: u16,
 
     // Delete confirmation state
     delete_confirming: Option<usize>,
@@ -3144,7 +3147,74 @@ struct ConnectionFlow {
     resized: Option<(u16, u16)>,
 }
 
+/// The rows of the terminal, or those of a common one where there is none
+/// to ask (and in a test, so that what it draws does not go by the window
+/// it is run in).
+fn terminal_rows() -> u16 {
+    if cfg!(test) {
+        return 24;
+    }
+    terminal::size().map(|(_, rows)| rows).unwrap_or(24)
+}
+
+/// The connections the picker draws, of `envs` (the ones a search left, in
+/// order): all of them where they fit on `budget` rows, else the `budget`
+/// around the selected one, with whether some are left out above and below.
+/// The first or the last row drawn is then a `⋯` in the place of its
+/// connection. With `selected` on none of them (the row that adds a
+/// connection, under the list) it is the end of the list that is shown.
+fn picker_window(envs: &[usize], selected: usize, budget: usize) -> (Vec<usize>, bool, bool) {
+    if envs.len() <= budget {
+        return (envs.to_vec(), false, false);
+    }
+    let at = envs.iter().position(|&i| i == selected).unwrap_or(envs.len() - 1);
+    let start = at.saturating_sub(budget / 2).min(envs.len() - budget);
+    let end = start + budget;
+    // A marker takes a row of the window, so it needs one to spare beside
+    // the selected row: none on a window of one or two rows.
+    let marks = budget >= 3;
+    (envs[start..end].to_vec(), marks && start > 0, marks && end < envs.len())
+}
+
 impl ConnectionFlow {
+    /// The saved connections drawn, and whether more stand above and below
+    /// them: see `picker_window`. Everything else the picker draws takes
+    /// six rows (two rulers, the separator, the row under it, the hint and
+    /// the "(no matches)" a search can leave).
+    fn shown_envs(&self) -> (Vec<usize>, bool, bool) {
+        let envs: Vec<usize> =
+            self.picker.filtered_indices.iter().copied().filter(|&i| !self.picker.is_add_row(i)).collect();
+        picker_window(&envs, self.picker.selected, (self.height as usize).saturating_sub(6).max(1))
+    }
+
+    /// Take the size of a terminal that was resized, and draw the flow anew
+    /// on a cleared screen.
+    fn redraw_resized(&mut self, stdout: &mut io::Stdout, w: u16, h: u16) -> io::Result<()> {
+        self.width = w;
+        self.height = h;
+        self.resized = Some((w, h));
+
+        // Disable raw mode for redraw
+        terminal::disable_raw_mode()?;
+
+        // Clear screen and move to home
+        out!("\x1b[2J\x1b[3J\x1b[H");
+        io::stdout().flush().ok();
+
+        // Redraw splash if showing
+        if self.show_splash {
+            self.render_splash(stdout)?;
+        }
+
+        io::stdout().flush().ok();
+
+        // Re-enable raw mode
+        terminal::enable_raw_mode()?;
+
+        // Re-render the flow UI
+        self.render(stdout, true)
+    }
+
     fn for_startup(envs: &[String], width: u16, show_splash: bool) -> Self {
         let has_connections = !envs.is_empty();
         let picker = PickerState::new(envs);
@@ -3173,6 +3243,7 @@ impl ConnectionFlow {
             setup_conn_fail_count: 0,
             show_splash,
             width,
+            height: terminal_rows(),
             delete_confirming: None,
             last_rendered_lines,
             resized: None,
@@ -3200,6 +3271,7 @@ impl ConnectionFlow {
             setup_conn_fail_count: 0,
             show_splash: false,
             width,
+            height: terminal_rows(),
             delete_confirming: None,
             last_rendered_lines,
             resized: None,
@@ -3220,10 +3292,8 @@ impl ConnectionFlow {
             // Picker: top ruler + env items + (no matches) + separator + search/add line + bottom ruler
             // Hint line doesn't have \r\n, cursor stays on it, so we don't count it
 
-            // Count env items (excluding "+ Add new")
-            let env_count = self.picker.filtered_indices.iter()
-                .filter(|&&i| !self.picker.is_add_row(i))
-                .count() as u16;
+            // The rows of connections drawn: all, or as many as fit.
+            let env_count = self.shown_envs().0.len() as u16;
 
             // Check if we have any envs displayed
             let had_env = self.picker.filtered_indices.iter().any(|&i| {
@@ -3397,9 +3467,12 @@ impl ConnectionFlow {
 
         // Render only filtered items (excluding "+ Add new" which we handle separately)
         let mut had_env = false;
-        for &i in &self.picker.filtered_indices {
-            // Skip "+ Add new" here - we handle it after the separator
-            if self.picker.is_add_row(i) {
+        let (shown, more_above, more_below) = self.shown_envs();
+        for (row, &i) in shown.iter().enumerate() {
+            had_env = true;
+            // More connections than rows: the list goes on past this row.
+            if (row == 0 && more_above) || (row + 1 == shown.len() && more_below) {
+                execute!(stdout, Print(format!("    {}\r\n", "⋯".dimmed())))?;
                 continue;
             }
 
@@ -3750,11 +3823,15 @@ impl ConnectionFlow {
             thread::sleep(Duration::from_millis(80));
 
             // Check for ctrl+c to cancel
+            // A resize is taken as it is at any other time: the picker is
+            // drawn at the new size, and the session gets it afterwards.
             if event::poll(Duration::from_millis(0))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
+                match event::read()? {
+                    Event::Key(key) if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') => {
                         return Ok(None);
                     }
+                    Event::Resize(w, h) => self.redraw_resized(stdout, w, h)?,
+                    _ => {}
                 }
             }
         }
@@ -4127,30 +4204,7 @@ impl ConnectionFlow {
                         }
                     }
                     Event::Paste(text) => self.handle_paste(&text, stdout)?,
-                    Event::Resize(w, h) => {
-                        self.width = w;
-                        self.resized = Some((w, h));
-
-                        // Disable raw mode for redraw
-                        terminal::disable_raw_mode()?;
-
-                        // Clear screen and move to home
-                        out!("\x1b[2J\x1b[3J\x1b[H");
-                        io::stdout().flush().ok();
-
-                        // Redraw splash if showing
-                        if self.show_splash {
-                            self.render_splash(stdout)?;
-                        }
-
-                        io::stdout().flush().ok();
-
-                        // Re-enable raw mode
-                        terminal::enable_raw_mode()?;
-
-                        // Re-render the flow UI
-                        self.render(stdout, true)?;
-                    }
+                    Event::Resize(w, h) => self.redraw_resized(stdout, w, h)?,
                     _ => {}
                 }
             }
@@ -16693,6 +16747,9 @@ fn load_behind_flow(flow: &mut ConnectionFlow, stdout: &mut io::Stdout, config: 
         let tick = Instant::now();
         while event::poll(Duration::from_millis(80).saturating_sub(tick.elapsed())).unwrap_or(false) {
             let Ok(event) = event::read() else { break };
+            if let Event::Resize(w, h) = event {
+                flow.redraw_resized(stdout, w, h).ok();
+            }
             if let Event::Key(key) = event {
                 let pressed = key.kind == event::KeyEventKind::Press;
                 if pressed && key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
@@ -29186,6 +29243,34 @@ mod tests {
             "PUT /x {\"a\":1, // first, then b\n  "
         );
         assert_eq!(entered_in_brackets(r#"PUT /x {"a":1,^ /* b, c */ "d":2}"#), "PUT /x {\"a\":1,\n   /* b, c */ \"d\":2}");
+    }
+
+    #[test]
+    fn the_picker_shows_the_connections_that_fit_around_the_selected_one() {
+        let envs: Vec<usize> = (0..10).collect();
+        // All of them where they fit.
+        assert_eq!(picker_window(&envs, 4, 10), (envs.clone(), false, false));
+        assert_eq!(picker_window(&envs, 4, 30), (envs.clone(), false, false));
+        assert_eq!(picker_window(&[], 0, 5), (vec![], false, false));
+        // Else a window that holds the selected one, with what it leaves out.
+        assert_eq!(picker_window(&envs, 0, 5), (vec![0, 1, 2, 3, 4], false, true));
+        assert_eq!(picker_window(&envs, 2, 5), (vec![0, 1, 2, 3, 4], false, true));
+        assert_eq!(picker_window(&envs, 5, 5), (vec![3, 4, 5, 6, 7], true, true));
+        assert_eq!(picker_window(&envs, 9, 5), (vec![5, 6, 7, 8, 9], true, false));
+        // The row that adds a connection is under the list: its end is shown.
+        assert_eq!(picker_window(&envs, 10, 5), (vec![5, 6, 7, 8, 9], true, false));
+        // A search leaves some of them: the window is of those.
+        assert_eq!(picker_window(&[1, 4, 6, 8, 9], 6, 3), (vec![4, 6, 8], true, true));
+        // The selected one is never a row a marker takes.
+        for budget in 1..12 {
+            for selected in 0..10 {
+                let (shown, above, below) = picker_window(&envs, selected, budget);
+                assert_eq!(shown.len(), budget.min(10), "{selected} in {budget}");
+                let at = shown.iter().position(|&i| i == selected).unwrap_or_else(|| panic!("{selected} in {budget}"));
+                assert!(!(above && at == 0) && !(below && at + 1 == shown.len()), "{selected} in {budget}: {shown:?}");
+                assert!(above == (shown[0] > 0 && budget >= 3) && below == (shown[shown.len() - 1] < 9 && budget >= 3));
+            }
+        }
     }
 
     #[test]

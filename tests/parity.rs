@@ -8411,6 +8411,105 @@ fn ctrl_y_says_why_it_copied_nothing() {
     assert_eq!(ruler_rows(&rows).len(), 2, "{}", rows.join("\n"));
 }
 
+/// More saved connections than the terminal has rows: the picker shows the
+/// ones that fit, moved along with the selection, with a `⋯` where the list
+/// goes on. It is drawn in place whatever is selected, searched or deleted.
+#[cfg(unix)]
+#[test]
+fn the_connection_picker_keeps_to_a_short_terminal() {
+    const COLS: usize = 80;
+    const ROWS: usize = 12;
+    let server = RecordingServer::start();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let names: Vec<String> = (1..=30).map(|n| format!("c{n:02}")).collect();
+    let connections: Vec<(&str, String, &str, &str, &str)> =
+        names.iter().map(|name| (name.as_str(), url.clone(), "key", "k", "")).collect();
+    write_credentials(d, &connections, "");
+
+    // The picker's rows, from its top ruler to its hint.
+    let picker = |prompt: &pty::Prompt, what: &str| -> Vec<String> {
+        let rows = pty::rows(&prompt.screen, COLS);
+        let shown = rows.join("\n");
+        let rulers = ruler_rows(&rows);
+        assert_eq!(rulers.len(), 2, "{what}: a ruler was left behind\n{shown}");
+        assert_eq!(rows.len(), rulers[1] + 2, "{what}:\n{shown}");
+        let picker = rows[rulers[0]..].to_vec();
+        assert!(picker.len() < ROWS, "{what}: {} rows on {ROWS}\n{shown}", picker.len());
+        assert_eq!(picker.iter().filter(|row| row.starts_with("  › ")).count(), 1, "{what}: one row is selected\n{shown}");
+        picker
+    };
+    let names_of = |picker: &[String]| -> Vec<String> {
+        picker[1..].iter().take_while(|row| !row.starts_with("    ──")).map(|row| row.split_whitespace().take(2).collect::<Vec<_>>().join(" ")).collect()
+    };
+
+    let mut prompt = pty::Prompt::open_with(api_bare(d), COLS as u16, ROWS as u16);
+    prompt.wait_for("+ Add new connection", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(400));
+    let shown = picker(&prompt, "opened");
+    assert_eq!(names_of(&shown), ["› c01", "c02 http://127.0.0.1", "c03 http://127.0.0.1", "c04 http://127.0.0.1", "c05 http://127.0.0.1", "⋯"].map(|row| row.replace("http://127.0.0.1", &url)));
+
+    // Down the list: the selected one stays in view, between two markers.
+    for _ in 0..10 {
+        prompt.send(b"\x1b[B");
+        prompt.pump(Duration::from_millis(120));
+    }
+    let shown = picker(&prompt, "ten down");
+    let listed = names_of(&shown);
+    assert_eq!((listed[0].as_str(), listed[5].as_str()), ("⋯", "⋯"), "{}", shown.join("\n"));
+    assert!(listed.iter().any(|row| row == "› c11"), "{}", shown.join("\n"));
+    // To the row under the list: the end of the list is over it.
+    for _ in 0..25 {
+        prompt.send(b"\x1b[B");
+        prompt.pump(Duration::from_millis(80));
+    }
+    let shown = picker(&prompt, "at the end");
+    let listed = names_of(&shown);
+    assert_eq!(listed[0], "⋯", "{}", shown.join("\n"));
+    assert!(listed[5].starts_with("c30 "), "{}", shown.join("\n"));
+    assert!(shown.iter().any(|row| row == "  › + Add new connection"), "{}", shown.join("\n"));
+    // And back up to the first.
+    for _ in 0..35 {
+        prompt.send(b"\x1b[A");
+        prompt.pump(Duration::from_millis(80));
+    }
+    let shown = picker(&prompt, "back up");
+    assert_eq!((names_of(&shown)[0].as_str(), names_of(&shown)[5].as_str()), ("› c01", "⋯"), "{}", shown.join("\n"));
+
+    // A search that leaves more than fit is cut the same way; one that
+    // leaves few is shown whole.
+    prompt.send(b"c2");
+    prompt.pump(Duration::from_millis(300));
+    let shown = picker(&prompt, "searched c2");
+    assert_eq!(names_of(&shown)[5], "⋯", "{}", shown.join("\n"));
+    assert!(shown.iter().any(|row| row.trim() == "search: c2"), "{}", shown.join("\n"));
+    prompt.send(b"7");
+    prompt.pump(Duration::from_millis(300));
+    let shown = picker(&prompt, "searched c27");
+    assert_eq!(names_of(&shown), ["› c27"], "{}", shown.join("\n"));
+
+    // A taller window shows more of them, a shorter one fewer.
+    prompt.send(b"\x7f\x7f\x7f");
+    prompt.pump(Duration::from_millis(300));
+    prompt.resize(COLS as u16, 20);
+    prompt.pump(Duration::from_millis(600));
+    let rows = pty::rows(&prompt.screen, COLS);
+    let rulers = ruler_rows(&rows);
+    let top = rulers[rulers.len() - 2];
+    let listed = rows[top + 1..].iter().take_while(|row| !row.starts_with("    ──")).count();
+    assert_eq!(listed, 14, "{}", rows[top..].join("\n"));
+    assert_eq!(rows.len() - top, 19, "{}", rows[top..].join("\n"));
+
+    // The one that is selected is the one Enter connects to.
+    prompt.send(b"c07");
+    prompt.pump(Duration::from_millis(300));
+    prompt.send(b"\r");
+    prompt.wait_ready(Duration::from_secs(15));
+    press(&mut prompt, &["GET /through-c07"]);
+    assert_eq!(entered(&mut prompt, &server), ["GET /through-c07"]);
+}
+
 /// The last row of the screen that holds `text`.
 #[cfg(unix)]
 fn row_with(prompt: &pty::Prompt, cols: usize, text: &str) -> String {

@@ -49,6 +49,8 @@
 - **Enter under `-x` reads no bracket in a comment.** In a body of several lines, Enter behind a comment that held more closing brackets than the body had open (`"a": 1 // }}`) ended the client with a panic. A bracket in a comment is none now, the line's indent goes by what stands before its comment, and a body on one line that holds a comment is not laid out anew, which broke the comment at its first comma.
 - **Down in the connection picker stops at the last match of a search.** While a search was typed, Down moved on to the row the search line stands on, with no row marked, and Enter there opened the form for a new connection in the place of connecting to the match.
 - **`ctrl+y` says why it copied nothing.** Before any request, and where the clipboard could not be written, the key did nothing and said nothing. It now says `no request to copy yet` or `could not copy to the clipboard: …`.
+- **The connection picker keeps to a short terminal.** With more saved connections than the terminal has rows the picker printed them all, the screen scrolled, and every key and every frame of the spinner drew the list once more under the last. It now shows the connections that fit, moved along with the selected one, with a `⋯` on the first or the last row where the list goes on. A search is cut the same way, and a taller window shows more.
+- **A window resized while a connection is tried is drawn at its new size.** A resize that arrived while the picker or the form waited for a server was dropped: the picker went on at the old width, and so did the prompt behind it until the next resize.
 
 ## 3.3.1
 
