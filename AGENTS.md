@@ -13,6 +13,7 @@ METHOD URI [BODY] [> OUTFILE]
 - `METHOD` is one of `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS`.
 - If the first token starts with `/`, `GET` is implied — `/people` is the same as `GET /people`.
 - `URI` may be written **with or without its leading slash**, and with or without the `/api/v1` prefix — `GET api/v1/people`, `GET /api/v1/people`, `GET v1/people`, and `GET /people` all request the same thing. That makes a path copied out of a browser URL or a log usable as-is. In a `.api` file this needs an explicit method, because a bare line that doesn't start with `/` is an [include](#6-includes).
+- A method needs a URI behind it. `DELETE` alone is an error (`DELETE needs a URI`), in a file, as arguments and at the prompt: it is not a request to `/`.
 - `BODY` and `OUTFILE` are optional. If both are present, `BODY` comes first; the `> path` suffix is parsed off the end. A ` >` inside a JSON string, inside brackets or inside the parentheses of a URI operator is not an outfile: `PUT /x {"a":"b > c"}` and `GET /x~where(name="a > b")` are sent as written.
 - The `>` needs a blank in front of it, a space or a tab, and a path behind it. A `>` or `>>` that names no file (`GET /x >`) stops the batch before anything is sent: ``a `>` or `>>` needs a path to write to``. That holds for a plain line, a chain segment, an `assert` and a `sleep while`.
 - A body starts on the request line. A `{` that starts a line of its own is a [describe block](#describe-block), which belongs at the top of the file.
@@ -146,6 +147,10 @@ PUT /events @events/*.ndjson
 # X-Request-Map header via ~map(type) suffix on a file body
 PUT /sync-webhooks @data.csv~map(com.heads.csv-product)
 ```
+
+`~map(type)` is the only function an `@file` body takes. Any other
+(`@backup~old(1)`) is an error and the request is not sent: `unknown body
+function ~old(1)`.
 
 Globs are processed in **sorted order** and skip OS junk (`.DS_Store`,
 `Thumbs.db`, `desktop.ini`, `._*`). `.njson` counts as NDJSON too, and the
@@ -875,6 +880,9 @@ url has test.app.heads.com
 url is https://cos.example.com
 ```
 
+- A `url` line is a line of its own. In a `&&`/`||` chain (`url has x && PUT
+  /y {…}`) it stops the batch before anything is sent, as every directive in
+  a chain does.
 - `url has <text>` is a substring match against the base URL as the client
   has it (`http://localhost:5000`: scheme in lower case, no trailing `/`, no
   `/api/v1`). The text is compared as written, so `url has localhost:5000/`
@@ -904,6 +912,7 @@ stdin alone, so it never waits for a pipe and can sit inside a `while read`
 loop.
 
 **A piped body is sent as it is.** Only the blanks around it are trimmed.
+One that starts with `@` is that text, not the name of a file to send.
 It is not read the way a body argument or a body in a `.api` file is: `//`,
 `#` and `/* */` comments are not stripped, and a raw newline in a string is
 not escaped. A piped body is often not JSON at all (CSV, NDJSON), and a
@@ -1349,6 +1358,7 @@ Run it: `api -sa workshop.api`.
 - **Piping a body to a `GET`** → it is not sent. Stdin is read as a body only for `POST`, `PUT` and `PATCH` without a body argument. And `echo '{…}' | api -p PUT /x` with no terminal is an error: stdin can't be the body and the answer to `-p`. Give the body as an argument or an `@file`.
 - **A response that stops before its end** → a body cut short by the server or the network, or one that takes longer than `--timeout`, is no answer: `The response was cut short: …` or `Timed out after …`, exit 1, with or without `-f`. Nothing is written to the outfile, a chain or an `assert` does not take it for a "no", and nothing after it is sent.
 - **Unclosed brackets** → the whole run fails with `"unclosed body at end of bulk file"`. If a body looks wrong, check that `{}` and `[]` balance.
+- **A method with no URI** → `api DELETE`, or a line `DELETE` in a file, is an error and sends nothing. Write the root as `DELETE /` if that is what is meant.
 - **Glob with no matches** → hard error. Check the directory and pattern.
 - **Include loops** → `a.api` including `b.api` which includes `a.api` is detected and refused.
 - **`import … @cloddy.json` run from another directory** → the `@` path is relative to the working directory, like every `@file`, not to the `.api` file. Run from the directory that holds the JSON, or give an absolute or `~/` path.

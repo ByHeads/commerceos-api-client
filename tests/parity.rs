@@ -668,6 +668,15 @@ fn cases(dir: &Path) -> Vec<Case> {
             .fails("chain segment is not a request: `sleep 100ms`"),
         case("typo in a chain", "GET /a && peple", Some(&["GET", "/a", "&&", "peple"]), &[])
             .fails("chain segment is not a request: `peple`"),
+        // A method names nothing to send without a URI: not a request to `/`
+        case("a method alone", "DELETE", Some(&["DELETE"]), &[]).fails("DELETE needs a URI"),
+        case("a method alone in a chain", "GET /a && PUT", Some(&["GET", "/a", "&&", "PUT"]), &[]).fails("PUT needs a URI"),
+        // A function an @file body does not have is not dropped
+        case("an unknown body function", "PUT /x @body.json~old(1)", Some(&["PUT", "/x", "@body.json~old(1)"]), &[])
+            .fails("unknown body function ~old(1)"),
+        // A gate is a line of its own
+        case("url in a chain", r#"url has 127.0.0.1 && PUT /x {"a":1}"#, Some(&["url", "has", "127.0.0.1", "&&", "PUT", "/x", r#"{"a":1}"#]), &[])
+            .fails("can't be part of a `&&`/`||` chain"),
         // Directives
         case("sleep", "sleep 100ms", Some(&["sleep", "100ms"]), &[]),
         case("sleep with a bad duration", "sleep abc", Some(&["sleep", "abc"]), &[]).fails("invalid sleep duration"),
@@ -9768,9 +9777,13 @@ fn a_piped_body_is_sent_as_it_is_and_a_body_argument_is_read() {
     let server = RecordingServer::start();
     let dir = tempfile::tempdir().unwrap();
     const BODY: &str = "{\n  // the name\n  \"name\": \"a # b\",\n  \"note\": \"two\nlines\"\n}";
+    std::fs::write(dir.path().join("real.json"), r#"{"from":"file"}"#).unwrap();
     for (stdin, sent) in [
         (format!("\n{BODY}\n\n"), format!("PUT /x {BODY}")),
         ("a,b # c\n1,2\n".to_string(), "PUT /x a,b # c\n1,2".to_string()),
+        // An `@` in front is data too: no file is looked for, or sent.
+        ("@handle,name\n1,2\n".to_string(), "PUT /x @handle,name\n1,2".to_string()),
+        ("@real.json~map(x)".to_string(), "PUT /x @real.json~map(x)".to_string()),
     ] {
         server.take();
         let mut cmd = api(server.port, dir.path());

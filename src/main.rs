@@ -591,6 +591,9 @@ struct Config {
     /// `-k` or `--token` gave the credential in use, so what a saved
     /// connection has stored (a client secret to renew with) is not it.
     credential_overridden: bool,
+    /// The body came from a piped stdin and is sent as it is: one that
+    /// starts with `@` is that text, not the name of a file to send.
+    body_verbatim: bool,
 }
 
 impl Default for Config {
@@ -626,6 +629,7 @@ impl Default for Config {
             oauth2_client_id: String::new(),
             oauth2_client_secret: String::new(),
             one_shot: false,
+            body_verbatim: false,
             connection_overridden: false,
             credential_overridden: false,
         }
@@ -745,7 +749,7 @@ fn parse_store(json: &str) -> Result<KeychainData, String> {
         return Ok(KeychainData::default());
     }
     let mut data: KeychainData =
-        serde_json::from_str(json).map_err(|e| format!("it is not what the client wrote there ({})", e))?;
+        serde_json::from_str(json).map_err(|e| format!("it is not what the client wrote there ({})", store_error_text(&e)))?;
     // A known `auth_type` in the spelling the client writes and compares
     // with (`"Token"` is `"token"`). One it does not know is left as it is,
     // for `connection_problem` to name.
@@ -755,6 +759,23 @@ fn parse_store(json: &str) -> Result<KeychainData, String> {
         }
     }
     Ok(data)
+}
+
+/// Why a store could not be read, without anything the store holds. A
+/// value of the wrong kind is quoted in the parser's message (``invalid
+/// type: integer `1234`, expected a string``), and in a store that value
+/// can be a credential: the kind that was expected and the place are kept,
+/// the value is not.
+fn store_error_text(e: &serde_json::Error) -> String {
+    let text = e.to_string();
+    if !e.is_data() {
+        return text;
+    }
+    match (text.split_once(": "), text.rfind(", expected ")) {
+        (Some((what, _)), Some(expected)) if what.starts_with("invalid ") => format!("{}{}", what, &text[expected..]),
+        _ if text.starts_with("missing field ") => text,
+        _ => format!("a value that does not belong there at line {} column {}", e.line(), e.column()),
+    }
 }
 
 /// Read a credentials file. One that does not exist is an empty store; one
@@ -3946,8 +3967,9 @@ fn host_is_local(host: &str) -> bool {
 /// read in (`HTTP://host/api/v1` is chosen by `host`).
 fn url_selects(stored: &str, selector: &str) -> bool {
     let bare = |url: &str| url.trim_start_matches("https://").trim_start_matches("http://").to_string();
-    let stored = normalize_base_uri(stored);
-    let asked = normalize_base_uri(selector);
+    // A host is the same in any case, as it is to `url is`.
+    let stored = host_lowered(&normalize_base_uri(stored));
+    let asked = host_lowered(&normalize_base_uri(selector));
     if stored.is_empty() || asked.is_empty() {
         return false;
     }
@@ -4264,6 +4286,7 @@ fn main() {
     // none. A GET or a DELETE never reads it: it would wait for a pipe that
     // stays open, and swallow the input of a `while read` loop around it.
     let takes_body = ["POST", "PUT", "PATCH"].contains(&method.as_str()) && !uri.is_empty();
+    let mut piped_body = false;
     if body.is_empty() && takes_body && args.all.is_none() && program_line.is_none() && !io::stdin().is_terminal() {
         // `-p` asks a question, and with no terminal its answer comes from
         // stdin too. Stdin can't be both.
@@ -4277,7 +4300,10 @@ fn main() {
         // A body that can't be read is not an empty one: nothing is sent.
         let mut stdin_content = String::new();
         match io::stdin().read_to_string(&mut stdin_content) {
-            Ok(_) => body = stdin_content.trim().to_string(),
+            Ok(_) => {
+                body = stdin_content.trim().to_string();
+                piped_body = true;
+            }
             Err(e) => {
                 errln!("error: could not read the body from stdin: {}", e);
                 exit_process(1);
@@ -4293,9 +4319,18 @@ fn main() {
         && !uri.is_empty()
     {
         errln!("Reading body from stdin (ctrl+d to finish):");
+        // What is typed there is a body from stdin like a piped one: one
+        // that can't be read is not an empty one, and nothing is sent.
         let mut stdin_content = String::new();
-        if io::stdin().read_to_string(&mut stdin_content).is_ok() {
-            body = stdin_content.trim().to_string();
+        match io::stdin().read_to_string(&mut stdin_content) {
+            Ok(_) => {
+                body = stdin_content.trim().to_string();
+                piped_body = true;
+            }
+            Err(e) => {
+                errln!("error: could not read the body from stdin: {}", e);
+                exit_process(1);
+            }
         }
     }
 
@@ -4683,6 +4718,7 @@ fn main() {
             }
         }
         config.one_shot = true;
+        config.body_verbatim = piped_body;
         run_non_interactive(&mut config, &method, &uri, &body);
         return;
     }
@@ -5215,11 +5251,24 @@ fn redirect_lacks_path(text: &str) -> bool {
     })
 }
 
+const REQUEST_METHODS: [&str; 7] = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+
 /// A request that could be parsed but must not be sent, and why. Checked
 /// while a file or a line is read, so nothing has been sent when it is said.
 fn refuse_request(request: &str) -> Result<(), String> {
     if redirect_lacks_path(request) {
         return Err(format!("a `>` or `>>` needs a path to write to: `{}`", request.trim()));
+    }
+    // A method with no URI behind it names nothing to send. It is not read
+    // as a request to `/`: a `DELETE` there was never what was meant.
+    let written = match outfile_marker_at(request) {
+        Some(at) => &request[..at],
+        None => request,
+    };
+    if let [method] = written.split_whitespace().collect::<Vec<_>>()[..] {
+        if REQUEST_METHODS.iter().any(|known| known.eq_ignore_ascii_case(method)) {
+            return Err(format!("{} needs a URI: `{} /people`", method.to_uppercase(), method.to_uppercase()));
+        }
     }
     let Some((_, uri, _)) = parse_request_line(request) else {
         return Ok(());
@@ -6107,7 +6156,38 @@ fn append_to_outfile(path: &str, new_content: &str) -> io::Result<()> {
         }
     };
 
-    fs::write(path, merged)
+    replace_outfile(path, &merged)
+}
+
+/// Put `content` in the place of what the outfile at `path` holds, in one
+/// step where that can be done: written beside it, then renamed over it. An
+/// append rewrites the whole file, and a write that fails halfway (a full
+/// disk) must not cost what had been collected. The file keeps its mode, a
+/// link stays a link, and a file that may not be written is not replaced.
+///
+/// Where no file can be made beside it, or it can't take the target's
+/// place, the target is written as it stands, as a `>` writes it.
+fn replace_outfile(path: &str, content: &str) -> io::Result<()> {
+    let target = resolve_link(std::path::Path::new(path));
+    let Some(existing) = fs::metadata(&target).ok().filter(|meta| meta.is_file()) else {
+        return fs::write(path, content);
+    };
+    fs::OpenOptions::new().write(true).open(&target)?;
+    let Ok((part, mut file)) = create_part(&target) else {
+        return fs::write(&target, content);
+    };
+    let _ = file.set_permissions(existing.permissions());
+    let staged = file.write_all(content.as_bytes()).and_then(|()| file.flush());
+    drop(file);
+    if let Err(e) = staged {
+        let _ = fs::remove_file(&part);
+        return Err(e);
+    }
+    if fs::rename(&part, &target).is_ok() {
+        return Ok(());
+    }
+    let _ = fs::remove_file(&part);
+    fs::write(&target, content)
 }
 
 /// `MatchOptions` for glob expansion: behave like a shell — `*` does NOT match
@@ -6993,6 +7073,11 @@ fn parse_url_condition(trimmed: &str) -> Result<Option<UrlCondition>, String> {
     let (op, value) = split_first_word(rest);
     let op = op.to_ascii_lowercase();
     let op = op.as_str();
+    // A gate is a line of its own. Read as its value, a request behind a
+    // `&&` would never be sent, and nothing would say so.
+    if matches!(op, "has" | "is") && chain_parts(value).len() > 1 {
+        return Err(format!("a `url` line can't be part of a `&&`/`||` chain: `{}`", trimmed));
+    }
     match op {
         "has" | "is" if !value.is_empty() => Ok(Some(if op == "has" {
             UrlCondition::Has(value.to_string())
@@ -9955,9 +10040,10 @@ fn build_request(config: &Config, parts: &RequestParts) -> Result<BuiltRequest, 
         accept = "application/x-ndjson".to_string();
     }
 
-    if parts.body.starts_with('@') {
+    if parts.body.starts_with('@') && !config.body_verbatim {
         // `~func(arg)` suffixes (`~map(name)`) are for `@file` bodies only.
         let (file_body, extra_headers) = parse_body_functions(&parts.body);
+        refuse_unknown_body_function(&file_body)?;
         for (name, value) in &extra_headers {
             request = request.header(name.as_str(), value.as_str());
         }
@@ -17547,11 +17633,29 @@ fn parse_body_functions(body: &str) -> (String, Vec<(String, String)>) {
         if !arg.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.') { break; }
         match func {
             "map" => headers.push(("X-Request-Map".to_string(), arg.to_string())),
-            _ => {} // ignore unknown functions
+            // One the client does not have stays on the path, for
+            // `refuse_unknown_body_function` to name.
+            _ => break,
         }
         remaining = remaining[..tilde_pos].to_string();
     }
     (remaining, headers)
+}
+
+/// What is left of an `@file` body once its `~map(name)` is read must be the
+/// path alone. A `~word(arg)` still at its end is a function the client does
+/// not have: sending the file without it would send something else than was
+/// asked for.
+fn refuse_unknown_body_function(file_body: &str) -> Result<(), String> {
+    let Some(tilde) = file_body.rfind('~') else { return Ok(()) };
+    let call = &file_body[tilde + 1..];
+    let Some(open) = call.find('(') else { return Ok(()) };
+    let name = &call[..open];
+    let named = !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-');
+    if !named || !call.ends_with(')') || name == "map" {
+        return Ok(());
+    }
+    Err(format!("unknown body function ~{}: an @file body takes ~map(<type>) and nothing else", call))
 }
 
 /// The bytes of a file that is a body, without the UTF-8 byte order mark
@@ -28862,5 +28966,153 @@ mod tests {
             describe_redirect_failure("example.com:8443"),
             "Too many redirects from example.com:8443: the request was never answered."
         );
+    }
+
+    #[test]
+    fn a_saved_connection_is_chosen_by_its_url_with_the_host_in_any_case() {
+        assert!(url_selects("https://COS.example.com", "cos.example.com"));
+        assert!(url_selects("https://cos.example.com", "COS.Example.com"));
+        assert!(url_selects("https://COS.example.com", "https://cos.example.com"));
+        // A path below the host is compared as written.
+        assert!(!url_selects("https://cos.example.com/Tenant", "cos.example.com/tenant"));
+    }
+
+    #[test]
+    fn a_store_that_cannot_be_read_is_said_without_what_it_holds() {
+        for store in [
+            r#"{"connections":[{"name":"a","url":"http://x","auth_type":"key","credential":1234567890}]}"#,
+            r#"{"connections":["SECRETVALUE"]}"#,
+            r#"{"connections":[{"name":"a","url":"http://x","auth_type":"key","credential":["SECRETVALUE"]}]}"#,
+            r#"{"connections":{"SECRETVALUE":true}}"#,
+        ] {
+            let said = parse_store(store).err().unwrap_or_else(|| panic!("{store} was read"));
+            assert!(!said.contains("1234567890") && !said.contains("SECRETVALUE"), "{said}");
+            assert!(said.contains("line 1 column"), "{said}");
+        }
+        // What was expected is still said, and a syntax error as it was.
+        let said = parse_store(r#"{"connections":[{"name":"a","url":"http://x","auth_type":"key","credential":1234567890}]}"#).unwrap_err();
+        assert!(said.contains("invalid type, expected a string at line 1"), "{said}");
+        assert!(parse_store(r#"{"connections":[],}"#).unwrap_err().contains("trailing comma"));
+    }
+
+    #[test]
+    fn a_url_line_is_not_part_of_a_chain() {
+        for line in ["url has localhost && PUT /x {\"a\":1}", "url is http://localhost:5000 || GET /a", "URL HAS x&&GET /a"] {
+            let said = parse_url_condition(line).unwrap_err();
+            assert!(said.contains("can't be part of a `&&`/`||` chain"), "{line}: {said}");
+            assert!(split_bulk_requests(&format!("url has localhost\n{line}\nGET /y\n"), None).is_err(), "{line}");
+        }
+        // A `&&` in the parentheses of a value is text of the gate.
+        assert!(parse_url_condition("url has (a&&b)").unwrap().is_some());
+    }
+
+    #[test]
+    fn a_method_alone_is_not_a_request_to_the_root() {
+        for line in ["DELETE", "delete", "GET", " PUT  ", "DELETE > out.json", "POST >> out.json"] {
+            let said = refuse_request(line).unwrap_err();
+            assert!(said.contains("needs a URI"), "{line}: {said}");
+        }
+        for line in ["DELETE /", "GET /people", "/", "PUT /x {\"a\":1}"] {
+            assert_eq!(refuse_request(line), Ok(()), "{line}");
+        }
+        assert!(split_bulk_requests("GET /a\nDELETE\n", None).unwrap_err().contains("DELETE needs a URI"));
+        assert!(split_bulk_requests("GET /a || DELETE\n", None).unwrap_err().contains("DELETE needs a URI"));
+    }
+
+    #[test]
+    fn a_body_function_the_client_does_not_have_is_refused() {
+        for (body, said) in [
+            ("@backup~old(1)", Some("unknown body function ~old(1)")),
+            ("@a.csv~Map(x)", Some("unknown body function ~Map(x)")),
+            ("@a.csv~old(1)~map(x)", Some("unknown body function ~old(1)")),
+            ("@a.csv~map(x)", None),
+            ("@a.csv", None),
+            ("@~/a.csv", None),
+            ("@dir~1/a.csv", None),
+        ] {
+            let (file_body, _) = parse_body_functions(body);
+            let got = refuse_unknown_body_function(&file_body);
+            match said {
+                Some(said) => assert!(got.as_ref().is_err_and(|e| e.contains(said)), "{body}: {got:?}"),
+                None => assert_eq!(got, Ok(()), "{body}"),
+            }
+        }
+        // The file is there, and still is not sent without the function.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("backup");
+        fs::write(&file, "{}").unwrap();
+        let parts = RequestParts {
+            method: "PUT".to_string(),
+            uri: "/x".to_string(),
+            body: format!("@{}~old(1)", file.display()),
+            outfile: None,
+            streaming: false,
+        };
+        let config = Config { base_uri: "http://localhost:1".to_string(), ..Config::default() };
+        assert!(build_request(&config, &parts).is_err_and(|e| e.contains("unknown body function")));
+    }
+
+    #[test]
+    fn body_functions_are_read_from_the_end_of_a_file_body() {
+        let map = |name: &str| vec![("X-Request-Map".to_string(), name.to_string())];
+        assert_eq!(parse_body_functions("@a.csv~map(com.heads.csv)"), ("@a.csv".to_string(), map("com.heads.csv")));
+        assert_eq!(parse_body_functions("@~/a.csv~map(x)"), ("@~/a.csv".to_string(), map("x")));
+        assert_eq!(parse_body_functions("@~/a.csv"), ("@~/a.csv".to_string(), vec![]));
+        // Nothing to map to is no function, and is left on the path.
+        assert_eq!(parse_body_functions("@a~map()"), ("@a~map()".to_string(), vec![]));
+        assert_eq!(parse_body_functions("@a~map(x"), ("@a~map(x".to_string(), vec![]));
+    }
+
+    #[test]
+    fn a_piped_body_that_starts_with_an_at_sign_is_not_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("real.json");
+        fs::write(&file, "{\"from\":\"file\"}").unwrap();
+        let parts = |body: String| RequestParts { method: "PUT".to_string(), uri: "/x".to_string(), body, outfile: None, streaming: false };
+        let sent = |config: &Config, body: String| {
+            let built = build_request(config, &parts(body)).unwrap().request.build().unwrap();
+            String::from_utf8(built.body().unwrap().as_bytes().unwrap().to_vec()).unwrap()
+        };
+        let base = Config { base_uri: "http://localhost:1".to_string(), ..Config::default() };
+        let piped = Config { body_verbatim: true, ..base.clone() };
+        let named = format!("@{}", file.display());
+        assert_eq!(sent(&base, named.clone()), "{\"from\":\"file\"}");
+        assert_eq!(sent(&piped, named.clone()), named);
+        assert_eq!(sent(&piped, "@handle,name\n1,2".to_string()), "@handle,name\n1,2");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_append_replaces_the_file_in_one_step_and_keeps_what_it_is() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let left = || {
+            let mut names: Vec<String> = fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+            names.sort();
+            names
+        };
+        let target = dir.path().join("all.json");
+        fs::write(&target, "[1]").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("link.json")).unwrap();
+        let before = fs::metadata(&target).unwrap().ino();
+
+        // Through a link: the link stays one, the file it names is replaced
+        // by a new file with the old mode, and nothing is left beside it.
+        append_to_outfile(dir.path().join("link.json").to_str().unwrap(), "[2]").unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "[1,2]");
+        assert!(fs::symlink_metadata(dir.path().join("link.json")).unwrap().file_type().is_symlink());
+        assert_eq!(fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o640);
+        assert_ne!(fs::metadata(&target).unwrap().ino(), before, "written in place, not beside and renamed");
+        assert_eq!(left(), ["all.json", "link.json"]);
+
+        // A file that may not be written is not replaced by one that was.
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o444)).unwrap();
+        assert!(append_to_outfile(target.to_str().unwrap(), "[3]").is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "[1,2]");
+        assert_eq!(left(), ["all.json", "link.json"]);
+
+        // Something that is not a regular file is written as it stands.
+        replace_outfile("/dev/null", "x").unwrap();
     }
 }
