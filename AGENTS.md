@@ -44,9 +44,12 @@ JSON string, brackets and the parentheses of a URI operator, like ` >`:
 GET /people > /tmp/people.json   # a comment
 shared/checks.api                # a comment
 sleep 2                          # a comment
-GET /people#x                    # the `#x` is sent: no blank in front
+GET /people#x                    # the `#x` is no comment: no blank in front
 PUT /x {"note":"a # b"}          # the string is sent whole
 ```
+
+The `#x` of `GET /people#x` stays in the URI, where it is a fragment, and a
+fragment is not sent to a server: what arrives is `GET /people`.
 
 A `confirm` line has none: all of it is the question.
 
@@ -149,6 +152,10 @@ Globs are processed in **sorted order** and skip OS junk (`.DS_Store`,
 extension is read in any case, as an outfile's is: `@ROWS.CSV` is sent as
 `text/csv`. Empty match sets and invalid JSON (`invalid JSON in <file>: …`)
 are hard errors: the run exits non-zero and the request is not sent.
+
+A UTF-8 byte order mark in front of a file body is not sent: not of a single
+file that is text (UTF-8 throughout, whatever its extension), and not of any
+file of a glob. A file that is not text is sent as the bytes it holds.
 
 A number in a combined glob body is sent with the digits its file has
 (`12345678901234567890123`, `0.10`), as a single `@file` is sent byte for byte.
@@ -388,7 +395,7 @@ import archive cl {
 
 | Key | |
 |---|---|
-| `url` | required. `https://…` or `file:///…`. Plain `http://` only for `localhost`/`127.0.0.1`. A `file://` url names a file of this machine: its path may hold a blank, `%20` and the like are decoded, and `file://host/…` is refused |
+| `url` | required. `https://…` or `file:///…`. Plain `http://` only for `localhost`/`127.0.0.1`/`[::1]`. A `file://` url names a file of this machine: its path may hold a blank, `%20` and the like are decoded, and `file://host/…` is refused |
 | `sha256` | optional. The archive's SHA-256, 64 hex characters |
 | `token_env` | optional. The **name** of an environment variable whose value is sent as `Authorization: Bearer …` |
 | `path` | optional. A subdirectory of the archive for the alias to stand for |
@@ -858,14 +865,25 @@ request.
 ### `url has <text>` / `url is <url>`
 
 Environment gate. Before anything runs, the configured base URL must match at
-least one `url` line in the file (or its includes): `has` is a substring match,
-`is` is exact. No match aborts the whole batch, so test data can't be sent to
-the wrong environment. Multiple `url` lines form an allowlist.
+least one `url` line in the file (or its includes). No match aborts the whole
+batch, so test data can't be sent to the wrong environment. Multiple `url`
+lines form an allowlist.
 
 ```
 url has localhost:5000
 url has test.app.heads.com
+url is https://cos.example.com
 ```
+
+- `url has <text>` is a substring match against the base URL as the client
+  has it (`http://localhost:5000`: scheme in lower case, no trailing `/`, no
+  `/api/v1`). The text is compared as written, so `url has localhost:5000/`
+  matches nothing.
+- `url is <url>` is the whole base URL, and its value is read as a base URL
+  is read from `-b`: `url is https://cos.example.com/`, `url is
+  HTTPS://COS.example.com/api/v1` and `url is cos.example.com` all name
+  `https://cos.example.com`. A host is the same in any case; a path below it
+  (`https://host/tenant`) is compared as written.
 
 ## 8. Running
 
@@ -885,6 +903,20 @@ A single request reads a piped stdin as its body only when it is a `POST`,
 stdin alone, so it never waits for a pipe and can sit inside a `while read`
 loop.
 
+**A piped body is sent as it is.** Only the blanks around it are trimmed.
+It is not read the way a body argument or a body in a `.api` file is: `//`,
+`#` and `/* */` comments are not stripped, and a raw newline in a string is
+not escaped. A piped body is often not JSON at all (CSV, NDJSON), and a
+` #` in it is data. JSON with comments goes in a body argument, in a `.api`
+file, or through something that strips them before the pipe.
+
+`-a <file>` and a request are two different runs. Both on one command line
+(`api -sa seed.api GET /people`) is an error, before anything is sent:
+`-a seed.api runs a file and GET /people is a request: give one of the two`.
+
+An option given twice (`-k a -k b`) is an error (`--key was given twice`), and
+so is one with no value behind it (`--export needs a value`).
+
 ### Previewing (`-p`, `--preview`)
 
 `-p` lists what would be sent (imports and includes followed) and asks
@@ -892,6 +924,10 @@ loop.
 **not a dry run**: Enter, `y` or `yes` sends everything.
 
 - `n` prints `aborted`, sends nothing and exits 0.
+- The header counts the requests of the program and lists their methods:
+  `Preview — 3 requests | GET PUT [http://localhost:5000]`. The request of an
+  `assert` and of a `sleep while` is one of them; a `sleep`, a `confirm` and
+  an `export` line are listed and not counted.
 - The answer is read like a `confirm`'s: from the terminal, or from stdin when
   there is none. A question nobody answered (end of input) sends nothing,
   prints `aborted (could not read confirmation)` and exits 1.
@@ -1028,6 +1064,10 @@ What it does to every object in the response, however deep:
   server lists identifiers a record doesn't have (`"clientID": null`); such a
   record still has only its key and keeps it as `key?` and under the name.
   The `null` member stays in the output, since `-i` asked for it.
+- **Neither is an identifier that is masked.** A value the server sent as
+  `********` becomes `null` (below), and a record can't be found by it: a
+  record whose only other identifier is masked keeps its key as `key?` and
+  under the name, like one that has none.
 - **A masked value (`********`) becomes `null`**, and a line on stderr says
   where: `Response had masked data, now null at oauth2Clients/secret,
   localCredentials/password and 1 other place`. A path is written from the
@@ -1089,7 +1129,8 @@ ignores the variable entirely.
 
 **Where the file lives**, in order:
 
-1. `API_CREDENTIALS_FILE`, if set — an absolute path is safest.
+1. `API_CREDENTIALS_FILE`, if set — an absolute path is safest. Set to
+   nothing (`API_CREDENTIALS_FILE=`) it is not set.
 2. Otherwise `./.api-credentials.json`, relative to the **current working
    directory**. Running from a different directory silently finds no
    credentials, so prefer the env var in scripts.
@@ -1111,7 +1152,9 @@ ignores the variable entirely.
 }
 ```
 
-- `auth_type` is `"key"` (Basic), `"token"` (Bearer), or `"oauth2"`.
+- `auth_type` is `"key"` (Basic), `"token"` (Bearer), or `"oauth2"`, read in
+  any case (`"Token"`). A connection with any other `auth_type` is not used:
+  its credential is not sent as a kind it was not saved as.
 - For `"oauth2"`, put the client secret in `credential` and the client ID in
   `client_id`; the client exchanges them for a token at startup, and again
   when a request is answered `401` because the token ran out. That request is
@@ -1119,8 +1162,12 @@ ignores the variable entirely.
 - For `"key"` and `"token"`, `client_id` is `""` or left out.
 - A `url` without a scheme gets one inferred: `http` for `localhost`, an IP
   address, or anything with an explicit port; `https` otherwise. A scheme is
-  read in any case, and a trailing `/`, `/api` or `/api/v1` is dropped, here
-  and for `-b`: the base URL is the host, not the API path.
+  read in any case, and a trailing `/`, `/api` or `/api/v1` (in any case
+  too) is dropped, here and for `-b`: the base URL is the host, not the API
+  path. A scheme other than `http` and `https` (`ftp://host`), or one that
+  is not written whole (`http:/host`), is refused: `-b` with exit 1, a saved
+  connection by not being used.
+- A UTF-8 byte order mark in front of the file is ignored.
 
 **Using it.** With a `default` set, no connection flags are needed at all:
 
@@ -1183,6 +1230,18 @@ saved connection is used:
 
 ```
 WARNING: the default connection "locl" is not among the saved connections (local, stage). No saved connection is used.
+```
+
+The same is said when the file has no connections at all (`… is not among
+the saved connections (none)`).
+
+A connection that can't be used as it is written is named with the reason.
+As the default it is a warning and no saved connection is used; asked for
+with `-c` it ends the run with exit 1:
+
+```
+WARNING: the default connection "local" can't be used: its auth_type "bearer" is not "key", "token" or "oauth2". No saved connection is used.
+The connection "local" can't be used: a base URL starts with http:// or https://, not ftp://.
 ```
 
 A file that exists but can't be read, or is not valid (a trailing comma is
@@ -1286,6 +1345,7 @@ Run it: `api -sa workshop.api`.
 - **A `#` with a blank in front, outside a string** → a comment from there to the end of the line (`GET /x # note`). A body that is not JSON and holds ` #` (`PUT /x a # b`) loses what follows; quote it (`"a # b"`) or send it as an `@file`.
 - **A chain broken over two lines** → `GET /x ||` with the `PUT` on the next line is an error. Write the chain on one line; a body may still span lines.
 - **Piping a body that is not UTF-8** → `error: could not read the body from stdin`, exit 1, nothing sent. Send it as an `@file`.
+- **Piping a JSON body with comments, or with a raw newline in a string** → it is sent as piped, and the server answers with a parse error. Only a body argument and a body in a `.api` file have comments stripped and newlines escaped. Give such a body as an argument, or put the request in a `.api` file.
 - **Piping a body to a `GET`** → it is not sent. Stdin is read as a body only for `POST`, `PUT` and `PATCH` without a body argument. And `echo '{…}' | api -p PUT /x` with no terminal is an error: stdin can't be the body and the answer to `-p`. Give the body as an argument or an `@file`.
 - **A response that stops before its end** → a body cut short by the server or the network, or one that takes longer than `--timeout`, is no answer: `The response was cut short: …` or `Timed out after …`, exit 1, with or without `-f`. Nothing is written to the outfile, a chain or an `assert` does not take it for a "no", and nothing after it is sent.
 - **Unclosed brackets** → the whole run fails with `"unclosed body at end of bulk file"`. If a body looks wrong, check that `{}` and `[]` balance.
@@ -1296,6 +1356,11 @@ Run it: `api -sa workshop.api`.
 - **Importing a branch and expecting yesterday's run** → a branch is re-resolved every run. Pin a tag or a SHA, and check the commit in the `import …` log line.
 - **An archive URL without `sha256`** → downloaded again on every run, and whatever it serves that day is what runs. Add the `sha256` from the `import …` log line to pin it.
 - **`token_env` or another host in an imported file** → refused before anything is fetched. Import the second repository or archive from the file you run, next to the first.
+- **`-sa file.api GET /x`** → an error: `-a` runs the file, and the request beside it is neither dropped nor run after it. Give one of the two.
+- **`-b ftp://host` or `-b http:/host`** → `error: invalid value for -b: … (a base URL starts with http:// or https://, not ftp://)`. A base URL is `http://` or `https://`, or a host with no scheme at all. The same URL in the credentials file makes that connection unusable, with the same reason.
+- **`"auth_type": "bearer"` in the credentials file** → `The connection "x" can't be used: its auth_type "bearer" is not "key", "token" or "oauth2".` A bearer token is `"token"`. The three names are read in any case.
+- **`url has localhost:5000/`** → matches nothing: `has` compares text with the base URL as the client has it, which ends at the host. `url is` reads its value as a base URL, so a trailing `/` or `/api/v1` there is fine.
+- **A `\` in a URI** → sent as `%5C`. It is not another way to write `/`, so the escaped quote in `~where(name="a \" b")` arrives as `%5C%22`.
 - **`-b` alone, expecting the default connection's key** → none is sent, and the request is answered `401`. Add `-k`, or `-c <name>` to lend that connection's credential to the other host.
 - **`"token_env": "<the token>"`** → rejected or reported as an unset variable. It takes the *name* of an environment variable, so the secret stays out of the file.
 - **`import dir cl { "path": "cl" }`** → `import alias … clashes`. An alias can't share its name with a file or directory next to the `.api` file; name the alias something else.
@@ -1310,9 +1375,11 @@ Run it: `api -sa workshop.api`.
 - **Expecting a failed request to stop a batch** → it doesn't, unless the line is an `assert`, a chain or a poll, or the run has `-f`. A plain `PUT /assert {…}` that answers 409 is logged and the next line runs. Run with `-f`.
 - **Chaining on `PUT /assert`** → a passing `/assert` answers `200` with `null`, which is falsy, so `PUT /assert {…} && …` skips what follows and `assert PUT /assert {…}` fails on a pass. Write it on its own line and run with `-f`.
 - **`assert` on a list endpoint** → `[]` is truthy, so `assert GET /people~where(x)` passes even when nothing matches. Assert a `~count` or a single item by identifier instead.
-- **A slashless URI on its own line in a `.api` file** → `api/v1/people` alone is read as an *include* path and fails with "could not read include". Write `GET api/v1/people`, or lead with the slash: `/api/v1/people`.
+- **A slashless URI on its own line in a `.api` file** → `api/v1/people` alone is read as an *include* path and fails with `include not found: api/v1/people`. Write `GET api/v1/people`, or lead with the slash: `/api/v1/people`.
 - **`sleep while` that never ends** → `[]` and `{}` are truthy, so `sleep while GET /people~where(x)` loops forever once the list is merely empty. Poll a `~count` (or a single scalar field) instead, so the answer can become `0`/`null`.
 - **`https://` to a server with a self-signed or private certificate** → `The certificate of <host> is not trusted: it is not signed by a public certificate authority.` The client trusts the public authorities compiled into it and nothing from the machine, so such a certificate can't be made to pass; use `http://` for a local server. `Is COS running on <host>?` is kept for a host that did not answer at all.
+- **A server that redirects a request round in circles** → `Too many redirects from <host>: the request was never answered.`, exit 1, in a batch as at the prompt. A redirect that ends is followed: a 307 or 308 arrives as the request it was, with its method, body and `Authorization`.
+- **A response with bytes that are not of its charset** → the text shown and written has U+FFFD (`�`) in their place, and stderr says so once for that response: `WARNING: the response held bytes that are not valid UTF-8: each is now U+FFFD (�)`. It is said with `-s` and in `-sa` too, since it is about the data; not for an `assert` or a poll, whose body goes nowhere, nor for a `-sa` line without an outfile. At the prompt it shows in the hint line. `--stream` to a file writes the bytes as they came, so nothing is replaced there.
 - **`API_CREDENTIALS_FILE` without `--no-keychain`** → the variable is ignored and the keychain is read instead. A path that names no file fails as silently: no warning, just `Error: no base URL specified`. A file that is there but malformed is reported (`WARNING: could not read …`).
 
 ## 11. Tips for agents

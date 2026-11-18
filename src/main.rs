@@ -739,10 +739,22 @@ fn store_problem() -> Option<String> {
 /// The saved connections in `json`. Nothing at all is an empty store, as a
 /// file that was created but never written to.
 fn parse_store(json: &str) -> Result<KeychainData, String> {
+    // A byte order mark an editor put in front is not part of the JSON.
+    let json = json.strip_prefix('\u{feff}').unwrap_or(json);
     if json.trim().is_empty() {
         return Ok(KeychainData::default());
     }
-    serde_json::from_str(json).map_err(|e| format!("it is not what the client wrote there ({})", e))
+    let mut data: KeychainData =
+        serde_json::from_str(json).map_err(|e| format!("it is not what the client wrote there ({})", e))?;
+    // A known `auth_type` in the spelling the client writes and compares
+    // with (`"Token"` is `"token"`). One it does not know is left as it is,
+    // for `connection_problem` to name.
+    for connection in &mut data.connections {
+        if let Some(known) = known_auth_type(&connection.auth_type) {
+            connection.auth_type = known.to_string();
+        }
+    }
+    Ok(data)
 }
 
 /// Read a credentials file. One that does not exist is an empty store; one
@@ -3537,6 +3549,14 @@ impl ConnectionFlow {
                 KeyCode::Enter if !self.setup_url.is_empty() => {
                     // Scheme added, and the API prefix cut: only the base URL
                     // is kept, read the way `-b` reads it.
+                    // What `-b` refuses is refused here, and said why.
+                    if let Some(problem) = base_url_problem(&self.setup_url) {
+                        let said = fit_to_width(&format!("✗ {}", problem), (self.width as usize).saturating_sub(3));
+                        self.setup_status = format!("\x1b[31m{}\x1b[0m", said);
+                        self.setup_status_clear_at = Some(Instant::now() + Duration::from_secs(3));
+                        self.render(stdout, false)?;
+                        return Ok(None);
+                    }
                     let (base_url, trimmed) = base_url_of(&self.setup_url);
                     // What names no host (`http://`, a blank, `/`) is not a
                     // URL to go on with: the field keeps it, to be corrected.
@@ -3850,7 +3870,9 @@ fn base_url_of(text: &str) -> (String, bool) {
     // The first `/api` that is a whole path component, and all after it.
     let mut kept = path;
     let mut from = 0;
-    while let Some(found) = path[from..].find("/api") {
+    // In any case: ASCII letters keep their length, so the places are the same.
+    let lower_path = path.to_ascii_lowercase();
+    while let Some(found) = lower_path[from..].find("/api") {
         let at = from + found;
         let after = &path[at + 4..];
         if after.is_empty() || after.starts_with('/') {
@@ -3862,6 +3884,49 @@ fn base_url_of(text: &str) -> (String, bool) {
     let kept = kept.trim_end_matches('/');
     let scheme = scheme.unwrap_or(if host_is_local(host) { "http://" } else { "https://" });
     (format!("{}{}{}", scheme, host, kept), kept.len() != path.len())
+}
+
+/// Why what was given as a base URL can't be one, if it can't: it names a
+/// scheme that is not `http` or `https` (`ftp://host`), or its scheme is not
+/// written whole (`http:/host`). `base_url_of` would take either for a host
+/// without a scheme and put `http://` in front of it.
+fn base_url_problem(text: &str) -> Option<String> {
+    let text = text.trim();
+    let (scheme, rest) = text.split_once(':')?;
+    // A scheme, and not the host of `localhost:5000`: a word, then `:/`.
+    let is_scheme = scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+        && rest.starts_with('/');
+    if !is_scheme {
+        return None;
+    }
+    let known = scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https");
+    match (known, rest.starts_with("//")) {
+        (true, true) => None,
+        (false, true) => Some(format!(
+            "a base URL starts with http:// or https://, not {}://",
+            scheme.to_ascii_lowercase()
+        )),
+        (_, false) => Some(format!("{} is not a URL: a base URL starts with http:// or https://", text)),
+    }
+}
+
+/// The `auth_type` of a saved connection as the client writes it, when it is
+/// one the client knows. A file written by hand may have it in any case.
+fn known_auth_type(auth_type: &str) -> Option<&'static str> {
+    ["key", "token", "oauth2"].into_iter().find(|known| auth_type.eq_ignore_ascii_case(known))
+}
+
+/// Why a saved connection can't be used as it stands, if it can't: a URL
+/// that is no base URL, or an `auth_type` the client does not know. Such a
+/// connection is not used at all: its credential is not sent as a kind it
+/// was not saved as.
+fn connection_problem(env: &SavedConnection) -> Option<String> {
+    base_url_problem(&env.url).or_else(|| {
+        known_auth_type(&env.auth_type)
+            .is_none()
+            .then(|| format!("its auth_type \"{}\" is not \"key\", \"token\" or \"oauth2\"", env.auth_type))
+    })
 }
 
 /// Whether a host written without a scheme is one to reach over plain
@@ -3917,16 +3982,19 @@ fn require_base_uri(config: &Config) {
 /// the caller's to decide what a failure means: a batch ends, the prompt and
 /// the connection picker say so and stay.
 fn apply_connection_to_config(config: &mut Config, env: &SavedConnection) -> Result<(), String> {
+    if let Some(problem) = connection_problem(env) {
+        return Err(format!("The connection \"{}\" can't be used: {}.", env.name, problem));
+    }
     config.base_uri = normalize_base_uri(&env.url);
     // Only an OAuth2 connection has credentials to renew a token with.
     config.oauth2_client_id.clear();
     config.oauth2_client_secret.clear();
-    match env.auth_type.as_str() {
-        "token" => {
+    match known_auth_type(&env.auth_type) {
+        Some("token") => {
             config.token = env.credential.clone();
             config.api_key = String::new();
         }
-        "oauth2" => {
+        Some("oauth2") => {
             config.api_key = String::new();
             config.token = String::new();
             config.oauth2_client_id = env.client_id.clone();
@@ -3936,7 +4004,7 @@ fn apply_connection_to_config(config: &mut Config, env: &SavedConnection) -> Res
             config.token = token;
         }
         _ => {
-            // "key" or anything else
+            // "key": nothing else gets here.
             config.api_key = env.credential.clone();
             config.token = String::new();
         }
@@ -3994,6 +4062,25 @@ fn main() {
                 out!("{}", e);
                 exit_process(0);
             }
+            let msg = e.to_string();
+            let option = e
+                .get(clap::error::ContextKind::InvalidArg)
+                .map(|arg| arg.to_string())
+                .and_then(|arg| arg.split_whitespace().next().map(str::to_string));
+            if let Some(option) = option {
+                // `-k a -k b`: clap calls it a conflict of the option with itself.
+                if e.kind() == clap::error::ErrorKind::ArgumentConflict && msg.contains("multiple times") {
+                    errln!("error: {} was given twice", option);
+                    exit_process(1);
+                }
+                // An option that is the last word of the line (`api -c`):
+                // clap calls it an invalid value, and names none.
+                let value = e.get(clap::error::ContextKind::InvalidValue).map(|v| v.to_string());
+                if e.kind() == clap::error::ErrorKind::InvalidValue && value.map_or(true, |v| v.is_empty()) {
+                    errln!("error: {} needs a value", option);
+                    exit_process(1);
+                }
+            }
             // A value an option can't take (`--timeout abc`) is named with
             // its option; it is not an unexpected option.
             if matches!(e.kind(), clap::error::ErrorKind::ValueValidation | clap::error::ErrorKind::InvalidValue) {
@@ -4008,7 +4095,6 @@ fn main() {
                 }
             }
             // For unexpected arguments, print a simple message
-            let msg = e.to_string();
             if let Some(arg) = msg.split('\'').nth(1) {
                 errln!("error: unexpected option {}", arg);
             } else {
@@ -4037,12 +4123,29 @@ fn main() {
         exit_process(print_assertions(file, api_path, args.raw));
     }
 
+    // `-a` runs a file, and the words beside it are a request of their own.
+    // Which of the two was meant is not something to guess, and running one
+    // of them without a word about the other is worse.
+    if let (Some(file), Some(_)) = (&args.all, &args.method) {
+        let request: Vec<&str> = [&args.method, &args.uri]
+            .into_iter()
+            .flatten()
+            .chain(args.body.iter())
+            .map(String::as_str)
+            .collect();
+        errln!("error: -a {} runs a file and {} is a request: give one of the two", file, request.join(" "));
+        exit_process(1);
+    }
+
     // Route all credential I/O to a file instead of the OS keychain.
     // Must happen before any keychain access below.
     if args.no_keychain {
-        let path = std::env::var("API_CREDENTIALS_FILE")
+        // Set to nothing is not set. The value is a path, whatever bytes it
+        // is written in.
+        let path = std::env::var_os("API_CREDENTIALS_FILE")
+            .filter(|value| !value.is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(".api-credentials.json"));
+            .unwrap_or_else(|| PathBuf::from(".api-credentials.json"));
         enable_no_keychain(path);
     }
 
@@ -4050,6 +4153,10 @@ fn main() {
 
     // Apply CLI args to config
     if let Some(ref uri) = args.base_uri {
+        if let Some(problem) = base_url_problem(uri) {
+            errln!("error: invalid value for -b: {} ({})", uri, problem);
+            exit_process(1);
+        }
         config.base_uri = normalize_base_uri(uri);
     }
     config.silent = args.silent;
@@ -4318,11 +4425,31 @@ fn main() {
         let envs = list_connections();
         let default_connection = get_default_connection();
 
+        // A default that names a connection when none is saved.
+        if let Some(def) = default_connection.as_ref().filter(|_| envs.is_empty()) {
+            errln!(
+                "WARNING: the default connection \"{}\" is not among the saved connections (none). No saved connection is used.",
+                def
+            );
+        }
+
         if !envs.is_empty() {
             // If there's a default connection, auto-load it
             if let Some(ref def) = default_connection {
                 if let Some(env) = load_connection(def) {
-                    if has_explicit_auth {
+                    // With a credential from the command line only the URL
+                    // is taken, so only the URL has to be one.
+                    let problem = match has_explicit_auth {
+                        true => base_url_problem(&env.url),
+                        false => connection_problem(&env),
+                    };
+                    if let Some(problem) = problem {
+                        errln!(
+                            "WARNING: the default connection \"{}\" can't be used: {}. No saved connection is used.",
+                            def,
+                            problem
+                        );
+                    } else if has_explicit_auth {
                         // URL only. Deliberately not apply_connection_to_config:
                         // an oauth2 connection would exchange a token we'd throw
                         // away, and the CLI credential must win.
@@ -4890,6 +5017,30 @@ fn op_environment(env_data: &Value, selector: &str) -> Result<(String, String), 
 
 /// Returns (connected, complete) where:
 /// - connected: true if server responded at all
+/// Whether a server with this `openapi-metadata-version` has a spec the
+/// client can complete from: 1.1 or later. Only the first two numbers are
+/// looked at, and a missing second one is 0, so `1.1`, `1.1.0`, `1.2-beta`,
+/// `2` and `2.0` all do. A version that does not start with a number is one
+/// the client can't read: no spec, as for a server that names none.
+fn metadata_version_has_spec(version: &str) -> bool {
+    let number = |part: &str| {
+        let digits: String = part.chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse::<u32>().ok()
+    };
+    let mut parts = version.trim().split('.');
+    let Some(major) = parts.next().and_then(number) else {
+        return false;
+    };
+    let minor = match parts.next() {
+        Some(part) => match number(part) {
+            Some(minor) => minor,
+            None => return false,
+        },
+        None => 0,
+    };
+    major > 1 || (major == 1 && minor >= 1)
+}
+
 /// Check connection by calling /about endpoint
 /// Returns: (connected, complete, streaming)
 /// - connected: true if server responded
@@ -4918,19 +5069,10 @@ fn check_connection(config: &Config) -> Result<(bool, bool, bool), u16> {
             }
             // Server responded - we're connected
             if let Ok(body) = resp.json::<serde_json::Value>() {
-                let complete = if let Some(version) = body.get("openapi-metadata-version").and_then(|v| v.as_str()) {
-                    if let Some((major, minor)) = version.split_once('.') {
-                        if let (Ok(maj), Ok(min)) = (major.parse::<u32>(), minor.parse::<u32>()) {
-                            maj > 1 || (maj == 1 && min >= 1)
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
+                let complete = body
+                    .get("openapi-metadata-version")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(metadata_version_has_spec);
                 // Check for streaming in feature-flags array within /about response
                 let streaming = body.get("feature-flags")
                     .and_then(|v| v.as_array())
@@ -5440,6 +5582,9 @@ struct TransferProgress {
     status: AtomicU16,
     received: AtomicU64,
     total: AtomicU64,
+    /// The charset the body was decoded as, once decoding has replaced bytes
+    /// that are not valid in it: see `decode_body`.
+    replaced: std::sync::Mutex<Option<&'static str>>,
 }
 
 /// One consistent reading of a `TransferProgress`.
@@ -5458,7 +5603,14 @@ impl TransferProgress {
             status: AtomicU16::new(0),
             received: AtomicU64::new(0),
             total: AtomicU64::new(TOTAL_UNKNOWN),
+            replaced: std::sync::Mutex::new(None),
         })
+    }
+
+    /// The charset of a body that was not all of that charset, if the body
+    /// read was such a one.
+    fn replaced(&self) -> Option<&'static str> {
+        self.replaced.lock().ok().and_then(|charset| *charset)
     }
 
     fn headers_arrived(&self, resp: &reqwest::blocking::Response) {
@@ -5538,14 +5690,21 @@ fn charset_of(content_type: &str) -> Option<&str> {
 }
 
 /// Decode a body as reqwest's `text()` would: the declared charset, UTF-8
-/// when there is none, a leading byte-order mark dropped.
-fn decode_body(bytes: &[u8], content_type: Option<&str>) -> String {
+/// when there is none, a leading byte-order mark dropped. Bytes that are not
+/// valid in the charset become U+FFFD; the charset is returned beside the
+/// text when that happened, since the text is then not what the server sent.
+fn decode_body(bytes: &[u8], content_type: Option<&str>) -> (String, Option<&'static str>) {
     let encoding = content_type
         .and_then(charset_of)
         .and_then(|label| encoding_rs::Encoding::for_label(label.as_bytes()))
         .unwrap_or(encoding_rs::UTF_8);
-    let (text, _, _) = encoding.decode(bytes);
-    text.into_owned()
+    let (text, used, replaced) = encoding.decode(bytes);
+    (text.into_owned(), replaced.then(|| used.name()))
+}
+
+/// What to say about a body that `decode_body` had to replace bytes of.
+fn replaced_bytes_warning(charset: &str) -> String {
+    format!("WARNING: the response held bytes that are not valid {}: each is now U+FFFD (\u{fffd})", charset)
 }
 
 /// Read a whole response body, counting it into `progress` as it arrives.
@@ -5557,7 +5716,11 @@ fn read_body_text(resp: reqwest::blocking::Response, progress: &TransferProgress
         .map(str::to_string);
     let mut bytes = Vec::new();
     CountingReader::new(resp, progress).read_to_end(&mut bytes)?;
-    Ok(decode_body(&bytes, content_type.as_deref()))
+    let (text, replaced) = decode_body(&bytes, content_type.as_deref());
+    if let Ok(mut noted) = progress.replaced.lock() {
+        *noted = replaced;
+    }
+    Ok(text)
 }
 
 /// Whether a failed body read was the client's own timeout, which reqwest
@@ -5616,6 +5779,13 @@ fn describe_tls_failure(e: &rustls::Error, host: &str) -> String {
     }
 }
 
+/// What to say when the server sent the request on more often than the
+/// client follows. It answered every time, so it is not asked about as a
+/// server that is not there.
+fn describe_redirect_failure(host: &str) -> String {
+    format!("Too many redirects from {}: the request was never answered.", host)
+}
+
 /// The host part of a base URL, as the connection messages name it.
 fn host_of(base_uri: &str) -> &str {
     base_uri.trim_start_matches("https://").trim_start_matches("http://")
@@ -5626,6 +5796,8 @@ struct RequestFailure {
     timed_out: bool,
     /// A refused certificate or a failed handshake, described.
     tls: Option<String>,
+    /// The request was sent on from one place to the next without an end.
+    redirected: bool,
     /// The response came, and its body stopped before its end or stalled.
     body: Option<io::Error>,
 }
@@ -5635,6 +5807,7 @@ impl RequestFailure {
         RequestFailure {
             timed_out: e.is_timeout(),
             tls: tls_failure(&e).map(|tls| describe_tls_failure(tls, host_of(base_uri))),
+            redirected: e.is_redirect(),
             body: None,
         }
     }
@@ -5642,7 +5815,7 @@ impl RequestFailure {
 
 impl From<io::Error> for RequestFailure {
     fn from(e: io::Error) -> Self {
-        RequestFailure { timed_out: io_error_is_timeout(&e), tls: None, body: Some(e) }
+        RequestFailure { timed_out: io_error_is_timeout(&e), tls: None, redirected: false, body: Some(e) }
     }
 }
 
@@ -6487,7 +6660,12 @@ impl UrlCondition {
     fn matches(&self, url: &str) -> bool {
         match self {
             UrlCondition::Has(s) => url.contains(s.as_str()),
-            UrlCondition::Is(s) => url == s,
+            // The value is a base URL, read as `-b` reads one. What can't
+            // be read as one matches only as it is written.
+            UrlCondition::Is(s) => {
+                let written = normalize_base_uri(s);
+                url == s || (!written.is_empty() && host_lowered(&written) == host_lowered(url))
+            }
         }
     }
     /// The original directive text, for error messages.
@@ -6791,6 +6969,14 @@ fn format_latency(d: Duration) -> String {
     } else {
         format_minutes(hundredths / 100)
     }
+}
+
+/// A base URL with its host in lower case, for comparing: a host is the same
+/// host in any case, a path below it is not.
+fn host_lowered(base_url: &str) -> String {
+    let from = base_url.find("://").map_or(0, |at| at + 3);
+    let to = base_url[from..].find('/').map_or(base_url.len(), |at| from + at);
+    format!("{}{}{}", &base_url[..from], base_url[from..to].to_ascii_lowercase(), &base_url[to..])
 }
 
 /// If `line` (already trimmed, known not to be a request) is a `url has`/`url is`
@@ -9263,7 +9449,22 @@ fn confirm_preview(lines: &[String], base_uri: &str) -> bool {
             .strip_prefix("&&")
             .or_else(|| trimmed_line.strip_prefix("||"))
             .unwrap_or(line);
-        if let Some(m) = line.split_whitespace().next() {
+        // A check sends a request too: the one behind `assert [not]` and
+        // behind `sleep <interval> while [not]`.
+        let mut words = line.split_whitespace().peekable();
+        match words.peek().copied() {
+            Some("assert") => {
+                words.next();
+            }
+            Some("sleep") if line.split_whitespace().nth(2) == Some("while") => {
+                words.nth(2);
+            }
+            _ => {}
+        }
+        if words.peek() == Some(&"not") {
+            words.next();
+        }
+        if let Some(m) = words.next() {
             if http_methods.contains(&m.to_uppercase().as_str()) {
                 request_count += 1;
                 if !methods.iter().any(|x| x == m) {
@@ -9708,6 +9909,15 @@ fn home_relative(path: &str, backslash_separates: bool) -> Option<&str> {
         .or_else(|| if backslash_separates { path.strip_prefix("~\\") } else { None })
 }
 
+/// A request path with each `\` of its path part written `%5C`. A URL parser
+/// reads a `\` in an `http` path as another `/`, so the escaped quote of
+/// `~where(name="a \" b")` would arrive as `/"`. Nothing else is touched: a
+/// query keeps its `\`, which is not rewritten there.
+fn backslashes_encoded(path: &str) -> String {
+    let end = path.find(['?', '#']).unwrap_or(path.len());
+    format!("{}{}", path[..end].replace('\\', "%5C"), &path[end..])
+}
+
 /// A request ready to send, and the `Accept` it carries (which says how the
 /// response is to be read).
 struct BuiltRequest {
@@ -9721,7 +9931,7 @@ struct BuiltRequest {
 /// here. `Err` is an `@file` body that could not be read; nothing is sent.
 fn build_request(config: &Config, parts: &RequestParts) -> Result<BuiltRequest, String> {
     let client = build_request_client(config.timeout_secs);
-    let url = format!("{}{}", config.base_uri, resolve_request_path(&config.api_path, &parts.uri));
+    let url = format!("{}{}", config.base_uri, backslashes_encoded(&resolve_request_path(&config.api_path, &parts.uri)));
 
     let mut request = match parts.method.as_str() {
         "GET" => client.get(&url),
@@ -10225,6 +10435,8 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                 );
             } else if let Some(tls) = tls_failure(&e) {
                 errln!("{}\n", describe_tls_failure(tls, host_of(&config.base_uri)));
+            } else if e.is_redirect() {
+                errln!("{}\n", describe_redirect_failure(host_of(&config.base_uri)));
             } else {
                 errln!("Is COS running on {}? 🤔\n", host_of(&config.base_uri));
             }
@@ -10347,6 +10559,16 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
     if config.quiet || config.check_only {
         config.last_response = Some((status.as_u16(), body_text));
         return outcome;
+    }
+
+    // A body that is shown or written is not the bytes the server sent when
+    // some of them were not of its charset. Said once, and with `-s` too: it
+    // is about the data, not about the run. A body that goes nowhere (a
+    // `-sa` line without an outfile) has nothing to be said about.
+    if let Some(charset) = progress.replaced() {
+        if target.is_some() || !config.bulk_silent || fail_fast_trips(config, status.as_u16()) {
+            errln!("{}", replaced_bytes_warning(charset));
+        }
     }
 
     // `-f`: this response ends the run. Nothing is written to an
@@ -12397,6 +12619,8 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
                 )
             } else if let Some(tls) = &e.tls {
                 format!("\n{}\n\n", tls)
+            } else if e.redirected {
+                format!("\n{}\n\n", describe_redirect_failure(host_of(&state.config.base_uri)))
             } else {
                 format!("\nIs COS running on {}? 🤔\n\n", host_of(&state.config.base_uri))
             };
@@ -12410,6 +12634,11 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     // Said last, so it is what the hint line shows under the response.
     if let Some(note) = export_note.filter(|_| !state.config.quiet && !state.config.check_only) {
         state.status_msg = note;
+        state.status_msg_at = Some(Instant::now());
+    }
+    // And this after it: what is shown or written is not what was sent.
+    if let Some(charset) = progress.replaced().filter(|_| !state.config.quiet && !state.config.check_only) {
+        state.status_msg = format!("response had bytes that are not valid {}, now U+FFFD", charset);
         state.status_msg_at = Some(Instant::now());
     }
 
@@ -17325,6 +17554,18 @@ fn parse_body_functions(body: &str) -> (String, Vec<(String, String)>) {
     (remaining, headers)
 }
 
+/// The bytes of a file that is a body, without the UTF-8 byte order mark
+/// some editors put in front of a text. Only a text has one: when what
+/// follows the mark is not UTF-8 throughout, the file is something else that
+/// happens to start with those three bytes, and is left as it is.
+fn without_bom(mut bytes: Vec<u8>) -> Vec<u8> {
+    const BOM: &[u8] = b"\xEF\xBB\xBF";
+    if bytes.starts_with(BOM) && std::str::from_utf8(&bytes[BOM.len()..]).is_ok() {
+        bytes.drain(..BOM.len());
+    }
+    bytes
+}
+
 /// Result of resolving an `@file` (possibly glob) body argument.
 struct AtFileResult {
     contents: Vec<u8>,
@@ -17346,6 +17587,7 @@ fn resolve_at_file_body(path_raw: &str) -> Result<AtFileResult, String> {
         // Single file — preserve existing behavior
         match fs::read(&expanded) {
             Ok(contents) => {
+                let contents = without_bom(contents);
                 let (content_type, accept_type) = match outfile_format(&expanded) {
                     OutFormat::Ndjson => (
                         Some("application/x-ndjson".to_string()),
@@ -17381,6 +17623,7 @@ fn resolve_at_file_body(path_raw: &str) -> Result<AtFileResult, String> {
             let mut combined: Vec<u8> = Vec::new();
             for path in &paths {
                 let bytes = fs::read(path)
+                    .map(without_bom)
                     .map_err(|e| format!("could not read {}: {}", path.display(), e))?;
                 combined.extend_from_slice(&bytes);
                 if !combined.ends_with(b"\n") {
@@ -17397,6 +17640,7 @@ fn resolve_at_file_body(path_raw: &str) -> Result<AtFileResult, String> {
             let mut combined: Vec<Value> = Vec::new();
             for path in &paths {
                 let bytes = fs::read(path)
+                    .map(without_bom)
                     .map_err(|e| format!("could not read {}: {}", path.display(), e))?;
                 let v: Value = serde_json::from_slice(&bytes).map_err(|e| {
                     format!("invalid JSON in {}: {}", path.display(), e)
@@ -17930,6 +18174,9 @@ fn get_schema_for_path(state: &AppState, path: &str) -> String {
     String::new()
 }
 
+// Unit tests. They need this machine only: no server, no credentials, no
+// network, no clipboard. The import tests build git repositories in a
+// temporary directory, so `git` must be on the `PATH`.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -18874,7 +19121,9 @@ mod tests {
             negate,
             request: request.to_string(),
         };
-        let five = DEFAULT_SLEEP_WHILE_INTERVAL;
+        // The documented default, as a number: not the constant, which
+        // would agree with itself whatever it was changed to.
+        let five = Duration::from_secs(5);
         assert_eq!(
             parse_sleep_step("while GET /people~count/==0").unwrap(),
             step(five, false, "GET /people~count/==0")
@@ -19189,15 +19438,16 @@ mod tests {
 
     #[test]
     fn a_chain_segment_must_be_a_request() {
-        for line in ["GET /a && sleep 1", "GET /a || peple", "assert /a && GET /b"] {
+        for (line, says) in [
+            ("GET /a && sleep 1", "chain segment is not a request: `sleep 1`"),
+            ("GET /a || peple", "chain segment is not a request: `peple`"),
+            ("assert /a && GET /b", "assert condition can't be a `&&`/`||` chain: `/a && GET /b`"),
+        ] {
             let err = match split_bulk_requests(line, None) {
                 Err(e) => e,
                 Ok(p) => panic!("{line} parsed as {:?}", p.steps),
             };
-            assert!(
-                err.contains("chain segment is not a request") || err.contains("can't be a"),
-                "{line}: {err}"
-            );
+            assert_eq!(err, says, "{line}");
         }
         // The real thing still parses.
         assert!(matches!(
@@ -23071,13 +23321,21 @@ mod tests {
 
     #[test]
     fn decode_body_matches_what_reqwest_text_would_give() {
-        assert_eq!(decode_body("{\"name\":\"Åsa\"}".as_bytes(), None), "{\"name\":\"Åsa\"}");
+        assert_eq!(decode_body("{\"name\":\"Åsa\"}".as_bytes(), None), ("{\"name\":\"Åsa\"}".to_string(), None));
         // A byte-order mark is dropped, as `text()` drops it.
-        assert_eq!(decode_body(b"\xEF\xBB\xBF[1]", Some("application/json")), "[1]");
+        assert_eq!(decode_body(b"\xEF\xBB\xBF[1]", Some("application/json")), ("[1]".to_string(), None));
         // A declared charset is honoured.
-        assert_eq!(decode_body(b"\xC5sa", Some("text/plain; charset=iso-8859-1")), "Åsa");
-        // An unknown one falls back to UTF-8, invalid bytes replaced rather than fatal.
-        assert_eq!(decode_body(b"a\xFFb", Some("text/plain; charset=nonsense")), "a\u{FFFD}b");
+        assert_eq!(decode_body(b"\xC5sa", Some("text/plain; charset=iso-8859-1")).0, "Åsa");
+        // An unknown one falls back to UTF-8, invalid bytes replaced rather than fatal,
+        // and the charset they were not valid in is handed back.
+        assert_eq!(decode_body(b"a\xFFb", Some("text/plain; charset=nonsense")), ("a\u{FFFD}b".to_string(), Some("UTF-8")));
+        assert_eq!(decode_body(b"\"caf\xE9\"", None), ("\"caf\u{FFFD}\"".to_string(), Some("UTF-8")));
+        // A U+FFFD the server sent is not one the client put there.
+        assert_eq!(decode_body("a\u{FFFD}b".as_bytes(), None).1, None);
+        assert_eq!(
+            replaced_bytes_warning("UTF-8"),
+            "WARNING: the response held bytes that are not valid UTF-8: each is now U+FFFD (\u{fffd})"
+        );
     }
 
     #[test]
@@ -28405,5 +28663,204 @@ mod tests {
         assert_eq!(ghost_then_tab(r#"PUT /zoo {"animals": ["#, true).0, "");
         assert_eq!(ghost_then_tab(r#"PUT /zoo {"animals": [{""#, true).0, "");
         assert_eq!(ghost_then_tab_everywhere("GET /zoo/animals/x/"), "");
+    }
+
+    #[test]
+    fn the_api_prefix_of_a_base_url_is_cut_in_any_case() {
+        for (typed, base) in [
+            ("http://h/API/v1", "http://h"),
+            ("https://h/Api", "https://h"),
+            ("h/tenant/API/V1/people", "https://h/tenant"),
+            ("localhost:5000/Api/v1/", "http://localhost:5000"),
+        ] {
+            assert_eq!(base_url_of(typed), (base.to_string(), true), "{typed}");
+        }
+        // Still only a whole component.
+        assert_eq!(base_url_of("https://h/APIary"), ("https://h/APIary".to_string(), false));
+    }
+
+    #[test]
+    fn url_is_compares_base_urls_and_url_has_compares_text() {
+        let is = |value: &str, base: &str| UrlCondition::Is(value.to_string()).matches(base);
+        for value in [
+            "http://127.0.0.1:9",
+            "http://127.0.0.1:9/",
+            "HTTP://127.0.0.1:9",
+            "http://127.0.0.1:9/api",
+            "http://127.0.0.1:9/API/v1/",
+            "127.0.0.1:9",
+        ] {
+            assert!(is(value, "http://127.0.0.1:9"), "{value}");
+        }
+        // A host is the same host in any case, on either side.
+        assert!(is("https://COS.Example.com", "https://cos.example.com"));
+        assert!(is("cos.example.com/api/v1", "https://COS.example.com"));
+        // A path below the host is not.
+        assert!(is("https://h/Tenant", "https://h/Tenant"));
+        assert!(!is("https://h/tenant", "https://h/Tenant"));
+        for value in ["https://127.0.0.1:9", "http://127.0.0.1:90", "http://127.0.0.1:9/tenant", "http://127.0.0.1", "ftp://127.0.0.1:9"] {
+            assert!(!is(value, "http://127.0.0.1:9"), "{value}");
+        }
+        // `has` is a piece of the URL as the client has it.
+        let has = |value: &str, base: &str| UrlCondition::Has(value.to_string()).matches(base);
+        assert!(has("127.0.0.1:9", "http://127.0.0.1:9"));
+        assert!(!has("127.0.0.1:9/", "http://127.0.0.1:9"));
+        assert!(!has("HTTP://", "http://127.0.0.1:9"));
+    }
+
+    #[test]
+    fn a_store_is_read_behind_a_byte_order_mark_and_under_its_old_name() {
+        let entry = r#"{"name":"a","url":"http://h","auth_type":"key","credential":"k"}"#;
+        let marked = parse_store(&format!("\u{feff}{{\"connections\":[{entry}],\"default\":\"a\"}}")).unwrap();
+        assert_eq!((marked.connections.len(), marked.default.as_str()), (1, "a"));
+        assert!(parse_store("\u{feff}").unwrap().connections.is_empty());
+        // What the client wrote when a connection was an environment.
+        let old = parse_store(&format!("{{\"environments\":[{entry}],\"default\":\"a\"}}")).unwrap();
+        assert_eq!(old.connections.len(), 1);
+        assert_eq!((old.connections[0].name.as_str(), old.connections[0].url.as_str()), ("a", "http://h"));
+        assert_eq!(old.default, "a");
+        // And it is written back under the name it has now.
+        let written = serde_json::to_string(&old).unwrap();
+        assert!(written.starts_with(r#"{"connections":[{"name":"a","#), "{written}");
+    }
+
+    #[test]
+    fn a_text_body_is_sent_without_its_byte_order_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let at = |name: &str| dir.path().join(name).display().to_string();
+        let write = |name: &str, bytes: &[u8]| fs::write(dir.path().join(name), [b"\xEF\xBB\xBF", bytes].concat()).unwrap();
+        write("a.json", br#"{"a":1}"#);
+        write("b.JSON", br#"[{"b":2}]"#);
+        write("rows.csv", b"a,b\n1,2\n");
+        write("1.ndjson", b"{\"a\":1}\n");
+        write("2.ndjson", b"{\"b\":2}");
+        write("blob.bin", b"\xFF\x00");
+        write("only", b"");
+        let contents = |name: &str| resolve_at_file_body(&at(name)).unwrap().contents;
+        assert_eq!(contents("a.json"), br#"{"a":1}"#);
+        assert_eq!(contents("rows.csv"), b"a,b\n1,2\n");
+        assert_eq!(contents("1.ndjson"), b"{\"a\":1}\n");
+        assert_eq!(contents("only"), b"");
+        // Not text: the bytes the file holds, all of them.
+        assert_eq!(contents("blob.bin"), b"\xEF\xBB\xBF\xFF\x00");
+        // Each file of a glob.
+        assert_eq!(contents("*.[jJ][sS][oO][nN]"), br#"[{"a":1},{"b":2}]"#);
+        assert_eq!(contents("*.ndjson"), b"{\"a\":1}\n{\"b\":2}\n");
+    }
+
+    #[test]
+    fn a_base_url_with_another_scheme_or_a_broken_one_is_named() {
+        let other = |scheme: &str| Some(format!("a base URL starts with http:// or https://, not {scheme}://"));
+        let broken = |text: &str| Some(format!("{text} is not a URL: a base URL starts with http:// or https://"));
+        assert_eq!(base_url_problem("ftp://h"), other("ftp"));
+        assert_eq!(base_url_problem("FILE:///tmp/x"), other("file"));
+        assert_eq!(base_url_problem(" ws://h:1/api "), other("ws"));
+        assert_eq!(base_url_problem("git+ssh://h/x"), other("git+ssh"));
+        assert_eq!(base_url_problem("http:/h"), broken("http:/h"));
+        assert_eq!(base_url_problem("HTTPS:/h/api"), broken("HTTPS:/h/api"));
+        assert_eq!(base_url_problem("ftp:/h"), broken("ftp:/h"));
+        // A host with a port, a path, or nothing at all is not a scheme.
+        for fine in [
+            "http://h",
+            "HTTPS://h/api/v1",
+            "h",
+            "localhost:5000",
+            "localhost:5000/api/v1",
+            "example.com:8080/tenant",
+            "[::1]:5000",
+            "10.0.0.5",
+            "h/a:/b",
+            "",
+            "http://",
+        ] {
+            assert_eq!(base_url_problem(fine), None, "{fine}");
+        }
+    }
+
+    #[test]
+    fn a_saved_connection_is_usable_with_a_known_auth_type_and_a_base_url() {
+        let saved = |url: &str, auth_type: &str| SavedConnection {
+            name: "c".to_string(),
+            url: url.to_string(),
+            auth_type: auth_type.to_string(),
+            credential: "SECRET".to_string(),
+            client_id: String::new(),
+        };
+        for known in ["key", "token", "oauth2", "Key", "TOKEN", "OAuth2"] {
+            assert_eq!(connection_problem(&saved("http://h", known)), None, "{known}");
+            assert_eq!(known_auth_type(known), Some(known.to_ascii_lowercase().as_str()), "{known}");
+        }
+        for unknown in ["bearer", "basic", "", "oauth", "key "] {
+            assert_eq!(
+                connection_problem(&saved("http://h", unknown)),
+                Some(format!("its auth_type \"{unknown}\" is not \"key\", \"token\" or \"oauth2\"")),
+                "{unknown}"
+            );
+            // Nothing of it reaches the config: its credential is not a key.
+            let mut config = Config::default();
+            assert_eq!(
+                apply_connection_to_config(&mut config, &saved("http://h", unknown)),
+                Err(format!("The connection \"c\" can't be used: its auth_type \"{unknown}\" is not \"key\", \"token\" or \"oauth2\"."))
+            );
+            assert_eq!((config.base_uri.as_str(), config.api_key.as_str(), config.token.as_str()), ("", "", ""), "{unknown}");
+        }
+        // The URL is looked at first.
+        assert_eq!(
+            connection_problem(&saved("ftp://h", "bearer")),
+            Some("a base URL starts with http:// or https://, not ftp://".to_string())
+        );
+        // In any case a token is a token, and is sent as one.
+        let mut config = Config::default();
+        assert_eq!(apply_connection_to_config(&mut config, &saved("h", "Token")), Ok(()));
+        assert_eq!((config.base_uri.as_str(), config.api_key.as_str(), config.token.as_str()), ("https://h", "", "SECRET"));
+        // And the store hands it out in the spelling the client compares with.
+        let read = parse_store(
+            r#"{"connections":[{"name":"a","url":"h","auth_type":"OAuth2","credential":"s","client_id":"i"},{"name":"b","url":"h","auth_type":"Bearer","credential":"s"}]}"#,
+        )
+        .unwrap();
+        assert_eq!((read.connections[0].auth_type.as_str(), read.connections[1].auth_type.as_str()), ("oauth2", "Bearer"));
+    }
+
+    #[test]
+    fn the_metadata_version_is_read_by_its_first_two_numbers() {
+        for has_spec in ["1.1", "1.1.0", "1.2", "1.2-beta", "1.10", "2", "2.0", "2-beta", "3.0.0-rc.1", " 1.1 "] {
+            assert!(metadata_version_has_spec(has_spec), "{has_spec}");
+        }
+        for none in ["1.0", "1", "1.0.5", "0.9", "", "beta", "v1.1", "1.x", ".1", "-1.1"] {
+            assert!(!metadata_version_has_spec(none), "{none}");
+        }
+    }
+
+    #[test]
+    fn a_backslash_in_the_path_of_a_request_is_percent_encoded() {
+        assert_eq!(backslashes_encoded(r#"/api/v1/a~where(n="a \" b")"#), r#"/api/v1/a~where(n="a %5C" b")"#);
+        assert_eq!(backslashes_encoded(r"/a\b\c"), "/a%5Cb%5Cc");
+        // Only the path, and nothing else of it.
+        assert_eq!(backslashes_encoded(r"/a\b?x=c\d"), r"/a%5Cb?x=c\d");
+        assert_eq!(backslashes_encoded(r"/a#x\y"), r"/a#x\y");
+        assert_eq!(backslashes_encoded("/a%5Cb/c d/å~where(x=1)"), "/a%5Cb/c d/å~where(x=1)");
+        assert_eq!(backslashes_encoded(""), "");
+    }
+
+    #[test]
+    fn a_certificate_that_is_not_valid_yet_or_was_revoked_is_said_to_be_that() {
+        let says = |why| describe_tls_failure(&rustls::Error::InvalidCertificate(why), "example.com:8443");
+        assert_eq!(
+            says(rustls::CertificateError::NotValidYet),
+            "The certificate of example.com:8443 is not trusted: it is not valid yet."
+        );
+        assert_eq!(
+            says(rustls::CertificateError::Revoked),
+            "The certificate of example.com:8443 is not trusted: it has been revoked."
+        );
+        // Anything else about a certificate is the public authorities' line.
+        assert_eq!(
+            says(rustls::CertificateError::BadSignature),
+            "The certificate of example.com:8443 is not trusted: it is not signed by a public certificate authority."
+        );
+        assert_eq!(
+            describe_redirect_failure("example.com:8443"),
+            "Too many redirects from example.com:8443: the request was never answered."
+        );
     }
 }

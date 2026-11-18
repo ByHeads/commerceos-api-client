@@ -1,15 +1,32 @@
-//! End-to-end CLI tests against a running local CommerceOS instance.
+//! End-to-end CLI tests.
 //!
-//! Requirements:
-//!   - Credentials on disk: copy `.api-credentials-sample.json` to
-//!     `.api-credentials.json` in the repo root and fill in the key for
-//!     http://localhost:5000. (Or set `API_TEST_BASE_URI` + `API_TEST_KEY`.)
-//!     Tests run with `--no-keychain`, so the OS keychain is never unlocked.
-//!   - The local server must respond to `/echo-all`, which echoes back whatever it receives
-//!     (either as a single-element array or the array itself).
+//! What each test needs:
 //!
-//! All tests target the `/echo-all` endpoint so nothing is persisted.
-//! Run with: `cargo test --test cli`
+//!   - **A local CommerceOS and a credentials file**: every test that calls
+//!     `require_local_cos()`, about fifty of them. They send to `/echo-all`
+//!     (which echoes what it receives, as an array), `/about` and `/assert`,
+//!     so nothing is persisted, and they panic with instructions when the
+//!     server or the credentials are missing. Copy
+//!     `.api-credentials-sample.json` to `.api-credentials.json` in the repo
+//!     root and fill in the key for http://localhost:5000, or set
+//!     `API_TEST_BASE_URI` + `API_TEST_KEY`. The server must have the
+//!     `/assert` endpoint: `fail_fast_against_the_assert_endpoint_of_a_local_cos`
+//!     fails on one that has not.
+//!   - **Nothing but this machine**: the rest. They start a small server of
+//!     their own on a free port of 127.0.0.1 (`answering_server`,
+//!     `whole_request_server`, `flipping_server`, …) or send nothing at all,
+//!     and are where a test belongs whose point is what was sent.
+//!   - **The system clipboard**: the tests with `clipboard` in their name
+//!     copy to it, and overwrite what it held. They take turns inside this
+//!     suite, but run them on their own and one at a time:
+//!     `cargo test --test cli -- clipboard --test-threads=1`. On macOS
+//!     `export_to_the_clipboard_…` reads it back with `pbpaste`.
+//!   - **git** on the `PATH`, for the import tests (local repositories only).
+//!
+//! No test contacts a host other than this machine. Tests run with
+//! `--no-keychain`, so the OS keychain is never unlocked.
+//!
+//! Run with: `cargo test --test cli -- --skip clipboard`
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -222,45 +239,52 @@ fn glob_at_file_combines_json_files_into_array() {
         .success();
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
 
-    // All four items should be present in the echoed array
-    for name in &["Alice", "Bob", "Carol", "Dan"] {
-        assert!(stdout.contains(name), "expected {name} in: {stdout}");
-    }
-}
-
-#[test]
-fn glob_at_file_combines_ndjson_streams() {
-    require_local_cos();
-    let dir = tempdir().unwrap();
-    std::fs::write(dir.path().join("a.ndjson"), "{\"row\":1}\n{\"row\":2}\n").unwrap();
-    std::fs::write(dir.path().join("b.ndjson"), "{\"row\":3}\n{\"row\":4}\n").unwrap();
-
-    let pattern = format!("@{}/*.ndjson", dir.path().display());
-    let assert = api()
-        .args(["PUT", "/echo-all", &pattern, "--ndjson"])
-        .assert()
-        .success();
-    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
-
-    // Server may echo a different shape; we just check the request succeeded.
-    // (The server-side handler determines the response.)
-    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
-    assert!(
-        stderr.contains("HTTP/1.1 200"),
-        "expected 200, stderr={stderr} stdout={stdout}"
+    // One array: the files in sorted order, an object as one element and an
+    // array flattened into its elements.
+    let echoed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+    assert_eq!(
+        echoed,
+        serde_json::json!([
+            {"id": 1, "name": "Alice"},
+            {"id": 2, "name": "Bob"},
+            {"id": 3, "name": "Carol"},
+            {"id": 4, "name": "Dan"}
+        ]),
+        "{stdout}"
     );
 }
 
 #[test]
+fn glob_at_file_combines_ndjson_streams() {
+    // What is sent is the point, so a server that keeps the request whole.
+    let (port, server) = whole_request_server(vec![("200 OK", "null")]);
+    let dir = tempdir().unwrap();
+    // Written out of order: the files are sent in sorted order.
+    std::fs::write(dir.path().join("b.ndjson"), "{\"row\":3}\n{\"row\":4}\n").unwrap();
+    std::fs::write(dir.path().join("a.ndjson"), "{\"row\":1}\n{\"row\":2}\n").unwrap();
+
+    let pattern = format!("@{}/*.ndjson", dir.path().display());
+    let out = api_against_port(port).args(["PUT", "/things", &pattern]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let seen = server.join().unwrap();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert!(seen[0].starts_with("PUT /api/v1/things HTTP/1.1\r\n"), "{}", seen[0]);
+    assert_eq!(header(&seen[0], "content-type"), Some("application/x-ndjson"), "{}", seen[0]);
+    // One stream, a record per line.
+    let body = seen[0].split_once("\r\n\r\n").unwrap().1;
+    assert_eq!(body.lines().collect::<Vec<_>>(), [r#"{"row":1}"#, r#"{"row":2}"#, r#"{"row":3}"#, r#"{"row":4}"#], "{body:?}");
+}
+
+#[test]
 fn glob_with_no_matches_errors() {
-    require_local_cos();
+    let (port, server) = answering_server(vec![OK]);
     let dir = tempdir().unwrap();
     let pattern = format!("@{}/nothing-*.json", dir.path().display());
-    api()
-        .args(["PUT", "/echo-all", &pattern])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("no files match"));
+    let out = api_against_port(port).args(["PUT", "/things", &pattern]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no files match"), "{}", String::from_utf8_lossy(&out.stderr));
+    // And nothing was sent in the body's place.
+    assert_eq!(server.join().unwrap(), Vec::<String>::new());
 }
 
 #[test]
@@ -766,36 +790,20 @@ fn or_chain_runs_fallback_on_falsy_and_skips_on_truthy() {
 
 #[test]
 fn mixed_chain_behaves_as_if_then_else() {
-    require_local_cos();
-    let dir = tempdir().unwrap();
+    // Which branch was sent is the point: a server that says what it got.
+    let chain = "GET /cond && PUT /then {\"then\":1} || PUT /else {\"else\":1}\nGET /after\n";
 
-    // Truthy condition: && branch runs, || branch skipped → 2 requests sent.
-    let req = dir.path().join("ite-truthy.api");
-    std::fs::write(
-        &req,
-        "GET /about && PUT /echo-all [{\"then\":1}] || PUT /echo-all [{\"else\":1}]\n",
-    )
-    .unwrap();
-    let assert = api().args(["-sa"]).arg(&req).assert().success();
-    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
-    assert_eq!(stdout.matches("└─HTTP/1.1").count(), 2, "then-branch only: {stdout}");
-    assert!(stdout.contains("skipped 1 request"), "else-branch skipped: {stdout}");
+    // Truthy condition: the && branch runs and the || branch is skipped.
+    let run = run_fail_fast("-sa", chain, vec![OK]);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.seen, vec!["GET /cond", "PUT /then", "GET /after"]);
+    assert!(run.stdout.contains("skipped 1 request"), "else-branch skipped: {}", run.stdout);
 
-    // Falsy condition: && branch skipped, || branch runs → 2 requests sent,
-    // and the else body is the one that went out.
-    let req = dir.path().join("ite-falsy.api");
-    std::fs::write(
-        &req,
-        "GET /no-such-endpoint && PUT /echo-all [{\"then\":1}] || PUT /echo-all [{\"else\":1}]\n",
-    )
-    .unwrap();
-    let assert = api().args(["-sa"]).arg(&req).assert().success();
-    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
-    assert_eq!(stdout.matches("└─HTTP/1.1").count(), 2, "else-branch ran: {stdout}");
-    assert!(stdout.contains("\"else\":1"), "the else body should have been sent: {stdout}");
-    assert!(!stdout.contains("\"then\":1") || stdout.matches("PUT /echo-all").count() == 2,
-        "then-branch must not run: {stdout}");
-    assert!(stdout.contains("skipped 1 request"), "then-branch skipped: {stdout}");
+    // Falsy condition: the && branch is skipped and the || branch runs.
+    let run = run_fail_fast("-sa", chain, vec![NOT_FOUND, OK]);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.seen, vec!["GET /cond", "PUT /else", "GET /after"]);
+    assert!(run.stdout.contains("skipped 1 request"), "then-branch skipped: {}", run.stdout);
 }
 
 /// A tiny HTTP server that answers each request with the next body from
@@ -1298,80 +1306,41 @@ fn one_shot_runs_an_api_file_named_as_the_argument() {
 
 #[test]
 fn sleep_while_aborts_on_error_status() {
-    require_local_cos();
-    let dir = tempdir().unwrap();
-    // A bad key makes the poll a 401: Errored, not falsy — the run must stop
-    // with exit 1 and say why, rather than retry forever.
-    let req = dir.path().join("poll-err.api");
-    std::fs::write(&req, "sleep 100ms while GET /about\nGET /about\n").unwrap();
-    let mut cmd = Command::cargo_bin("api").expect("api binary built");
-    cmd.arg("--no-keychain");
-    cmd.env("API_CREDENTIALS_FILE", credentials_file());
-    let assert = cmd
-        .args(["-b", "http://localhost:5000", "-k", "badkey", "-sa"])
-        .arg(&req)
-        .assert()
-        .failure();
-    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
-    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
-    assert_eq!(stdout.matches("└─HTTP/1.1").count(), 1, "the 401 should be shown once: {stdout}");
-    assert!(stderr.contains("could not be evaluated"), "{stderr}");
-    assert!(!stdout.contains("waited"), "must not report success: {stdout}");
+    // A 401 on the poll is Errored, not falsy: the run must stop with exit 1
+    // and say why, rather than retry forever.
+    let run = run_fail_fast("-sa", "sleep 100ms while GET /q\nGET /never\n", vec![("401 Unauthorized", "{}"), OK]);
+    assert_eq!(run.code, Some(1), "{}", run.stderr);
+    assert_eq!(run.seen, vec!["GET /q"]);
+    assert_eq!(run.stdout.matches("└─HTTP/1.1 401").count(), 1, "the 401 should be shown once: {}", run.stdout);
+    assert!(run.stderr.contains("could not be evaluated"), "{}", run.stderr);
+    assert!(!run.stdout.contains("waited"), "must not report success: {}", run.stdout);
 }
 
 #[test]
 fn or_chain_does_not_catch_errors() {
-    require_local_cos();
-    let dir = tempdir().unwrap();
-    // A 401 is Errored, not Falsy — the || fallback must NOT run, and the run
+    // A 401 is Errored, not Falsy: the || fallback must NOT run, and the run
     // aborts with exit 1.
-    let req = dir.path().join("or-err.api");
-    std::fs::write(&req, "GET /about || PUT /echo-all [{\"fallback\":1}]\n").unwrap();
-    let mut cmd = Command::cargo_bin("api").expect("api binary built");
-    cmd.arg("--no-keychain");
-    cmd.env("API_CREDENTIALS_FILE", credentials_file());
-    let assert = cmd
-        .args(["-b", "http://localhost:5000", "-k", "badkey", "-sa"])
-        .arg(&req)
-        .assert()
-        .failure();
-    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
-    assert_eq!(
-        stdout.matches("└─HTTP/1.1").count(),
-        1,
-        "the fallback must not run on a 401: {stdout}"
-    );
+    let run = run_fail_fast("-sa", "GET /q || PUT /fallback {\"fallback\":1}\nGET /never\n", vec![("401 Unauthorized", "{}"), OK]);
+    assert_eq!(run.code, Some(1), "{}", run.stderr);
+    assert_eq!(run.seen, vec!["GET /q"], "the fallback must not run on a 401");
+    assert_eq!(run.stdout.matches("└─HTTP/1.1").count(), 1, "{}", run.stdout);
 }
 
-#[test]
-fn append_to_clipboard_is_rejected() {
-    require_local_cos();
-    let assert = api()
-        .args(["GET", "/echo-all >> clipboard"])
-        .assert()
-        .failure();
-    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
-    assert!(
-        stderr.contains("cannot append to clipboard"),
-        "expected append-to-clipboard rejection, got: {stderr}"
-    );
-}
 
 #[test]
 fn outfile_csv_extension_sets_csv_accept() {
-    require_local_cos();
+    let (port, server) = whole_request_server(vec![("200 OK", "a,b\n1,2\n")]);
     let dir = tempdir().unwrap();
     let outfile = dir.path().join("out.csv");
-    let uri_with_outfile = format!("/echo-all > {}", outfile.display());
+    let uri_with_outfile = format!("/things > {}", outfile.display());
 
-    let assert = api()
-        .args(["GET", &uri_with_outfile])
-        .assert()
-        .success();
-    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
-    // Server may not return CSV for a null payload, but the request must succeed —
-    // the goal is to verify the client sets the right Accept header without errors.
-    assert!(stderr.contains("HTTP/1.1") || std::fs::metadata(&outfile).is_ok());
+    let out = api_against_port(port).args(["GET", &uri_with_outfile]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let seen = server.join().unwrap();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert_eq!(header(&seen[0], "accept"), Some("text/csv"), "{}", seen[0]);
+    // And what came back is in the file as it came.
+    assert_eq!(std::fs::read_to_string(&outfile).unwrap(), "a,b\n1,2\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -1400,16 +1369,14 @@ fn explicit_api_prefix_is_used_as_is() {
 
 #[test]
 fn version_like_prefix_that_is_not_a_version_uses_default() {
-    require_local_cos();
-    // `/version/foo` is NOT a version prefix — should resolve to /api/v1/version/foo
-    // which is a 404 (no such endpoint), but the request itself reaches the server
-    // and gets a structured response.
-    let assert = api().args(["GET", "/version/foo"]).assert();
-    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
-    assert!(
-        stderr.contains("HTTP/1.1"),
-        "request should reach the server, stderr={stderr}"
-    );
+    // `/version/foo` is NOT a version prefix: it is a path under the default
+    // one, `/api/v1/version/foo`.
+    let (port, server) = whole_request_server(vec![("200 OK", "null")]);
+    let out = api_against_port(port).args(["GET", "/version/foo"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let seen = server.join().unwrap();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert!(seen[0].starts_with("GET /api/v1/version/foo HTTP/1.1\r\n"), "{}", seen[0]);
 }
 
 #[test]
@@ -1506,49 +1473,17 @@ fn bulk_mode_reads_from_stdin_when_no_value() {
     assert_eq!(stderr.matches("HTTP/1.1").count(), 2);
 }
 
-/// A bare api binary with --no-keychain and an explicit base/key, for tests that
-/// need a deterministic base URL (the URL gate) without touching saved creds.
-fn api_with_base(base: &str) -> Command {
-    let mut cmd = Command::cargo_bin("api").expect("api binary built");
-    cmd.arg("--no-keychain");
-    cmd.env("API_CREDENTIALS_FILE", credentials_file());
-    cmd.args(["-b", base, "-k", "testkey"]);
-    cmd
-}
-
-#[test]
-fn url_gate_blocks_non_matching_base() {
-    // No live server needed: the gate must fail before any request is attempted.
-    let dir = tempdir().unwrap();
-    let req_file = dir.path().join("gated.api");
-    std::fs::write(
-        &req_file,
-        "url has test.app.heads.com\nurl has localhost:5000\nGET /echo-all\n",
-    )
-    .unwrap();
-
-    api_with_base("https://api.heads.com")
-        .args(["-a"])
-        .arg(&req_file)
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("URL gate failed"));
-}
-
 #[test]
 fn url_gate_allows_matching_base() {
-    require_local_cos();
+    let (port, server) = answering_server(vec![OK]);
     let dir = tempdir().unwrap();
     let req_file = dir.path().join("gated-ok.api");
-    std::fs::write(
-        &req_file,
-        "url has localhost:5000\nGET /echo-all\n",
-    )
-    .unwrap();
+    // Two lines are an allowlist: one that fits is enough.
+    std::fs::write(&req_file, format!("url has nowhere.example.invalid\nurl has 127.0.0.1:{port}\nGET /gated\n")).unwrap();
 
-    let assert = api().args(["-a"]).arg(&req_file).assert().success();
-    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
-    assert_eq!(stderr.matches("HTTP/1.1").count(), 1, "stderr: {stderr}");
+    let out = api_against_port(port).args(["-a"]).arg(&req_file).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(server.join().unwrap(), vec!["GET /gated"]);
 }
 
 #[test]
@@ -1569,19 +1504,6 @@ fn bulk_sleep_directive_delays_execution() {
     );
 }
 
-#[test]
-fn bulk_sleep_invalid_value_errors() {
-    let dir = tempdir().unwrap();
-    let req_file = dir.path().join("badsleep.api");
-    std::fs::write(&req_file, "GET /echo-all\nsleep abc\n").unwrap();
-
-    api_with_base("http://localhost:5000")
-        .args(["-a"])
-        .arg(&req_file)
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("invalid sleep duration"));
-}
 
 #[test]
 fn bulk_mode_supports_outfile_per_line() {
@@ -1679,37 +1601,7 @@ fn bulk_mode_supports_include_directives() {
     assert!(stdout.contains("included"));
 }
 
-#[test]
-fn bulk_mode_include_loop_detected() {
-    require_local_cos();
-    let dir = tempdir().unwrap();
-    let a = dir.path().join("a.api");
-    let b = dir.path().join("b.api");
-    std::fs::write(&a, "b.api\n").unwrap();
-    std::fs::write(&b, "a.api\n").unwrap();
 
-    api()
-        .args(["-a"])
-        .arg(&a)
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("include loop"));
-}
-
-#[test]
-fn bulk_mode_include_not_found() {
-    require_local_cos();
-    let dir = tempdir().unwrap();
-    let main = dir.path().join("main.api");
-    std::fs::write(&main, "missing.api\n").unwrap();
-
-    api()
-        .args(["-a"])
-        .arg(&main)
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("include not found"));
-}
 
 #[test]
 fn bulk_mode_supports_multiline_bodies() {
@@ -1756,12 +1648,13 @@ fn bulk_mode_escapes_raw_newlines_in_strings() {
     let assert = api().args(["-a"]).arg(&req_file).assert().success();
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
 
-    // Server should have parsed the JSON successfully (newline escaped to \n)
-    // and echo back the bio with the escaped newline preserved as a real one in JSON output
-    assert!(
-        stdout.contains("line1\\nline2") || stdout.contains("line1\nline2"),
-        "expected escaped newline in echoed body: {stdout}"
-    );
+    // The server read the body as JSON, so the newline was sent escaped, and
+    // the value it echoes holds the newline. Printed, it is escaped again:
+    // the raw form in the output would be JSON nobody can read back.
+    assert!(stdout.contains("line1\\nline2"), "expected the escaped newline in the echoed body: {stdout}");
+    let echoed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+    let record = echoed.get(0).unwrap_or(&echoed);
+    assert_eq!(record["bio"], "line1\nline2", "{stdout}");
 }
 
 #[test]
@@ -1779,22 +1672,16 @@ fn silent_bulk_mode_prints_request_and_compact_status_only() {
         .success();
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
 
-    // Each request line should appear in output, each followed by a |-HTTP/1.1 status
-    assert!(
-        stdout.contains("PUT /echo-all [{\"name\":\"Joe\"}]"),
-        "expected request line in stdout: {stdout}"
-    );
-    assert!(stdout.contains("GET /echo-all"));
-    assert_eq!(
-        stdout.matches("└─HTTP/1.1").count(),
-        2,
-        "expected 2 compact status lines; got: {stdout}"
-    );
-    // No bodies should appear
-    assert!(
-        !stdout.contains("\"name\":\"Joe\"") || stdout.matches("\"name\"").count() == 1,
-        "body should not be echoed back in silent bulk mode (only in request line): {stdout}"
-    );
+    // The environment once, then each request line with its compact status
+    // under it, and nothing else: no line is left over for a body, whatever
+    // the server answered.
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 5, "{stdout}");
+    assert!(lines[0].starts_with("[http") && lines[0].ends_with(']'), "{stdout}");
+    assert_eq!(lines[1], "PUT /echo-all [{\"name\":\"Joe\"}]", "{stdout}");
+    assert!(lines[2].starts_with("└─HTTP/1.1 200 OK "), "{stdout}");
+    assert_eq!(lines[3], "GET /echo-all", "{stdout}");
+    assert!(lines[4].starts_with("└─HTTP/1.1 200 OK "), "{stdout}");
 }
 
 #[test]
@@ -2209,6 +2096,38 @@ fn a_certificate_nobody_signed_is_refused_and_nothing_is_sent_over_it() {
     }
 }
 
+/// The same in a batch: the run ends at the first line, with the certificate
+/// named and nothing sent, as it does for a single request.
+#[test]
+fn a_certificate_nobody_signed_ends_a_batch_at_its_first_request() {
+    let (port, server) = self_signed_https_server();
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("batch.api"), "GET /first\nGET /never\n").unwrap();
+    for flags in ["-sa", "-sfa"] {
+        let out = Command::cargo_bin("api")
+            .unwrap()
+            .arg("--no-keychain")
+            .env("API_CREDENTIALS_FILE", "/nonexistent/credentials.json")
+            .env("NO_COLOR", "1")
+            .current_dir(dir.path())
+            .args(["-b", &format!("https://127.0.0.1:{port}"), "-k", "my-secret-key", "--timeout", "5", flags, "batch.api"])
+            .output()
+            .expect("api runs");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{flags}: {stderr}");
+        assert_eq!(
+            stderr.trim(),
+            format!("The certificate of 127.0.0.1:{port} is not trusted: it is not signed by a public certificate authority."),
+            "{flags}"
+        );
+        // The log got as far as the request that could not be sent.
+        assert_eq!(String::from_utf8_lossy(&out.stdout), format!("[https://127.0.0.1:{port}]\nGET /first\n"), "{flags}");
+    }
+    let (shook, heard) = server.join().expect("server thread");
+    assert!(!shook, "the client accepted the certificate");
+    assert_eq!(heard, "");
+}
+
 // ----- -f / --fail-fast -----
 
 /// A server that answers each request with the next `(status, body)` of
@@ -2315,7 +2234,7 @@ fn without_fail_fast_a_failed_request_does_not_stop_a_batch() {
 #[test]
 fn fail_fast_stops_a_silent_batch_at_a_failed_assert_and_ends_stdout_with_its_body() {
     let run = run_fail_fast("-sfa", ASSERT_BATCH, vec![OK, ASSERT_FAILED, OK]);
-    assert!(!run.ok);
+    assert_eq!(run.code, Some(1), "{}", run.stderr);
     assert_eq!(run.code, Some(1));
     assert_eq!(run.seen, vec!["GET /before", "PUT /assert"]);
 
@@ -2344,7 +2263,7 @@ fn fail_fast_lets_a_held_assert_pass_and_stops_on_an_invalid_one() {
 
     // A request the server can't read is a 400, which stops the run as well.
     let run = run_fail_fast("-sfa", ASSERT_BATCH, vec![OK, ASSERT_INVALID, OK]);
-    assert!(!run.ok);
+    assert_eq!(run.code, Some(1), "{}", run.stderr);
     assert_eq!(run.seen, vec!["GET /before", "PUT /assert"]);
     assert_eq!(run.stdout.lines().last().unwrap(), ASSERT_INVALID.1);
 }
@@ -2352,7 +2271,7 @@ fn fail_fast_lets_a_held_assert_pass_and_stops_on_an_invalid_one() {
 #[test]
 fn fail_fast_in_a_plain_batch_prints_the_bodies_so_far_then_the_failing_one() {
     let run = run_fail_fast("-fa", ASSERT_BATCH, vec![OK, ASSERT_FAILED, OK]);
-    assert!(!run.ok);
+    assert_eq!(run.code, Some(1), "{}", run.stderr);
     assert_eq!(run.seen.len(), 2);
     assert_eq!(run.stdout, format!("{}\n{}\n", OK.1, ASSERT_FAILED.1));
     // The status lines are on stderr, as without `-f`.
@@ -2370,7 +2289,7 @@ fn fail_fast_trips_on_every_status_from_400_up() {
         ("503 Service Unavailable", ""),
     ] {
         let run = run_fail_fast("-sfa", "PUT /x {\"a\":1}\nGET /never\n", vec![answer, OK]);
-        assert!(!run.ok, "{}", answer.0);
+        assert_eq!(run.code, Some(1), "{}: {}", answer.0, run.stderr);
         assert_eq!(run.seen, vec!["PUT /x"], "{}", answer.0);
         // A body that isn't JSON, or has no newline of its own, is still
         // passed on as it came, with one newline to end the line. An empty
@@ -2449,7 +2368,7 @@ fn a_request_timeout_and_a_rate_limit_are_never_an_answer() {
 fn fail_fast_trips_on_the_last_request_of_a_chain() {
     let batch = "GET /people/1 && PUT /people/1 {\"name\":\"Ann\"}\nGET /never\n";
     let run = run_fail_fast("-sfa", batch, vec![OK, ASSERT_FAILED, OK]);
-    assert!(!run.ok);
+    assert_eq!(run.code, Some(1), "{}", run.stderr);
     assert_eq!(run.seen, vec!["GET /people/1", "PUT /people/1"]);
     assert!(run.stdout.ends_with(&format!("{}\n", ASSERT_FAILED.1)), "{:?}", run.stdout);
 }
@@ -2460,7 +2379,7 @@ fn fail_fast_prints_the_body_of_a_condition_that_could_not_be_answered() {
     // the body says why.
     let batch = "GET /people/1 || PUT /people/1 {\"name\":\"Ann\"}\nGET /never\n";
     let run = run_fail_fast("-sfa", batch, vec![("500 Internal Server Error", "database is down"), OK]);
-    assert!(!run.ok);
+    assert_eq!(run.code, Some(1), "{}", run.stderr);
     assert_eq!(run.seen, vec!["GET /people/1"]);
     assert!(run.stdout.ends_with("database is down\n"), "{:?}", run.stdout);
 }
@@ -2468,7 +2387,7 @@ fn fail_fast_prints_the_body_of_a_condition_that_could_not_be_answered() {
 #[test]
 fn the_assert_keyword_still_reports_its_own_failure_under_fail_fast() {
     let run = run_fail_fast("-sfa", "assert GET /people/1\nGET /never\n", vec![NOT_FOUND, OK]);
-    assert!(!run.ok);
+    assert_eq!(run.code, Some(1), "{}", run.stderr);
     assert_eq!(run.seen, vec!["GET /people/1"]);
     assert!(run.stderr.contains("assertion failed: assert GET /people/1 (404 Not Found)"), "{}", run.stderr);
     // An assert is a verdict: its body is not printed, with or without `-f`.
@@ -2535,8 +2454,21 @@ fn fail_fast_stops_a_one_shot_program_line_and_a_batch_on_stdin() {
         .unwrap();
     assert_eq!(server.join().unwrap(), vec!["PUT /assert"]);
     // The condition said no, which is an answer: the chain is cut short, not
-    // the run.
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    // the run, and no body is put on stdout.
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("failed assertion"), "{}", String::from_utf8_lossy(&out.stdout));
+
+    // A program of two lines in one argument: the first line is a plain
+    // request, so its 409 stops the run before the second.
+    let (port, server) = answering_server(vec![ASSERT_FAILED, OK]);
+    let out = api_against_port(port)
+        .env("NO_COLOR", "1")
+        .args(["-sf", "PUT /assert {\"api/v1/x\":{\"is\":1}}\nGET /never"])
+        .output()
+        .unwrap();
+    assert_eq!(server.join().unwrap(), vec!["PUT /assert"]);
+    assert_eq!(out.status.code(), Some(1), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).ends_with(&format!("{}\n", ASSERT_FAILED.1)));
 
     let (port, server) = answering_server(vec![ASSERT_FAILED, OK]);
     let out = api_against_port(port)
@@ -2546,7 +2478,7 @@ fn fail_fast_stops_a_one_shot_program_line_and_a_batch_on_stdin() {
         .output()
         .unwrap();
     assert_eq!(server.join().unwrap(), vec!["PUT /assert"]);
-    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(1), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(String::from_utf8_lossy(&out.stdout).ends_with(&format!("{}\n", ASSERT_FAILED.1)));
 }
 
@@ -2556,7 +2488,7 @@ fn fail_fast_stops_a_one_shot_program_line_and_a_batch_on_stdin() {
 fn fail_fast_passes_on_a_body_of_several_lines_whole() {
     const PRETTY: &str = "{\n  \"@type\": \"failed assertion\",\n  \"failures\": {\n    \"api/v1/x\": {\n      \"was\": 1\n    }\n  }\n}\n";
     let run = run_fail_fast("-sfa", "GET /before\nPUT /assert {\"api/v1/x\":{\"is\":2}}\n", vec![OK, ("409 Conflict", PRETTY)]);
-    assert!(!run.ok);
+    assert_eq!(run.code, Some(1), "{}", run.stderr);
     let (log, body) = run.stdout.rsplit_once("HTTP/1.1 409 Conflict").expect("a 409 status line");
     assert!(log.ends_with("└─"), "{log:?}");
     let body = body.split_once('\n').expect("the rest of the status line").1;
@@ -2572,10 +2504,14 @@ fn fail_fast_against_the_assert_endpoint_of_a_local_cos() {
     // `GET /assert` answers `200` with `{}` where the endpoint exists and a
     // 404 on a server from before it.
     let probe = api().args(["-sr", "GET", "/assert"]).output().unwrap();
-    if String::from_utf8_lossy(&probe.stdout).trim() != "{}" {
-        eprintln!("fail_fast_against_the_assert_endpoint_of_a_local_cos: skipped, this server has no /assert");
-        return;
-    }
+    // A server without it is not one this suite can run against: a test
+    // that returned here would pass having checked nothing.
+    assert_eq!(
+        String::from_utf8_lossy(&probe.stdout).trim(),
+        "{}",
+        "the local CommerceOS has no /assert endpoint: this suite needs a build that has it\nstderr: {}",
+        String::from_utf8_lossy(&probe.stderr)
+    );
     let dir = tempdir().unwrap();
     let run = |name: &str, batch: &str| {
         let file = dir.path().join(name);
@@ -2626,6 +2562,7 @@ const MASKED_WARNING: &str = "Response had masked data, now null at oauth2Client
 
 struct ExportRun {
     ok: bool,
+    code: Option<i32>,
     stdout: String,
     stderr: String,
     seen: Vec<String>,
@@ -2645,6 +2582,7 @@ fn run_export(args: &[&str], answers: Vec<(&'static str, &'static str)>) -> Expo
         .expect("api runs");
     ExportRun {
         ok: out.status.success(),
+        code: out.status.code(),
         stdout: String::from_utf8_lossy(&out.stdout).to_string(),
         stderr: String::from_utf8_lossy(&out.stderr).to_string(),
         seen: server.join().expect("server thread"),
@@ -2808,17 +2746,31 @@ fn an_assert_and_a_poll_are_judged_on_what_the_server_said_not_on_the_seed_data(
 
     // And the other way round: `assert not` on a masked value fails.
     let run = run_export(&["--export", SEED, "-s", "assert not GET /secret"], vec![("200 OK", r#""********""#)]);
-    assert!(!run.ok);
+    assert_eq!(run.code, Some(1), "{}", run.stderr);
     assert!(run.stderr.contains("assertion failed"), "{}", run.stderr);
 }
 
 #[test]
 fn export_to_the_clipboard_and_appended_to_ndjson_is_seed_data_too() {
     let _turn = clipboard_turn();
-    // The clipboard is not read back (a headless runner has none to read);
-    // the response is kept off stdout and the masked place is still named.
+    // The response is kept off stdout and the masked place is still named.
     let run = run_export(&["--export", SEED, "GET", "/users", ">", "clipboard"], vec![("200 OK", USERS)]);
+    assert!(run.ok, "{}", run.stderr);
+    assert_eq!(run.seen, vec!["GET /users"]);
     assert_eq!(run.stdout, "");
+    // On macOS the clipboard can be read back, and holds the seed data. The
+    // tests that copy take turns (`clipboard_turn`), so it is still this one's.
+    if cfg!(target_os = "macos") {
+        match std::process::Command::new("pbpaste").output() {
+            Ok(pasted) if pasted.status.success() => {
+                let pasted = String::from_utf8_lossy(&pasted.stdout).to_string();
+                assert_eq!(compact(&pasted), USERS_EXPORTED, "{pasted}");
+            }
+            other => eprintln!("export_to_the_clipboard…: the clipboard was NOT read back, pbpaste did not run: {other:?}"),
+        }
+    } else {
+        eprintln!("export_to_the_clipboard…: the clipboard was NOT read back (only done on macOS)");
+    }
     assert!(run.stderr.contains(MASKED_WARNING), "{}", run.stderr);
     assert!(!run.dir.path().join("clipboard").exists());
 
@@ -3023,6 +2975,47 @@ fn an_export_line_holds_from_where_it_is_written_to_the_end_of_its_file() {
     assert!(at("\nexport com.heads.seedID\n") < at("GET /b > b.json"), "{}", run.stdout);
     assert!(at("\nexport other.name.id\n") < at("\nexport off\n"), "{}", run.stdout);
     assert!(!run.stdout.contains("ignored"), "{}", run.stdout);
+}
+
+/// Under an `export` line, as under `--export`, a chain, an `assert` and a
+/// poll are judged on what the server said. A masked value is a "yes" from
+/// the server, and `null` once exported.
+#[test]
+fn under_an_export_line_a_chain_and_a_check_are_judged_on_what_the_server_said() {
+    const MASKED: (&str, &str) = ("200 OK", r#""********""#);
+    let (port, server) = answering_server(vec![MASKED, MASKED, MASKED, MASKED, MASKED, ("200 OK", USERS)]);
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("batch.api"),
+        "export com.heads.seedID\n\
+         GET /secret && GET /then\n\
+         GET /secret || GET /never\n\
+         assert GET /secret\n\
+         sleep 10ms while not GET /secret\n\
+         GET /users > users.json\n",
+    )
+    .unwrap();
+    let out = api_against_port(port).env("NO_COLOR", "1").current_dir(dir.path()).args(["-sa", "batch.api"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        server.join().unwrap(),
+        vec!["GET /secret", "GET /then", "GET /secret", "GET /secret", "GET /secret", "GET /users"],
+        "{stderr}"
+    );
+    assert!(out.status.success(), "{stderr}");
+    assert_eq!(compact(&std::fs::read_to_string(dir.path().join("users.json")).unwrap()), USERS_EXPORTED);
+    // The answer to an `assert` or a poll is not data. The three requests of
+    // the chains and the one that was written are, and each is warned about.
+    assert_eq!(stderr.matches("masked data").count(), 4, "{stderr}");
+
+    // And the other way round: `assert not` on a masked value fails, and a
+    // poll that waits for a "no" does not take the exported `null` for one.
+    let (port, server) = answering_server(vec![MASKED]);
+    std::fs::write(dir.path().join("not.api"), "export com.heads.seedID\nassert not GET /secret\nGET /never\n").unwrap();
+    let out = api_against_port(port).env("NO_COLOR", "1").current_dir(dir.path()).args(["-sa", "not.api"]).output().unwrap();
+    assert_eq!(server.join().unwrap(), vec!["GET /secret"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("assertion failed"), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
 #[test]
@@ -3848,7 +3841,9 @@ fn describe_first_follows_the_locale_and_prints_only_the_file_that_is_run() {
             cmd.env(name, value);
         }
         let out = cmd.args(args).write_stdin("n\n").output().unwrap();
-        assert!(out.status.success(), "{args:?}");
+        // Declined: exit 0, and `aborted` says nothing was sent.
+        assert_eq!(out.status.code(), Some(0), "{args:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).ends_with("aborted\n"), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
         String::from_utf8(out.stderr).unwrap()
     };
 
@@ -3865,7 +3860,9 @@ fn describe_first_follows_the_locale_and_prints_only_the_file_that_is_run() {
     // A file named with `~/`.
     let mut home = connected(d);
     let out = home.env("HOME", d).env("LANG", "en_GB.UTF-8").args(["-spm", "~/cat.api"]).write_stdin("n\n").output().unwrap();
-    assert!(String::from_utf8(out.stderr).unwrap().starts_with("Catalog\n"));
+    let shown = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{shown}");
+    assert!(shown.starts_with("Catalog\n") && shown.ends_with("aborted\n"), "{shown}");
 
     // Without `-p`, and for a file that only describes: the block is
     // printed, nothing is sent, and that is no failure.

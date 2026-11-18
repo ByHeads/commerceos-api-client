@@ -5,6 +5,21 @@
 //! Every case in `cases` is run through all of them against a recording
 //! server, and what reached the server is compared — first between the
 //! entry points, then against what the case says it should be.
+//!
+//! The rest of the suite is what the client sends, prints, writes and exits
+//! with, from a batch and at the prompt, shown on that same recording server.
+//!
+//! What it needs: this machine only. Every request goes to a server the test
+//! starts on a free port of 127.0.0.1; no local CommerceOS, no credentials
+//! file (a test that wants one writes its own in a temporary directory), no
+//! keychain, no network and no clipboard. `git` must be on the `PATH`, for
+//! the import rows, which use a repository built in a temporary directory.
+//! The tests that drive the prompt do it through a pseudo-terminal and are
+//! compiled on unix only.
+//!
+//! Run with: `cargo test --test parity`, under a time limit (a pty test that
+//! hangs takes the suite with it): `perl -e 'alarm 900; exec @ARGV' cargo
+//! test --test parity`.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -181,6 +196,30 @@ fn answer(
         let _ = stream.flush();
         return;
     }
+    if path.contains("/loop") || path.contains("/moved") {
+        // `/loop` is sent on to itself, for ever; `/moved` to `/landed`, as
+        // the request it was (307).
+        let (status, to) = match path.contains("/loop") {
+            true => ("302 Found", path.clone()),
+            false => ("307 Temporary Redirect", "/api/v1/landed".to_string()),
+        };
+        let _ = stream.write_all(
+            format!("HTTP/1.1 {status}\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes(),
+        );
+        let _ = stream.flush();
+        return;
+    }
+    if path.contains("/notutf8") {
+        // A JSON string with one byte that is Latin-1, not UTF-8.
+        let body = b"\"caf\xe9 x\"";
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(head.as_bytes()).and_then(|()| stream.write_all(body));
+        let _ = stream.flush();
+        return;
+    }
     if let Some((rest, hold)) = broken {
         let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{rest}").as_bytes());
         let _ = stream.flush();
@@ -222,6 +261,13 @@ fn answer(
         ("200 OK", format!("[{NUMBERS}]"))
     } else if path.contains("/boom") {
         ("500 Internal Server Error", "{}".to_string())
+    } else if path.contains("/conflict") {
+        ("409 Conflict", r#"{"error":"conflict"}"#.to_string())
+    } else if path.contains("/barred") {
+        ("403 Forbidden", r#"{"error":"barred"}"#.to_string())
+    } else if path.ends_with("/assert") && method == "PUT" {
+        // Every assertion holds: `200` with `null`, as the API answers.
+        ("200 OK", "null".to_string())
     } else if path.contains("/keyed") {
         // A record with only a database key and a masked value, for `--export`.
         ("200 OK", r#"{"name":"Ann","identifiers":{"key":"k1"},"secret":"********"}"#.to_string())
@@ -672,10 +718,10 @@ fn cases(dir: &Path) -> Vec<Case> {
         ),
         case("import of a directory", import_dir, None, &["GET /dir1", r#"PUT /dir2 {"from":"dir"}"#]),
         case("import of an archive", &import_archive, None, &["GET /zip1"]),
-        case("import of an unknown kind", r#"import svn x {"url":"https://example.com/r"}"#, None, &[])
+        case("import of an unknown kind", r#"import svn x {"url":"https://example.invalid/r"}"#, None, &[])
             .fails("unknown import kind `svn`"),
         case("import of a missing ref", &import_missing_ref, None, &[]).fails("import ref not found: 9.9"),
-        case("import without a ref", r#"import git cl {"url":"https://example.com/r"}"#, None, &[])
+        case("import without a ref", r#"import git cl {"url":"https://example.invalid/r"}"#, None, &[])
             .fails("`ref` is required"),
         case("include then request", "seed.api\nGET /after", None, &["GET /inc1", "GET /inc2", "GET /after"]),
         case("missing include", "nope.api", Some(&["nope.api"]), &[]).fails("include not found: nope.api"),
@@ -713,6 +759,20 @@ fn cases(dir: &Path) -> Vec<Case> {
             Some(&["GET", r#"/a~where(n="x > y")"#]),
             &["GET /a~where(n=%22x%20%3E%20y%22)"],
         ),
+        // A `\` is a character of the URI, not another way to write `/`
+        case(
+            "an escaped quote inside a URI operator",
+            r#"GET /a~where(n="a \" b")"#,
+            Some(&["GET", r#"/a~where(n="a \" b")"#]),
+            &["GET /a~where(n=%22a%20%5C%22%20b%22)"],
+        ),
+        case(
+            "what is percent-encoded already stays as written",
+            "GET /a~where(n=%22x%5Cy%2Fz%22)/b%20c",
+            Some(&["GET", "/a~where(n=%22x%5Cy%2Fz%22)/b%20c"]),
+            &["GET /a~where(n=%22x%5Cy%2Fz%22)/b%20c"],
+        ),
+        case(r"a \ in a query is left as it is", r"GET /a?x=b\c", Some(&["GET", r"/a?x=b\c"]), &[r"GET /a?x=b\c"]),
         case("appending to the clipboard", r#"PUT /a {"x":1} >> clipboard"#, Some(&["PUT", "/a", r#"{"x":1}"#, ">>", "clipboard"]), &[])
             .fails("cannot append to clipboard"),
         // Directives are read in any case and with any blanks between words
@@ -803,6 +863,12 @@ fn check(case: &Case, how: &str, got: &Outcome, shown: &str, expected_sent: &[&s
         exit_ok: case.exit_ok,
     };
     assert_eq!(got, &expected, "[{}] {how}: `{}`\nshown:\n{shown}", case.label, case.line);
+    check_shown_and_written(case, how, shown);
+}
+
+/// The half of `check` that does not depend on how the run ended: what the
+/// user was told and what the line wrote.
+fn check_shown_and_written(case: &Case, how: &str, shown: &str) {
     if let Some(phrase) = case.says {
         assert!(shown.contains(phrase), "[{}] {how}: expected {phrase:?} to be shown, got:\n{shown}", case.label);
     }
@@ -1124,8 +1190,9 @@ fn a_stream_that_fails_leaves_no_partial_outfile() {
     let one = run_in(&server, d, &["--stream", "GET", "/midfail", ">", "part.json"]);
     assert_eq!(one.code, Some(1), "{}", one.stderr);
     assert!(one.stderr.contains("The response was cut short"), "{}", one.stderr);
-    assert!(!d.join("part.json").exists(), "a partial outfile is left");
-    assert!(!d.join("part.json.part").exists(), "the .part file is left");
+    // The partial file is `part.json.<pid>.part`, so it is the directory
+    // that is looked at, not a name.
+    assert_eq!(left_in(d), Vec::<String>::new(), "a partial outfile or its .part file is left");
 
     // What the file held before is still there.
     std::fs::write(d.join("kept.json"), "[\"before\"]").unwrap();
@@ -1135,7 +1202,7 @@ fn a_stream_that_fails_leaves_no_partial_outfile() {
         assert_eq!(batch.code, Some(1), "{flags}: {}", batch.stderr);
         assert_eq!(batch.sent, ["GET /midfail"], "{flags}");
         assert_eq!(std::fs::read_to_string(d.join("kept.json")).unwrap(), "[\"before\"]", "{flags}");
-        assert!(!d.join("kept.json.part").exists(), "{flags}");
+        assert_eq!(left_in(d), ["kept.json", "stream.api"], "{flags}");
     }
 
     // To stdout, and drained in `-sa`: no answer either way.
@@ -1149,7 +1216,7 @@ fn a_stream_that_fails_leaves_no_partial_outfile() {
     let good = run_in(&server, d, &["--stream", "GET", "/a", ">", "good.json"]);
     assert_eq!(good.code, Some(0), "{}", good.stderr);
     assert_eq!(std::fs::read_to_string(d.join("good.json")).unwrap(), r#"{"ok":"/api/v1/a"}"#);
-    assert!(!d.join("good.json.part").exists());
+    assert_eq!(left_in(d), ["drain.api", "good.json", "kept.json", "stream.api"]);
 }
 
 /// What a directory holds, dot-files (the history, the credentials) aside.
@@ -3752,7 +3819,8 @@ fn the_preview_lists_directives_and_chains_and_counts_only_requests() {
     assert_eq!(
         &lines[..9],
         [
-            &format!("Preview — 4 requests | GET PUT DELETE [http://127.0.0.1:{}]", server.port)[..],
+            // The request of a poll and of an assert are requests too.
+            &format!("Preview — 6 requests | GET PUT DELETE [http://127.0.0.1:{}]", server.port)[..],
             "  GET /a",
             "  && PUT /b {\"x\":1}",
             "  || GET /c",
@@ -3772,6 +3840,15 @@ fn the_preview_lists_directives_and_chains_and_counts_only_requests() {
     let ran = ask(&server, dir.path(), &["-spa", "s.api"], Some("n\n"));
     assert!(ran.stderr.starts_with("Preview — 0 requests ["), "{}", ran.stderr);
     assert!(ran.stderr.contains("  sleep 10ms") && ran.stderr.contains("Run? [Y/n]"), "{}", ran.stderr);
+
+    // A file of checks alone is not a file of no requests, and their
+    // methods are listed.
+    std::fs::write(dir.path().join("checks.api"), "assert GET /x\nsleep 1 while not POST /q {\"a\":1}\nassert not /implied\n").unwrap();
+    let ran = ask(&server, dir.path(), &["-spa", "checks.api"], Some("n\n"));
+    assert!(ran.stderr.starts_with("Preview — 3 requests | GET POST ["), "{}", ran.stderr);
+    std::fs::write(dir.path().join("check.api"), "assert GET /x\nconfirm assert GET /y?\n").unwrap();
+    let ran = ask(&server, dir.path(), &["-spa", "check.api"], Some("n\n"));
+    assert!(ran.stderr.starts_with("Preview — 1 request | GET ["), "{}", ran.stderr);
 
     // One request, singular.
     let ran = ask(&server, dir.path(), &["-sp", "PUT", "/x", "{\"a\":1}"], Some("n\n"));
@@ -4375,10 +4452,14 @@ fn the_prompt_reads_the_same_lines() {
         prompt.send(b"\x1b");
         prompt.pump(Duration::from_millis(60));
 
-        let got = Outcome { sent: server.take(), exit_ok: case.exit_ok };
+        let sent = server.take();
         let shown = plain(&prompt.screen[mark..]);
         let expected = case.prompt_sent.clone().unwrap_or_else(|| case.sent.clone());
-        check(&case, "prompt", &got, &shown, &expected);
+        assert_eq!(sent, expected, "[{}] prompt: `{}`\nshown:\n{shown}", case.label, case.line);
+        // A prompt has no exit code to compare: a line that fails says so
+        // (`says`, below) and the session stays open.
+        assert_eq!(prompt.exited(), None, "[{}] prompt: `{}` ended the session\n{shown}", case.label, case.line);
+        check_shown_and_written(&case, "prompt", &shown);
     }
 }
 
@@ -5267,7 +5348,12 @@ fn the_connection_picker_reads_the_store_afresh() {
     let listed = pump_until(&mut prompt, Duration::from_secs(5), |p| pty::plain(&p.screen[mark..]).contains("fixed-one"));
     assert!(listed, "{}", pty::plain(&prompt.screen[mark..]));
     assert!(!pty::plain(&prompt.screen[mark..]).contains("could not read"), "{}", pty::plain(&prompt.screen[mark..]));
+    // Wait until the picker is gone: an esc the client has not read yet
+    // when the next key arrives would be read together with it, as one key.
+    let mark = prompt.screen.len();
     prompt.send(b"\x1b");
+    let closed = pump_until(&mut prompt, Duration::from_secs(5), |p| pty::plain(&p.screen[mark..]).contains("ctrl+h for shortcuts"));
+    assert!(closed, "{}", pty::plain(&prompt.screen[mark..]));
     prompt.pump(Duration::from_millis(400));
 
     // Broken from outside: nothing to pick from, and nothing written.
@@ -5654,7 +5740,7 @@ fn fail_fast_stops_the_same_way_in_a_file_from_stdin_and_as_arguments() {
         }
         let out = child.wait_with_output().unwrap();
         server.settle(Duration::from_millis(150), Duration::from_secs(3));
-        (server.take(), out.status.success(), String::from_utf8_lossy(&out.stdout).to_string())
+        (server.take(), out.status.code() == Some(0), String::from_utf8_lossy(&out.stdout).to_string(), out.status.code())
     };
 
     // (the lines, what is sent, whether the run succeeds)
@@ -5676,19 +5762,25 @@ fn fail_fast_stops_the_same_way_in_a_file_from_stdin_and_as_arguments() {
         let quoted = run(&["-sf", lines], None);
         for (how, got) in [("file", &from_file), ("stdin", &from_stdin), ("one quoted argument", &quoted)] {
             assert_eq!(got.0, sent, "{how}: {lines:?}");
-            assert_eq!(got.1, ok, "{how}: {lines:?}");
+            assert_eq!(got.3, Some(if ok { 0 } else { 1 }), "{how}: {lines:?}");
             // The failing body, `{}` from this server, ends stdout.
             assert_eq!(got.2.ends_with("\n{}\n"), !ok, "{how}: {lines:?}\n{}", got.2);
         }
         // Without the flag every line is sent and the run succeeds.
+        // Every case ends in `GET /b`, the line `-f` did not get to.
         let unflagged = run(&["-sa", "case.api"], None);
-        assert!(unflagged.1 && unflagged.0.len() >= sent.len(), "{lines:?}: {unflagged:?}");
+        let mut all: Vec<&str> = sent.to_vec();
+        if !ok {
+            all.push("GET /b");
+        }
+        assert_eq!((unflagged.3, &unflagged.0), (Some(0), &all.iter().map(|s| s.to_string()).collect::<Vec<_>>()), "{lines:?}: {unflagged:?}");
+        assert!(!unflagged.2.ends_with("\n{}\n"), "{lines:?}: {}", unflagged.2);
     }
 
     // One request, split by the shell or not.
     for args in [&["-f", "GET", "/missing"][..], &["-f", "GET /missing"], &["GET", "/missing", "-f"]] {
         let got = run(args, None);
-        assert_eq!((got.0, got.1, got.2.as_str()), (vec!["GET /missing".to_string()], false, "{}\n"), "{args:?}");
+        assert_eq!((got.0, got.3, got.2.as_str()), (vec!["GET /missing".to_string()], Some(1), "{}\n"), "{args:?}");
     }
 }
 
@@ -7056,11 +7148,31 @@ fn a_key_beside_an_oauth2_connection_is_not_renewed_with_the_stored_secret() {
     // loaded, and until that has ended it takes no key and no paste.
     prompt.wait_for("connected to: o", Duration::from_secs(15));
 
-    let (sent, shown) = run_pasted(&mut prompt, &server, "GET /denied");
-    assert_eq!(sent, ["GET /denied"], "{shown}");
+    // Not `run_pasted`, which empties the server's log and headers when it
+    // returns: they are what is looked at here.
+    prompt.send(b"\x15");
+    prompt.pump(Duration::from_millis(60));
+    server.take();
+    prompt.paste("GET /denied");
+    prompt.pump(Duration::from_millis(80));
+    let mark = prompt.screen.len();
+    prompt.send(b"\r");
+    let start = Instant::now();
+    let mut quiet = 0;
+    while (server.seen() == 0 || quiet < 3) && start.elapsed() < Duration::from_secs(6) {
+        let before = server.seen();
+        prompt.pump(Duration::from_millis(120));
+        quiet = if server.seen() == before { quiet + 1 } else { 0 };
+    }
+    let shown = pty::plain(&prompt.screen[mark..]);
     let all = server.log.lock().unwrap().clone();
-    assert_eq!(counts(&all, &["/oauth2/v1/token"]), [0], "{all:?}");
-    assert!(server.heads().iter().all(|h| !h.contains("Bearer")), "{:?}", server.heads());
+    let heads = server.heads();
+    // One request, with the key, and no token asked for: not now and not
+    // when the session started (the count is never reset).
+    assert_eq!(all, ["GET /denied"], "{shown}");
+    assert_eq!(server.tokens.load(Ordering::SeqCst), 0, "a token was asked for");
+    assert_eq!(heads.len(), 1, "{heads:?}");
+    assert!(heads[0].contains("authorization=Basic "), "{heads:?}");
 
     save_as(&mut prompt, "mine", "saved");
     let (connections, _) = stored(d);
@@ -7801,8 +7913,8 @@ fn the_url_field_completes_confirms_and_keeps_what_it_shows() {
     // Confirmed, the URL has its scheme, and keeps it over Esc and Enter.
     for (typed_url, confirmed) in [
         ("https://127.0.0.1:18731", "https://127.0.0.1:18731"),
-        ("http://example.com", "http://example.com"),
-        ("example.com", "https://example.com"),
+        ("http://example.invalid", "http://example.invalid"),
+        ("example.invalid", "https://example.invalid"),
         ("127.0.0.1:18731", "http://127.0.0.1:18731"),
     ] {
         typed(&mut prompt, typed_url);
@@ -8719,4 +8831,946 @@ fn the_input_line_of_a_saved_connection_is_drawn_when_it_takes_keys() {
         assert!(first.contains("Connecting to a") || first.contains("from a"), "round {round}: {first:?}");
         assert!(!first.contains("GET /"), "round {round}: an input line that takes no key\n{first:?}");
     }
+}
+
+// ----- options, the store, base URLs and what a response is said to be -----
+
+/// An option given twice is said to be given twice, and one that is the last
+/// word of the command line, with no value behind it, to need one.
+#[test]
+fn an_option_given_twice_or_without_its_value_is_said_to_be_that() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    for (args, says) in [
+        (&["-b", &url, "-k", "a", "-k", "b", "GET", "/a"][..], "error: --key was given twice"),
+        (&["-b", &url, "-k", "k", "--timeout", "1", "--timeout", "2", "GET", "/a"], "error: --timeout was given twice"),
+        (&["-b", &url, "-k", "k", "-s", "-s", "GET", "/a"], "error: --silent was given twice"),
+        (&["-b", &url, "-k", "k", "GET", "/a", "--export"], "error: --export needs a value"),
+        (&["-b", &url, "-k", "k", "GET", "/a", "--timeout"], "error: --timeout needs a value"),
+        (&["-c"], "error: --connection needs a value"),
+    ] {
+        let got = run_bare(&server, d, args);
+        assert_eq!((got.code, got.sent.len()), (Some(1), 0), "{args:?}: {}", got.stderr);
+        assert_eq!(got.stderr.trim(), says, "{args:?}");
+        assert_eq!(got.stdout, "", "{args:?}");
+    }
+}
+
+/// A known `auth_type` is read in any case. One the client does not know is
+/// not sent as a key: the connection is not used, and that is said.
+#[test]
+fn a_connection_with_an_auth_type_the_client_does_not_know_is_not_used() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    write_credentials(
+        d,
+        &[
+            ("shout", url.clone(), "Token", "STOREDTOKEN", ""),
+            ("caps", url.clone(), "KEY", "STOREDKEY", ""),
+            ("oauth", url.clone(), "OAuth2", "secret", "id"),
+            ("odd", url.clone(), "bearer", "SECRET", ""),
+        ],
+        "odd",
+    );
+    for (name, authorization_sent) in [("shout", "Bearer STOREDTOKEN"), ("caps", "Basic OlNUT1JFREtFWQ==")] {
+        let got = run_bare(&server, d, &["-c", name, "GET", "/a"]);
+        assert_eq!((got.code, &got.sent[..]), (Some(0), &["GET /a".to_string()][..]), "{name}: {}", got.stderr);
+        assert_eq!(authorization(&server), authorization_sent, "{name}");
+    }
+    let got = run_bare(&server, d, &["-c", "oauth", "GET", "/a"]);
+    assert_eq!(got.code, Some(0), "{}", got.stderr);
+    assert!(got.sent[0].starts_with("POST /oauth2/v1/token"), "{:?}", got.sent);
+    assert_eq!(got.sent[1], "GET /a");
+    assert!(server.heads()[1].contains("authorization=Bearer "), "{:?}", server.heads());
+
+    // The default connection, and the same one asked for by name.
+    let unknown = r#"its auth_type "bearer" is not "key", "token" or "oauth2""#;
+    for args in [&["GET", "/a"][..], &["-sa", "one.api"]] {
+        std::fs::write(d.join("one.api"), "GET /a\n").unwrap();
+        let got = run_bare(&server, d, args);
+        assert_eq!((got.code, got.sent.len()), (Some(1), 0), "{args:?}: {}", got.stderr);
+        assert_eq!(
+            got.stderr.lines().next(),
+            Some(&format!("WARNING: the default connection \"odd\" can't be used: {unknown}. No saved connection is used.")[..]),
+            "{args:?}"
+        );
+        assert!(got.stderr.contains("no base URL specified"), "{args:?}: {}", got.stderr);
+    }
+    let got = run_bare(&server, d, &["-c", "odd", "GET", "/a"]);
+    assert_eq!((got.code, got.sent.len()), (Some(1), 0), "{}", got.stderr);
+    assert_eq!(got.stderr.trim(), format!("The connection \"odd\" can't be used: {unknown}."));
+
+    // With a credential on the command line the stored one is not looked at.
+    for args in [&["-k", "CLIKEY", "GET", "/a"][..], &["-c", "odd", "-k", "CLIKEY", "GET", "/a"]] {
+        let got = run_bare(&server, d, args);
+        assert_eq!((got.code, &got.sent[..]), (Some(0), &["GET /a".to_string()][..]), "{args:?}: {}", got.stderr);
+        assert_eq!(authorization(&server), "Basic OkNMSUtFWQ==", "{args:?}");
+    }
+}
+
+/// `API_CREDENTIALS_FILE` set to nothing is the variable not set. A value
+/// that is no UTF-8 is still a path, and the file it names is the one read.
+#[cfg(unix)]
+#[test]
+fn an_empty_credentials_variable_is_unset_and_any_path_is_used_as_it_is() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write_credentials(d, &[("local", format!("http://127.0.0.1:{}", server.port), "key", "STOREDKEY", "")], "local");
+    let with = |value: &std::ffi::OsStr| {
+        let mut cmd = api_bare(d);
+        cmd.env("API_CREDENTIALS_FILE", value).args(["GET", "/a"]);
+        ran(&server, cmd)
+    };
+
+    let empty = with(std::ffi::OsStr::new(""));
+    assert_eq!((empty.code, &empty.sent[..]), (Some(0), &["GET /a".to_string()][..]), "{}", empty.stderr);
+
+    // Not the file in the working directory in its place: there is no such
+    // file, so there is no connection.
+    let odd = with(std::ffi::OsStr::from_bytes(b"/nonexistent/\xff.json"));
+    assert_eq!((odd.code, odd.sent.len()), (Some(1), 0), "{}", odd.stderr);
+    assert!(odd.stderr.contains("no base URL specified"), "{}", odd.stderr);
+
+    // A file somewhere else, named by the variable.
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::fs::rename(d.join(".api-credentials.json"), elsewhere.path().join("named.json")).unwrap();
+    let named = with(elsewhere.path().join("named.json").as_os_str());
+    assert_eq!((named.code, &named.sent[..]), (Some(0), &["GET /a".to_string()][..]), "{}", named.stderr);
+}
+
+/// A server that sends a request round in circles is there. It is not asked
+/// about as one that did not answer.
+#[test]
+fn a_redirect_loop_is_said_to_be_one() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let says = format!("Too many redirects from 127.0.0.1:{}", server.port);
+    std::fs::write(d.join("loop.api"), "GET /loop\nGET /never\n").unwrap();
+    std::fs::write(d.join("chain.api"), "GET /loop || GET /never\n").unwrap();
+    for args in [&["GET", "/loop"][..], &["-sa", "loop.api"], &["-sa", "chain.api"], &["assert not GET /loop"]] {
+        let got = run_in(&server, d, args);
+        assert_eq!(got.code, Some(1), "{args:?}: {}", got.stderr);
+        assert!(got.stderr.contains(&says), "{args:?}: {}", got.stderr);
+        assert!(!got.stderr.contains("Is COS running"), "{args:?}: {}", got.stderr);
+        assert!(!got.sent.is_empty() && got.sent.iter().all(|r| r == "GET /loop"), "{args:?}: {:?}", got.sent);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn the_prompt_says_a_redirect_loop_is_one() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = open_prompt(&server, dir.path(), &[]);
+    let shown = enter_line(&mut prompt, "GET /loop", "Too many redirects");
+    assert!(shown.contains(&format!("Too many redirects from 127.0.0.1:{}", server.port)), "{shown}");
+    assert!(!shown.contains("Is COS running"), "{shown}");
+}
+
+/// `-a` runs a file. A request beside it is not dropped without a word, and
+/// not run after the file either: it is an error, and nothing is sent.
+#[test]
+fn a_file_and_a_request_on_one_command_line_is_an_error() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::write(d.join("f.api"), "GET /from-file\n").unwrap();
+    for (args, file, request) in [
+        (&["-sa", "f.api", "GET", "/ignored"][..], "-a f.api", "GET /ignored"),
+        (&["-a", "f.api", "/ignored"], "-a f.api", "/ignored"),
+        (&["-sfa", "f.api", "PUT", "/x", "{\"a\":1}"], "-a f.api", "PUT /x {\"a\":1}"),
+        (&["GET", "/ignored", "-a", "f.api"], "-a f.api", "GET /ignored"),
+        (&["-a", "-", "GET", "/ignored"], "-a -", "GET /ignored"),
+    ] {
+        let got = run_in(&server, d, args);
+        assert_eq!((got.code, got.sent.len()), (Some(1), 0), "{args:?}: {}", got.stderr);
+        assert_eq!(
+            got.stderr.trim(),
+            format!("error: {file} runs a file and {request} is a request: give one of the two"),
+            "{args:?}"
+        );
+        assert_eq!(got.stdout, "", "{args:?}");
+    }
+    let got = run_in(&server, d, &["-sa", "f.api"]);
+    assert_eq!((got.code, &got.sent[..]), (Some(0), &["GET /from-file".to_string()][..]), "{}", got.stderr);
+}
+
+/// A base URL is `http://` or `https://`. Another scheme, or one that is not
+/// written whole, is refused where it is given: with `-b`, and in a saved
+/// connection. The API prefix is cut in any case.
+#[test]
+fn a_base_url_that_is_not_http_is_refused() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let host = format!("127.0.0.1:{}", server.port);
+    std::fs::write(d.join("one.api"), "GET /a\n").unwrap();
+    for (base, says) in [
+        (format!("ftp://{host}"), "a base URL starts with http:// or https://, not ftp://".to_string()),
+        (format!("http:/{host}"), format!("http:/{host} is not a URL: a base URL starts with http:// or https://")),
+    ] {
+        for args in [&["GET", "/a"][..], &["-sa", "one.api"]] {
+            let mut all = vec!["-b", base.as_str(), "-k", "k"];
+            all.extend_from_slice(args);
+            let got = run_bare(&server, d, &all);
+            assert_eq!((got.code, got.sent.len()), (Some(1), 0), "{all:?}: {}", got.stderr);
+            assert_eq!(got.stderr.trim(), format!("error: invalid value for -b: {base} ({says})"), "{all:?}");
+        }
+        // The same URL in a saved connection.
+        write_credentials(d, &[("odd", base.clone(), "key", "k", "")], "odd");
+        let got = run_bare(&server, d, &["GET", "/a"]);
+        assert_eq!((got.code, got.sent.len()), (Some(1), 0), "{base}: {}", got.stderr);
+        assert_eq!(
+            got.stderr.lines().next(),
+            Some(&format!("WARNING: the default connection \"odd\" can't be used: {says}. No saved connection is used.")[..]),
+            "{base}"
+        );
+        for args in [&["-c", "odd", "GET", "/a"][..], &["-k", "CLIKEY", "GET", "/a"]] {
+            let got = run_bare(&server, d, args);
+            assert_eq!((got.code, got.sent.len()), (Some(1), 0), "{base} {args:?}: {}", got.stderr);
+            assert!(got.stderr.contains(&says), "{base} {args:?}: {}", got.stderr);
+            assert!(!got.stderr.contains("Is COS running"), "{base} {args:?}: {}", got.stderr);
+        }
+        std::fs::remove_file(d.join(".api-credentials.json")).unwrap();
+    }
+
+    for base in [format!("http://{host}/API/v1"), format!("http://{host}/Api"), format!("{host}/API/V1/people")] {
+        let got = run_bare(&server, d, &["-b", &base, "-k", "k", "GET", "/a"]);
+        assert_eq!((got.code, &got.sent[..]), (Some(0), &["GET /a".to_string()][..]), "{base}: {}", got.stderr);
+    }
+}
+
+/// The URL field of the form reads a URL as `-b` does, so it refuses what
+/// `-b` refuses: the field stays, with the URL in it to correct.
+#[cfg(unix)]
+#[test]
+fn the_connection_form_refuses_a_url_that_is_not_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = pty::Prompt::open(api_bare(dir.path()));
+    assert!(
+        pump_until(&mut prompt, Duration::from_secs(10), |p| pty::plain(&p.screen).contains("URL")),
+        "{}",
+        pty::plain(&prompt.screen)
+    );
+    prompt.pump(Duration::from_millis(400));
+    prompt.send(b"ftp://example.com");
+    prompt.pump(Duration::from_millis(300));
+    let mark = prompt.screen.len();
+    prompt.send(b"\r");
+    let says = "a base URL starts with http:// or https://, not ftp://";
+    let said = pump_until(&mut prompt, Duration::from_secs(4), |p| pty::plain(&p.screen[mark..]).contains(says));
+    let shown = pty::plain(&prompt.screen[mark..]);
+    assert!(said, "{shown}");
+    // Still the URL field: what is typed now is added to the URL.
+    let mark = prompt.screen.len();
+    prompt.send(b"/more");
+    assert!(
+        pump_until(&mut prompt, Duration::from_secs(4), |p| pty::plain(&p.screen[mark..]).contains("ftp://example.com/more")),
+        "{}",
+        pty::plain(&prompt.screen[mark..])
+    );
+    assert_eq!(prompt.exited(), None);
+}
+
+/// `url is` names a base URL, and is read as one: with a trailing slash, the
+/// API prefix or a scheme in capitals it is the same URL. `url has` is a
+/// piece of text, and matches as written.
+#[test]
+fn url_is_reads_its_value_as_a_base_url() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let host = format!("127.0.0.1:{}", server.port);
+    for value in [
+        format!("http://{host}"),
+        format!("http://{host}/"),
+        format!("HTTP://{host}"),
+        format!("http://{host}/api/v1"),
+        format!("http://{host}/API/v1/"),
+        host.clone(),
+    ] {
+        let got = run_in(&server, d, &[&format!("url is {value}\nGET /gated")]);
+        assert_eq!((got.code, &got.sent[..]), (Some(0), &["GET /gated".to_string()][..]), "{value}: {}", got.stderr);
+    }
+    for line in [
+        format!("url is https://{host}"),
+        format!("url is http://{host}0"),
+        format!("url is http://{host}/tenant"),
+        format!("url has {host}/"),
+        format!("url has HTTP://{host}"),
+    ] {
+        let got = run_in(&server, d, &[&format!("{line}\nGET /gated")]);
+        assert_eq!((got.code, got.sent.len()), (Some(1), 0), "{line}: {}", got.stderr);
+        assert!(got.stderr.contains("URL gate failed"), "{line}: {}", got.stderr);
+        // The line is named as it was written.
+        assert!(got.stderr.contains(&line), "{line}: {}", got.stderr);
+    }
+}
+
+/// A byte order mark in front of a file is not part of what the file says:
+/// not of the credentials file, and not of a text body, alone or in a glob.
+#[test]
+fn a_byte_order_mark_is_dropped_from_the_store_and_from_a_text_body() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let sent = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let file = |name: &str, bytes: &[u8]| {
+        std::fs::create_dir_all(d.join(name).parent().unwrap()).unwrap();
+        std::fs::write(d.join(name), [b"\xEF\xBB\xBF", bytes].concat()).unwrap()
+    };
+
+    file("body.json", br#"{"a":1}"#);
+    file("rows.csv", b"a,b\n1,2\n");
+    file("rows.ndjson", b"{\"a\":1}\n{\"a\":2}\n");
+    file("plain", br#"{"a":1}"#);
+    for (body, request) in [
+        ("@body.json", "PUT /x {\"a\":1}"),
+        ("@rows.csv", "PUT /x a,b\n1,2\n"),
+        ("@rows.ndjson", "PUT /x {\"a\":1}\n{\"a\":2}\n"),
+        ("@plain", "PUT /x {\"a\":1}"),
+    ] {
+        let got = run_in(&server, d, &["PUT", "/x", body]);
+        assert_eq!((got.code, got.sent), (Some(0), sent(&[request])), "{body}: {}", got.stderr);
+    }
+    // A file that is not text is sent as the bytes it holds.
+    file("blob.bin", b"\xFF\x00\x01");
+    let got = run_in(&server, d, &["PUT", "/x", "@blob.bin"]);
+    assert_eq!(got.code, Some(0), "{}", got.stderr);
+    assert!(got.sent[0].starts_with("PUT /x \u{feff}\u{fffd}"), "{:?}", got.sent);
+
+    // Each file of a glob.
+    file("g/1.json", br#"{"a":1}"#);
+    file("g/2.json", br#"[{"b":2}]"#);
+    let got = run_in(&server, d, &["PUT", "/x", "@g/*.json"]);
+    assert_eq!((got.code, got.sent), (Some(0), sent(&[r#"PUT /x [{"a":1},{"b":2}]"#])), "{}", got.stderr);
+    file("n/1.ndjson", b"{\"a\":1}\n");
+    file("n/2.ndjson", b"{\"b\":2}");
+    let got = run_in(&server, d, &["PUT", "/x", "@n/*.ndjson"]);
+    assert_eq!((got.code, got.sent), (Some(0), sent(&["PUT /x {\"a\":1}\n{\"b\":2}\n"])), "{}", got.stderr);
+
+    // The credentials file, as an editor on Windows may save it.
+    let store = format!(
+        r#"{{"connections":[{{"name":"local","url":"http://127.0.0.1:{}","auth_type":"key","credential":"k"}}],"default":"local"}}"#,
+        server.port
+    );
+    std::fs::write(d.join(".api-credentials.json"), format!("\u{feff}{store}")).unwrap();
+    let got = run_bare(&server, d, &["GET", "/a"]);
+    assert_eq!((got.code, got.sent), (Some(0), sent(&["GET /a"])), "{}", got.stderr);
+    assert!(!got.stderr.contains("WARNING"), "{}", got.stderr);
+}
+
+/// What a broken or half-written store is said to be, word for word, and
+/// what is not worth a word: a file that is not there.
+#[test]
+fn what_is_wrong_with_the_store_is_said_in_full() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let file = d.join(".api-credentials.json");
+    let url = format!("http://127.0.0.1:{}", server.port);
+    let no_base = "Error: no base URL specified. Use -b <url> or -c <connection>.";
+
+    // No file: an empty store, and nothing said about it.
+    let got = run_bare(&server, d, &["GET", "/a"]);
+    assert_eq!((got.code, got.sent.len()), (Some(1), 0));
+    assert_eq!(got.stderr.trim(), no_base);
+
+    // A default that names none of the connections.
+    write_credentials(d, &[("local", url.clone(), "key", "k", ""), ("stage", url.clone(), "key", "k", "")], "locl");
+    let got = run_bare(&server, d, &["GET", "/a"]);
+    assert_eq!((got.code, got.sent.len()), (Some(1), 0));
+    assert_eq!(
+        got.stderr.lines().collect::<Vec<_>>(),
+        [
+            "WARNING: the default connection \"locl\" is not among the saved connections (local, stage). No saved connection is used.",
+            no_base
+        ]
+    );
+    // …also when there are none to be among.
+    std::fs::write(&file, r#"{"connections":[],"default":"local"}"#).unwrap();
+    let got = run_bare(&server, d, &["GET", "/a"]);
+    assert_eq!((got.code, got.sent.len()), (Some(1), 0));
+    assert_eq!(
+        got.stderr.lines().collect::<Vec<_>>(),
+        ["WARNING: the default connection \"local\" is not among the saved connections (none). No saved connection is used.", no_base]
+    );
+    // With the connection on the command line there is nothing to warn of.
+    let got = run_bare(&server, d, &["-b", &url, "-k", "k", "GET", "/a"]);
+    assert_eq!((got.code, got.sent.len(), got.stderr.contains("WARNING")), (Some(0), 1, false), "{}", got.stderr);
+
+    // A trailing comma: the reason, with its place, and the whole sentence.
+    std::fs::write(&file, r#"{"connections":[],"default":"local",}"#).unwrap();
+    let got = run_bare(&server, d, &["GET", "/a"]);
+    assert_eq!((got.code, got.sent.len()), (Some(1), 0));
+    assert_eq!(
+        got.stderr.lines().collect::<Vec<_>>(),
+        [
+            &format!(
+                "WARNING: could not read {}: it is not what the client wrote there (trailing comma at line 1 column 37). No saved connection is used.",
+                ".api-credentials.json"
+            )[..],
+            no_base
+        ]
+    );
+}
+
+/// A response whose bytes are not all of its charset is shown and written
+/// with U+FFFD in their place. That is said, once for the response.
+#[test]
+fn a_response_with_bytes_its_charset_does_not_have_is_said_to_be_changed() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let says = "WARNING: the response held bytes that are not valid UTF-8: each is now U+FFFD (\u{fffd})";
+    let warnings = |stderr: &str| stderr.matches("WARNING").count();
+
+    let got = run_in(&server, d, &["GET", "/notutf8"]);
+    assert_eq!((got.code, got.stdout.trim()), (Some(0), "\"caf\u{fffd} x\""), "{}", got.stderr);
+    assert!(got.stderr.contains(says), "{}", got.stderr);
+    assert_eq!(warnings(&got.stderr), 1, "{}", got.stderr);
+
+    // To a file, in a batch, and with `-s`: it is a warning, not a note.
+    std::fs::write(d.join("b.api"), "GET /notutf8 > b.json\nGET /a\n").unwrap();
+    for args in [&["GET", "/notutf8", ">", "f.json"][..], &["-s", "GET", "/notutf8", ">", "f.json"], &["-sa", "b.api"], &["-a", "b.api"]] {
+        let got = run_in(&server, d, args);
+        assert_eq!(got.code, Some(0), "{args:?}: {}", got.stderr);
+        assert!(got.stderr.contains(says), "{args:?}: {}", got.stderr);
+        assert_eq!(warnings(&got.stderr), 1, "{args:?}: {}", got.stderr);
+    }
+    assert_eq!(std::fs::read_to_string(d.join("f.json")).unwrap().trim(), "\"caf\u{fffd} x\"");
+    assert_eq!(std::fs::read_to_string(d.join("b.json")).unwrap().trim(), "\"caf\u{fffd} x\"");
+
+    // Nothing for a response that is what it says, nor for a check, whose
+    // body goes nowhere.
+    for args in [&["GET", "/a"][..], &["assert GET /notutf8"]] {
+        let got = run_in(&server, d, args);
+        assert_eq!((got.code, warnings(&got.stderr)), (Some(0), 0), "{args:?}: {}", got.stderr);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn the_prompt_says_that_a_response_had_bytes_replaced() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = open_prompt(&server, dir.path(), &[]);
+    let says = "response had bytes that are not valid UTF-8, now U+FFFD";
+    let shown = enter_line(&mut prompt, "GET /notutf8", says);
+    assert!(shown.contains(says), "{shown}");
+    let shown = enter_line(&mut prompt, "GET /notutf8 > f.json", says);
+    assert!(shown.contains(says), "{shown}");
+    prompt.pump(Duration::from_millis(3300));
+    let shown = enter_line(&mut prompt, "GET /a", "/api/v1/a");
+    assert!(!shown.contains(says), "{shown}");
+}
+
+// ----- documented behaviour that nothing else pinned -----
+
+/// `--export` and an `export` line rewrite responses. A request body is sent
+/// as it is written, a database key and a masked value in it included.
+#[test]
+fn a_request_body_is_never_rewritten_by_export() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    const BODY: &str = r#"{"identifiers": {"key":"k1"},  "secret":"********", "password": null}"#;
+    let request = format!("PUT /x {BODY}");
+    let sent = [request.clone()];
+    std::fs::write(d.join("flag.api"), format!("{request}\n")).unwrap();
+    std::fs::write(d.join("line.api"), format!("export com.heads.seedID\n{request}\n")).unwrap();
+    std::fs::write(d.join("body.json"), BODY).unwrap();
+
+    for args in [
+        &["--export", "com.heads.seedID", "PUT", "/x", BODY][..],
+        &["--export", "com.heads.seedID", &request],
+        &["--export", "com.heads.seedID", "PUT", "/x", "@body.json"],
+        &["--export", "com.heads.seedID", "-sa", "flag.api"],
+        &["-sa", "line.api"],
+        &[&format!("export com.heads.seedID\n{request}")],
+    ] {
+        let got = run_in(&server, d, args);
+        assert_eq!((got.code, &got.sent[..]), (Some(0), &sent[..]), "{args:?}: {}", got.stderr);
+    }
+    // And from stdin, as the body and as the program.
+    for (args, stdin) in [(&["--export", "com.heads.seedID", "PUT", "/x"][..], BODY.to_string()), (&["-sa", "-"], format!("export com.heads.seedID\n{request}\n"))]
+    {
+        server.take();
+        let mut cmd = api(server.port, d);
+        cmd.args(args).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn api");
+        child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+        let out = child.wait_with_output().expect("api runs");
+        server.settle(Duration::from_millis(150), Duration::from_secs(3));
+        assert_eq!((out.status.code(), &server.take()[..]), (Some(0), &sent[..]), "{args:?}");
+    }
+}
+
+/// A `url` line gates the whole batch from wherever it stands: in a file
+/// that is only included, too.
+#[test]
+fn a_url_line_in_an_included_file_gates_the_batch() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::create_dir_all(d.join("shared")).unwrap();
+    std::fs::write(d.join("main.api"), "GET /own\nshared/gated.api\nGET /last\n").unwrap();
+    std::fs::write(d.join("shared/gated.api"), "url has nomatch.example\nGET /included\n").unwrap();
+    for args in [&["-sa", "main.api"][..], &["-a", "main.api"], &["main.api"]] {
+        let got = run_in(&server, d, args);
+        assert_eq!((got.code, got.sent.len()), (Some(1), 0), "{args:?}: {}", got.stderr);
+        assert!(got.stderr.contains("URL gate failed"), "{args:?}: {}", got.stderr);
+        assert!(got.stderr.contains("url has nomatch.example"), "{args:?}: {}", got.stderr);
+        assert_eq!(got.stdout, "", "{args:?}");
+    }
+    // A line that fits lets it all through.
+    std::fs::write(d.join("shared/gated.api"), format!("url has 127.0.0.1:{}\nGET /included\n", server.port)).unwrap();
+    let got = run_in(&server, d, &["-sa", "main.api"]);
+    assert_eq!(got.code, Some(0), "{}", got.stderr);
+    assert_eq!(got.sent, ["GET /own", "GET /included", "GET /last"]);
+}
+
+/// A batch that can't be run is refused when it is read: exit 1, the reason,
+/// and none of its requests sent, the ones above the fault included. No
+/// request is the point, so the base URL is the recording server and never a
+/// host that would take one.
+#[test]
+fn a_batch_that_cannot_run_exits_one_and_sends_none_of_it() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let file = |name: &str, text: &str| std::fs::write(d.join(name), text).unwrap();
+    // An allowlist of two, neither of which is where the client points.
+    file("gated.api", "url has test.app.example.invalid\nurl has localhost:5000\nGET /first\n");
+    file("a.api", "GET /first\nb.api\n");
+    file("b.api", "a.api\n");
+    file("lost.api", "GET /first\nmissing.api\n");
+    file("badsleep.api", "GET /first\nsleep abc\n");
+    for (name, says) in [
+        ("gated.api", "URL gate failed"),
+        ("a.api", "include loop"),
+        ("lost.api", "include not found"),
+        ("badsleep.api", "invalid sleep duration"),
+    ] {
+        for flags in ["-a", "-sa", "-sfa"] {
+            let got = run_in(&server, d, &[flags, name]);
+            assert_eq!((got.code, &got.sent), (Some(1), &Vec::new()), "{flags} {name}: {}", got.stderr);
+            assert!(got.stderr.contains(says), "{flags} {name}: {}", got.stderr);
+        }
+    }
+    // The server is there and takes what a batch that can run sends.
+    file("fine.api", "GET /first\n");
+    let got = run_in(&server, d, &["-sa", "fine.api"]);
+    assert_eq!((got.code, got.sent), (Some(0), vec!["GET /first".to_string()]), "{}", got.stderr);
+}
+
+/// Under an `export` line a request is not streamed, as under `--export`:
+/// the whole body is needed. The requests around the line are.
+#[test]
+fn a_request_under_an_export_line_is_not_streamed() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::write(
+        d.join("e.api"),
+        "GET /a > before.json\nexport com.heads.seedID\nGET /keyed > keyed.json\nexport off\nGET /b > after.json\n",
+    )
+    .unwrap();
+    let got = run_in(&server, d, &["--stream", "-sa", "e.api"]);
+    assert_eq!(got.code, Some(0), "{}", got.stderr);
+    assert_eq!(got.sent, ["GET /a", "GET /keyed", "GET /b"]);
+    let streamed: Vec<bool> = server.heads().iter().map(|head| head.contains("stream=true")).collect();
+    assert_eq!(streamed, [true, false, true], "{:?}", server.heads());
+    let keyed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(d.join("keyed.json")).unwrap()).unwrap();
+    assert_eq!(keyed["identifiers"], serde_json::json!({"key?": "k1", "com.heads.seedID": "k1"}));
+    assert_eq!(keyed["secret"], serde_json::Value::Null);
+}
+
+/// A request that times out got no answer. In a chain, a poll or an assert
+/// that is not a "no": the run ends there with exit 1.
+#[test]
+fn a_timeout_in_a_chain_or_a_check_ends_the_run() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    for (program, sent) in [
+        ("GET /stall && GET /never", &["GET /stall"][..]),
+        ("GET /stall || GET /never", &["GET /stall"]),
+        ("GET /a && GET /stall || GET /never", &["GET /a", "GET /stall"]),
+        ("sleep 1 while GET /stall", &["GET /stall"]),
+        ("sleep 1 while not GET /stall", &["GET /stall"]),
+        ("assert GET /stall", &["GET /stall"]),
+        ("assert not GET /stall", &["GET /stall"]),
+    ] {
+        std::fs::write(d.join("t.api"), format!("{program}\nGET /never\n")).unwrap();
+        for flags in ["-sa", "-sfa"] {
+            let got = run_in(&server, d, &["--timeout", "1", flags, "t.api"]);
+            assert_eq!((got.code, &got.sent[..]), (Some(1), &sent.iter().map(|s| s.to_string()).collect::<Vec<_>>()[..]), "{program} {flags}: {}", got.stderr);
+            assert!(got.stderr.contains("Timed out after 1s"), "{program} {flags}: {}", got.stderr);
+        }
+    }
+}
+
+/// Every segment of a chain is a request. An include or a directive in one
+/// is an error before anything is sent, not a step that is dropped.
+#[test]
+fn an_include_or_a_directive_in_a_chain_is_an_error() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::write(d.join("seed.api"), "GET /seeded\n").unwrap();
+    for (line, segment) in [
+        ("GET /a && seed.api", "seed.api"),
+        ("GET /a && GET /b || seed.api", "seed.api"),
+        ("GET /a || sleep 2", "sleep 2"),
+        ("GET /a && assert GET /b", "assert GET /b"),
+    ] {
+        std::fs::write(d.join("c.api"), format!("GET /first\n{line}\nGET /last\n")).unwrap();
+        for args in [&["-sa", "c.api"][..], &[line]] {
+            let got = run_in(&server, d, args);
+            assert_eq!((got.code, got.sent.len()), (Some(1), 0), "{args:?}: {}", got.stderr);
+            assert_eq!(got.stderr.trim(), format!("error: chain segment is not a request: `{segment}`"), "{args:?}");
+        }
+    }
+}
+
+/// `~/` is the home directory in an outfile and in an include line, wherever
+/// the client is run from.
+#[test]
+fn a_tilde_path_is_in_the_home_directory() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let work = home.join("work");
+    std::fs::create_dir_all(home.join("seeds")).unwrap();
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(home.join("seeds/one.api"), "GET /from-home\n").unwrap();
+    std::fs::write(home.join("body.json"), r#"{"from":"home"}"#).unwrap();
+    std::fs::write(work.join("t.api"), "~/seeds/one.api\n~/seeds/*.api\nPUT /x @~/body.json\nGET /a > ~/out.json\nGET /a >> ~/more.json\n").unwrap();
+    let run = |args: &[&str]| {
+        let mut cmd = api(server.port, home);
+        cmd.current_dir(&work).args(args);
+        ran(&server, cmd)
+    };
+
+    let got = run(&["-sa", "t.api"]);
+    assert_eq!(got.code, Some(0), "{}", got.stderr);
+    assert_eq!(got.sent, ["GET /from-home", "GET /from-home", r#"PUT /x {"from":"home"}"#, "GET /a", "GET /a"]);
+    // Logged as written, written where it says.
+    assert!(got.stdout.contains("\nGET /a > ~/out.json\n"), "{}", got.stdout);
+    assert_eq!(left_in(home), ["body.json", "more.json", "out.json", "seeds", "work"]);
+    assert_eq!(left_in(&work), ["t.api"]);
+
+    // As arguments, and as the file to run.
+    std::fs::remove_file(home.join("out.json")).unwrap();
+    let got = run(&["GET", "/a", ">", "~/out.json"]);
+    assert_eq!(got.code, Some(0), "{}", got.stderr);
+    assert!(home.join("out.json").is_file());
+    for args in [&["-sa", "~/seeds/one.api"][..], &["~/seeds/one.api"]] {
+        let got = run(args);
+        assert_eq!((got.code, &got.sent[..]), (Some(0), &["GET /from-home".to_string()][..]), "{args:?}: {}", got.stderr);
+    }
+    assert_eq!(left_in(&work), ["t.api"]);
+}
+
+/// A connection given whole on the command line is used and not saved:
+/// without a credentials file there is none afterwards either.
+#[test]
+fn a_connection_from_the_command_line_creates_no_credentials_file() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    std::fs::write(d.join("one.api"), "GET /a\n").unwrap();
+    for args in [&["GET", "/a"][..], &["-sa", "one.api"], &["GET /a && GET /a"], &["--token", "t", "GET", "/a"]] {
+        let mut all = vec!["-b", url.as_str(), "-k", "k"];
+        all.extend_from_slice(args);
+        let got = run_bare(&server, d, &all);
+        assert_eq!((got.code, got.sent.is_empty()), (Some(0), false), "{all:?}: {}", got.stderr);
+        let left: Vec<String> = std::fs::read_dir(d).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+        assert_eq!(left, ["one.api"], "{all:?}");
+    }
+    // Nor at a path the variable names.
+    let named = d.join("named-credentials.json");
+    let mut cmd = api_bare(d);
+    cmd.env("API_CREDENTIALS_FILE", &named).args(["-b", &url, "-k", "k", "GET", "/a"]);
+    let got = ran(&server, cmd);
+    assert_eq!((got.code, got.sent.len()), (Some(0), 1), "{}", got.stderr);
+    assert!(!named.exists());
+}
+
+/// A file body that is not there, or a glob that matches nothing, is a hard
+/// error in a batch: exit 1 at that line, with the lines before it sent and
+/// the lines after it not.
+#[test]
+fn a_missing_file_body_stops_a_batch_where_it_stands() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::create_dir_all(d.join("empty")).unwrap();
+    for (line, says) in [
+        ("PUT /x @no-such-file.json", "File not found: no-such-file.json"),
+        ("PUT /x @empty/*.json", "no files match: empty/*.json"),
+        ("PUT /x @no-such-dir/*.ndjson", "no files match: no-such-dir/*.ndjson"),
+        ("GET /a && PUT /x @no-such-file.json", "File not found: no-such-file.json"),
+    ] {
+        std::fs::write(d.join("m.api"), format!("GET /before\n{line}\nGET /after\n")).unwrap();
+        let chained = line.starts_with("GET");
+        for flags in ["-sa", "-a", "-sfa"] {
+            let got = run_in(&server, d, &[flags, "m.api"]);
+            let sent: &[&str] = if chained { &["GET /before", "GET /a"] } else { &["GET /before"] };
+            assert_eq!((got.code, &got.sent[..]), (Some(1), &sent.iter().map(|s| s.to_string()).collect::<Vec<_>>()[..]), "{line} {flags}: {}", got.stderr);
+            assert!(got.stderr.contains(says), "{line} {flags}: {}", got.stderr);
+        }
+    }
+}
+
+/// A describe block that is not the shape it should be is warned about, one
+/// line for each thing, and the batch runs.
+#[test]
+fn a_describe_block_that_is_off_in_shape_warns_and_the_batch_runs() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::write(
+        d.join("d.api"),
+        "# Catalog\n{\n  \"title\": { \"sv_SE\": \"Katalog\", \"en-US\": \"Catalog\" },\n  \"description\": \"x\",\n  \"docsLink\": \"ftp://docs\",\n  \"owner\": \"me\"\n}\nGET /a\n",
+    )
+    .unwrap();
+    let got = run_in(&server, d, &["-sa", "d.api"]);
+    assert_eq!((got.code, &got.sent[..]), (Some(0), &["GET /a".to_string()][..]), "{}", got.stderr);
+    assert_eq!(
+        got.stderr.lines().collect::<Vec<_>>(),
+        [
+            "warning: describe block: title/sv_SE is not a locale",
+            "warning: describe block: description is not an object of texts by locale, like { \"sv-SE\": \"…\" }",
+            "warning: describe block: docsLink is not an http(s) link",
+            "warning: describe block: owner is not a member of a describe block (title, description, docsLink)",
+        ]
+    );
+    // The log is the log of a run without one.
+    assert_eq!(got.stdout.lines().filter(|l| !l.starts_with("└─")).collect::<Vec<_>>(), [&format!("[http://127.0.0.1:{}]", server.port)[..], "GET /a"]);
+}
+
+/// A passing `PUT /assert` answers `200` with `null`, and `null` is falsy:
+/// chained, it skips what follows; behind the `assert` keyword it fails.
+#[test]
+fn a_passing_assert_request_is_falsy_to_a_chain_and_to_the_assert_keyword() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    const CHECK: &str = r#"PUT /assert {"api/v1/people~count":{"is":3}}"#;
+    std::fs::write(d.join("chain.api"), format!("{CHECK} && PUT /x {{\"a\":1}}\nGET /after\n")).unwrap();
+    for flags in ["-sa", "-sfa"] {
+        let got = run_in(&server, d, &[flags, "chain.api"]);
+        assert_eq!((got.code, &got.sent[..]), (Some(0), &[CHECK.to_string(), "GET /after".to_string()][..]), "{flags}: {}", got.stderr);
+        assert!(got.stdout.contains("↳ skipped 1 request"), "{flags}: {}", got.stdout);
+    }
+    std::fs::write(d.join("keyword.api"), format!("assert {CHECK}\nGET /never\n")).unwrap();
+    let got = run_in(&server, d, &["-sa", "keyword.api"]);
+    assert_eq!((got.code, &got.sent[..]), (Some(1), &[CHECK.to_string()][..]), "{}", got.stderr);
+    assert!(got.stderr.contains(&format!("assertion failed: assert {CHECK} (null)")), "{}", got.stderr);
+    // On a line of its own it is a request that went well.
+    std::fs::write(d.join("own.api"), format!("{CHECK}\nPUT /x {{\"a\":1}}\n")).unwrap();
+    let got = run_in(&server, d, &["-sfa", "own.api"]);
+    assert_eq!((got.code, got.sent.len()), (Some(0), 2), "{}", got.stderr);
+}
+
+/// Under `-f`, a check that gets a status which is never an answer ends the
+/// run with that response's body last on stdout. A 409 where a question was
+/// asked is the answer "no", and the run goes on.
+#[test]
+fn fail_fast_prints_the_body_of_a_check_that_got_no_answer_and_lets_a_no_pass() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    for (path, status, body) in [
+        ("/denied", "401 Unauthorized", r#"{"error":"denied"}"#),
+        ("/barred", "403 Forbidden", r#"{"error":"barred"}"#),
+        ("/boom", "500 Internal Server Error", "{}"),
+    ] {
+        for check in [format!("assert GET {path}"), format!("assert not GET {path}"), format!("sleep 1 while GET {path}"), format!("sleep 1 while not GET {path}")] {
+            std::fs::write(d.join("f.api"), format!("GET /before\n{check}\nGET /never\n")).unwrap();
+            let got = run_in(&server, d, &["-sfa", "f.api"]);
+            assert_eq!((got.code, &got.sent[..]), (Some(1), &["GET /before".to_string(), format!("GET {path}")][..]), "{check}: {}", got.stderr);
+            assert!(got.stderr.contains("could not be evaluated"), "{check}: {}", got.stderr);
+            assert!(got.stderr.trim_end().ends_with(", aborting"), "{check}: {}", got.stderr);
+            // Everything after the last status line is the body.
+            let last = got.stdout.rfind("└─HTTP/1.1 ").unwrap_or_else(|| panic!("{check}: {}", got.stdout));
+            let (status_line, rest) = got.stdout[last..].split_once('\n').unwrap();
+            assert!(status_line.contains(status), "{check}: {}", got.stdout);
+            assert_eq!(rest.trim_end(), body, "{check}: {}", got.stdout);
+        }
+    }
+
+    // A 409 as the answer to a question.
+    std::fs::write(
+        d.join("no.api"),
+        "GET /conflict || GET /then\nGET /conflict && GET /skipped\nassert not GET /conflict\nsleep 1 while GET /conflict\nGET /after\n",
+    )
+    .unwrap();
+    let got = run_in(&server, d, &["-sfa", "no.api"]);
+    assert_eq!(got.code, Some(0), "{}", got.stderr);
+    assert_eq!(got.sent, ["GET /conflict", "GET /then", "GET /conflict", "GET /conflict", "GET /conflict", "GET /after"]);
+    assert!(!got.stdout.contains("\"error\""), "{}", got.stdout);
+    // The last request of a chain asks nothing: there a 409 stops the run.
+    std::fs::write(d.join("last.api"), "GET /a && GET /conflict\nGET /never\n").unwrap();
+    let got = run_in(&server, d, &["-sfa", "last.api"]);
+    assert_eq!((got.code, &got.sent[..]), (Some(1), &["GET /a".to_string(), "GET /conflict".to_string()][..]), "{}", got.stderr);
+    assert!(got.stdout.trim_end().ends_with(r#"{"error":"conflict"}"#), "{}", got.stdout);
+}
+
+/// A declined `confirm` says `aborted`, and the `-sa` log has the line.
+#[cfg(unix)]
+#[test]
+fn a_declined_confirm_says_aborted_and_the_log_has_the_line() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("c.api"), "GET /before\nconfirm Really?\nconfirm\nGET /after\n").unwrap();
+
+    server.take();
+    let mut cmd = api(server.port, dir.path());
+    cmd.args(["-sa", "c.api"]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let run = |cmd: &mut std::process::Command, answers: &str| {
+        let mut child = cmd.spawn().expect("spawn api");
+        child.stdin.take().unwrap().write_all(answers.as_bytes()).unwrap();
+        let out = child.wait_with_output().expect("api runs");
+        server.settle(Duration::from_millis(150), Duration::from_secs(3));
+        (out.status.code(), String::from_utf8_lossy(&out.stdout).to_string(), String::from_utf8_lossy(&out.stderr).to_string(), server.take())
+    };
+
+    let (code, stdout, stderr, sent) = run(&mut cmd, "y\nn\n");
+    assert_eq!((code, &sent[..]), (Some(0), &["GET /before".to_string()][..]), "{stderr}");
+    // Both questions, on the line the answers left them on, and the verdict.
+    assert_eq!(stderr.trim_end(), "Really? [Y/n] Continue? [Y/n] aborted");
+    let log: Vec<&str> = stdout.lines().filter(|l| !l.starts_with("└─")).collect();
+    assert_eq!(log, [&format!("[http://127.0.0.1:{}]", server.port)[..], "GET /before", "confirm Really?", "confirm"], "{stdout}");
+
+    let (code, stdout, stderr, sent) = run(&mut cmd, "\n\n");
+    assert_eq!((code, &sent[..]), (Some(0), &["GET /before".to_string(), "GET /after".to_string()][..]), "{stderr}");
+    assert!(!stderr.contains("aborted"), "{stderr}");
+    let log: Vec<&str> = stdout.lines().filter(|l| !l.starts_with("└─")).collect();
+    assert_eq!(log[1..], ["GET /before", "confirm Really?", "confirm", "GET /after"], "{stdout}");
+}
+
+/// At the prompt a `confirm` is answered with a key: Enter goes on, esc does
+/// not, and the session stays either way.
+#[cfg(unix)]
+#[test]
+fn a_confirm_at_the_prompt_takes_enter_for_yes_and_esc_for_no() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = open_prompt(&server, dir.path(), &[]);
+    for (key, sent) in [(&b"\r"[..], &["GET /before", "GET /after"][..]), (b"\x1b", &["GET /before"]), (b"y", &["GET /before", "GET /after"]), (b"n", &["GET /before"])] {
+        prompt.send(b"\x15");
+        prompt.pump(Duration::from_millis(60));
+        server.take();
+        prompt.paste("GET /before\rconfirm Really\rGET /after");
+        prompt.pump(Duration::from_millis(80));
+        let mark = prompt.screen.len();
+        prompt.send(b"\r");
+        assert!(
+            pump_until(&mut prompt, Duration::from_secs(5), |p| pty::plain(&p.screen[mark..]).contains("Really? (Y/n)")),
+            "{}",
+            pty::plain(&prompt.screen[mark..])
+        );
+        assert_eq!(server.log.lock().unwrap().clone(), ["GET /before"]);
+        prompt.send(key);
+        pump_until(&mut prompt, Duration::from_secs(2), |_| server.seen() == sent.len());
+        prompt.pump(Duration::from_millis(400));
+        assert_eq!(server.take(), sent, "{key:?}: {}", pty::plain(&prompt.screen[mark..]));
+        assert_eq!(prompt.exited(), None, "{key:?}");
+    }
+}
+
+/// The `-sa` log names the environment once, however many files and requests
+/// the run has. `-s` on a single request keeps the size line of an outfile
+/// to itself.
+#[test]
+fn the_silent_log_names_the_base_once_and_s_drops_the_outfile_line() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let base = format!("[http://127.0.0.1:{}]", server.port);
+    std::fs::write(d.join("main.api"), "GET /a\ninc.api\nGET /a && GET /b\ninc.api\nGET /c > c.json\n").unwrap();
+    std::fs::write(d.join("inc.api"), "GET /inc\n").unwrap();
+    let got = run_in(&server, d, &["-sa", "main.api"]);
+    assert_eq!((got.code, got.sent.len()), (Some(0), 6), "{}", got.stderr);
+    assert_eq!(got.stdout.lines().next(), Some(&base[..]));
+    assert_eq!(got.stdout.matches(&base).count(), 1, "{}", got.stdout);
+    assert_eq!(got.stdout.matches("127.0.0.1").count(), 1, "{}", got.stdout);
+
+    // The size line: there for a request, and under the status line of a
+    // batch line; gone with `-s`, where the file is still written.
+    let shown = run_in(&server, d, &["GET", "/a", ">", "one.json"]);
+    assert!(shown.stderr.contains("> one.json ("), "{}", shown.stderr);
+    let batch = run_in(&server, d, &["-a", "main.api"]);
+    assert!(batch.stderr.contains("> c.json ("), "{}", batch.stderr);
+    std::fs::remove_file(d.join("one.json")).unwrap();
+    let silent = run_in(&server, d, &["-s", "GET", "/a", ">", "one.json"]);
+    assert_eq!((silent.code, silent.stdout.as_str(), silent.stderr.as_str()), (Some(0), "", ""));
+    assert!(d.join("one.json").is_file());
+    let silent = run_in(&server, d, &["-s", "GET", "/a", ">>", "one.json"]);
+    assert_eq!((silent.code, silent.stdout.as_str(), silent.stderr.as_str()), (Some(0), "", ""));
+}
+
+/// A request that is sent on with a 307 arrives as the request it was: the
+/// method, the body and the credential.
+#[test]
+fn a_redirected_request_keeps_its_method_body_and_authorization() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::write(d.join("r.api"), "PUT /moved {\"x\":1}\n").unwrap();
+    for args in [&["PUT", "/moved", "{\"x\":1}"][..], &["-sa", "r.api"]] {
+        let got = run_in(&server, d, args);
+        assert_eq!(got.code, Some(0), "{args:?}: {}", got.stderr);
+        assert_eq!(got.sent, ["PUT /moved {\"x\":1}", "PUT /landed {\"x\":1}"], "{args:?}");
+        let heads = server.heads();
+        assert_eq!(heads[0], heads[1], "{args:?}");
+        assert!(heads[1].contains("content-type=application/json; authorization=Basic Oms=;"), "{args:?}: {heads:?}");
+    }
+    let got = run_in(&server, d, &["PATCH", "/moved", "{\"y\":2}"]);
+    assert_eq!(got.sent, ["PATCH /moved {\"y\":2}", "PATCH /landed {\"y\":2}"]);
+    assert!(got.stdout.contains("/api/v1/landed"), "{}", got.stdout);
+}
+
+/// A body piped on stdin is sent as it is, trimmed and nothing else: it is
+/// not read as a body argument is, so a comment in it is not stripped and a
+/// raw newline is not escaped. The same text as an argument is read.
+#[test]
+fn a_piped_body_is_sent_as_it_is_and_a_body_argument_is_read() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    const BODY: &str = "{\n  // the name\n  \"name\": \"a # b\",\n  \"note\": \"two\nlines\"\n}";
+    for (stdin, sent) in [
+        (format!("\n{BODY}\n\n"), format!("PUT /x {BODY}")),
+        ("a,b # c\n1,2\n".to_string(), "PUT /x a,b # c\n1,2".to_string()),
+    ] {
+        server.take();
+        let mut cmd = api(server.port, dir.path());
+        cmd.args(["PUT", "/x"]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn api");
+        child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+        let out = child.wait_with_output().expect("api runs");
+        server.settle(Duration::from_millis(150), Duration::from_secs(3));
+        assert_eq!((out.status.code(), server.take()), (Some(0), vec![sent]), "{stdin:?}");
+    }
+    let got = run_in(&server, dir.path(), &["PUT", "/x", BODY]);
+    assert_eq!((got.code, got.sent), (Some(0), vec!["PUT /x {\n  \n  \"name\": \"a # b\",\n  \"note\": \"two\\nlines\"\n}".to_string()]), "{}", got.stderr);
 }

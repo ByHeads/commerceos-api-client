@@ -85,7 +85,8 @@ api --export com.heads.seedID GET /users > users.json
 
 A first word that is neither a method nor a path is an error (`not a request or .api file`),
 not a request to a nonsense path. Bodies are read as in a batch file, comments stripped and
-raw newlines inside strings escaped, and a `> file` may sit in any argument.
+raw newlines inside strings escaped, and a `> file` may sit in any argument. A body piped
+on stdin is sent as it is: no comments stripped, no newlines escaped.
 
 ### Bodies
 
@@ -127,7 +128,7 @@ no path is an error. Numbers in a body written to a file keep the digits the ser
 
 In interactive mode and in batch files, `&&` runs the next request only if the previous one
 was truthy and `||` only if it was falsy. Truthy means a 2xx whose body is not `false`,
-`null`, `0`, or `""`. A 404 is falsy; 401/403, 5xx, and timeouts abort the whole line.
+`null`, `0`, or `""`. A 404 is falsy; 401/403, 408/429, 5xx, and timeouts abort the whole line.
 Chains evaluate left to right like a shell, and separators inside JSON are ignored.
 
 ```
@@ -363,16 +364,31 @@ Usage: api [OPTIONS] [METHOD] [URI] [BODY]
 
 ```sh
 cargo test --bin api                                     # unit tests
-cargo test --test parity                                 # one table of lines through file, arguments and prompt
-cargo test --test imports                                # import git/dir/archive; fetches this repo from GitHub (API_TEST_OFFLINE=1 skips that)
-API_TEST_BASE_URI=http://localhost:5000 API_TEST_KEY=… cargo test --test cli   # end-to-end, needs a local COS
+perl -e 'alarm 900; exec @ARGV' cargo test --test parity # what is sent, printed and written, from a file, arguments and the prompt
+cargo test --test imports                                # import git/dir/archive
+cargo test --test cli -- --skip clipboard                # end-to-end, most of it against a local COS
+cargo test --test cli -- clipboard --test-threads=1      # the tests that copy to the clipboard
 ```
 
-The parity tests need no server: they drive the binary, prompt included, against a
-recording server of their own.
+What each suite needs:
 
-The end-to-end tests go through `/echo-all`, so nothing is persisted. Without the two
-variables they use the default saved connection and prompt for keychain access.
+| Suite | Needs |
+|---|---|
+| `--bin api` | This machine only, and `git` on the `PATH`. |
+| `--test parity` | This machine only, and `git`. It drives the binary, prompt included (through a pseudo-terminal, unix only), against a recording server of its own on `127.0.0.1`. Run it under a time limit: a prompt test that hangs takes the suite with it. |
+| `--test imports` | `git`. Five of its tests fetch this repository from github.com and need the network; `API_TEST_OFFLINE=1` skips them. One of the five goes over ssh and also needs an ssh key GitHub accepts; without one it skips itself. A skipped test prints a line starting with `SKIPPED` on stderr (`-- --nocapture` shows it). |
+| `--test cli` | A local COS with the `/assert` endpoint, and credentials for it, for about fifty of its tests: they fail with instructions when either is missing. The rest start a small server of their own. The four tests named `…clipboard…` copy to the system clipboard, overwriting what it held, and are run on their own, one at a time. |
+
+No test sends anything to a host other than this machine, apart from the five that read
+from github.com.
+
+The tests against the local COS go through `/echo-all`, `/about` and `/assert`, so nothing
+is persisted. They always run with `--no-keychain`, on the credentials file
+`.api-credentials.json` in the repository root (gitignored; copy
+`.api-credentials-sample.json` and put in the key of the local COS). `API_TEST_BASE_URI`
+and `API_TEST_KEY`, when both are set, are passed as `-b` and `-k` and win over the file.
+Without the file and without the variables the tests that need the server fail: the
+keychain is never asked.
 
 ## License
 

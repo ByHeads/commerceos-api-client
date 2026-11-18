@@ -6,9 +6,18 @@
 //! Repositories that import each other are built the same way, in a
 //! temporary directory.
 //!
-//! The last group fetches this client's own repository from GitHub, over
-//! https and over ssh, and so needs the network (and, for ssh, a key GitHub
-//! accepts). Set `API_TEST_OFFLINE=1` to skip that group.
+//! Five tests fetch this client's own repository from github.com and so
+//! need the network: `the_api_client_repository_imports_over_https`,
+//! `the_api_client_repository_imports_over_ssh`,
+//! `the_api_client_release_tarball_imports_over_https`,
+//! `the_released_fixture_imports_from_a_subdirectory_of_the_repository` and
+//! `an_imported_file_can_import_the_api_client_repository_from_github`.
+//! `API_TEST_OFFLINE=1` skips the five. The ssh one also needs an ssh key
+//! that GitHub accepts, and skips itself where there is none. A skipped test
+//! prints a line that starts with `SKIPPED` on stderr (shown with
+//! `-- --nocapture`): it passes without having checked anything.
+//!
+//! Nothing here needs a local CommerceOS, a credentials file or a clipboard.
 //!
 //! Run with: `cargo test --test imports`
 #![cfg(unix)]
@@ -1035,8 +1044,8 @@ fn an_import_line_that_cannot_be_meant_stops_the_batch_before_any_request() {
     let here = fixture().display().to_string();
     for (import, says) in [
         // An archive over plain http from anywhere but this machine.
-        (r#"import archive lib { "url": "http://example.com/lib.tar.gz" }"#.to_string(), "unsupported url"),
-        (r#"import archive lib { "url": "ftp://example.com/lib.tar.gz" }"#.to_string(), "unsupported url"),
+        (r#"import archive lib { "url": "http://example.invalid/lib.tar.gz" }"#.to_string(), "unsupported url"),
+        (r#"import archive lib { "url": "ftp://example.invalid/lib.tar.gz" }"#.to_string(), "unsupported url"),
         (r#"import archive lib { "url": "file://relative/lib.tar.gz" }"#.to_string(), "unsupported url"),
         // A hash that is not one.
         (format!(r#"import archive lib {{ "url": "{}", "sha256": "abc" }}"#, server.url("/lib.tar.gz")), "import lib: `sha256` must be 64 hexadecimal characters"),
@@ -1055,8 +1064,8 @@ fn an_import_line_that_cannot_be_meant_stops_the_batch_before_any_request() {
         (r#"import svn lib { "url": "x" }"#.to_string(), "unknown import kind `svn` (expected `git`, `dir` or `archive`)"),
         // A `file://` url that names another machine, and a `\` in any url.
         (r#"import archive lib { "url": "file://fileserver/share/lib.tar.gz" }"#.to_string(), "a file:// url reads a file of this machine, not of the host `fileserver`"),
-        (r#"import archive lib { "url": "https://example.com\\@127.0.0.1/lib.tar.gz" }"#.to_string(), "unsupported url"),
-        (r#"import git lib { "url": "https://example.com\\@127.0.0.1/repo", "ref": "main" }"#.to_string(), "unsupported url"),
+        (r#"import archive lib { "url": "https://example.invalid\\@127.0.0.1/lib.tar.gz" }"#.to_string(), "unsupported url"),
+        (r#"import git lib { "url": "https://example.invalid\\@127.0.0.1/repo", "ref": "main" }"#.to_string(), "unsupported url"),
         (format!(r#"import git lib {{ "url": "file://{here}", "ref": "1.0", "path": "/etc" }}"#), "`path` must be a relative path inside the import"),
     ] {
         let ran = run_batch(&dir, server.port, "-sa", &format!("{import}\nGET /never\n"));
@@ -1495,13 +1504,41 @@ const REPO_TARBALL: &str = "https://github.com/byheads/commerceos-api-client/arc
 const TAG: &str = "3.2.2";
 const TAG_COMMIT: &str = "154faa4762c01badbd555ab2acfd3916e57a5d20";
 
-/// Whether the tests that need GitHub were asked to stand down.
+/// Whether the tests that need GitHub were asked to stand down. A test that
+/// is skipped says so on stderr: it has checked nothing.
 fn offline(test: &str) -> bool {
     let offline = std::env::var_os("API_TEST_OFFLINE").is_some_and(|v| !v.is_empty());
     if offline {
-        eprintln!("{test}: skipped, API_TEST_OFFLINE is set");
+        eprintln!("SKIPPED {test}: API_TEST_OFFLINE is set, so nothing was fetched from github.com and nothing was checked");
     }
     offline
+}
+
+/// Whether GitHub refuses this machine over ssh: no key, a key it does not
+/// know, or a host key nobody has accepted. Asked the way the client asks
+/// (`git ls-remote`, never stopping for a password), so the answer is the
+/// one the import would get. Anything else that goes wrong (no network) is
+/// not a reason to skip, and is left for the test to fail on.
+fn ssh_to_github_is_refused(test: &str) -> bool {
+    let out = Command::new("git")
+        .args(["ls-remote", "--", REPO_SSH, TAG])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=20")
+        .stdin(Stdio::null())
+        .output()
+        .expect("git runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let refused = !out.status.success()
+        && (stderr.contains("Permission denied") || stderr.contains("Host key verification failed"));
+    if refused {
+        eprintln!(
+            "SKIPPED {test}: github.com refuses this machine over ssh, so nothing was checked.\n\
+             It needs an ssh key that GitHub accepts and github.com among the known hosts.\n\
+             git said: {}",
+            stderr.trim()
+        );
+    }
+    refused
 }
 
 /// `example3.api` of the release: a poll, then a write. The server answers
@@ -1512,6 +1549,8 @@ fn assert_example3_ran(sent: &[String], how: &str) {
     assert!(sent[1].starts_with("POST /people {") && sent[1].contains("\"name\": \"Mr 214\""), "{how}: {}", sent[1]);
 }
 
+/// Needs the network: the repository is fetched from github.com over https,
+/// by tag, by commit and by branch.
 #[test]
 fn the_api_client_repository_imports_over_https() {
     if offline("the_api_client_repository_imports_over_https") {
@@ -1577,9 +1616,14 @@ fn the_api_client_repository_imports_over_https() {
     assert_eq!(server.sent(), Vec::<String>::new());
 }
 
+/// Needs the network and an ssh key that GitHub accepts: the repository is
+/// fetched from github.com over ssh. Without such a key it is skipped, and
+/// says so.
 #[test]
 fn the_api_client_repository_imports_over_ssh() {
-    if offline("the_api_client_repository_imports_over_ssh") {
+    if offline("the_api_client_repository_imports_over_ssh")
+        || ssh_to_github_is_refused("the_api_client_repository_imports_over_ssh")
+    {
         return;
     }
     let (_guard, dir) = temp();
@@ -1595,6 +1639,7 @@ fn the_api_client_repository_imports_over_ssh() {
     assert_example3_ran(&server.sent(), "ssh");
 }
 
+/// Needs the network: a release tarball is downloaded from github.com.
 #[test]
 fn the_api_client_release_tarball_imports_over_https() {
     if offline("the_api_client_release_tarball_imports_over_https") {
@@ -1635,6 +1680,9 @@ const FIXTURE_PATH: &str = "tests/fixtures/import";
 /// `path`, sends what the copy in the working tree does. Only the files that
 /// release holds are run (`seed.api`, `chain.api`, `with-json.api`), which is
 /// why those three must keep sending what `fixture_requests` lists.
+///
+/// Needs the network: the release is fetched from github.com, as a
+/// repository and as a tarball.
 #[test]
 fn the_released_fixture_imports_from_a_subdirectory_of_the_repository() {
     if offline("the_released_fixture_imports_from_a_subdirectory_of_the_repository") {
@@ -1691,6 +1739,8 @@ fn the_released_fixture_imports_from_a_subdirectory_of_the_repository() {
 /// A nested import across the network: the fixture, imported from the working
 /// tree and from a local repository, holds files that import this client's
 /// repository from GitHub themselves, as a repository and as a tarball.
+///
+/// Needs the network: both are fetched from github.com.
 #[test]
 fn an_imported_file_can_import_the_api_client_repository_from_github() {
     if offline("an_imported_file_can_import_the_api_client_repository_from_github") {
@@ -2368,5 +2418,58 @@ fn a_fetch_clears_out_nothing_that_the_client_did_not_put_in_the_cache() {
             let known = foreign.iter().any(|f| *f == entry.path());
             assert!(known || !name.starts_with(".tmp-"), "left behind: {}", entry.path().display());
         }
+    }
+}
+
+/// `import … @x.json` reads its JSON as a request reads an `@file` body:
+/// from the working directory, not from beside the `.api` file. A file of
+/// that name beside the `.api` file is not the one.
+#[test]
+fn the_import_json_is_relative_to_the_working_directory_not_to_the_file() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", Vec::new());
+    std::fs::create_dir_all(dir.join("batches")).unwrap();
+    std::fs::write(dir.join("batches/batch.api"), format!("import dir lib @where.json\n{RUN_THE_FIXTURE}")).unwrap();
+    let run = || {
+        let mut cmd = api(&dir, server.port);
+        cmd.args(["-sa", "batches/batch.api"]);
+        finish(cmd, "")
+    };
+
+    // Only beside the `.api` file: not found, and nothing is sent.
+    std::fs::write(dir.join("batches/where.json"), format!("{{\"path\": \"{}\"}}", fixture().display())).unwrap();
+    let ran = run();
+    assert!(!ran.ok, "{}", ran.stdout);
+    assert!(ran.stderr.contains("where.json"), "{}", ran.stderr);
+    assert_eq!(server.sent(), Vec::<String>::new());
+
+    // In the working directory: read, and the one beside the file is not.
+    std::fs::write(dir.join("batches/where.json"), "{\"path\": \"no-such-directory\"}").unwrap();
+    std::fs::write(dir.join("where.json"), format!("{{\"path\": \"{}\"}}", fixture().display())).unwrap();
+    let ran = run();
+    assert!(ran.ok, "{}", ran.stderr);
+    assert_eq!(server.sent(), fixture_requests());
+}
+
+/// `~/` is the home directory in the path of an `import dir` and in the
+/// `@file` an import's JSON is read from.
+#[test]
+fn a_tilde_path_of_an_import_is_in_the_home_directory() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", Vec::new());
+    let home = dir.join("home");
+    let work = dir.join("work");
+    std::fs::create_dir_all(home.join("libs/own")).unwrap();
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(home.join("libs/own/x.api"), "GET /from-home\n").unwrap();
+    std::fs::write(home.join("where.json"), "{\"path\": \"~/libs/own\"}").unwrap();
+    for import in ["import dir own {\"path\": \"~/libs/own\"}", "import dir own @~/where.json"] {
+        std::fs::write(work.join("batch.api"), format!("{import}\nown/x.api\n")).unwrap();
+        let mut cmd = api(&work, server.port);
+        cmd.env("HOME", &home).args(["-sa", "batch.api"]);
+        let ran = finish(cmd, "");
+        assert!(ran.ok, "{import}: {}", ran.stderr);
+        assert_eq!(server.sent(), ["GET /from-home"], "{import}");
+        assert!(ran.stdout.contains(&format!("import own {}", home.join("libs/own").display())), "{import}: {}", ran.stdout);
     }
 }
