@@ -183,6 +183,10 @@ fn answer(
     } else {
         None
     };
+    if path.contains("/late") {
+        // Two seconds of nothing, then an answer like any other.
+        std::thread::sleep(Duration::from_secs(2));
+    }
     if path.contains("/slow") {
         // A whole body, in pieces over three seconds.
         let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n1\r\n[\r\n");
@@ -1206,6 +1210,53 @@ fn a_response_cut_short_ends_the_run() {
     assert_eq!(stalled.code, Some(1), "{}", stalled.stderr);
     assert!(stalled.stderr.contains("Timed out after"), "{}", stalled.stderr);
     assert!(!d.join("s.json").exists());
+}
+
+/// The timeout is how long nothing may arrive, not how long a response may
+/// take. A body that keeps coming for three seconds is whole under a timeout
+/// of one, buffered and streamed, by the option and by a `set` line. (From
+/// the change to one HTTP client until 3.3.2 was released it was a deadline
+/// for the whole transfer, which ended any export longer than `--timeout`.)
+#[test]
+fn a_timeout_is_for_silence_not_for_the_whole_transfer() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let whole = |name: &str| {
+        let text = std::fs::read_to_string(d.join(name)).unwrap_or_default();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{name}: {e}: {text:?}"));
+        assert_eq!(value.as_array().map(Vec::len), Some(16), "{text}");
+    };
+
+    let buffered = run_in(&server, d, &["--timeout", "1", "GET", "/slow", ">", "b.json"]);
+    assert_eq!((buffered.code, &buffered.sent[..]), (Some(0), &["GET /slow".to_string()][..]), "{}", buffered.stderr);
+    whole("b.json");
+    let streamed = run_in(&server, d, &["--stream", "--timeout", "1", "GET", "/slow", ">", "s.json"]);
+    assert_eq!(streamed.code, Some(0), "{}", streamed.stderr);
+    whole("s.json");
+    std::fs::write(d.join("t.api"), "set timeout 1\nGET /slow > f.json\nGET /after\n").unwrap();
+    let by_line = run_in(&server, d, &["-sa", "t.api"]);
+    assert_eq!((by_line.code, by_line.sent.len()), (Some(0), 2), "{}", by_line.stderr);
+    whole("f.json");
+
+    // Silence is what it is for: an answer that is two seconds in coming.
+    let late = run_in(&server, d, &["--timeout", "1", "GET", "/late"]);
+    assert_eq!(late.code, Some(1), "{}", late.stderr);
+    assert!(late.stderr.contains("Timed out after 1s"), "{}", late.stderr);
+    // `0` waits for as long as it takes, and is not the default under
+    // another name: it holds against a `set timeout 1` of the file.
+    let never = run_in(&server, d, &["--timeout", "0", "GET", "/late"]);
+    assert_eq!(never.code, Some(0), "{}", never.stderr);
+    std::fs::write(d.join("t.api"), "set timeout 1\nGET /late\n").unwrap();
+    let over_line = run_in(&server, d, &["--timeout", "0", "-sa", "t.api"]);
+    assert_eq!(over_line.code, Some(0), "{}", over_line.stderr);
+    assert!(over_line.stdout.contains("↳ ignored: --timeout 0 is set"), "{}", over_line.stdout);
+    // `set timeout 0` and `set timeout off` both end a `set timeout 1`.
+    for back in ["0", "off"] {
+        std::fs::write(d.join("t.api"), format!("set timeout 1\nset timeout {back}\nGET /late\nGET /after\n")).unwrap();
+        let got = run_in(&server, d, &["-sa", "t.api"]);
+        assert_eq!((got.code, &got.sent[..]), (Some(0), &["GET /late", "GET /after"].map(String::from)[..]), "{back}: {}", got.stderr);
+    }
 }
 
 /// With `--stream` a body that fails partway leaves the outfile as it was:

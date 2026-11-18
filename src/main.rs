@@ -772,28 +772,66 @@ fn client_builder() -> reqwest::blocking::ClientBuilder {
 /// `sleep while` poll comes round every 5 seconds by default.
 const IDLE_CONNECTION_SECS: u64 = 3;
 
-/// The HTTP client of the process. Every request to the API goes through
-/// this one, so a request that follows another within `IDLE_CONNECTION_SECS`
-/// is sent on the connection that is already open, with no new TCP and TLS
-/// handshake: the calls a session starts with, and the lines of a batch.
-///
-/// It has no timeout of its own, and reqwest's hidden 30s default can never
-/// apply: each request is given its own with `timed`.
-fn http_client() -> &'static Client {
-    static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(|| {
-        client_builder()
-            .timeout(None)
-            .pool_idle_timeout(Duration::from_secs(IDLE_CONNECTION_SECS))
-            .build()
-            .expect("could not set up the HTTP client")
-    })
+/// The HTTP clients of the process, by the timeout each was built with, and
+/// the timeout the last one asked for had.
+struct HttpClients {
+    by_timeout: HashMap<u64, Client>,
+    last: u64,
 }
 
-/// `request` with its timeout, from the start of the request to the end of
-/// the response body. `0` is no timeout (`--timeout 0`).
+fn http_clients() -> std::sync::MutexGuard<'static, HttpClients> {
+    static CLIENTS: std::sync::OnceLock<std::sync::Mutex<HttpClients>> = std::sync::OnceLock::new();
+    CLIENTS
+        .get_or_init(|| std::sync::Mutex::new(HttpClients { by_timeout: HashMap::new(), last: DEFAULT_TIMEOUT_SECS }))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The HTTP client for requests that are given up on after `timeout_secs`
+/// without anything arriving (`0`: never). Every request to the API goes
+/// through it, so a request that follows another within
+/// `IDLE_CONNECTION_SECS` is sent on the connection that is already open,
+/// with no new TCP and TLS handshake: the calls a session starts with, and
+/// the lines of a batch.
+///
+/// The timeout is the client's and not the request's, because the two are
+/// not the same thing to reqwest. A client's timeout is how long to wait for
+/// the answer, and then for each read of its body, so a response that keeps
+/// arriving is never cut off. A request's own timeout (`timed`) is a deadline
+/// from its start to the end of its body, which would end an export that
+/// takes longer than `--timeout` however well it is going. So there is one
+/// client per timeout a run uses: nearly always one.
+fn http_client_for(timeout_secs: u64) -> Client {
+    let mut clients = http_clients();
+    clients.last = timeout_secs;
+    clients
+        .by_timeout
+        .entry(timeout_secs)
+        .or_insert_with(|| {
+            client_builder()
+                // `None` also keeps reqwest's hidden 30s default away.
+                .timeout((timeout_secs != 0).then(|| Duration::from_secs(timeout_secs)))
+                .pool_idle_timeout(Duration::from_secs(IDLE_CONNECTION_SECS))
+                .build()
+                .expect("could not set up the HTTP client")
+        })
+        .clone()
+}
+
+/// The client the last request was sent through, for a call that has no
+/// `Config` to read a timeout from and is `timed` itself: it shares that
+/// request's connection.
+fn http_client() -> Client {
+    let last = http_clients().last;
+    http_client_for(last)
+}
+
+/// `request` with a deadline of its own, from its start to the end of the
+/// response body, whatever the client it is sent through waits. For the
+/// short calls around the requests of a run (`/about`, the token exchange,
+/// the spec), which are small and either answer soon or are done without.
 fn timed(request: reqwest::blocking::RequestBuilder, timeout_secs: u64) -> reqwest::blocking::RequestBuilder {
-    if timeout_secs == 0 { request } else { request.timeout(Duration::from_secs(timeout_secs)) }
+    request.timeout(Duration::from_secs(timeout_secs))
 }
 
 /// How a request timeout should be described in errors and help text.
@@ -5240,7 +5278,7 @@ fn metadata_version_has_spec(version: &str) -> bool {
 fn check_connection(config: &Config) -> Result<(bool, bool, bool), u16> {
     let url = format!("{}{}/about", config.base_uri, config.api_path);
 
-    let mut request = timed(http_client().get(&url), 5);
+    let mut request = timed(http_client_for(config.timeout_secs).get(&url), 5);
 
     if let Some(authorization) = auth_header(config) {
         request = request.header("Authorization", authorization);
@@ -6498,6 +6536,9 @@ impl Config {
         self.raw = given.raw || file.raw;
         self.stream_requested = !self.no_streaming && (given.stream || file.stream);
         self.timeout_secs = given.timeout.or(file.timeout).unwrap_or(DEFAULT_TIMEOUT_SECS);
+        // A call with no `Config` of its own (the token exchange a run may
+        // start with) goes through the client the requests will use.
+        http_clients().last = self.timeout_secs;
         // The prompt knows whether the server streams; a batch assumes so.
         self.streaming = self.stream_requested && self.server_streaming;
     }
@@ -10501,10 +10542,10 @@ struct BuiltRequest {
 /// body. The batch, the prompt and the retry after a renewed token all build
 /// here. `Err` is an `@file` body that could not be read; nothing is sent.
 fn build_request(config: &Config, parts: &RequestParts) -> Result<BuiltRequest, String> {
-    let client = http_client();
+    let client = http_client_for(config.timeout_secs);
     let url = format!("{}{}", config.base_uri, backslashes_encoded(&resolve_request_path(&config.api_path, &parts.uri)));
 
-    let request = match parts.method.as_str() {
+    let mut request = match parts.method.as_str() {
         "GET" => client.get(&url),
         "POST" => client.post(&url),
         "PUT" => client.put(&url),
@@ -10514,7 +10555,6 @@ fn build_request(config: &Config, parts: &RequestParts) -> Result<BuiltRequest, 
         "OPTIONS" => client.request(reqwest::Method::OPTIONS, &url),
         _ => client.get(&url),
     };
-    let mut request = timed(request, config.timeout_secs);
 
     if let Some(authorization) = auth_header(config) {
         request = request.header("Authorization", authorization);
@@ -16102,7 +16142,7 @@ fn take_spec(state: &mut AppState) -> bool {
 /// answer that is not a list.
 fn fetch_mapped_type_names(config: &Config) -> Option<Vec<String>> {
     let url = format!("{}{}/mapped-types", config.base_uri, config.api_path);
-    let mut request = timed(http_client().get(&url), 10);
+    let mut request = timed(http_client_for(config.timeout_secs).get(&url), 10);
 
     if let Some(authorization) = auth_header(config) {
         request = request.header("Authorization", authorization);
@@ -16204,7 +16244,7 @@ fn apply_spec(state: &mut AppState, result: BackgroundLoadResult) {
 fn load_openapi_spec_into(config: &Config, result: &mut BackgroundLoadResult) {
     let url = format!("{}/openapi/spec.json", config.base_uri);
 
-    let mut request = timed(http_client().get(&url), 30);
+    let mut request = timed(http_client_for(config.timeout_secs).get(&url), 30);
 
     if let Some(authorization) = auth_header(config) {
         request = request.header("Authorization", authorization);

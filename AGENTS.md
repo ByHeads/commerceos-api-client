@@ -863,7 +863,7 @@ GET /people~count > /tmp/count.json          # as the server answers, nulls incl
 | `set ndjson` | `--ndjson` | NDJSON is sent and asked for |
 | `set raw` | `-r` | JSON is printed and written to a `> file` as it came, not indented |
 | `set stream` | `--stream` | [a response bound for a `> file` is written as it arrives](#streaming-large-exports---stream) |
-| `set timeout <seconds>` | `--timeout <seconds>` | a request is given up on after that long; `0` is no timeout |
+| `set timeout <seconds>` | `--timeout <seconds>` | a request is given up on when nothing has arrived for that long; `0` is no timeout |
 
 - **`set <name> off` turns it off again**, and for `timeout` is the default
   of ten minutes again. `set <name> on` is `set <name>`. The preview and the
@@ -1507,7 +1507,7 @@ Run it: `api -sa workshop.api`.
 - **Piping a body that is not UTF-8** → `error: could not read the body from stdin`, exit 1, nothing sent. Send it as an `@file`.
 - **Piping a JSON body with comments, or with a raw newline in a string** → it is sent as piped, and the server answers with a parse error. Only a body argument and a body in a `.api` file have comments stripped and newlines escaped. Give such a body as an argument, or put the request in a `.api` file.
 - **Piping a body to a `GET`** → it is not sent. Stdin is read as a body only for `POST`, `PUT` and `PATCH` without a body argument. And `echo '{…}' | api -p PUT /x` with no terminal is an error: stdin can't be the body and the answer to `-p`. Give the body as an argument or an `@file`.
-- **A response that stops before its end** → a body cut short by the server or the network, or one that takes longer than `--timeout`, is no answer: `The response was cut short: …` or `Timed out after …`, exit 1, with or without `-f`. Nothing is written to the outfile, a chain or an `assert` does not take it for a "no", and nothing after it is sent.
+- **A response that stops before its end** → a body cut short by the server or the network, or one that nothing arrives from for as long as `--timeout`, is no answer: `The response was cut short: …` or `Timed out after …`, exit 1, with or without `-f`. Nothing is written to the outfile, a chain or an `assert` does not take it for a "no", and nothing after it is sent.
 - **Unclosed brackets** → the whole run fails with `"unclosed body at end of bulk file"`. If a body looks wrong, check that `{}` and `[]` balance.
 - **A method with no URI** → `api DELETE`, or a line `DELETE` in a file, is an error and sends nothing. Write the root as `DELETE /` if that is what is meant.
 - **Glob with no matches** → hard error. Check the directory and pattern.
@@ -1531,6 +1531,7 @@ Run it: `api -sa workshop.api`.
 - **A `set` line under its option** → the command line wins: under `--export` the name on a `set export` line is not used, and `set include-nulls off` under `-i` turns nothing off. The `-sa` log notes `↳ ignored: … is set`.
 - **`set nulls`, `set key …`** → `unknown setting`. A setting has the name of its long option (`include-nulls`), and only `export`, `include-nulls`, `fail-fast`, `ndjson`, `raw`, `stream` and `timeout` are settings.
 - **`export com.heads.seedID` as a line** → `not a request or .api file: export`. The line is `set export com.heads.seedID`.
+- **`--timeout` as a limit on how long an export may take** → it is not one. The timeout is how long the client waits for the answer and then for more of its body: a response that keeps arriving is read to its end, however long that takes.
 - **`set timeout off` to wait for ever** → `off` is the default of ten minutes. No timeout is `set timeout 0`.
 - **Expecting secrets in an export** → the API masks them (`********`) and `--export` leaves the member out, and warns where (`warning: response had masked data, left out at …`). A password, an API key or a client secret has to be set separately. Read without the masked members (`~just`, `~without`) and the warning is gone.
 - **Expecting `null` where an export had a masked value** → up to 3.3.1 it was written as `null`, and a `PUT` of that export cleared the secret where it was read. The member is now not in the export at all, so a write leaves the secret as it is.
