@@ -24327,6 +24327,72 @@ mod tests {
     }
 
     #[test]
+    fn a_check_whose_body_is_not_closed_on_its_line_is_refused() {
+        for line in ["assert PUT /x {", "assert not PUT /x [1,", "sleep while PUT /x {\"a\": [", "sleep 2 while not PUT /x ["] {
+            let err = split_bulk_requests(&format!("{line}\n\"a\": 1 }}\nGET /after\n"), None).unwrap_err();
+            assert!(err.contains("condition must fit on one line"), "{line}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_request_under_the_cursor_is_found_past_an_escaped_quote() {
+        // The `{` behind the escaped quote is text: the first line ends at
+        // its line break, and the second is a request of its own.
+        let block = "PUT /a {\"s\":\"x \\\" {\"}\nGET /b";
+        let second = block.find("GET").unwrap();
+        assert_eq!(request_bounds_at(block, block.len()), (second, block.len()));
+        assert_eq!(request_bounds_at(block, 3), (0, second - 1));
+        // A line break in a string, and in a body that is open, is no end.
+        let block = "PUT /a {\"s\":\"x\ny\",\n\"t\":1}\nGET /b";
+        let second = block.find("GET").unwrap();
+        assert_eq!(request_bounds_at(block, 12), (0, second - 1));
+        assert_eq!(request_bounds_at(block, second + 1), (second, block.len()));
+    }
+
+    #[test]
+    fn a_spec_whose_types_go_round_in_circles_is_indexed_and_completed() {
+        // `a` is its own grandparent, by `x-parent-type`, by
+        // `x-child-types` and by `allOf`. Indexing ends, and so does Tab.
+        let spec = r##"{
+          "paths": { "/loops": { "put": { "tags": ["loops"] } } },
+          "tags": [{ "name": "loops", "x-entity-type": "a", "x-indexer": { "$ref": "#/components/schemas/a" } }],
+          "components": { "schemas": {
+            "a": { "type": "object", "x-parent-type": "b", "x-child-types": ["b"],
+                   "allOf": [{ "$ref": "#/components/schemas/b" }],
+                   "properties": { "name": { "$ref": "#/components/schemas/text" }, "next": { "$ref": "#/components/schemas/b" } } },
+            "b": { "type": "object", "x-parent-type": "a", "x-child-types": ["a", "b"],
+                   "allOf": [{ "$ref": "#/components/schemas/a" }],
+                   "properties": { "back": { "$ref": "#/components/schemas/a" } } },
+            "text": { "type": "string" }
+          } }
+        }"##;
+        let (done, finished) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let spec: ApiSpec = serde_json::from_str(spec).expect("a spec");
+            let mut result = BackgroundLoadResult { complete: true, connected: true, ..Default::default() };
+            index_spec(spec, &mut result);
+            let mut parents = HashMap::new();
+            parents.insert("a".to_string(), "b".to_string());
+            parents.insert("b".to_string(), "a".to_string());
+            assert!(schema_inherits_from(&parents, "a", "b"));
+            assert!(!schema_inherits_from(&parents, "a", "nowhere"));
+            let mut state = test_state();
+            state.config.experimental = true;
+            apply_background_result(&mut state, result);
+            for line in ["PUT /loops {\"", "PUT /loops {\"next\": {\"back\": {\"", "PUT /loops {\"@type\": ", "GET /loops/", "GET /loops~with(next/back/"] {
+                state.input = line.to_string();
+                state.cursor_pos = char_len(line);
+                state.completions.clear();
+                tab_pressed(&mut state);
+                tab_pressed(&mut state);
+                let _ = render_input_content(&mut state, 200);
+            }
+            let _ = done.send(());
+        });
+        assert!(finished.recv_timeout(Duration::from_secs(20)).is_ok(), "a spec that goes round in circles was never done with");
+    }
+
+    #[test]
     fn a_pattern_that_the_directory_above_matches_can_climb() {
         for climbs in [".*/x.api", "a/.?/x.api", ".[.]/x", "a/b/.*", r".*\x.api", ".*/.*/**/*.api", ".{/x"] {
             assert_eq!(pattern_can_climb(climbs), climbs != ".{/x", "{climbs}");

@@ -8510,6 +8510,162 @@ fn the_connection_picker_keeps_to_a_short_terminal() {
     assert_eq!(entered(&mut prompt, &server), ["GET /through-c07"]);
 }
 
+/// Under `-f` at the prompt a chain is judged as in a batch: its last
+/// request is a plain request and stops the block, and a "no" that was
+/// asked for (a segment with another after it) does not.
+#[cfg(unix)]
+#[test]
+fn fail_fast_at_the_prompt_stops_at_the_last_request_of_a_chain() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = open_prompt(&server, dir.path(), &["-f"]);
+
+    let (sent, shown) = run_pasted(&mut prompt, &server, "GET /a && GET /missing\rGET /never");
+    assert_eq!(sent, ["GET /a", "GET /missing"], "{shown}");
+    assert!(shown.contains("stopped at 404 (--fail-fast)"), "{shown}");
+
+    let (sent, shown) = run_pasted(&mut prompt, &server, "GET /missing || GET /b\rGET /c");
+    assert_eq!(sent, ["GET /missing", "GET /b", "GET /c"], "{shown}");
+    assert!(!shown.contains("stopped at"), "{shown}");
+
+    // The session is as it was.
+    press(&mut prompt, &["GET /after"]);
+    assert_eq!(entered(&mut prompt, &server), ["GET /after"]);
+}
+
+/// esc and ctrl+c end the request of an `assert` and the poll of a `sleep
+/// while` as they end any request: the block stops there with no verdict,
+/// and the next line typed is a plain request again, logged with its body
+/// and without the check's prefix.
+#[cfg(unix)]
+#[test]
+fn a_check_that_is_aborted_at_the_prompt_stops_the_block_and_leaves_no_trace() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = open_prompt(&server, dir.path(), &[]);
+
+    for (block, key) in [
+        ("assert GET /stall\rGET /never", "\x1b"),
+        ("assert GET /stall\rGET /never", "\x03"),
+        ("sleep 1 while GET /stall\rGET /never", "\x1b"),
+        ("sleep 1 while not GET /stall\rGET /never", "\x03"),
+    ] {
+        prompt.send(b"\x15");
+        prompt.pump(Duration::from_millis(60));
+        server.take();
+        prompt.paste(block);
+        prompt.pump(Duration::from_millis(80));
+        let mark = prompt.screen.len();
+        prompt.send(b"\r");
+        assert!(pump_until(&mut prompt, Duration::from_secs(4), |_| server.seen() > 0), "{block:?} was not sent");
+        prompt.pump(Duration::from_millis(300));
+        prompt.send(key.as_bytes());
+        let said = pump_until(&mut prompt, Duration::from_secs(4), |p| {
+            let shown = pty::plain(&p.screen[mark..]);
+            shown.contains("request aborted") || shown.contains("cancelled")
+        });
+        let shown = pty::plain(&prompt.screen[mark..]);
+        assert!(said, "{block:?} {key:?}: {shown}");
+        prompt.pump(Duration::from_millis(400));
+        let shown = pty::plain(&prompt.screen[mark..]);
+        assert!(!shown.contains("assertion failed") && !shown.contains("could not be evaluated"), "{block:?} {key:?}: {shown}");
+        assert_eq!(server.take(), ["GET /stall"], "{block:?} {key:?}");
+
+        // What follows is a request like any other.
+        let (sent, shown) = run_pasted(&mut prompt, &server, "GET /plain");
+        assert_eq!(sent, ["GET /plain"], "{block:?} {key:?}");
+        assert!(shown.contains("\"ok\": \"/api/v1/plain\""), "{block:?} {key:?}: the body is shown\n{shown}");
+        assert!(!shown.contains("assert GET /plain") && !shown.contains("sleep"), "{block:?} {key:?}: {shown}");
+    }
+}
+
+/// A server that is gone in the middle of a session: the request says so,
+/// a block stops at it, and the session stays.
+#[cfg(unix)]
+#[test]
+fn a_server_that_went_away_stops_a_block_at_the_prompt() {
+    let server = RecordingServer::start();
+    let port = server.port;
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = open_prompt(&server, dir.path(), &[]);
+    let (sent, _) = run_pasted(&mut prompt, &server, "GET /a");
+    assert_eq!(sent, ["GET /a"]);
+    drop(server);
+
+    prompt.send(b"\x15");
+    prompt.pump(Duration::from_millis(60));
+    prompt.paste("GET /b\rGET /c\rGET /d");
+    prompt.pump(Duration::from_millis(80));
+    let mark = prompt.screen.len();
+    prompt.send(b"\r");
+    let asked = format!("Is COS running on 127.0.0.1:{port}?");
+    let said = pump_until(&mut prompt, Duration::from_secs(8), |p| pty::plain(&p.screen[mark..]).contains(&asked));
+    prompt.pump(Duration::from_millis(800));
+    let shown = pty::plain(&prompt.screen[mark..]);
+    assert!(said, "{shown}");
+    // Once: the lines behind it were not tried.
+    let rows = pty::rows(&prompt.screen, 200);
+    assert_eq!(rows.iter().filter(|row| row.contains(&asked)).count(), 1, "{}", rows.join("\n"));
+    assert!(!shown.contains("panicked"), "{shown}");
+    assert_eq!(ruler_rows(&rows).len(), 2, "{}", rows.join("\n"));
+}
+
+/// ctrl+s in a session that runs on OAuth2 client credentials saves the
+/// client's id and secret, not the token they were exchanged for: a saved
+/// token would work until it ran out, and then never again.
+#[cfg(unix)]
+#[test]
+fn saving_an_oauth2_session_saves_the_client_and_not_its_token() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write_credentials(d, &[("o", format!("http://127.0.0.1:{}", server.port), "oauth2", "s3cret", "client-7")], "o");
+    let mut prompt = pty::Prompt::open(api_bare(d));
+    prompt.wait_ready(Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(500));
+
+    save_as(&mut prompt, "copy", "connection copy saved");
+    let text = std::fs::read_to_string(d.join(".api-credentials.json")).unwrap();
+    let data: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let saved: Vec<(&str, &str, &str, &str)> = data["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| (c["name"].as_str().unwrap(), c["auth_type"].as_str().unwrap(), c["credential"].as_str().unwrap(), c["client_id"].as_str().unwrap()))
+        .collect();
+    assert!(saved.contains(&("copy", "oauth2", "s3cret", "client-7")), "{text}");
+    assert!(!text.contains("stale") && !text.contains("fresh"), "a token was saved: {text}");
+}
+
+/// Deleting the connection that is the default leaves no default: the next
+/// start does not name a connection that is gone.
+#[cfg(unix)]
+#[test]
+fn deleting_the_default_connection_leaves_no_default() {
+    let server = RecordingServer::start();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write_credentials(d, &[("alpha", url.clone(), "key", "k1", ""), ("beta", url.clone(), "key", "k2", "")], "");
+    let mut prompt = pty::Prompt::open(api_bare(d));
+    prompt.wait_for("+ Add new connection", Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(400));
+
+    // beta is made the default, then deleted.
+    prompt.send(b"\x1b[B\t");
+    prompt.pump(Duration::from_millis(300));
+    assert_eq!(stored(d).1, "beta");
+    keys_then(&mut prompt, "\x1b[3~", "Delete? y/n");
+    keys_then(&mut prompt, "y", "beta deleted");
+    assert_eq!(stored(d), (vec!["alpha=k1".to_string()], String::new()));
+    drop(prompt);
+
+    // A batch has no default to run on, and no warning about one that is gone.
+    let got = run_bare(&server, d, &["GET", "/a"]);
+    assert_eq!((got.code, got.sent.len()), (Some(1), 0), "{}", got.stderr);
+    assert!(got.stderr.contains("no base URL specified") && !got.stderr.contains("WARNING"), "{}", got.stderr);
+}
+
 /// The last row of the screen that holds `text`.
 #[cfg(unix)]
 fn row_with(prompt: &pty::Prompt, cols: usize, text: &str) -> String {
