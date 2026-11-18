@@ -3706,8 +3706,15 @@ impl ConnectionFlow {
                         Some(Ok(deleted_name)) => {
                             // If no saved connections left (only "+ Add new"), go to setup
                             if self.picker.items.len() == 1 {
+                                // An empty form: what an earlier visit to
+                                // it left typed is not this one's.
                                 self.in_setup = true;
+                                self.setup_url.clear();
+                                self.setup_auth_idx = 0;
+                                self.setup_credential.clear();
+                                self.setup_client_id.clear();
                                 self.setup_active_field = SetupField::Url;
+                                self.setup_status.clear();
                             }
                             self.picker_error_msg = Some(format!("{} deleted", deleted_name));
                             self.picker_error_clear_at = Some(Instant::now() + Duration::from_secs(2));
@@ -31130,5 +31137,60 @@ mod tests {
         let (heading, _) = splash_heading(title, &format!("v{}", VERSION), SPLASH_MIN_WIDTH);
         assert!(visible_text(&heading).contains(VERSION), "{heading:?}");
         assert!(visible_text(&splash_heading(title, "v3.3.10", SPLASH_MIN_WIDTH).0).contains("v3.3.10"));
+    }
+
+    /// What is said of a store that is not what the client wrote, without
+    /// anything the store holds: a member that is missing is named, and any
+    /// other value out of place is given by where it stands.
+    #[test]
+    fn a_store_error_names_what_is_missing_and_where_but_no_value() {
+        let said = |json: &str| parse_store(json).err().unwrap_or_else(|| panic!("{json} was read"));
+        let missing = said(r#"{"connections":[{"name":"local","credential":"s3cret-key"}]}"#);
+        assert!(missing.contains("missing field `url`"), "{missing}");
+        assert!(!missing.contains("s3cret-key"), "{missing}");
+
+        let twice = said(r#"{"connections":[{"name":"a","url":"u","auth_type":"key","credential":"s3cret-key","credential":"other"}]}"#);
+        assert!(twice.contains("a value that does not belong there at line 1 column "), "{twice}");
+        assert!(!twice.contains("s3cret-key") && !twice.contains("other"), "{twice}");
+
+        let kind = said(r#"{"connections":[{"name":"a","url":"u","auth_type":"key","credential":123456}]}"#);
+        assert!(kind.contains("invalid type, expected a string"), "{kind}");
+        assert!(!kind.contains("123456"), "{kind}");
+    }
+
+    /// With every name for a partial file taken, none is made: an append
+    /// then writes its target as it stands, and nothing that was there
+    /// beside it is touched.
+    #[test]
+    fn with_no_free_name_for_a_partial_file_the_target_is_written_as_it_stands() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("out.json");
+        fs::write(&target, "[1]").unwrap();
+        let taken: Vec<PathBuf> = (0..8)
+            .map(|n| match n {
+                0 => dir.path().join(format!("out.json.{}.part", std::process::id())),
+                n => dir.path().join(format!("out.json.{}-{}.part", std::process::id(), n)),
+            })
+            .collect();
+        for part in &taken {
+            fs::write(part, "someone else's").unwrap();
+        }
+        let refused = create_part(&target).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::AlreadyExists);
+
+        append_to_outfile(target.to_str().unwrap(), "[2]").unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "[1,2]");
+        for part in &taken {
+            assert_eq!(fs::read_to_string(part).unwrap(), "someone else's");
+        }
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 9);
+    }
+
+    /// A connection that could not be loaded is named with one word.
+    #[test]
+    fn a_refused_load_is_said_in_a_word() {
+        assert_eq!(load_refusal("HTTP/1.1 401 Unauthorized"), "unauthorized");
+        assert_eq!(load_refusal("HTTP/1.1 403 Forbidden"), "forbidden");
+        assert_eq!(load_refusal("op: item not found"), "auth failed");
     }
 }

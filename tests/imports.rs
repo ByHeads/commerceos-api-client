@@ -2288,6 +2288,10 @@ fn telling_git(dir: &Path, log: &Path) -> PathBuf {
          :*) ;;\n\
          *ls-remote*) echo \"$FAKE_GIT_SAYS\" >&2; exit 128 ;;\n\
          esac\n\
+         case \"$FAKE_GIT_FETCH_SAYS:$*\" in\n\
+         :*) ;;\n\
+         *' fetch '*) echo \"$FAKE_GIT_FETCH_SAYS\" >&2; exit 128 ;;\n\
+         esac\n\
          exec '{real}' \"$@\"\n",
         log.display()
     );
@@ -2366,6 +2370,54 @@ fn git_is_run_so_that_it_never_stops_to_ask() {
     for line in told.lines() {
         assert!(line.starts_with("prompt=0 ssh=[] "), "{line}");
     }
+}
+
+/// A remote that answers the lookup and then fails the fetch stops the batch
+/// with what git said, nothing sent, and leaves nothing in the cache that a
+/// later run could take for the checkout.
+#[test]
+fn a_fetch_that_fails_after_the_lookup_stops_the_batch_and_leaves_no_checkout() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", Vec::new());
+    let repo = dir.join("repos/breaks");
+    commit(&repo, &[("step.api", b"GET /step\n")], None);
+    let url = repo_url(&repo);
+    let log = dir.join("git.log");
+    std::fs::write(dir.join("batch.api"), format!("{}GET /own\nlib/step.api\n", import_git("lib", &url, "main"))).unwrap();
+    let run = |says: Option<&str>| {
+        let mut cmd = api_with_telling_git(&dir, server.port, &log);
+        cmd.args(["-sa", "batch.api"]).env_remove("FAKE_GIT_FETCH_SAYS");
+        if let Some(says) = says {
+            cmd.env("FAKE_GIT_FETCH_SAYS", says);
+        }
+        finish(cmd, "")
+    };
+    fn files_named(dir: &Path, name: &str) -> usize {
+        let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+        entries
+            .flatten()
+            .map(|entry| match entry.path() {
+                path if path.is_dir() => files_named(&path, name),
+                path => usize::from(path.file_name().is_some_and(|n| n == name)),
+            })
+            .sum()
+    }
+
+    let said = "fatal: the remote end hung up unexpectedly";
+    let ran = run(Some(said));
+    assert!(!ran.ok);
+    assert!(ran.stderr.contains(&format!("could not fetch import {url} main: ")), "{}", ran.stderr);
+    assert!(ran.stderr.contains(said), "{}", ran.stderr);
+    assert_eq!(server.sent(), Vec::<String>::new());
+    let told = std::fs::read_to_string(&log).unwrap();
+    assert!(told.contains("ls-remote") && told.contains(" fetch "), "{told}");
+    assert_eq!(files_named(&dir.join(".import-cache"), "step.api"), 0, "a checkout was left behind");
+
+    // The next run fetches, and runs.
+    let ran = run(None);
+    assert!(ran.ok, "{}", ran.stderr);
+    assert_eq!(server.sent(), ["GET /own", "GET /step"]);
+    assert_eq!(files_named(&dir.join(".import-cache"), "step.api"), 1);
 }
 
 /// The cached copy stands in for a remote that gave no answer, and for no

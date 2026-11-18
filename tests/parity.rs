@@ -324,6 +324,12 @@ fn answer(
     } else if path.contains("/about") && header("authorization") == Some("Basic OmJhZHNwZWM=") {
         // …from a server that says it has one.
         ("200 OK", r#"{"feature-flags":[],"openapi-metadata-version":"1.1"}"#.to_string())
+    } else if path.contains("/openapi") && header("authorization") == Some("Basic Om5vc3BlYw==") {
+        // For a session with the key `nospec`: a server that says it has a
+        // spec and has none.
+        ("404 Not Found", "{}".to_string())
+    } else if path.contains("/about") && header("authorization") == Some("Basic Om5vc3BlYw==") {
+        ("200 OK", r#"{"feature-flags":[],"openapi-metadata-version":"1.2"}"#.to_string())
     } else if path.contains("/openapi") && header("authorization") == Some("Basic OmZhaWxzcGVj") {
         // For a session with the key `failspec`: the spec request fails.
         ("500 Internal Server Error", "{}".to_string())
@@ -5461,6 +5467,8 @@ fn a_spec_that_cannot_be_read_is_said_with_b_and_with_c() {
         (&["-b", &url, "-k", "badspec"][..], true),
         // A spec request that fails is no more a spec than an answer that is none.
         (&["-b", &url, "-k", "failspec"][..], true),
+        // A server without a spec (a 404) simply has none: nothing is said.
+        (&["-b", &url, "-k", "nospec"][..], false),
         (&["-c", "bad"][..], true),
         (&["-c", "good"][..], false),
     ] {
@@ -7314,9 +7322,21 @@ fn the_startup_picker_is_left_with_esc_and_empties_into_the_form() {
     let mut prompt = pty::Prompt::open(api_bare(d));
     prompt.wait_for("+ Add new connection", Duration::from_secs(15));
     prompt.pump(Duration::from_millis(400));
+    // A visit to the form first, left with something typed in it.
+    keys_then(&mut prompt, "\x1b[B\r", "Type the API base URL");
+    prompt.send(b"stale.example.com");
+    prompt.pump(Duration::from_millis(300));
+    assert!(row_with(&prompt, 200, "URL:").contains("stale.example.com"));
+    keys_then(&mut prompt, "\x1b", "type to search");
+    prompt.send(b"\x1b[A");
+    prompt.pump(Duration::from_millis(300));
+    assert!(selected_row(&prompt).contains("only"), "{}", selected_row(&prompt));
     keys_then(&mut prompt, "\x1b[3~", "Delete? y/n");
     keys_then(&mut prompt, "y", "Type the API base URL");
     assert_eq!(stored(d).0, Vec::<String>::new());
+    // The form the picker empties into is an empty one.
+    prompt.pump(Duration::from_millis(300));
+    assert_eq!(row_with(&prompt, 200, "URL:").trim(), "› URL:");
     // With no connection to go back to, Esc in the form ends the client too.
     prompt.send(b"\x1b");
     assert_eq!(ended(&mut prompt), Some(true), "the client did not end well");
@@ -9925,8 +9945,9 @@ fn a_response_with_bytes_its_charset_does_not_have_is_said_to_be_changed() {
     assert_eq!(std::fs::read_to_string(d.join("b.json")).unwrap().trim(), "\"caf\u{fffd} x\"");
 
     // Nothing for a response that is what it says, nor for a check, whose
-    // body goes nowhere.
-    for args in [&["GET", "/a"][..], &["assert GET /notutf8"]] {
+    // body goes nowhere, nor for a `-sa` line without an outfile.
+    std::fs::write(d.join("shown.api"), "GET /notutf8\nGET /a\n").unwrap();
+    for args in [&["GET", "/a"][..], &["assert GET /notutf8"], &["-sa", "shown.api"]] {
         let got = run_in(&server, d, args);
         assert_eq!((got.code, warnings(&got.stderr)), (Some(0), 0), "{args:?}: {}", got.stderr);
     }
@@ -11645,4 +11666,162 @@ fn a_connection_added_in_a_session_loads_behind_its_form() {
     prompt.send(b"\r");
     pump_until(&mut prompt, Duration::from_secs(4), |_| server.seen() > 0);
     assert_eq!(server.take(), ["GET /"], "what was typed behind the form reached the prompt");
+}
+
+/// A program on stdin that is not text is not run in part: `could not read
+/// stdin`, exit 1 and nothing sent, for a run and for a document about it.
+#[test]
+fn a_program_on_stdin_that_is_not_utf8_is_refused() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    for args in [&["-sa", "-"][..], &["-a", "-"], &["--describe", "-"], &["--assert", "-"], &["--imports", "-"]] {
+        server.take();
+        let mut cmd = api(server.port, dir.path());
+        cmd.args(args).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        child.stdin.take().unwrap().write_all(b"GET /first\nGET /caf\xe9\n").unwrap();
+        let out = child.wait_with_output().unwrap();
+        server.settle(Duration::from_millis(150), Duration::from_secs(2));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!((out.status.code(), server.seen()), (Some(1), 0), "{args:?}: {stderr}");
+        assert!(stderr.contains("could not read stdin"), "{args:?}: {stderr}");
+        assert!(out.stdout.is_empty(), "{args:?}");
+    }
+}
+
+/// A streamed response on stdout reads as the buffered one does, and a
+/// chain under `--stream` is judged by what the server answered.
+#[test]
+fn a_streamed_response_prints_and_is_judged_as_a_buffered_one() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    for uri in ["/a", "/numbers", "/zero"] {
+        let buffered = run_in(&server, d, &["GET", uri]);
+        let streamed = run_in(&server, d, &["--stream", "GET", uri]);
+        assert_eq!(streamed.code, Some(0), "{uri}: {}", streamed.stderr);
+        assert_eq!(streamed.stdout, buffered.stdout, "{uri}");
+        assert!(streamed.stdout.ends_with('\n'), "{uri}: {:?}", streamed.stdout);
+        assert_eq!(accepts_of(&server), ["application/json;stream=true"], "{uri}");
+    }
+    // A falsy answer is a "no", a truthy one a "yes", streamed or not.
+    for flag in [&[][..], &["--stream"]] {
+        let run = |line: &str| {
+            let mut args = flag.to_vec();
+            args.push(line);
+            run_in(&server, d, &args)
+        };
+        assert_eq!(run("GET /zero && GET /never").sent, ["GET /zero"], "{flag:?}");
+        assert_eq!(run("GET /zero || GET /then").sent, ["GET /zero", "GET /then"], "{flag:?}");
+        assert_eq!(run("GET /a && GET /then").sent, ["GET /a", "GET /then"], "{flag:?}");
+        assert_eq!(run("GET /missing || GET /then").sent, ["GET /missing", "GET /then"], "{flag:?}");
+        let failed = run("assert GET /zero");
+        assert_eq!(failed.code, Some(1), "{flag:?}");
+        assert!(failed.stderr.contains("assertion failed: assert GET /zero (0)"), "{flag:?}: {}", failed.stderr);
+    }
+}
+
+/// `-m` prints the describe block of a file named as a one-shot argument
+/// too, with no `-a`, and the file runs.
+#[test]
+fn describe_first_works_for_a_file_named_as_an_argument() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::write(
+        d.join("catalog.api"),
+        "{ \"title\": { \"en-US\": \"Catalog\" }, \"docsLink\": \"https://docs.example.com/catalog\" }\nGET /products\n",
+    )
+    .unwrap();
+    std::fs::write(d.join("bare.api"), "GET /products\n").unwrap();
+    let mut cmd = api(server.port, d);
+    cmd.args(["-m", "catalog.api"]).env("LANG", "en_US.UTF-8").env_remove("LC_ALL").env_remove("LC_MESSAGES");
+    let got = ran(&server, cmd);
+    assert_eq!((got.code, &got.sent[..]), (Some(0), &["GET /products".to_string()][..]), "{}", got.stderr);
+    assert!(got.stderr.starts_with("Catalog\nhttps://docs.example.com/catalog\n"), "{}", got.stderr);
+    // A file without a block prints nothing for it, and a request is no file.
+    for args in [&["-m", "bare.api"][..], &["-m", "GET", "/products"]] {
+        let got = run_in(&server, d, args);
+        assert_eq!((got.code, got.sent.len()), (Some(0), 1), "{args:?}: {}", got.stderr);
+        assert!(!got.stderr.contains("Catalog"), "{args:?}: {}", got.stderr);
+    }
+}
+
+/// A file that can't be read as text, and a glob that is none, stop the
+/// batch before anything is sent, naming the file or the pattern.
+#[test]
+fn an_include_that_cannot_be_read_stops_the_batch() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::write(d.join("latin.api"), b"GET /caf\xe9\n").unwrap();
+    std::fs::write(d.join("latin.json"), b"{ \"path\": \"caf\xe9\" }").unwrap();
+    for (program, says) in [
+        ("GET /first\nlatin.api\n", "could not read include"),
+        ("GET /first\nshared/[.api\n", "invalid include glob 'shared/[.api'"),
+        ("import dir lib @latin.json\nGET /first\n", "import file is not UTF-8 text: latin.json"),
+    ] {
+        std::fs::write(d.join("batch.api"), program).unwrap();
+        for args in [&["-sa", "batch.api"][..], &["--assert", "batch.api"]] {
+            let got = run_in(&server, d, args);
+            assert_eq!((got.code, got.sent.len()), (Some(1), 0), "{program:?} {args:?}: {}", got.stderr);
+            assert!(got.stderr.contains(says), "{program:?} {args:?}: {}", got.stderr);
+        }
+    }
+}
+
+/// A file written from the prompt can be opened with ctrl+o, and the hint
+/// says so; a write that failed leaves no such hint, and a clipboard none.
+#[cfg(unix)]
+#[test]
+fn the_prompt_offers_to_open_a_file_it_wrote() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = pty::Prompt::open(api(server.port, dir.path()));
+    prompt.wait_ready(Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(600));
+
+    let (sent, shown) = run_pasted(&mut prompt, &server, "GET /a > kept.json");
+    assert_eq!(sent, ["GET /a"]);
+    assert!(shown.contains("ctrl+o to open file"), "{shown}");
+    assert!(dir.path().join("kept.json").exists());
+    prompt.pump(Duration::from_millis(3300));
+
+    let (sent, shown) = run_pasted(&mut prompt, &server, "GET /b > no-such-dir/lost.json");
+    assert_eq!(sent, ["GET /b"]);
+    assert!(shown.contains("Error writing to no-such-dir/lost.json"), "{shown}");
+    assert!(!shown.contains("ctrl+o to open file"), "{shown}");
+
+    // An error is not appended, and is not a file to open either.
+    let (sent, shown) = run_pasted(&mut prompt, &server, "GET /missing >> kept.json");
+    assert_eq!(sent, ["GET /missing"]);
+    assert!(shown.contains("(not appended)"), "{shown}");
+    assert!(!shown.contains("ctrl+o to open file"), "{shown}");
+}
+
+/// `-c` with a connection that can't be used says why and, at a terminal,
+/// opens the prompt all the same: another connection can be picked there.
+#[cfg(unix)]
+#[test]
+fn a_connection_that_cannot_be_used_still_opens_the_prompt_at_a_terminal() {
+    let server = RecordingServer::start();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write_credentials(d, &[("alpha", url.clone(), "key", "k1", ""), ("odd", url.clone(), "bearer", "t", "")], "alpha");
+    let mut cmd = api_bare(d);
+    cmd.args(["-c", "odd"]);
+    let mut prompt = pty::Prompt::open(cmd);
+    prompt.wait_for("The connection \"odd\" can't be used: its auth_type \"bearer\"", Duration::from_secs(15));
+    prompt.wait_ready(Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(600));
+    // Nothing of the connection is sent anywhere.
+    assert_eq!(server.seen(), 0);
+    keys_then(&mut prompt, "\x11", "+ Add new connection");
+    prompt.send(b"alpha");
+    prompt.pump(Duration::from_millis(300));
+    keys_then(&mut prompt, "\r", "connected to: alpha");
+    prompt.pump(Duration::from_millis(500));
+    let (sent, shown) = run_pasted(&mut prompt, &server, "GET /picked");
+    assert_eq!(sent, ["GET /picked"], "{shown}");
 }
