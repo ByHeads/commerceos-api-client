@@ -572,14 +572,23 @@ struct Config {
     fail_fast: bool,
     /// `-m`: print the describe block of the file being run before it runs.
     describe_first: bool,
-    /// Export mode, from `--export <name>` or ctrl+r at the prompt: responses
-    /// are rewritten as seed data, with `name` as the external identifier a
-    /// lone database key is kept under, beside `key?`. `None` is off. See
-    /// `export_value`.
+    /// Export mode, from `--export <name>`, a `set export <name>` line or the
+    /// prompt: responses are rewritten as seed data, with `name` as the
+    /// external identifier a lone database key is kept under, beside `key?`.
+    /// `None` is off. See `export_value`.
     export_id: Option<String>,
-    /// Export mode was set for the whole run or session (`--export`, ctrl+r)
-    /// and an `export` line does not change it: the command line overrides.
-    export_pinned: bool,
+    /// What the command line set for the whole run, and at the prompt what
+    /// the session has set. A setting that is on here stays on: a `set` line
+    /// of a file does not change it.
+    given: Settings,
+    /// What the `set` lines of the file being run have set so far. The
+    /// fields requests read (`include_nulls`, `export_id`, `timeout_secs`…)
+    /// are made of the two by `apply_settings`.
+    file: Settings,
+    /// `--no-streaming`: nothing is streamed, whatever else asks for it.
+    no_streaming: bool,
+    /// Streaming was asked for by `API_STREAMING` and not by `--stream`.
+    stream_by_env: bool,
     /// The status of the last response the prompt received, for `-f` there.
     last_status: Option<u16>,
     /// OAuth2 client credentials of the connection, when it has them: what a
@@ -630,7 +639,10 @@ impl Default for Config {
             fail_fast: false,
             describe_first: false,
             export_id: None,
-            export_pinned: false,
+            given: Settings::default(),
+            file: Settings::default(),
+            no_streaming: false,
+            stream_by_env: false,
             last_status: None,
             oauth2_client_id: String::new(),
             oauth2_client_secret: String::new(),
@@ -4220,26 +4232,28 @@ fn main() {
         config.base_uri = normalize_base_uri(uri);
     }
     config.silent = args.silent;
-    config.raw = args.raw;
-    config.include_nulls = args.include_nulls;
-    config.ndjson = args.ndjson;
-    // Streaming is opt-in: --no-streaming beats --stream beats API_STREAMING.
-    config.stream_requested = !args.no_streaming && (args.stream || env_streaming_requested());
     config.experimental = args.experimental;
-    if let Some(secs) = args.timeout {
-        config.timeout_secs = secs;
-    }
     config.preview = args.preview;
-    config.fail_fast = args.fail_fast;
     config.describe_first = args.describe_first;
-    if let Some(name) = &args.export {
-        if !is_namespaced_key(name) {
-            errln!("error: invalid export identifier: {} ({})", name, NAMESPACED_KEY_HELP);
-            exit_process(1);
-        }
-        config.export_id = Some(name.clone());
-        config.export_pinned = true;
+    if let Some(name) = args.export.as_ref().filter(|name| !is_namespaced_key(name)) {
+        errln!("error: invalid export identifier: {} ({})", name, NAMESPACED_KEY_HELP);
+        exit_process(1);
     }
+    // What a `set` line can change too. Given here it holds for the whole
+    // run. Streaming is opt-in: --no-streaming beats --stream beats
+    // API_STREAMING.
+    config.no_streaming = args.no_streaming;
+    config.stream_by_env = !args.stream && env_streaming_requested();
+    config.given = Settings {
+        export: args.export.clone(),
+        include_nulls: args.include_nulls,
+        fail_fast: args.fail_fast,
+        ndjson: args.ndjson,
+        raw: args.raw,
+        stream: !args.no_streaming && (args.stream || config.stream_by_env),
+        timeout: args.timeout,
+    };
+    config.apply_settings();
 
     if args.me {
         config.api_path = "/api/me/v1".to_string();
@@ -4700,11 +4714,14 @@ fn main() {
     // exits 1 and a chain chains. Includes resolve against the working
     // directory.
     if let Some(line) = program_line {
-        // `api export com.heads.seedID` would set a mode and send nothing.
+        // `api set include-nulls` would change a setting and send nothing.
+        // A line that is no setting is said to be none, further down.
+        let (first_word, rest) = split_first_word(line.trim());
         let alone = line.lines().filter(|l| !l.trim().is_empty()).count() == 1
-            && line.split_whitespace().next().is_some_and(|w| w.eq_ignore_ascii_case("export"));
+            && first_word.eq_ignore_ascii_case("set")
+            && parse_set_line(rest).is_ok();
         if alone {
-            errln!("error: `export` alone sends nothing. Use --export <name> with a request, or put the line in a .api file.");
+            errln!("error: `set` alone sends nothing. Give the setting as an option with a request (`-i`, `--export <name>`), or put the line in a .api file.");
             exit_process(1);
         }
         // The file named on the line is the file being run, so `-m` prints
@@ -6260,6 +6277,211 @@ fn is_os_junk(path: &std::path::Path) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `set <name> [value]`: what a file, a line at the prompt and the command
+// line can each set
+// ---------------------------------------------------------------------------
+
+/// One setting with the value a `set` line gives it. A setting is named as
+/// its long option is: `--include-nulls` is `set include-nulls`.
+#[derive(Debug, Clone, PartialEq)]
+enum Setting {
+    /// `set export <name>` / `set export off`.
+    Export(Option<String>),
+    IncludeNulls(bool),
+    FailFast(bool),
+    Ndjson(bool),
+    Raw(bool),
+    Stream(bool),
+    /// `set timeout <seconds>`; `off` is back to the default.
+    Timeout(Option<u64>),
+}
+
+/// The names `set` takes, in the order they are listed in.
+const SETTING_NAMES: [&str; 7] = ["export", "include-nulls", "fail-fast", "ndjson", "raw", "stream", "timeout"];
+
+impl Setting {
+    fn name(&self) -> &'static str {
+        match self {
+            Setting::Export(_) => "export",
+            Setting::IncludeNulls(_) => "include-nulls",
+            Setting::FailFast(_) => "fail-fast",
+            Setting::Ndjson(_) => "ndjson",
+            Setting::Raw(_) => "raw",
+            Setting::Stream(_) => "stream",
+            Setting::Timeout(_) => "timeout",
+        }
+    }
+
+    /// The value as a `set` line has it: nothing for on, `off`, a name, or
+    /// seconds.
+    fn value(&self) -> Option<String> {
+        match self {
+            Setting::Export(name) => Some(name.clone().unwrap_or_else(|| "off".to_string())),
+            Setting::Timeout(seconds) => Some(seconds.map_or_else(|| "off".to_string(), |s| s.to_string())),
+            Setting::IncludeNulls(on)
+            | Setting::FailFast(on)
+            | Setting::Ndjson(on)
+            | Setting::Raw(on)
+            | Setting::Stream(on) => (!on).then(|| "off".to_string()),
+        }
+    }
+
+    /// The line as shown in previews and the logs: `set include-nulls`,
+    /// `set export com.heads.seedID`, `set timeout off`.
+    fn line(&self) -> String {
+        match self.value() {
+            Some(value) => format!("set {} {}", self.name(), value),
+            None => format!("set {}", self.name()),
+        }
+    }
+
+    /// Whether this is the setting left alone: off, or the default timeout.
+    fn is_off(&self) -> bool {
+        matches!(
+            self,
+            Setting::Export(None)
+                | Setting::Timeout(None)
+                | Setting::IncludeNulls(false)
+                | Setting::FailFast(false)
+                | Setting::Ndjson(false)
+                | Setting::Raw(false)
+                | Setting::Stream(false)
+        )
+    }
+}
+
+/// A value for every setting. The default is all of them left alone.
+#[derive(Debug, Clone, PartialEq, Default)]
+struct Settings {
+    export: Option<String>,
+    include_nulls: bool,
+    fail_fast: bool,
+    ndjson: bool,
+    raw: bool,
+    stream: bool,
+    timeout: Option<u64>,
+}
+
+impl Settings {
+    fn put(&mut self, setting: &Setting) {
+        match setting {
+            Setting::Export(name) => self.export = name.clone(),
+            Setting::IncludeNulls(on) => self.include_nulls = *on,
+            Setting::FailFast(on) => self.fail_fast = *on,
+            Setting::Ndjson(on) => self.ndjson = *on,
+            Setting::Raw(on) => self.raw = *on,
+            Setting::Stream(on) => self.stream = *on,
+            Setting::Timeout(seconds) => self.timeout = *seconds,
+        }
+    }
+
+    /// The value held for the setting that `like` is one of.
+    fn get(&self, like: &Setting) -> Setting {
+        match like {
+            Setting::Export(_) => Setting::Export(self.export.clone()),
+            Setting::IncludeNulls(_) => Setting::IncludeNulls(self.include_nulls),
+            Setting::FailFast(_) => Setting::FailFast(self.fail_fast),
+            Setting::Ndjson(_) => Setting::Ndjson(self.ndjson),
+            Setting::Raw(_) => Setting::Raw(self.raw),
+            Setting::Stream(_) => Setting::Stream(self.stream),
+            Setting::Timeout(_) => Setting::Timeout(self.timeout),
+        }
+    }
+}
+
+impl Config {
+    /// Make the fields a request reads out of what the command line (or the
+    /// session) and the file being run have set. One that is on for the run
+    /// stays on, whatever the file says.
+    fn apply_settings(&mut self) {
+        let (given, file) = (&self.given, &self.file);
+        self.export_id = given.export.clone().or_else(|| file.export.clone());
+        self.include_nulls = given.include_nulls || file.include_nulls;
+        self.fail_fast = given.fail_fast || file.fail_fast;
+        self.ndjson = given.ndjson || file.ndjson;
+        self.raw = given.raw || file.raw;
+        self.stream_requested = !self.no_streaming && (given.stream || file.stream);
+        self.timeout_secs = given.timeout.or(file.timeout).unwrap_or(DEFAULT_TIMEOUT_SECS);
+        // The prompt knows whether the server streams; a batch assumes so.
+        self.streaming = self.stream_requested && self.server_streaming;
+    }
+
+    /// What keeps a `set` line of a file from doing what it says, if
+    /// anything does: the option the run was started with, as it was given.
+    /// A line that asks for what holds anyway is not kept from anything.
+    fn overriding_option(&self, setting: &Setting) -> Option<String> {
+        if let Setting::Stream(true) = setting {
+            if self.no_streaming {
+                return Some("--no-streaming".to_string());
+            }
+        }
+        let held = self.given.get(setting);
+        if held.is_off() || held == *setting {
+            return None;
+        }
+        Some(match held {
+            Setting::Export(name) => format!("--export {}", name.unwrap_or_default()),
+            Setting::IncludeNulls(_) => "-i".to_string(),
+            Setting::FailFast(_) => "-f".to_string(),
+            Setting::Ndjson(_) => "--ndjson".to_string(),
+            Setting::Raw(_) => "-r".to_string(),
+            Setting::Stream(_) if self.stream_by_env => "API_STREAMING".to_string(),
+            Setting::Stream(_) => "--stream".to_string(),
+            Setting::Timeout(seconds) => format!("--timeout {}", seconds.unwrap_or_default()),
+        })
+    }
+}
+
+/// Parse what follows `set`: a setting's name and, where it takes one, its
+/// value.
+fn parse_set_line(rest: &str) -> Result<Setting, String> {
+    // A setting is a line of its own. Read as its value, a request behind a
+    // `&&` would never be sent.
+    if chain_parts(rest).len() > 1 {
+        return Err(format!("a `set` line can't be part of a `&&`/`||` chain: `set {}`", rest.trim()));
+    }
+    let mut words = rest.split_whitespace();
+    let Some(name) = words.next() else {
+        return Err(format!("set needs a setting: `set include-nulls` (one of {})", SETTING_NAMES.join(", ")));
+    };
+    let value = words.next();
+    if words.next().is_some() {
+        return Err(format!("set takes a setting and one value: `set {}`", rest.trim()));
+    }
+    let off = value.is_some_and(|v| v.eq_ignore_ascii_case("off"));
+    let name = name.to_ascii_lowercase();
+    let switch = || match value {
+        None => Ok(true),
+        Some(v) if v.eq_ignore_ascii_case("on") => Ok(true),
+        Some(_) if off => Ok(false),
+        Some(v) => Err(format!("set {} takes `on` or `off`, not `{}`", name, v)),
+    };
+    Ok(match name.as_str() {
+        "export" => match value {
+            None => {
+                return Err("set export needs a name: `set export com.heads.seedID`, or `set export off`".to_string());
+            }
+            Some(_) if off => Setting::Export(None),
+            Some(v) if is_namespaced_key(v) => Setting::Export(Some(v.to_string())),
+            Some(v) => return Err(format!("invalid export identifier: {} ({})", v, NAMESPACED_KEY_HELP)),
+        },
+        "include-nulls" => Setting::IncludeNulls(switch()?),
+        "fail-fast" => Setting::FailFast(switch()?),
+        "ndjson" => Setting::Ndjson(switch()?),
+        "raw" => Setting::Raw(switch()?),
+        "stream" => Setting::Stream(switch()?),
+        "timeout" => match value {
+            Some(_) if off => Setting::Timeout(None),
+            Some(v) if v.parse::<u64>().is_ok() => Setting::Timeout(v.parse().ok()),
+            _ => {
+                return Err("set timeout needs whole seconds: `set timeout 30` (0 is no timeout), or `set timeout off`".to_string());
+            }
+        },
+        _ => return Err(format!("unknown setting `{}` (one of {})", name, SETTING_NAMES.join(", "))),
+    })
+}
+
 /// One executable step in a parsed `.api` bulk program, in file order.
 #[derive(Debug, Clone, PartialEq)]
 enum BulkStep {
@@ -6285,12 +6507,19 @@ enum BulkStep {
     /// continuing. If a message is provided, it's used as the prompt; otherwise
     /// the default "Continue?" is used.
     Confirm(Option<String>),
-    /// Export mode from here on: under `name`, or off. `written` is an
-    /// `export <name>` / `export off` line of a file and is shown in the
-    /// preview and the log. The rest are the parser's own, put around an
-    /// included file so that a file's export mode stays that file's: off on
-    /// the way in, back to what it was on the way out.
-    Export { name: Option<String>, written: bool },
+    /// `set <name> [value]`: a setting for the requests that follow.
+    Set {
+        /// The line, shown in the preview and the log. None for the parser's
+        /// own steps, put around an included file so that what a file sets
+        /// stays that file's: nothing set on the way in, what the including
+        /// file had set on the way out.
+        written: Option<Setting>,
+        /// Everything the file has set, from this step on.
+        file: Settings,
+        /// A line typed at the prompt, where the session stands in the
+        /// file's place: it changes what the session itself has set.
+        session: bool,
+    },
 }
 
 /// Outcome of a single request, deciding whether a `&&` chain continues.
@@ -6821,11 +7050,6 @@ struct BulkProgram {
     /// What the describe blocks read hold that a describe block should not,
     /// one line each. A warning: the batch runs all the same.
     describe_warnings: Vec<String>,
-    /// The steps that came from a file named in the text itself, as a range
-    /// of `steps`, with the export mode the text is in around that file. A
-    /// prompt session outlives a program that stops inside one, and goes on
-    /// in that mode, not in the file's.
-    file_spans: Vec<(std::ops::Range<usize>, Option<String>)>,
 }
 
 impl BulkProgram {
@@ -6977,35 +7201,14 @@ fn parse_condition(condition: &str, what: &str, usage: &str) -> Result<(bool, St
     Ok((negate, request.to_string()))
 }
 
-/// Parse what follows `export`: the name of an external identifier, which
-/// turns export mode on for the rest of the file, or `off`.
-fn parse_export_step(rest: &str) -> Result<BulkStep, String> {
-    let mut words = rest.split_whitespace();
-    let name = match (words.next(), words.next()) {
-        (Some(word), None) if word.eq_ignore_ascii_case("off") => None,
-        (Some(word), None) if is_namespaced_key(word) => Some(word.to_string()),
-        (None, _) => {
-            return Err("export needs a name: `export com.heads.seedID`, or `export off`".to_string());
-        }
-        _ => return Err(format!("invalid export identifier: {} ({})", rest, NAMESPACED_KEY_HELP)),
-    };
-    Ok(BulkStep::Export { name, written: true })
-}
-
-/// The `export com.heads.seedID` line as shown in previews and the logs.
-fn format_export(name: &Option<String>) -> String {
-    format!("export {}", name.as_deref().unwrap_or("off"))
-}
-
-/// Apply an `export` step: the mode it sets holds until the next one. With
-/// `--export` (or ctrl+r at the prompt) the run has a mode of its own, and
-/// the step changes nothing. Returns whether it applied.
-fn apply_export_step(config: &mut Config, name: &Option<String>) -> bool {
-    if config.export_pinned {
-        return false;
-    }
-    config.export_id = name.clone();
-    true
+/// Apply a `set` step of a file: what the file has set is `file` from here
+/// on. Returns the option that keeps a written line from doing what it
+/// says, when one does.
+fn apply_set_step(config: &mut Config, written: &Option<Setting>, file: &Settings) -> Option<String> {
+    let overridden = written.as_ref().and_then(|setting| config.overriding_option(setting));
+    config.file = file.clone();
+    config.apply_settings();
+    overridden
 }
 
 /// The `assert not GET /x` line as shown in previews and the `-sa` log.
@@ -9045,7 +9248,7 @@ fn print_imports(file: &str, raw: bool) -> i32 {
             &mut ImportAliases::new(),
             &mut std::collections::HashSet::new(),
             &mut program,
-            None,
+            false,
             None,
         )
         .map_err(|e| describe_program_error(&e))?;
@@ -9136,13 +9339,14 @@ fn split_bulk_requests_inner(
     aliases: &mut ImportAliases,
     chain: &mut std::collections::HashSet<std::path::PathBuf>,
     program: &mut BulkProgram,
-    // The export mode this text starts in: none for a file, the session's
-    // for a line typed at the prompt. Returns the one it ends in.
-    mut export: Option<String>,
+    // The text is typed at the prompt, where a `set` line changes what the
+    // session has set and not what a file has.
+    session: bool,
     // The included or imported file this text is, as its include line names
     // it; none for the file being run, whose describe block is the program's.
     included_as: Option<&str>,
-) -> Result<Option<String>, String> {
+    // Returns what the text has set where it ends.
+) -> Result<Settings, String> {
     // Whatever the text came from (a file, an include, stdin), a byte order
     // mark in front of it is not part of its first line.
     let contents = contents.strip_prefix('\u{feff}').unwrap_or(contents);
@@ -9154,6 +9358,8 @@ fn split_bulk_requests_inner(
     // JSON may span lines, so it is assembled the way a request body is.
     let mut importing = false;
     let mut declared = std::collections::HashSet::new();
+    // What the `set` lines of this text have set so far.
+    let mut set = Settings::default();
 
     for line in contents.lines() {
         let trimmed = line.trim();
@@ -9200,14 +9406,14 @@ fn split_bulk_requests_inner(
                     program.steps.push(parse_confirm_step(rest)?);
                     continue;
                 }
-                // `export <name>` / `export off` — export mode for the rest
-                // of this file, and for this file only.
-                if first_word.eq_ignore_ascii_case("export") {
-                    let step = parse_export_step(trimmed["export".len()..].trim())?;
-                    if let BulkStep::Export { name, .. } = &step {
-                        export = name.clone();
+                // `set <name> [value]` — a setting for the rest of this
+                // file, and for this file only.
+                if first_word.eq_ignore_ascii_case("set") {
+                    let setting = parse_set_line(trimmed["set".len()..].trim())?;
+                    if !session {
+                        set.put(&setting);
                     }
-                    program.steps.push(step);
+                    program.steps.push(BulkStep::Set { written: Some(setting), file: set.clone(), session });
                     continue;
                 }
                 // `url has`/`url is` — environment gate, collected globally.
@@ -9249,11 +9455,12 @@ fn split_bulk_requests_inner(
                         .map_err(|e| format!("could not read include {}: {}", path.display(), e))?;
                     chain.insert(canonical.clone());
                     let new_base = canonical.parent().map(|p| p.to_path_buf());
-                    let first_step = program.steps.len();
-                    // This file's export mode is not the included file's:
-                    // that one starts without, and what it sets ends with it.
-                    if export.is_some() {
-                        program.steps.push(BulkStep::Export { name: None, written: false });
+                    // What this file has set is not the included file's:
+                    // that one starts with nothing set, and what it sets
+                    // ends with it.
+                    let nothing = Settings::default();
+                    if set != nothing {
+                        program.steps.push(BulkStep::Set { written: None, file: nothing.clone(), session: false });
                     }
                     let reading = program.reading.replace(canonical.clone());
                     let left_in = split_bulk_requests_inner(
@@ -9263,15 +9470,12 @@ fn split_bulk_requests_inner(
                         &mut ImportAliases::new(),
                         chain,
                         program,
-                        None,
+                        false,
                         Some(trimmed),
                     )?;
                     program.reading = reading;
-                    if export.is_some() || left_in.is_some() {
-                        program.steps.push(BulkStep::Export { name: export.clone(), written: false });
-                    }
-                    if included_as.is_none() {
-                        program.file_spans.push((first_step..program.steps.len(), export.clone()));
+                    if set != nothing || left_in != nothing {
+                        program.steps.push(BulkStep::Set { written: None, file: set.clone(), session: false });
                     }
                     chain.remove(&canonical);
                 }
@@ -9356,7 +9560,7 @@ fn split_bulk_requests_inner(
         ));
     }
 
-    Ok(export)
+    Ok(set)
 }
 
 /// Split a multi-line bulk file into an ordered program of requests and `sleep`
@@ -9368,7 +9572,7 @@ fn split_bulk_requests(
     contents: &str,
     base_dir: Option<&std::path::Path>,
 ) -> Result<BulkProgram, String> {
-    split_bulk_requests_with(contents, base_dir, &mut ImportAliases::new(), None)
+    split_bulk_requests_with(contents, base_dir, &mut ImportAliases::new(), false)
 }
 
 /// `split_bulk_requests` starting from `aliases`, which also receives the
@@ -9377,24 +9581,24 @@ fn split_bulk_requests_with(
     contents: &str,
     base_dir: Option<&std::path::Path>,
     aliases: &mut ImportAliases,
-    export: Option<String>,
+    // The text is typed at the prompt: see `BulkStep::Set`.
+    session: bool,
 ) -> Result<BulkProgram, String> {
     let mut program = BulkProgram::default();
     let mut chain = std::collections::HashSet::new();
-    split_bulk_requests_inner(contents, base_dir, None, aliases, &mut chain, &mut program, export, None)?;
+    split_bulk_requests_inner(contents, base_dir, None, aliases, &mut chain, &mut program, session, None)?;
     Ok(program)
 }
 
 /// `split_bulk_requests` for a line typed at the prompt: an alias imported
-/// there stays for the session, so a later line can include from it. The
-/// prompt is the file here: `export` is the mode an earlier line left on, and
-/// a file run from the line is kept out of it like any included file.
-fn split_bulk_requests_in_session(contents: &str, export: Option<String>) -> Result<BulkProgram, String> {
+/// there stays for the session, so a later line can include from it, and a
+/// `set` line changes what the session has set.
+fn split_bulk_requests_in_session(contents: &str) -> Result<BulkProgram, String> {
     // Each line asks the remote afresh: an `import` typed again after a push
     // gets the new commit, where a batch resolves a ref once per run.
     forget_resolved_imports();
     let mut aliases = session_imports().lock().unwrap().clone();
-    let program = split_bulk_requests_with(contents, None, &mut aliases, export)?;
+    let program = split_bulk_requests_with(contents, None, &mut aliases, true)?;
     *session_imports().lock().unwrap() = aliases;
     Ok(program)
 }
@@ -9802,8 +10006,7 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
                 }
                 BulkStep::Assert { negate, request } => vec![format_assert(*negate, request)],
                 BulkStep::Confirm(message) => vec![format_confirm(message)],
-                BulkStep::Export { name, written: true } => vec![format_export(name)],
-                BulkStep::Export { .. } => Vec::new(),
+                BulkStep::Set { written, .. } => written.iter().map(Setting::line).collect(),
             }))
             .collect();
         if !confirm_preview(&preview_lines, &config.base_uri) {
@@ -9857,13 +10060,12 @@ fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std:
                     return;
                 }
             }
-            BulkStep::Export { name, written } => {
-                let applied = apply_export_step(config, name);
-                if *written && config.bulk_silent {
-                    outln!("{}", format_export(name).dimmed());
-                    if !applied {
-                        let pinned = config.export_id.as_deref().unwrap_or_default();
-                        outln!("{}", format!("↳ ignored: --export {} is set", pinned).dimmed());
+            BulkStep::Set { written, file, .. } => {
+                let overridden = apply_set_step(config, written, file);
+                if let Some(setting) = written.as_ref().filter(|_| config.bulk_silent) {
+                    outln!("{}", setting.line().dimmed());
+                    if let Some(option) = overridden {
+                        outln!("{}", format!("↳ ignored: {} is set", option).dimmed());
                     }
                 }
             }
@@ -11514,7 +11716,7 @@ fn handle_key_event(
             // itself is left as it was typed.
             let typed = (state.input.clone(), state.cursor_pos);
             let line = if state.input.trim().is_empty() { "GET /".to_string() } else { state.input.trim().to_string() };
-            match classify_prompt_line(&line, typed_export(&state.config)) {
+            match classify_prompt_line(&line) {
                 PromptLine::Request(request) => {
                     parse_input(state, &request);
                     state.method = "GET".to_string();
@@ -11609,21 +11811,8 @@ fn handle_key_event(
 
         // Toggle response streaming (ctrl+t)
         (KeyModifiers::CONTROL, KeyCode::Char('t')) => {
-            if state.config.streaming {
-                state.config.streaming = false;
-                state.config.stream_requested = false;
-                state.streaming_flash_at = None;
-                clear_streaming_info(state);
-            } else if state.config.server_streaming {
-                state.config.streaming = true;
-                state.config.stream_requested = true;
-                state.streaming_flash_at = Some(Instant::now());
-                show_streaming_info(state);
-            } else {
-                state.status_msg = "streaming not available on this server".to_string();
-                state.status_msg_at = Some(Instant::now());
-            }
-            render(stdout, state)?;
+            let said = set_for_session(state, &Setting::Stream(!state.config.streaming));
+            show_program_status(state, stdout, said)?;
         }
 
         // Toggle export mode (ctrl+r)
@@ -11762,7 +11951,7 @@ fn handle_key_event(
                 // prompt's own handling (the body editor); a chain runs as a
                 // chain; anything else — a directive, an include, several
                 // lines at once, a typo — runs as a program.
-                let (request, segments) = match classify_prompt_line(&input, typed_export(&state.config)) {
+                let (request, segments) = match classify_prompt_line(&input) {
                     PromptLine::Request(r) => (r, Vec::new()),
                     PromptLine::Chain(s) => (s[0].1.clone(), s),
                     PromptLine::Program => {
@@ -13031,14 +13220,7 @@ enum PromptLine {
     Program,
 }
 
-/// The export mode an `export` line typed at the prompt left on, which the
-/// next line starts in. A mode set for the whole session (`--export`,
-/// ctrl+r) is not a line's: no step touches it, and nothing is kept out of it.
-fn typed_export(config: &Config) -> Option<String> {
-    if config.export_pinned { None } else { config.export_id.clone() }
-}
-
-fn classify_prompt_line(input: &str, export: Option<String>) -> PromptLine {
+fn classify_prompt_line(input: &str) -> PromptLine {
     // An import fetches, and its alias belongs to the session: both are
     // `run_program_line`'s to do.
     let imports = input
@@ -13047,10 +13229,7 @@ fn classify_prompt_line(input: &str, export: Option<String>) -> PromptLine {
     if imports {
         return PromptLine::Program;
     }
-    // Read in the export mode the prompt is in: a file named on the line is
-    // then more than its one request, since it has to be kept out of that
-    // mode, and runs as the program it is.
-    match split_bulk_requests_with(input, None, &mut ImportAliases::new(), export) {
+    match split_bulk_requests_with(input, None, &mut ImportAliases::new(), true) {
         Ok(mut program) if program.url_conditions.is_empty() && program.steps.len() == 1 => {
             match program.steps.pop() {
                 Some(BulkStep::Request(r)) => PromptLine::Request(r),
@@ -13106,10 +13285,10 @@ fn looks_like_a_path(word: &str) -> bool {
 fn run_program_line(state: &mut AppState, stdout: &mut io::Stdout, line: &str) -> io::Result<()> {
     // A fetch can take a moment; say what the prompt is busy with.
     let imports = line.lines().any(|l| split_first_word(l.trim()).0.eq_ignore_ascii_case("import"));
-    if imports && matches!(classify_prompt_line(line, None), PromptLine::Program) {
+    if imports && matches!(classify_prompt_line(line), PromptLine::Program) {
         show_program_status(state, stdout, "importing…".to_string())?;
     }
-    let program = match split_bulk_requests_in_session(line, typed_export(&state.config)) {
+    let program = match split_bulk_requests_in_session(line) {
         Ok(p) => p,
         Err(e) => return show_program_status(state, stdout, describe_program_error(&e)),
     };
@@ -13129,12 +13308,9 @@ fn run_program_line(state: &mut AppState, stdout: &mut io::Stdout, line: &str) -
     // Published so every per-request input restore shows the typed line.
     state.chain_input = Some(line.to_string());
     let result = run_program_steps(state, stdout, &program.steps);
-    // Stopped inside a file: the export mode there was the file's own.
-    if let Ok(Some(stopped)) = &result {
-        if let Some((_, around)) = program.file_spans.iter().find(|(span, _)| span.contains(stopped)) {
-            apply_export_step(&mut state.config, around);
-        }
-    }
+    // Stopped inside a file or not: what a file had set was that file's.
+    state.config.file = Settings::default();
+    state.config.apply_settings();
     state.chain_input = None;
     state.config.quiet = false;
     state.config.check_only = false;
@@ -13333,20 +13509,24 @@ fn run_program_steps(
                 }
                 yes
             }
-            BulkStep::Export { name, written } => {
-                let applied = apply_export_step(&mut state.config, name);
-                if *written {
-                    log_directive_line(state, stdout, format_export(name).dimmed().to_string())?;
-                    let said = match (applied, name) {
-                        (true, Some(name)) => format!("export on: {}", name),
-                        (true, None) => "export off".to_string(),
-                        // Set for the session with --export or ctrl+r, which a line doesn't undo.
-                        (false, _) => format!(
-                            "export stays {}: set for the session (ctrl+r turns it off)",
-                            state.config.export_id.as_deref().unwrap_or_default()
-                        ),
-                    };
-                    show_program_status(state, stdout, said)?;
+            // Typed here: the session's own setting, until it is changed.
+            BulkStep::Set { written: Some(setting), session: true, .. } => {
+                log_directive_line(state, stdout, setting.line().dimmed().to_string())?;
+                let said = set_for_session(state, setting);
+                show_program_status(state, stdout, said)?;
+                true
+            }
+            // A line of a file run from here: that file's, and the session's
+            // own setting holds where it is on.
+            BulkStep::Set { written, file, .. } => {
+                let held = written.as_ref().map(|setting| state.config.given.get(setting));
+                let overridden = apply_set_step(&mut state.config, written, file).is_some();
+                if let Some(setting) = written {
+                    log_directive_line(state, stdout, setting.line().dimmed().to_string())?;
+                    if let Some(held) = held.filter(|_| overridden) {
+                        let note = format!("↳ ignored: the session has {}", held.line());
+                        log_directive_line(state, stdout, note.dimmed().to_string())?;
+                    }
                 }
                 true
             }
@@ -14332,9 +14512,9 @@ fn handle_export_toggle(state: &mut AppState, stdout: &mut io::Stdout) -> io::Re
         render(stdout, state)?;
         Ok(false)
     };
-    if state.config.export_id.take().is_some() {
-        state.config.export_pinned = false;
-        return notice(state, stdout, "export off".to_string());
+    if state.config.given.export.is_some() {
+        let said = set_for_session(state, &Setting::Export(None));
+        return notice(state, stdout, said);
     }
     let name = match state.export_name.clone() {
         Some(name) => name,
@@ -14344,13 +14524,43 @@ fn handle_export_toggle(state: &mut AppState, stdout: &mut io::Stdout) -> io::Re
             InlineInput::Entered(name) => name,
         },
     };
-    state.streaming_flash_at = Some(Instant::now());
-    state.export_name = Some(name.clone());
-    state.config.export_id = Some(name.clone());
-    // For the session, as `--export` is for a run: an `export` line in a
-    // file run from here does not change it.
-    state.config.export_pinned = true;
-    notice(state, stdout, format!("export on: {}", name))
+    let said = set_for_session(state, &Setting::Export(Some(name)));
+    notice(state, stdout, said)
+}
+
+/// Change one of the session's own settings: a `set` line typed at the
+/// prompt, or its key. It holds for everything sent from here on, a file run
+/// from the prompt included, until it is changed again. Returns what the hint
+/// line says about it.
+fn set_for_session(state: &mut AppState, setting: &Setting) -> String {
+    if matches!(setting, Setting::Stream(true)) && !state.config.server_streaming {
+        return "streaming not available on this server".to_string();
+    }
+    state.config.given.put(setting);
+    state.config.apply_settings();
+    match setting {
+        Setting::Stream(true) => {
+            state.streaming_flash_at = Some(Instant::now());
+            STREAMING_INFO_MSG.to_string()
+        }
+        Setting::Stream(false) => {
+            state.streaming_flash_at = None;
+            "streaming off".to_string()
+        }
+        Setting::Export(Some(name)) => {
+            state.streaming_flash_at = Some(Instant::now());
+            state.export_name = Some(name.clone());
+            format!("export on: {}", name)
+        }
+        Setting::Export(None) => "export off".to_string(),
+        Setting::Timeout(_) => match state.config.timeout_secs {
+            0 => "no timeout".to_string(),
+            seconds => format!("timeout {}s", seconds),
+        },
+        Setting::IncludeNulls(on) | Setting::FailFast(on) | Setting::Ndjson(on) | Setting::Raw(on) => {
+            format!("{} {}", setting.name(), if *on { "on" } else { "off" })
+        }
+    }
 }
 
 /// Ask, in the command area, for the name export mode keeps a lone key
@@ -14849,7 +15059,7 @@ fn render_input_content(state: &mut AppState, width: usize) -> (String, u16, Str
         let file_ctx = extract_file_path_context(&state.input, state.cursor_pos);
         // The view shows one segment as a whole line, which would make a
         // chain's bare word look like an include. A chain can't hold one.
-        if behind_segment || (chained && file_ctx.as_ref().is_some_and(|ctx| ctx.is_include)) {
+        if behind_segment || (chained && file_ctx.as_ref().is_some_and(|ctx| ctx.is_include || ctx.is_setting)) {
             return (String::new(), param_hint);
         }
         let in_file_mode = file_ctx.is_some();
@@ -17414,9 +17624,12 @@ struct FilePathContext {
     is_append: bool,
     /// The line itself is a path to a `.api` file to run.
     is_include: bool,
+    /// No path at all: the name of a setting on a `set` line, which is
+    /// completed and shown ahead the same way.
+    is_setting: bool,
 }
 
-const DIRECTIVES: [&str; 6] = ["sleep", "assert", "confirm", "url", "import", "export"];
+const DIRECTIVES: [&str; 6] = ["sleep", "assert", "confirm", "url", "import", "set"];
 
 /// The include path being typed, when the line can only be one: a single line
 /// that is no chain and whose first word is no method, directive or `/path`.
@@ -17429,6 +17642,9 @@ fn include_path_context(input: &str, seg_start: usize, seg_end: usize) -> Option
     }
     let partial = input.trim();
     let first_word = partial.split_whitespace().next()?;
+    if first_word.eq_ignore_ascii_case("set") {
+        return setting_name_context(input);
+    }
     if starts_a_request(first_word)
         || first_word.starts_with('/')
         || DIRECTIVES.iter().any(|d| first_word.eq_ignore_ascii_case(d))
@@ -17444,6 +17660,28 @@ fn include_path_context(input: &str, seg_start: usize, seg_end: usize) -> Option
         is_outfile: false,
         is_append: false,
         is_include: true,
+        is_setting: false,
+    })
+}
+
+/// The name being typed on a `set` line, from the blank behind `set` up to
+/// the end of the line. Not once a value follows it: the name is whole then.
+fn setting_name_context(input: &str) -> Option<FilePathContext> {
+    let behind_set = input.len() - input.trim_start().len() + "set".len();
+    let rest = &input[behind_set..];
+    let name = rest.trim_start();
+    if name.len() == rest.len() || name.contains(char::is_whitespace) {
+        return None;
+    }
+    let path_start = input.len() - name.len();
+    Some(FilePathContext {
+        path_start,
+        path_end: input.len(),
+        partial: name.to_string(),
+        is_outfile: false,
+        is_append: false,
+        is_include: false,
+        is_setting: true,
     })
 }
 
@@ -17467,7 +17705,7 @@ fn body_file_marker(segment: &str) -> Option<usize> {
 /// and an include take no operator, and a `~` that starts the path is the
 /// home directory.
 fn body_file_operator(ctx: &FilePathContext) -> Option<(&str, &str)> {
-    if ctx.is_include || ctx.is_outfile {
+    if ctx.is_include || ctx.is_outfile || ctx.is_setting {
         return None;
     }
     let tilde = ctx.partial.rfind('~').filter(|&at| at > 0)?;
@@ -17525,6 +17763,7 @@ fn extract_file_path_context(input: &str, cursor_pos: usize) -> Option<FilePathC
                 is_outfile,
                 is_append,
                 is_include: false,
+                is_setting: false,
             });
         }
     }
@@ -17654,7 +17893,11 @@ fn get_include_completions(partial: &str) -> Vec<String> {
 }
 
 fn file_completions_for(ctx: &FilePathContext) -> Vec<String> {
-    if ctx.is_include {
+    if ctx.is_setting {
+        // As they are listed, in lower case: what the ghost shows ahead is
+        // what is left of the name as it was typed.
+        SETTING_NAMES.iter().filter(|name| name.starts_with(&ctx.partial)).map(|name| name.to_string()).collect()
+    } else if ctx.is_include {
         get_include_completions(&ctx.partial)
     } else if ctx.is_outfile && !ctx.is_append {
         // Append targets get plain file completions — the virtual `clipboard`
@@ -19164,7 +19407,7 @@ mod tests {
         handle_paste(&mut state, "assert /a\rassert /b\r\nassert /c\r", &mut out).unwrap();
         assert_eq!(state.input, "assert /a\nassert /b\nassert /c");
         assert_eq!(state.cursor_pos, char_len(&state.input));
-        assert!(matches!(classify_prompt_line(&state.input, None), PromptLine::Program));
+        assert!(matches!(classify_prompt_line(&state.input), PromptLine::Program));
 
         // A single copied line, newline and all, over the default prompt.
         let mut state = test_state();
@@ -19638,75 +19881,204 @@ mod tests {
     }
 
     #[test]
-    fn parse_export_step_takes_a_namespaced_key_or_off() {
-        let on = |name: &str| BulkStep::Export { name: Some(name.to_string()), written: true };
-        assert_eq!(parse_export_step("com.heads.seedID").unwrap(), on("com.heads.seedID"));
-        assert_eq!(parse_export_step("  my_co.my-org.seed-id$  ").unwrap(), on("my_co.my-org.seed-id$"));
-        for off in ["off", "OFF", "Off"] {
-            assert_eq!(parse_export_step(off).unwrap(), BulkStep::Export { name: None, written: true });
+    fn a_set_line_names_a_setting_as_its_long_option_does() {
+        let set = |rest: &str| parse_set_line(rest).unwrap();
+        assert_eq!(set("export com.heads.seedID"), Setting::Export(Some("com.heads.seedID".to_string())));
+        assert_eq!(set("  export   my_co.my-org.seed-id$  "), Setting::Export(Some("my_co.my-org.seed-id$".to_string())));
+        assert_eq!(set("EXPORT Off"), Setting::Export(None));
+        for (name, on, off) in [
+            ("include-nulls", Setting::IncludeNulls(true), Setting::IncludeNulls(false)),
+            ("fail-fast", Setting::FailFast(true), Setting::FailFast(false)),
+            ("ndjson", Setting::Ndjson(true), Setting::Ndjson(false)),
+            ("raw", Setting::Raw(true), Setting::Raw(false)),
+            ("stream", Setting::Stream(true), Setting::Stream(false)),
+        ] {
+            assert_eq!(set(name), on, "{name}");
+            assert_eq!(set(&format!("{name} on")), on, "{name}");
+            assert_eq!(set(&format!("{} ON", name.to_uppercase())), on, "{name}");
+            assert_eq!(set(&format!("{name} off")), off, "{name}");
+            assert_eq!(on.name(), name);
+            // A line is shown as the shortest way to write it.
+            assert_eq!(on.line(), format!("set {name}"));
+            assert_eq!(off.line(), format!("set {name} off"));
+            assert!(off.is_off() && !on.is_off(), "{name}");
+            let said = parse_set_line(&format!("{name} yes")).unwrap_err();
+            assert_eq!(said, format!("set {name} takes `on` or `off`, not `yes`"));
         }
-        assert!(parse_export_step("").unwrap_err().contains("export needs a name"));
-        for bad in ["seedID", "com.heads", "a.b.c d", "off now", "on"] {
-            assert!(parse_export_step(bad).unwrap_err().contains("invalid export identifier"), "{bad}");
+        assert_eq!(set("timeout 30"), Setting::Timeout(Some(30)));
+        assert_eq!(set("timeout 0"), Setting::Timeout(Some(0)));
+        assert_eq!(set("timeout off"), Setting::Timeout(None));
+        assert_eq!(Setting::Timeout(Some(30)).line(), "set timeout 30");
+        assert_eq!(Setting::Timeout(None).line(), "set timeout off");
+        assert_eq!(Setting::Export(Some("a.b.c".to_string())).line(), "set export a.b.c");
+        assert_eq!(Setting::Export(None).line(), "set export off");
+        // Every name `set` takes is one of the list its messages give.
+        for name in SETTING_NAMES {
+            let line = format!("{name} off");
+            assert_eq!(parse_set_line(&line).unwrap().name(), name);
         }
-        assert_eq!(format_export(&Some("a.b.c".to_string())), "export a.b.c");
-        assert_eq!(format_export(&None), "export off");
+
+        let refused = |rest: &str| parse_set_line(rest).unwrap_err();
+        assert!(refused("").starts_with("set needs a setting"), "{}", refused(""));
+        assert!(refused("export").starts_with("set export needs a name"));
+        for bad in ["export seedID", "export com.heads", "export on"] {
+            assert!(refused(bad).starts_with("invalid export identifier"), "{bad}");
+        }
+        for bad in ["timeout", "timeout soon", "timeout -1", "timeout 1.5"] {
+            assert!(refused(bad).starts_with("set timeout needs whole seconds"), "{bad}");
+        }
+        assert_eq!(refused("include-nulls on now"), "set takes a setting and one value: `set include-nulls on now`");
+        assert!(refused("nulls").starts_with("unknown setting `nulls` (one of export, include-nulls,"));
+        // What picks where a request goes is not a setting.
+        for never in ["base-uri", "key", "token", "connection", "no-keychain", "me", "silent", "preview"] {
+            assert!(refused(never).starts_with("unknown setting"), "{never}");
+        }
     }
 
     #[test]
-    fn an_export_line_is_scoped_to_its_file_by_steps_around_each_include() {
+    fn a_set_line_is_scoped_to_its_file_by_steps_around_each_include() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("plain.api"), "GET /plain\n").unwrap();
-        fs::write(dir.path().join("own.api"), "export in.ner.id\nGET /own\n").unwrap();
-        let steps = |text: &str, export: Option<&str>| {
-            split_bulk_requests_with(text, Some(dir.path()), &mut ImportAliases::new(), export.map(String::from))
-                .unwrap()
-                .steps
+        fs::write(dir.path().join("own.api"), "set export in.ner.id\nGET /own\n").unwrap();
+        let steps = |text: &str, session: bool| {
+            split_bulk_requests_with(text, Some(dir.path()), &mut ImportAliases::new(), session).unwrap().steps
         };
-        let written = |name: Option<&str>| BulkStep::Export { name: name.map(String::from), written: true };
-        let scope = |name: Option<&str>| BulkStep::Export { name: name.map(String::from), written: false };
+        let has = |settings: &[Setting]| {
+            let mut all = Settings::default();
+            settings.iter().for_each(|setting| all.put(setting));
+            all
+        };
+        let export = |name: &str| Setting::Export(Some(name.to_string()));
+        let written = |setting: Setting, file: &[Setting]| BulkStep::Set { written: Some(setting), file: has(file), session: false };
+        let scope = |file: &[Setting]| BulkStep::Set { written: None, file: has(file), session: false };
         let get = |uri: &str| BulkStep::Request(format!("GET {}", uri));
+        let nulls = Setting::IncludeNulls(true);
 
         // Without a line there is nothing to keep an include out of.
-        assert_eq!(steps("GET /a\nplain.api\n", None), [get("/a"), get("/plain")]);
-        // Under a line: off on the way in, back on the way out.
+        assert_eq!(steps("GET /a\nplain.api\n", false), [get("/a"), get("/plain")]);
+        // Under a line: nothing set on the way in, back on the way out.
         assert_eq!(
-            steps("export a.b.c\nplain.api\nGET /a\n", None),
-            [written(Some("a.b.c")), scope(None), get("/plain"), scope(Some("a.b.c")), get("/a")]
+            steps("set export a.b.c\nplain.api\nGET /a\n", false),
+            [written(export("a.b.c"), &[export("a.b.c")]), scope(&[]), get("/plain"), scope(&[export("a.b.c")]), get("/a")]
+        );
+        // Each step holds everything the file has set by then.
+        assert_eq!(
+            steps("set include-nulls\nset export a.b.c\nplain.api\n", false),
+            [
+                written(nulls.clone(), &[nulls.clone()]),
+                written(export("a.b.c"), &[nulls.clone(), export("a.b.c")]),
+                scope(&[]),
+                get("/plain"),
+                scope(&[nulls.clone(), export("a.b.c")]),
+            ]
         );
         // What an included file sets ends with it, whatever the includer has.
         assert_eq!(
-            steps("own.api\nGET /a\n", None),
-            [written(Some("in.ner.id")), get("/own"), scope(None), get("/a")]
+            steps("own.api\nGET /a\n", false),
+            [written(export("in.ner.id"), &[export("in.ner.id")]), get("/own"), scope(&[]), get("/a")]
         );
         assert_eq!(
-            steps("export a.b.c\nown.api\n", None),
-            [written(Some("a.b.c")), scope(None), written(Some("in.ner.id")), get("/own"), scope(Some("a.b.c"))]
+            steps("set include-nulls\nown.api\n", false),
+            [
+                written(nulls.clone(), &[nulls.clone()]),
+                scope(&[]),
+                written(export("in.ner.id"), &[export("in.ner.id")]),
+                get("/own"),
+                scope(&[nulls.clone()]),
+            ]
         );
-        // After `export off` an include needs nothing around it again.
+        // After `off` an include needs nothing around it again.
         assert_eq!(
-            steps("export a.b.c\nexport off\nplain.api\n", None),
-            [written(Some("a.b.c")), written(None), get("/plain")]
+            steps("set export a.b.c\nset export off\nplain.api\n", false),
+            [written(export("a.b.c"), &[export("a.b.c")]), written(Setting::Export(None), &[]), get("/plain")]
         );
-        // A line typed at the prompt starts in the mode an earlier one left.
-        assert_eq!(steps("plain.api", Some("a.b.c")), [scope(None), get("/plain"), scope(Some("a.b.c"))]);
-        assert_eq!(steps("GET /a", Some("a.b.c")), [get("/a")]);
 
-        // So a one-request file is a program there, not a request of the prompt's.
+        // A line typed at the prompt is the session's: no file has set it,
+        // and a file named under it is not kept out of anything.
+        let typed = BulkStep::Set { written: Some(nulls.clone()), file: has(&[]), session: true };
+        assert_eq!(steps("set include-nulls\nplain.api", true), [typed.clone(), get("/plain")]);
+        // A file's own line is still that file's, and ends with it.
+        assert_eq!(
+            steps("set include-nulls\nown.api", true),
+            [typed, written(export("in.ner.id"), &[export("in.ner.id")]), get("/own"), scope(&[])]
+        );
         let line = dir.path().join("plain.api").display().to_string();
-        assert!(matches!(classify_prompt_line(&line, None), PromptLine::Request(_)));
-        assert!(matches!(classify_prompt_line(&line, Some("a.b.c".to_string())), PromptLine::Program));
-        assert!(matches!(classify_prompt_line("export a.b.c", None), PromptLine::Program));
+        assert!(matches!(classify_prompt_line(&line), PromptLine::Request(_)));
+        assert!(matches!(classify_prompt_line("set export a.b.c"), PromptLine::Program));
 
-        // `--export` and ctrl+r pin the mode: a step leaves it alone.
+        // A `set` line is a line of its own.
+        let chained = split_bulk_requests("GET /a && set include-nulls", None).unwrap_err();
+        assert_eq!(chained, "chain segment is not a request: `set include-nulls`");
+        assert!(split_bulk_requests("set nulls\nGET /a", None).unwrap_err().starts_with("unknown setting `nulls`"));
+        let chained = split_bulk_requests("set include-nulls && GET /a", None).unwrap_err();
+        assert_eq!(chained, "a `set` line can't be part of a `&&`/`||` chain: `set include-nulls && GET /a`");
+    }
+
+    #[test]
+    fn what_the_run_was_started_with_stays_on_under_a_files_set_lines() {
         let mut config = Config::default();
-        assert!(apply_export_step(&mut config, &Some("a.b.c".to_string())));
+        let file = |settings: &[Setting]| {
+            let mut all = Settings::default();
+            settings.iter().for_each(|setting| all.put(setting));
+            all
+        };
+        // Nothing given: the file decides, and what it sets ends with `off`.
+        let all = [
+            Setting::Export(Some("a.b.c".to_string())),
+            Setting::IncludeNulls(true),
+            Setting::FailFast(true),
+            Setting::Ndjson(true),
+            Setting::Raw(true),
+            Setting::Stream(true),
+            Setting::Timeout(Some(30)),
+        ];
+        for setting in &all {
+            assert_eq!(apply_set_step(&mut config, &Some(setting.clone()), &file(&[setting.clone()])), None);
+        }
+        apply_set_step(&mut config, &None, &file(&all));
         assert_eq!(config.export_id.as_deref(), Some("a.b.c"));
-        assert_eq!(typed_export(&config).as_deref(), Some("a.b.c"));
-        config.export_pinned = true;
-        assert!(!apply_export_step(&mut config, &None));
+        assert!(config.include_nulls && config.fail_fast && config.ndjson && config.raw && config.stream_requested);
+        assert_eq!(config.timeout_secs, 30);
+        apply_set_step(&mut config, &None, &Settings::default());
+        assert_eq!(config.export_id, None);
+        assert!(!(config.include_nulls || config.fail_fast || config.ndjson || config.raw || config.stream_requested));
+        assert_eq!(config.timeout_secs, DEFAULT_TIMEOUT_SECS);
+
+        // Given on the command line: `off` and another value are ignored,
+        // and the option is named as it was given.
+        all.iter().for_each(|setting| config.given.put(setting));
+        for (line, option) in [
+            (Setting::Export(None), "--export a.b.c"),
+            (Setting::Export(Some("x.y.z".to_string())), "--export a.b.c"),
+            (Setting::IncludeNulls(false), "-i"),
+            (Setting::FailFast(false), "-f"),
+            (Setting::Ndjson(false), "--ndjson"),
+            (Setting::Raw(false), "-r"),
+            (Setting::Stream(false), "--stream"),
+            (Setting::Timeout(None), "--timeout 30"),
+            (Setting::Timeout(Some(5)), "--timeout 30"),
+        ] {
+            let said = apply_set_step(&mut config, &Some(line.clone()), &file(&[line.clone()]));
+            assert_eq!(said.as_deref(), Some(option), "{line:?}");
+        }
         assert_eq!(config.export_id.as_deref(), Some("a.b.c"));
-        assert_eq!(typed_export(&config), None);
+        assert!(config.include_nulls && config.fail_fast && config.ndjson && config.raw && config.stream_requested);
+        assert_eq!(config.timeout_secs, 30);
+        // A line that asks for what holds anyway is kept from nothing.
+        for setting in &all {
+            assert_eq!(apply_set_step(&mut config, &Some(setting.clone()), &file(&[setting.clone()])), None);
+        }
+
+        // `--no-streaming` and `API_STREAMING`.
+        let mut config = Config { no_streaming: true, ..Config::default() };
+        let stream = Setting::Stream(true);
+        assert_eq!(apply_set_step(&mut config, &Some(stream.clone()), &file(&[stream.clone()])).as_deref(), Some("--no-streaming"));
+        assert!(!config.stream_requested);
+        let mut config = Config { stream_by_env: true, ..Config::default() };
+        config.given.stream = true;
+        let off = Setting::Stream(false);
+        assert_eq!(apply_set_step(&mut config, &Some(off.clone()), &file(&[])).as_deref(), Some("API_STREAMING"));
+        assert!(config.stream_requested);
     }
 
     #[test]
@@ -19824,14 +20196,14 @@ mod tests {
 
     #[test]
     fn classify_prompt_line_keeps_one_request_or_chain_apart_from_programs() {
-        assert!(matches!(classify_prompt_line("GET /a", None), PromptLine::Request(r) if r == "GET /a"));
+        assert!(matches!(classify_prompt_line("GET /a"), PromptLine::Request(r) if r == "GET /a"));
         assert!(matches!(
-            classify_prompt_line("PUT /a {\"x\":1 // c\n}", None),
+            classify_prompt_line("PUT /a {\"x\":1 // c\n}"),
             PromptLine::Request(r) if !r.contains("// c")
         ));
-        assert!(matches!(classify_prompt_line("GET /a && GET /b", None), PromptLine::Chain(s) if s.len() == 2));
+        assert!(matches!(classify_prompt_line("GET /a && GET /b"), PromptLine::Chain(s) if s.len() == 2));
         for program in ["sleep 1", "GET /a\nGET /b", "peple", "url has x\nGET /a", "# note", "/tmp/x.api"] {
-            assert!(matches!(classify_prompt_line(program, None), PromptLine::Program), "{program}");
+            assert!(matches!(classify_prompt_line(program), PromptLine::Program), "{program}");
         }
     }
 
@@ -21812,7 +22184,7 @@ mod tests {
         for typed in ["g", "PU", "pat", "sl", "asser", "u", "options"] {
             assert!(could_become_a_keyword(typed), "{}", typed);
         }
-        for typed in ["pub", "se", "shared/", "get.api", "~/"] {
+        for typed in ["pub", "sea", "shared/", "get.api", "~/"] {
             assert!(!could_become_a_keyword(typed), "{}", typed);
         }
     }
@@ -24291,13 +24663,13 @@ mod tests {
     fn a_session_alias_outlives_the_line_and_completes() {
         let (_repo, url, _) = test_repo(&[("sv.api", "GET /sv\n"), ("seeds/a.api", "GET /a\n"), ("notes.txt", "x")]);
         let line = format!("import git zzsession {{ \"url\": \"{url}\", \"ref\": \"1.0\" }}");
-        assert!(matches!(classify_prompt_line(&line, None), PromptLine::Program));
-        let program = split_bulk_requests_in_session(&line, None).unwrap();
+        assert!(matches!(classify_prompt_line(&line), PromptLine::Program));
+        let program = split_bulk_requests_in_session(&line).unwrap();
         assert!(program.steps.is_empty());
         assert_eq!(program.import_notes.len(), 1);
 
         // A later line includes from it…
-        let program = split_bulk_requests_in_session("zzsession/sv.api", None).unwrap();
+        let program = split_bulk_requests_in_session("zzsession/sv.api").unwrap();
         assert_eq!(requests_of(&program), vec!["GET /sv".to_string()]);
         // …and a line that never declared it elsewhere still can't.
         assert!(split_bulk_requests("zzsession/sv.api", None).is_err());
@@ -24310,7 +24682,7 @@ mod tests {
         assert_eq!(get_include_completions("zzsession/seeds/"), vec!["zzsession/seeds/a.api".to_string()]);
 
         // Declaring it again at the prompt replaces it.
-        assert!(split_bulk_requests_in_session(&line, None).is_ok());
+        assert!(split_bulk_requests_in_session(&line).is_ok());
     }
 
     #[test]
@@ -24333,7 +24705,7 @@ mod tests {
         // only once is tested in tests/imports.rs, by counting what git was
         // asked: here another test may clear what this process remembers.)
         let at_prompt = import.replace(" moving ", " zzmoving ").replace("moving/a.api", "zzmoving/a.api");
-        let (requests, note) = ran(split_bulk_requests_in_session(&at_prompt, None).unwrap());
+        let (requests, note) = ran(split_bulk_requests_in_session(&at_prompt).unwrap());
         assert_eq!(requests, vec!["GET /second".to_string()]);
         assert!(note.ends_with(&format!("({})", &second[..7])), "{note}");
 
@@ -24341,9 +24713,9 @@ mod tests {
         // an `import` typed again looks the branch up.
         fs::write(repo.path().join("a.api"), "GET /third\n").unwrap();
         test_git(repo.path(), &["commit", "-q", "-am", "third"]);
-        let program = split_bulk_requests_in_session("zzmoving/a.api", None).unwrap();
+        let program = split_bulk_requests_in_session("zzmoving/a.api").unwrap();
         assert_eq!(requests_of(&program), vec!["GET /second".to_string()]);
-        let (requests, _) = ran(split_bulk_requests_in_session(&at_prompt, None).unwrap());
+        let (requests, _) = ran(split_bulk_requests_in_session(&at_prompt).unwrap());
         assert_eq!(requests, vec!["GET /third".to_string()]);
     }
 
@@ -25611,7 +25983,7 @@ mod tests {
             // take the block below into it.
             ("confirm Send [x?\n{ \"title\": {} }\n", late.to_string()),
             ("confirm Send {x?\n\n{ \"title\": {} }\n", late.to_string()),
-            ("export com.heads.seedID\n{ \"title\": {} }\n", late.to_string()),
+            ("set export com.heads.seedID\n{ \"title\": {} }\n", late.to_string()),
             ("import dir d { \"path\": \".\" }\n{ \"title\": {} }\n", late.to_string()),
             // Under a request with no body it is most likely the body.
             ("PUT /a\n{ \"x\": 1 }\n", format!("{late} (a body starts on the request line)")),
@@ -25764,9 +26136,9 @@ mod tests {
         assert!(!split_bulk_requests("{ \"title\": {} }\nurl has x", None).unwrap().only_describes());
         assert!(!split_bulk_requests("# note", None).unwrap().only_describes());
         // At the prompt it is a program, not a request to send.
-        assert!(matches!(classify_prompt_line("{ \"title\": {} }", None), PromptLine::Program));
+        assert!(matches!(classify_prompt_line("{ \"title\": {} }"), PromptLine::Program));
         assert!(matches!(
-            classify_prompt_line("{ \"title\": {} }\nGET /a", None),
+            classify_prompt_line("{ \"title\": {} }\nGET /a"),
             PromptLine::Request(r) if r == "GET /a"
         ));
     }
@@ -27301,7 +27673,10 @@ mod tests {
         );
         // Directives.
         assert_eq!(steps("sleep 2 # wait"), [BulkStep::Sleep(Duration::from_secs(2))]);
-        assert_eq!(steps("export off # done"), [BulkStep::Export { name: None, written: true }]);
+        assert_eq!(
+            steps("set raw off # done"),
+            [BulkStep::Set { written: Some(Setting::Raw(false)), file: Settings::default(), session: false }]
+        );
         assert_eq!(
             steps("assert not GET /a~count # none left"),
             [BulkStep::Assert { negate: true, request: "GET /a~count".to_string() }]
@@ -27352,32 +27727,6 @@ mod tests {
         // With a method nothing changes.
         assert_eq!(args(&["put", "/x", "{\"a\":1}", "{\"b\":2}"]), got("PUT", "/x", "{\"a\":1} {\"b\":2}"));
         assert_eq!(args(&["GET", "/people", ">", "out.json"]), got("GET", "/people", "> out.json"));
-    }
-
-    #[test]
-    fn a_program_knows_which_steps_a_named_file_gave_it() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("own.api"), "export other.name.id\nGET /o\ninner.api\n").unwrap();
-        fs::write(dir.path().join("inner.api"), "GET /i\n").unwrap();
-        fs::write(dir.path().join("plain.api"), "GET /p\n").unwrap();
-        let spans = |text: &str, export: Option<&str>| {
-            let program =
-                split_bulk_requests_with(text, Some(dir.path()), &mut ImportAliases::new(), export.map(String::from))
-                    .unwrap();
-            (program.steps.len(), program.file_spans)
-        };
-        // The file's steps, its closing step included; a file it includes
-        // is part of it and has no span of its own.
-        let (count, found) = spans("GET /a\nown.api\nGET /b", None);
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].1, None);
-        assert_eq!(found[0].0.start, 1);
-        assert_eq!(found[0].0.end, count - 1);
-        // Around each file is the mode the text was in when it named it.
-        let (_, found) = spans("plain.api\nexport a.b.c\nplain.api\nown.api", Some("x.y.z"));
-        let around: Vec<Option<&str>> = found.iter().map(|(_, e)| e.as_deref()).collect();
-        assert_eq!(around, [Some("x.y.z"), Some("a.b.c"), Some("a.b.c")]);
-        assert!(spans("GET /a", Some("x.y.z")).1.is_empty());
     }
 
     #[test]
@@ -29524,7 +29873,7 @@ mod tests {
     fn a_pasted_identifier_stays_one_request() {
         for value in ["R&&D", "a||b", "6\" disc", "a && b || c"] {
             let line = apply_identifier_index("GET /people", &identifier_segment("com.x.id", value));
-            match classify_prompt_line(&line, None) {
+            match classify_prompt_line(&line) {
                 PromptLine::Request(_) => {}
                 _ => panic!("{line} is not one request"),
             }
@@ -29594,14 +29943,42 @@ mod tests {
     }
 
     #[test]
-    fn export_is_a_keyword_and_no_start_of_a_path() {
-        for typed in ["e", "ex", "exp", "export", "EXPORT"] {
+    fn set_is_a_keyword_and_no_start_of_a_path() {
+        for typed in ["s", "se", "set", "SET"] {
             assert!(could_become_a_keyword(typed), "{typed}");
         }
-        assert!(!could_become_a_keyword("exports"));
+        assert!(!could_become_a_keyword("sets"));
         // The line of a directive is not an include to complete.
-        assert!(include_path_context("export com.heads.seedID", 0, "export com.heads.seedID".len()).is_none());
-        assert!(include_path_context("export off", 0, "export off".len()).is_none());
+        for line in ["set export com.heads.seedID", "set include-nulls off", "set ", "set in"] {
+            assert!(include_path_context(line, 0, line.len()).is_none_or(|ctx| !ctx.is_include), "{line}");
+        }
+        // `export` is a path like any other now.
+        assert!(include_path_context("export", 0, 6).is_some_and(|ctx| ctx.is_include));
+    }
+
+    #[test]
+    fn tab_completes_the_name_on_a_set_line() {
+        assert_eq!(ghost_then_tab("set in^", false), ("clude-nulls".to_string(), "set include-nulls^".to_string()));
+        assert_eq!(ghost_then_tab("set f^", false), ("ail-fast".to_string(), "set fail-fast^".to_string()));
+        assert_eq!(ghost_then_tab("SET t^", false), ("imeout".to_string(), "SET timeout^".to_string()));
+        // Nothing typed: the first of the list, and Tab goes through them.
+        let mut state = completing("set ^");
+        let mut seen = Vec::new();
+        for _ in 0..SETTING_NAMES.len() + 1 {
+            assert!(tab_pressed(&mut state));
+            seen.push(shown(&state));
+        }
+        let all: Vec<String> = SETTING_NAMES.iter().chain(SETTING_NAMES.first()).map(|name| format!("set {name}^")).collect();
+        assert_eq!(seen, all);
+        assert!(backtab_pressed(&mut state));
+        assert_eq!(shown(&state), format!("set {}^", SETTING_NAMES.last().unwrap()));
+        // Nothing to add to a name that is no setting, behind a value, or
+        // behind `set` with no blank yet.
+        for line in ["set nulls^", "set IN^", "set timeout 3^", "set export off^", "set include-nulls ^"] {
+            let (ghost, after) = ghost_then_tab(line, false);
+            assert_eq!((ghost.as_str(), after.as_str()), ("", line), "{line}");
+        }
+        assert_eq!(ghost_then_tab("set^", false).0, "");
     }
 
     #[test]

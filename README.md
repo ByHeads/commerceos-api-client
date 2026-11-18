@@ -77,7 +77,7 @@ to another environment: database keys are dropped, a record with no other identi
 under the name you give and as `key?` (a key that may name nothing), and masked values become `null`
 (it says where). The name is a namespaced key such as `com.heads.seedID`. At the prompt,
 `ctrl+r` turns it on and off and asks for the name the first time. In a `.api` file, a line
-`export com.heads.seedID` turns it on for the requests below it in that file, and `export off` ends it.
+`set export com.heads.seedID` turns it on for the requests below it in that file, and `set export off` ends it.
 
 ```sh
 api --export com.heads.seedID GET /users > users.json
@@ -230,7 +230,7 @@ GET /people~take(5) > /tmp/people.json
 | `sleep [N] while [not] <request>` | poll every N seconds (default 5) until the answer flips |
 | `assert [not] <request>` | exit 1 unless the answer is truthy (falsy with `not`) |
 | `confirm [message]` | pause and ask for confirmation before continuing |
-| `export <external-id>` / `export off` | export mode for the requests below it in this file |
+| `set <name> [value]` / `set <name> off` | a setting for the requests below it in this file, named as its long option: `export <external-id>`, `include-nulls`, `fail-fast`, `ndjson`, `raw`, `stream`, `timeout <seconds>`. An option on the command line holds for the whole run |
 | `url has <text>` / `url is <url>` | allowlist of base URLs; no match aborts before anything runs |
 
 `AGENTS.md` is the full reference for the file format.

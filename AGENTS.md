@@ -234,7 +234,8 @@ Re-running the batch overwrites the files.
 ### Streaming large exports (`--stream`)
 
 Off unless asked for, via `--stream` or `API_STREAMING=1` (`--no-streaming`
-overrides both). With it, a response bound for `> file` is written as it
+overrides both), or for some requests of a file by a
+[`set stream` line](#set-name-value). With it, a response bound for `> file` is written as it
 arrives instead of being held in memory first:
 
 ```sh
@@ -733,7 +734,7 @@ omnium/omnium.api
   ref that does not exist) is `error: …` on stderr with exit 1 and nothing on
   stdout.
 
-## 7. Directives: `sleep`, `sleep while`, `assert`, `confirm`, `export`, `url`
+## 7. Directives: `sleep`, `sleep while`, `assert`, `confirm`, `set`, `url`
 
 Besides requests and includes, a few control lines are recognised. `sleep while`
 and `assert` send a request whose answer is only judged, never printed as data.
@@ -833,54 +834,77 @@ POST /deploy { "go": true }
   there is nothing left there to answer with, so without a terminal a `confirm`
   in it always stops the run.
 
-### `export <external-id>` / `export off`
+### `set <name> [value]`
 
-Turn [export mode](#exporting-seed-data---export-external-id) on for the
-requests that follow in this file, as `--export <external-id>` does for a
-whole run, so that one file can read some things as seed data and others as
-they are:
+Change a setting for the requests that follow in this file, as its option on
+the command line does for a whole run. A setting is named as its long option
+is: `--include-nulls` is `set include-nulls`.
 
 ```
 GET /about > /tmp/about.json                 # as the server answers
 
-export com.heads.seedID
+set export com.heads.seedID
+set include-nulls
 
-GET /users > /tmp/users.json                 # seed data
-shared/checks.api                            # another file: not exported
-GET /companies > /tmp/companies.json         # seed data again
+GET /users > /tmp/users.json                 # seed data, nulls included
+shared/checks.api                            # another file: neither
+GET /companies > /tmp/companies.json         # seed data, nulls included
 
-export off
+set export off
 
-GET /people~count > /tmp/count.json          # as the server answers
+GET /people~count > /tmp/count.json          # as the server answers, nulls included
 ```
 
-- It holds **from the line down, to `export off` or the end of the file**. A
-  second `export <name>` replaces the name from there on.
+| Line | Is | Does to the requests under it |
+|---|---|---|
+| `set export <external-id>` | `--export <external-id>` | [responses are rewritten as seed data](#exporting-seed-data---export-external-id) |
+| `set include-nulls` | `-i` | members that are `null` are in the response |
+| `set fail-fast` | `-f` | [the first response of 400 or above ends the run](#stopping-at-the-first-failure--f---fail-fast) |
+| `set ndjson` | `--ndjson` | NDJSON is sent and asked for |
+| `set raw` | `-r` | JSON is printed and written to a `> file` as it came, not indented |
+| `set stream` | `--stream` | [a response bound for a `> file` is written as it arrives](#streaming-large-exports---stream) |
+| `set timeout <seconds>` | `--timeout <seconds>` | a request is given up on after that long; `0` is no timeout |
+
+- **`set <name> off` turns it off again**, and for `timeout` is the default
+  of ten minutes again. `set <name> on` is `set <name>`. The preview and the
+  log show a line the short way: `set include-nulls on` as `set include-nulls`.
+- It holds **from the line down, to `off` or the end of the file**. A second
+  line for the same setting replaces the first from there on.
 - It is **the file's own**. A file it includes, and a file of an import, runs
-  without it, and export is back on when the including file carries on. An
-  included or imported file may have an `export` line of its own, which ends
-  with that file and never reaches the file that included it.
-- The name is a namespaced key, as for `--export`. A name that is not one, a
-  missing name, or an `export` line as a segment of a `&&`/`||` chain stops
-  the batch with exit 1 before anything is sent.
-- **`--export` on the command line overrides every `export` line**: the whole
-  run, included files too, is exported under the command line's name, and
-  `export off` does not turn it off. The `-sa` log says so under each line:
-  `↳ ignored: --export com.heads.seedID is set`.
-- Each request under it behaves as with `--export`: a 2xx JSON response is
-  rewritten wherever it goes, an error body is left alone, `&&`/`||`,
-  `assert` and `sleep while` judge what the server answered, and the request
-  is not streamed.
-- The `-p` preview and the `-sa` log list the line where it is written.
-- **At the prompt** the line works the same, with the session in the place of
-  the file: `export com.heads.seedID` holds for the lines typed after it until
-  `export off` (or ctrl+r), and a file run from the prompt is kept out of it
-  like an included file. A session's own export mode, from `--export` or
-  ctrl+r, is the command line's and overrides a typed line too: the hint line
-  says `export stays <name>`.
-- As a one-shot argument on its own (`api export com.heads.seedID`) it would
-  send nothing and is an error; use `--export`. In an argument of several
-  lines it is a line like any other.
+  with nothing set, and the setting is back when the including file carries
+  on. An included or imported file may have `set` lines of its own, which end
+  with that file and never reach the file that included it. That holds for
+  `set fail-fast` too: a failed request in an included file is passed as it
+  is without the line.
+- **An option on the command line holds for the whole run**, included files
+  too, and no line turns it off or gives it another value. The `-sa` log
+  says so under a line that asked for something else: `↳ ignored: -i is
+  set`, `↳ ignored: --export com.heads.seedID is set`. A line can only turn a
+  setting on that the command line left alone. `--no-streaming` is the one
+  option that keeps a setting off: under it `set stream` is ignored.
+- **Only these seven are settings.** What decides where a request goes and
+  as whom (`-b`, `-k`, `--token`, `-c`, `--no-keychain`, `--me`) is never a
+  file's to set, and neither is what is for the reader of a run (`-s`, `-p`,
+  `-m`). A name that is no setting, a value a setting does not take, a
+  missing value or an export name that is no namespaced key stops the batch
+  with exit 1 before anything is sent: `unknown setting `nulls` (one of
+  export, include-nulls, fail-fast, ndjson, raw, stream, timeout)`. So a file
+  that needs a setting does not run without it on a client that lacks it.
+- A `set` line is a line of its own. In a `&&`/`||` chain it stops the batch
+  before anything is sent.
+- The `-p` preview and the `-sa` log list the line where it is written. It is
+  not counted as a request.
+- **At the prompt** a `set` line changes what the session has set, and Tab
+  completes the name. The session stands where the command line stands for a
+  batch: what it has set holds for every line typed after it and for a file
+  run from the prompt, and a `set` line in that file does not turn it off
+  (the log says `↳ ignored: the session has set include-nulls`). Unlike the
+  command line, the session's settings can be changed: the last `set` line
+  wins, also over an option the session was started with (`api -i`, then
+  `set include-nulls off`).
+- As a one-shot argument on its own (`api set include-nulls`) it would send
+  nothing and is an error; give the option. In an argument of several lines
+  it is a line like any other.
 
 ### The same syntax at the prompt and on the command line
 
@@ -911,8 +935,8 @@ or a `.api` file; a path starting with `/` completes as a URI. A block or a
 file carries on past a plain line that is answered with an error status, and
 past one whose outfile could not be written (`Error writing to …`), as a
 batch does; a chain stops there, and so does the program under `-f`. A stopped program (failed assert, declined confirm, a request
-that got no answer, esc) leaves the session open, in the export mode it had
-before a file that stopped set one of its own.
+that got no answer, esc) leaves the session open, with the settings it had
+before a file that stopped set some of its own.
 
 **One-shot arguments.** The positional arguments are joined into one line. A
 directive, an include, a `&&`/`||` chain, or several lines in one quoted
@@ -1000,7 +1024,7 @@ so is one with no value behind it (`--export needs a value`).
 - The header counts the requests of the program and lists their methods:
   `Preview — 3 requests | GET PUT [http://localhost:5000]`. The request of an
   `assert` and of a `sleep while` is one of them; a `sleep`, a `confirm` and
-  an `export` line are listed and not counted.
+  a `set` line are listed and not counted.
 - The answer is read like a `confirm`'s: from the terminal, or from stdin when
   there is none. A question nobody answered (end of input) sends nothing,
   prints `aborted (could not read confirmation)` and exits 1.
@@ -1040,6 +1064,8 @@ PUT /assert {"api/v1/people~count":{"is":3}}
 ```
 
 - Nothing after the failing request is sent, and the exit code is 1.
+- A file can ask for it itself with a [`set fail-fast` line](#set-name-value),
+  for the requests under the line in that file.
 - **The failing response's body is the last thing on stdout**, exactly as the
   server sent it, with `-sa` too (where bodies are otherwise not printed). A
   tool driving the client reads the reason from there; the status line stays
@@ -1168,7 +1194,7 @@ Rules:
   `-f` output is unaffected, and request bodies are never touched.
 - It works for one request and in a batch (`api --export com.heads.seedID
   -sa export.api`, with a `> file` per request). For only some requests of
-  a file, write an [`export` line](#export-external-id--export-off) in it.
+  a file, write a [`set export` line](#set-name-value) in it.
 - **At the interactive prompt, `ctrl+r` turns export mode on and off**, the
   way `ctrl+t` does streaming, and `export` shows at the right of the hint
   line while it is on. The first time, it asks for the name: there is no
@@ -1440,8 +1466,11 @@ Run it: `api -sa workshop.api`.
 - **`import dir cl { "path": "cl" }`** → `import alias … clashes`. An alias can't share its name with a file or directory next to the `.api` file; name the alias something else.
 - **Seeding from a plain `GET`** → the response carries `identifiers.key`, a database key of the environment it was read from. Written elsewhere it is refused (`400 failed indexing`: a `key` that names nothing). Read it with `--export <external-id>`, which takes the key out and keeps a lone one as `key?` and under the name.
 - **Writing an export to a server without `key?`** → `400 failed coercion`, `The key 'key?' is not a valid namespaced key`, as soon as the export holds a record that had only a key. Such an export needs a server that knows the optional key.
-- **An `export` line and an included file** → the line is for its own file only: `shared/users.api` included under it is not exported. Put an `export` line in the included file as well, or run with `--export`, which applies to every file.
-- **An `export` line under `--export`** → the command line wins: the name on the line is not used and `export off` does not turn export off. The `-sa` log notes `↳ ignored: --export … is set`.
+- **A `set` line and an included file** → the line is for its own file only: `shared/users.api` included under `set export …` is not exported, and under `set fail-fast` a failed request in it does not stop the batch. Put the `set` line in the included file as well, or run with the option (`--export`, `-f`), which applies to every file.
+- **A `set` line under its option** → the command line wins: under `--export` the name on a `set export` line is not used, and `set include-nulls off` under `-i` turns nothing off. The `-sa` log notes `↳ ignored: … is set`.
+- **`set nulls`, `set key …`** → `unknown setting`. A setting has the name of its long option (`include-nulls`), and only `export`, `include-nulls`, `fail-fast`, `ndjson`, `raw`, `stream` and `timeout` are settings.
+- **`export com.heads.seedID` as a line** → `not a request or .api file: export`. The line is `set export com.heads.seedID`.
+- **`set timeout off` to wait for ever** → `off` is the default of ten minutes. No timeout is `set timeout 0`.
 - **Expecting secrets in an export** → the API masks them (`********`) and `--export` turns that into `null`, and says where (`Response had masked data, now null at …`). A password, an API key or a client secret has to be set separately.
 - **`-p` or `confirm` without a terminal** → up to 3.3.1, end of input was read as Enter, so an unattended `api -spa file.api` or a `confirm` gate sent everything. From 3.3.2 it sends nothing and exits 1 with `aborted (could not read confirmation)`. Pipe the answer (`yes | …`, `echo n | …`); a program read from stdin (`api -a -`) has no stdin left to answer with.
 - **Collecting with `>>` and expecting the errors in the file** → a non-2xx body is not appended: the file keeps what it had, and `>> file (not appended)` is printed under the status line. A `> file` does take an error's body when the run has no `-f`.
@@ -1464,7 +1493,8 @@ Run it: `api -sa workshop.api`.
 - For repeated boilerplate, factor it into a `shared/` directory and use includes.
 - When generating files programmatically, prefer compact single-line JSON bodies — they're easier to grep and diff.
 - Use silent batch mode (`-sa`) when you want to verify that a long seeding script worked without drowning in response bodies.
-- To move data between environments, read it with `--export com.heads.seedID` (or under an `export com.heads.seedID` line in the `.api` file) into a file and `PUT` the file. Use the same identifier name every time, so a record exported twice is one record. The same file can be written back where it was read: a record is found by its identifiers, and one that had only a key by its `key?`.
+- To move data between environments, read it with `--export com.heads.seedID` (or under a `set export com.heads.seedID` line in the `.api` file) into a file and `PUT` the file. Use the same identifier name every time, so a record exported twice is one record. The same file can be written back where it was read: a record is found by its identifiers, and one that had only a key by its `key?`.
+- A file that only works with a setting should say so itself: `set fail-fast` above its `PUT /assert` lines, `set include-nulls` in a file whose output is applied elsewhere. It then runs the same by hand as from a tool.
 - Add `-f` (`-sfa`) so a failed request stops the batch: check the exit code, and on failure read the error body from the end of stdout (everything after the last `└─HTTP/1.1 …` line; it is usually several lines of JSON). Without it a batch exits 0 however many plain requests failed.
 - Open a file with a [describe block](#describe-block) (`title`, `description`, `docsLink`) so a tool or a person can tell what it does; read one with `api --describe file.api`, which sends nothing.
 - To see what a file checks without running it, `api --assert file.api` prints every `PUT /assert` body it sends as one JSON array.
