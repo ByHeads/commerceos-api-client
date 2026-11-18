@@ -4177,6 +4177,91 @@ fn output_is_coloured_at_a_terminal_and_plain_when_captured() {
     }
 }
 
+/// The command `cmd` is, run by a shell that puts `setup` in front of it: a
+/// redirection or a variable that the pty helper would otherwise undo.
+#[cfg(unix)]
+fn through_shell(cmd: &std::process::Command, setup: &str) -> std::process::Command {
+    let mut shell = std::process::Command::new("sh");
+    shell.arg("-c").arg(format!("{setup} exec \"$0\" \"$@\"")).arg(cmd.get_program()).args(cmd.get_args());
+    for (name, value) in cmd.get_envs() {
+        match value {
+            Some(value) => shell.env(name, value),
+            None => shell.env_remove(name),
+        };
+    }
+    if let Some(dir) = cmd.get_current_dir() {
+        shell.current_dir(dir);
+    }
+    shell
+}
+
+/// Each stream is coloured by what it is itself. A log sent to a file from a
+/// terminal (`api -sfa seed.api > run.log`) holds no escape codes, so what a
+/// tool is told to look for (`└─HTTP/1.1 …`) is there as written, and what
+/// stays on the terminal is still coloured. `NO_COLOR` holds at a terminal.
+#[cfg(unix)]
+#[test]
+fn a_stream_is_coloured_by_what_it_is_itself() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("p.api"), "GET /a\nsleep 1ms\nGET /missing || PUT /b {\"x\":1}\nGET /missing && GET /c\n").unwrap();
+    let run = |args: &[&str], setup: &str| {
+        server.take();
+        let mut cmd = api(server.port, dir.path());
+        cmd.args(args);
+        let mut term = pty::Prompt::open(through_shell(&cmd, setup));
+        let start = Instant::now();
+        let (mut ended, mut answered) = (None, false);
+        while ended.is_none() && start.elapsed() < Duration::from_secs(15) {
+            term.pump(Duration::from_millis(50));
+            if !answered && term.screen.contains("Run?") {
+                term.send(b"\n");
+                answered = true;
+            }
+            ended = term.exited();
+        }
+        term.pump(Duration::from_millis(100));
+        assert_eq!(ended, Some(true), "{args:?} {setup}:\n{}", term.screen);
+        assert!(!server.take().is_empty(), "{args:?}");
+        term.screen.clone()
+    };
+
+    // Stdout to a file, stderr at the terminal.
+    for args in [&["-sa", "p.api"][..], &["-a", "p.api"], &["GET", "/a"]] {
+        let _ = std::fs::remove_file(dir.path().join("out.log"));
+        let screen = run(args, "> out.log");
+        let log = std::fs::read_to_string(dir.path().join("out.log")).unwrap();
+        assert!(!log.contains('\x1b'), "{args:?}: escape codes in a file:\n{log:?}");
+        if args[0] == "-sa" {
+            assert!(log.contains("└─HTTP/1.1 200 OK"), "{log}");
+            assert!(log.contains("└─HTTP/1.1 404 Not Found"), "{log}");
+            assert!(log.contains("↳ skipped 1 request") && log.contains("sleep 1ms"), "{log}");
+        } else {
+            // The status lines are on the terminal, and coloured there.
+            assert!(pty::plain(&screen).contains("HTTP/1.1 200 OK"), "{args:?}:\n{screen}");
+            assert!(screen.contains("\x1b[32m200 OK"), "{args:?}: no colour at the terminal:\n{screen:?}");
+        }
+    }
+
+    // Stderr to a file, stdout at the terminal: the other way round.
+    let _ = std::fs::remove_file(dir.path().join("err.log"));
+    let screen = run(&["-a", "p.api"], "2> err.log");
+    let log = std::fs::read_to_string(dir.path().join("err.log")).unwrap();
+    assert!(log.contains("HTTP/1.1 200 OK") && log.contains("↳ skipped 1 request"), "{log}");
+    assert!(!log.contains('\x1b'), "escape codes in a file:\n{log:?}");
+    let screen = run(&["-sa", "p.api"], "2> err.log");
+    assert!(screen.contains("\x1b[32m200 OK"), "no colour at the terminal:\n{screen:?}");
+
+    // `NO_COLOR` at a terminal: the same lines, and no colour in them.
+    for args in [&["-sa", "p.api"][..], &["-a", "p.api"], &["-spa", "p.api"]] {
+        let screen = run(args, "NO_COLOR=1; export NO_COLOR;");
+        assert!(pty::plain(&screen).contains("HTTP/1.1 200 OK"), "{args:?}:\n{screen}");
+        for code in ["\x1b[32m", "\x1b[31m", "\x1b[2m", "\x1b[1m", "\x1b[38;5;208m"] {
+            assert!(!screen.contains(code), "{args:?}: {code:?} under NO_COLOR:\n{screen:?}");
+        }
+    }
+}
+
 /// The terminal is asked even when stdin is the program: with a terminal a
 /// `confirm` in a program read from stdin can be answered.
 #[cfg(unix)]

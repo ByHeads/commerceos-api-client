@@ -142,9 +142,54 @@ impl Write for ErrOut {
     }
 }
 
+/// Whether what goes to stderr is coloured: by what stderr is, where the
+/// colour crate goes by stdout for both. `api -sa seed.api > run.log` at a
+/// terminal has a log without escape codes and a coloured stderr, and
+/// `NO_COLOR` holds for both.
+fn stderr_coloured() -> bool {
+    static COLOURED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *COLOURED.get_or_init(|| {
+        let set = |name: &str| std::env::var(name).ok();
+        if set("CLICOLOR_FORCE").is_some_and(|v| v != "0") {
+            true
+        } else if set("NO_COLOR").is_some() {
+            false
+        } else {
+            set("CLICOLOR").is_none_or(|v| v != "0") && io::stderr().is_terminal()
+        }
+    })
+}
+
+/// Text made while this lives is coloured as stderr is, and as stdout is
+/// again afterwards. Held by `err!` and `errln!` for what they write, and by
+/// what builds a text for stderr ahead of writing it. Only the main thread
+/// writes coloured text, so only it holds one.
+struct ForStderr(bool);
+
+impl ForStderr {
+    fn new() -> Self {
+        let before = colored::control::SHOULD_COLORIZE.should_colorize();
+        // Where the two streams agree nothing is changed, and nothing can
+        // be left changed by a thread that writes a line of its own.
+        if before != stderr_coloured() {
+            colored::control::set_override(stderr_coloured());
+        }
+        ForStderr(before)
+    }
+}
+
+impl Drop for ForStderr {
+    fn drop(&mut self) {
+        if self.0 != stderr_coloured() {
+            colored::control::set_override(self.0);
+        }
+    }
+}
+
 /// `eprint!` to a stderr that may have closed. See `ErrOut`.
 macro_rules! err {
     ($($arg:tt)*) => {{
+        let _colour = ForStderr::new();
         let _ = write!(ErrOut, $($arg)*);
     }};
 }
@@ -155,6 +200,7 @@ macro_rules! errln {
         let _ = writeln!(ErrOut);
     }};
     ($($arg:tt)*) => {{
+        let _colour = ForStderr::new();
         let _ = writeln!(ErrOut, $($arg)*);
     }};
 }
@@ -6411,7 +6457,7 @@ impl ProgressTicker {
                         stderr,
                         cursor::MoveToColumn(0),
                         Clear(ClearType::CurrentLine),
-                        Print(line.dimmed())
+                        Print(if stderr_coloured() { format!("\x1b[2m{}\x1b[0m", line) } else { line })
                     );
                     *drawn = true;
                     frame += 1;
@@ -9944,8 +9990,8 @@ fn describe_first_lines(block: &DescribeBlock, locale: Option<&str>, width: usiz
 /// `-m`: say on stderr what the file about to run is, from its describe
 /// block, with an empty line under it.
 fn print_describe_first(block: &DescribeBlock) {
+    let _colour = ForStderr::new();
     let width = if io::stderr().is_terminal() {
-        colored::control::set_override(true);
         terminal::size().map(|(w, _)| w as usize).unwrap_or(80)
     } else {
         80
@@ -10679,9 +10725,7 @@ fn ask_yes_no(prompt: &str) -> bool {
 /// is a piped bulk file. Defaults to yes: an empty line (Enter) accepts.
 /// Returns true to proceed, false to abort.
 fn confirm_preview(lines: &[String], base_uri: &str) -> bool {
-    if io::stderr().is_terminal() {
-        colored::control::set_override(true);
-    }
+    let _colour = ForStderr::new();
     // Count and summarize only actual request lines (first token is an HTTP
     // method). Non-request preview lines like `sleep 2s` are still displayed but
     // don't inflate the count or appear in the method summary.
@@ -10824,10 +10868,6 @@ fn run_bulk_program(config: &mut Config, contents: &str, base_dir: Option<&std::
     }
 
     if config.bulk_silent && !config.base_uri.is_empty() {
-        // Ensure colors work even when stdout is piped
-        if io::stderr().is_terminal() {
-            colored::control::set_override(true);
-        }
         outln!("{}", format!("[{}]", config.base_uri).dimmed());
     }
 
@@ -11043,11 +11083,11 @@ fn note_skipped_chain(config: &Config, skipped: usize) {
         return;
     }
     let plural = if skipped == 1 { "request" } else { "requests" };
-    let note = format!("↳ skipped {} {}", skipped, plural).dimmed().to_string();
+    let note = format!("↳ skipped {} {}", skipped, plural);
     if config.bulk_silent {
-        outln!("{}", note);
+        outln!("{}", note.dimmed());
     } else {
-        errln!("{}", note);
+        errln!("{}", note.dimmed());
     }
 }
 
@@ -11631,11 +11671,6 @@ fn local_write_failed(config: &Config) -> RequestOutcome {
 fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str) -> RequestOutcome {
     let is_tty = io::stdout().is_terminal();
 
-    // Ensure colors work on stderr even when stdout is piped
-    if io::stderr().is_terminal() {
-        colored::control::set_override(true);
-    }
-
     require_base_uri(config);
 
     // Preview: show the request and confirm before sending (and before any
@@ -11739,9 +11774,10 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
     // Print status. A quiet poll only speaks up when the status is an
     // error, so the abort that follows has a reason next to it.
     if !config.silent && (!config.quiet || status_is_error(status.as_u16())) {
-        let status_str = format_status(status, config.expect_falsy);
-
         ticker.interrupt(|| {
+            // Coloured as the stream it is written to.
+            let _colour = (!config.bulk_silent).then(ForStderr::new);
+            let status_str = format_status(status, config.expect_falsy);
             if config.bulk_silent {
                 // Bulk silent mode: print compact status to stdout with box-draw prefix
                 outln!(
