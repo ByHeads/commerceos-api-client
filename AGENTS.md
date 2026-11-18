@@ -54,7 +54,9 @@ above deletes `com.x.id=A#1`, and `GET /x~where(ref="a #1")` asks for that
 text. A request has no fragment.
 
 A bracket in the middle of a word is part of the URI and opens no body:
-`GET /people/com.x.id=[A#1]` is one request, and its `#` is sent.
+`GET /people/com.x.id=[A#1]` is one request, and its `#` is sent. One that
+is never closed ends with its word: a `&&`, a ` >` or a ` #` behind
+`GET /people/com.x.id=[A` is read as it is behind any other URI.
 
 A `confirm` line has none: all of it is the question.
 

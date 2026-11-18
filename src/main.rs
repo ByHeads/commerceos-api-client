@@ -5801,34 +5801,85 @@ fn outfile_marker_at(text: &str) -> Option<usize> {
     }
 }
 
+/// Where a scan of a request line stands: in a JSON string, in the brackets
+/// of a body, in the parentheses of a URI operator, or in a bracket in the
+/// middle of a word. That last one is the URI's (`/people/com.x.id=[A#1]`)
+/// and opens no body, as `strip_body_comments_and_count` reads it: one that
+/// is never closed ends with its word, and does not take the rest of the
+/// line along.
+#[derive(Default)]
+struct Nesting {
+    depth: i32,
+    parens: i32,
+    glued: i32,
+    in_string: bool,
+    escape: bool,
+    /// Whether the character before this one was a blank, or there was none.
+    behind_blank: bool,
+    started: bool,
+}
+
+impl Nesting {
+    /// Takes the next character of the line. Whether it stands outside a
+    /// string, and so may be a `>`, a `#`, a `&&` or a bracket.
+    fn see(&mut self, ch: char) -> bool {
+        let behind_blank = self.behind_blank || !self.started;
+        self.started = true;
+        self.behind_blank = false;
+        if self.in_string {
+            if self.escape {
+                self.escape = false;
+            } else if ch == '\\' {
+                self.escape = true;
+            } else if ch == '"' {
+                self.in_string = false;
+            }
+            return false;
+        }
+        // A word ends at a blank, as the URI does, and its brackets with it.
+        if ch.is_whitespace() {
+            self.behind_blank = true;
+            if self.parens <= 0 {
+                self.glued = 0;
+            }
+        }
+        match ch {
+            '"' => self.in_string = true,
+            '{' | '[' if self.depth == 0 && !behind_blank => self.glued += 1,
+            '}' | ']' if self.depth == 0 && self.glued > 0 => self.glued -= 1,
+            '{' | '[' => self.depth += 1,
+            '}' | ']' => self.depth -= 1,
+            '(' => self.parens += 1,
+            ')' => self.parens -= 1,
+            _ => {}
+        }
+        true
+    }
+
+    /// Outside every string, body, parenthesis and bracket of a word.
+    fn outside(&self) -> bool {
+        !self.in_string && self.depth <= 0 && self.parens <= 0 && self.glued <= 0
+    }
+
+    /// Whether the line ended in a string, a body or a parenthesis that was
+    /// never closed.
+    fn unclosed(&self) -> bool {
+        self.in_string || self.depth > 0 || self.parens > 0
+    }
+}
+
 /// `outfile_marker_at` for a text whose quotes and brackets balance; `Err`
 /// for one where they don't, as a body that is still being typed.
 fn balanced_outfile_marker(text: &str) -> Result<Option<usize>, ()> {
     let bytes = text.as_bytes();
     let mut found = None;
-    let mut depth = 0i32;
-    let mut in_string = false;
-    let mut escape = false;
+    let mut nesting = Nesting::default();
     for (i, ch) in text.char_indices() {
-        if in_string {
-            if escape {
-                escape = false;
-            } else if ch == '\\' {
-                escape = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match ch {
-            '"' => in_string = true,
-            '{' | '[' | '(' => depth += 1,
-            '}' | ']' | ')' => depth -= 1,
-            ' ' | '\t' if depth <= 0 && bytes.get(i + 1) == Some(&b'>') => found = Some(i),
-            _ => {}
+        if nesting.see(ch) && matches!(ch, ' ' | '\t') && nesting.outside() && bytes.get(i + 1) == Some(&b'>') {
+            found = Some(i);
         }
     }
-    if in_string || depth > 0 {
+    if nesting.unclosed() {
         return Err(());
     }
     Ok(found)
@@ -6178,27 +6229,11 @@ fn strip_body_comments_and_count(s: &str) -> (String, i32) {
 /// `#` that follows a blank and is outside quotes, brackets and parentheses,
 /// the rule `strip_body_comments_and_count` has for a request.
 fn without_trailing_comment(line: &str) -> &str {
-    let mut depth = 0i32;
-    let mut in_string = false;
-    let mut escape = false;
+    let mut nesting = Nesting::default();
     let mut after_blank = false;
     for (i, ch) in line.char_indices() {
-        if in_string {
-            if escape {
-                escape = false;
-            } else if ch == '\\' {
-                escape = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match ch {
-            '"' => in_string = true,
-            '{' | '[' | '(' => depth += 1,
-            '}' | ']' | ')' => depth -= 1,
-            '#' if depth <= 0 && after_blank => return line[..i].trim_end(),
-            _ => {}
+        if nesting.see(ch) && ch == '#' && after_blank && nesting.outside() {
+            return line[..i].trim_end();
         }
         after_blank = ch.is_whitespace();
     }
@@ -7679,42 +7714,19 @@ fn chain_parts(input: &str) -> Vec<(ChainOp, String)> {
     let mut current = String::new();
     // Operator that introduced the segment being accumulated.
     let mut op = ChainOp::And;
-    let mut depth = 0i32;
-    let mut in_string = false;
-    let mut escape = false;
+    let mut nesting = Nesting::default();
     let mut chars = input.chars().peekable();
 
     while let Some(ch) = chars.next() {
-        if escape {
-            escape = false;
-            current.push(ch);
+        // Only a top-level doubled `&&` / `||` separates requests.
+        // Parentheses count too: `~where(a=1||b=2)` is one request.
+        if nesting.see(ch) && matches!(ch, '&' | '|') && nesting.outside() && chars.peek() == Some(&ch) {
+            chars.next();
+            nesting.see(ch);
+            segments.push((op, current.trim().to_string()));
+            current.clear();
+            op = if ch == '&' { ChainOp::And } else { ChainOp::Or };
             continue;
-        }
-        if ch == '\\' && in_string {
-            escape = true;
-            current.push(ch);
-            continue;
-        }
-        if ch == '"' {
-            in_string = !in_string;
-            current.push(ch);
-            continue;
-        }
-        if !in_string {
-            match ch {
-                // Parentheses count too: `~where(a=1||b=2)` is one request.
-                '{' | '[' | '(' => depth += 1,
-                '}' | ']' | ')' => depth -= 1,
-                // Only a top-level doubled `&&` / `||` separates requests.
-                c @ ('&' | '|') if depth <= 0 && chars.peek() == Some(&c) => {
-                    chars.next();
-                    segments.push((op, current.trim().to_string()));
-                    current.clear();
-                    op = if c == '&' { ChainOp::And } else { ChainOp::Or };
-                    continue;
-                }
-                _ => {}
-            }
         }
         current.push(ch);
     }
@@ -29858,6 +29870,20 @@ mod tests {
         assert_eq!(request("GET /a/com.x.id=[A#1] # note"), "GET /a/com.x.id=[A#1]");
         // One that is never closed does not take the lines under it along.
         assert_eq!(steps("GET /a/com.x.id=[A\nGET /after\n").len(), 2);
+        // And it ends with its word for the rest of the line too: a chain
+        // behind it is a chain, a ` >` in a body is the body's, and a ` #`
+        // is a comment.
+        let chain = split_request_chain(r#"GET /a/com.x.id=[A || PUT /a/com.x.id=[A {"n":1}"#);
+        assert_eq!(chain.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>(), ["GET /a/com.x.id=[A", r#"PUT /a/com.x.id=[A {"n":1}"#]);
+        assert_eq!(chain[1].0, ChainOp::Or);
+        assert_eq!(steps("GET /a/com.x.id=[A || PUT /a/com.x.id=[A {\"n\":1}\nGET /after\n").len(), 2);
+        assert_eq!(outfile_marker_at(r#"PUT /a/com.x.id=[A {"x":"a > b"}"#), None);
+        let redirected = r#"PUT /a/com.x.id=[A {"x":"a > b"} > out.json"#;
+        assert_eq!(outfile_marker_at(redirected).map(|at| &redirected[at..]), Some(" > out.json"));
+        assert_eq!(without_trailing_comment("seeds/a[1.api # the first"), "seeds/a[1.api");
+        // One that is closed holds what is in it, as parentheses do.
+        assert_eq!(split_request_chain("GET /a/com.x.id=[a||b] && GET /c").len(), 2);
+        assert_eq!(outfile_marker_at("GET /a/com.x.id=[A] > out.json"), Some(19));
         // A body is still one: behind a blank, or at the start of a line.
         assert_eq!(request("PUT /a/com.x.id=[A] [\n  1 // one\n]"), "PUT /a/com.x.id=[A] [\n  1 \n]");
         assert_eq!(request(r#"PUT /a {"x":"a # b"}"#), r#"PUT /a {"x":"a # b"}"#);

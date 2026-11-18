@@ -671,6 +671,20 @@ fn cases(dir: &Path) -> Vec<Case> {
         // A `#` in a URI is part of it, not a fragment that is never sent.
         case("a # in a path", "DELETE /people/com.x.id=A#1", Some(&["DELETE", "/people/com.x.id=A#1"]), &["DELETE /people/com.x.id=A%231"]),
         case("a # in a bracket of a path", "DELETE /people/com.x.id=[A#1]", Some(&["DELETE", "/people/com.x.id=[A#1]"]), &["DELETE /people/com.x.id=[A%231]"]),
+        // A bracket of a path that is never closed ends with its word: the
+        // chain behind it is a chain, and its write is sent.
+        case(
+            "a chain behind an open bracket of a path",
+            r#"GET /missing/com.x.id=[A || PUT /b/com.x.id=[A {"n":1}"#,
+            Some(&["GET", "/missing/com.x.id=[A", "||", "PUT", "/b/com.x.id=[A", r#"{"n":1}"#]),
+            &["GET /missing/com.x.id=[A", r#"PUT /b/com.x.id=[A {"n":1}"#],
+        ),
+        case(
+            "a > in a body behind an open bracket of a path",
+            r#"PUT /b/com.x.id=[A {"x":"a > b"}"#,
+            Some(&["PUT", "/b/com.x.id=[A", r#"{"x":"a > b"}"#]),
+            &[r#"PUT /b/com.x.id=[A {"x":"a > b"}"#],
+        ),
         case(
             "a # in a quoted value",
             r#"GET /a~where(n="x #y")"#,
