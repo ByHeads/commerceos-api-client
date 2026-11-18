@@ -8057,6 +8057,80 @@ fn ruler_rows(rows: &[String]) -> Vec<usize> {
     rows.iter().enumerate().filter(|(_, row)| row.starts_with("──")).map(|(at, _)| at).collect()
 }
 
+/// The body editor keeps to a short terminal. Taller than the screen, it
+/// scrolled it at every key and left a ruler in the scrollback each time.
+#[cfg(unix)]
+#[test]
+fn the_body_editor_keeps_to_a_short_terminal() {
+    for (cols, rows) in [(80u16, 7u16), (80, 6), (30, 8), (30, 7), (80, 9), (80, 24)] {
+        let server = RecordingServer::start();
+        let dir = tempfile::tempdir().unwrap();
+        let mut prompt = pty::Prompt::open_with(api(server.port, dir.path()), cols, rows);
+        prompt.wait_ready(Duration::from_secs(15));
+        prompt.pump(Duration::from_millis(600));
+        let width = cols as usize;
+        let before = ruler_rows(&pty::rows(&prompt.screen, width)).len();
+        assert_eq!(before, 2, "{cols}x{rows}");
+
+        press(&mut prompt, &["PUT /note"]);
+        prompt.send(b"\r");
+        prompt.wait_for("Enter body", Duration::from_secs(5));
+        // A body of more lines than the screen has rows, a key at a time.
+        for key in ["{", "\r", "\"a\":", "\r", "1,", "\r", "\"b\":", "\r", "2", "\r", "}"] {
+            prompt.send(key.as_bytes());
+            prompt.pump(Duration::from_millis(120));
+            let now = pty::rows(&prompt.screen, width);
+            let shown = now.join("\n");
+            assert_eq!(ruler_rows(&now).len(), 2, "{cols}x{rows} after {key:?}: a ruler was left\n{shown}");
+            let top = ruler_rows(&now)[0];
+            assert!(now.len() - top <= rows as usize, "{cols}x{rows} after {key:?}: taller than the screen\n{shown}");
+            assert!(now.iter().all(|row| row.chars().count() <= width), "{cols}x{rows}: a row is too wide\n{shown}");
+        }
+        // The end of the body is what is shown, and all of it is sent.
+        let now = pty::rows(&prompt.screen, width);
+        assert!(now.iter().any(|row| row.starts_with('}')), "{cols}x{rows}:\n{}", now.join("\n"));
+        server.take();
+        prompt.send(b"\x04");
+        assert!(pump_until(&mut prompt, Duration::from_secs(5), |_| server.seen() > 0), "{cols}x{rows}: nothing sent");
+        prompt.pump(Duration::from_millis(500));
+        assert_eq!(server.take(), vec!["PUT /note {\n\"a\":\n1,\n\"b\":\n2\n}".to_string()], "{cols}x{rows}");
+        let after = pty::rows(&prompt.screen, width);
+        assert_eq!(ruler_rows(&after).len(), 2, "{cols}x{rows}: a ruler was left when the body was sent\n{}", after.join("\n"));
+    }
+}
+
+/// When the connection of a session has loaded, the splash is told the host.
+/// On a terminal too short to still show that line, no other line of the
+/// splash is written over.
+#[cfg(unix)]
+#[test]
+fn the_splash_is_told_its_host_only_where_its_line_still_shows() {
+    let server = RecordingServer::start();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write_credentials(d, &[("a", url.clone(), "key", "k", "")], "a");
+    for rows in [24u16, 10, 9, 8, 6, 5] {
+        let mut cmd = api_bare(d);
+        cmd.args(["-c", "a"]);
+        let mut prompt = pty::Prompt::open_with(cmd, 80, rows);
+        prompt.wait_ready(Duration::from_secs(15));
+        prompt.pump(Duration::from_millis(1200));
+        let drawn = pty::rows(&prompt.screen, 80);
+        let shown = drawn.join("\n");
+        // The box is whole: its top, one line with the host, its bottom.
+        let top = drawn.iter().position(|row| row.starts_with('╭')).unwrap_or_else(|| panic!("{rows} rows: no splash\n{shown}"));
+        assert!(drawn[top + 1].starts_with("│ ") && drawn[top + 1].contains("ctrl+b for docs"), "{rows} rows:\n{shown}");
+        assert!(drawn[top + 2].starts_with('╰'), "{rows} rows: the bottom of the box was written over\n{shown}");
+        assert_eq!(drawn.iter().filter(|row| row.contains('│')).count(), 1, "{rows} rows:\n{shown}");
+        assert_eq!(drawn[top + 3], "", "{rows} rows: the row under the box was written over\n{shown}");
+        // Where its line is still on the screen, it names the host.
+        if rows >= 9 {
+            assert!(drawn[top + 1].contains(&format!("127.0.0.1:{}", server.port)), "{rows} rows:\n{shown}");
+        }
+    }
+}
+
 /// ctrl+x takes the body of the request the cursor is in and ctrl+space
 /// changes its method. Neither touches an outfile, the other requests of a
 /// chain or a line that is no request, and a body put aside by ctrl+space

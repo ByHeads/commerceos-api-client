@@ -2640,7 +2640,8 @@ fn visual_line_count(rendered: &str, width: usize) -> u16 {
 /// This keeps the printed input block from ever exceeding the screen, which would
 /// otherwise scroll the terminal and desync `render()`'s relative cursor math —
 /// the cause of the input area jumping upward after a multi-line paste. It holds
-/// for a `max_lines` of 3 or more (a row and both markers), which every caller gives.
+/// for a `max_lines` of 3 or more (a row and both markers). With fewer, the
+/// rows that end at the cursor's are shown without markers.
 fn clamp_input_viewport(rendered: &str, width: usize, max_lines: u16, cursor_line: usize, cursor_col: usize) -> (String, u16) {
     let total = visual_line_count(rendered, width);
     if total <= max_lines {
@@ -2655,6 +2656,32 @@ fn clamp_input_viewport(rendered: &str, width: usize, max_lines: u16, cursor_lin
 
     let cursor_line = cursor_line.min(n - 1);
     let marker = "\x1b[38;5;240m⋯\x1b[0m";
+
+    // No room for a row and both markers (the body editor on a terminal of
+    // six or seven rows): the rows that end at the cursor's, unmarked.
+    if max_lines < 3 && width > 0 {
+        let wrapped = hard_wrap_ansi(rendered, width).replace("\r\n", "\n");
+        let rows: Vec<&str> = wrapped.split('\n').collect();
+        let above: usize = logical[..cursor_line].iter().map(|l| line_rows(l, width)).sum();
+        let end = (above + row_of_column(logical[cursor_line], width, cursor_col) + 1).min(rows.len());
+        let first = end.saturating_sub(max_lines.max(1) as usize);
+        // A colour set in a row above, and not reset there, is still on.
+        let mut colour = String::new();
+        for row in &rows[..first] {
+            let mut rest = *row;
+            while let Some(at) = rest.find('\x1b') {
+                let len = rest[at..].find('m').map_or(rest.len() - at, |m| m + 1);
+                let code = &rest[at..at + len];
+                if code == "\x1b[0m" {
+                    colour.clear();
+                } else {
+                    colour.push_str(code);
+                }
+                rest = &rest[at + len..];
+            }
+        }
+        return (format!("{}{}", colour, rows[first..end].join("\n")), (end - first) as u16);
+    }
 
     // The cursor's line does not fit with the markers it needs: a window of
     // its rows, grown from the cursor's row like the window of lines below.
@@ -12287,11 +12314,14 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
             // when the splash is the box that has such a line. On a terminal
             // too narrow for the box the splash is one blank row, and the
             // rewrite would land on a row that is not its own.
-            if splash_line_count(state.width) == 5 {
-                // Loading resolved — update just the splash URL line in place
-                // From cursor (bottom of input area), the URL line is:
-                //   hint + input_lines + ruler + blank_after_splash + bottom_border
-                let url_line_offset = 2 + state.prev_input_lines + 3;
+            // Loading resolved — update just the splash URL line in place
+            // From cursor (bottom of input area), the URL line is:
+            //   hint + input_lines + ruler + blank_after_splash + bottom_border
+            // On a terminal too short to still show that line there is
+            // nothing to update: a move that far stops at the top row, which
+            // is another line of the splash.
+            let url_line_offset = 2 + state.prev_input_lines + 3;
+            if splash_line_count(state.width) == 5 && url_line_offset < state.height {
                 let host = state.config.base_uri.as_str();
                 let full_width = 60usize;
                 let hint_section_width = 20usize;
@@ -12317,7 +12347,7 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
                 execute!(
                     stdout,
                     cursor::SavePosition,
-                    cursor::MoveUp(url_line_offset.min(state.height.saturating_sub(1))),
+                    cursor::MoveUp(url_line_offset),
                     cursor::MoveToColumn(0),
                     Clear(ClearType::CurrentLine),
                     Print(url_line),
@@ -13370,6 +13400,16 @@ fn uppercase_method_token(line: &str) -> String {
 ///
 /// In every other case the paste is inserted verbatim — so writing real JSON
 /// request bodies still works exactly as before.
+/// Whether the cursor stands in a part of its request's URI that is still
+/// open: behind a quote or a parenthesis that nothing in front of the cursor
+/// closes, as in `GET /companies~where(name="^`.
+fn cursor_in_open_uri(input: &str, cursor_byte: usize) -> bool {
+    let (start, _) = request_bounds_at(input, cursor_byte);
+    let Some(typed) = input.get(start..cursor_byte) else { return false };
+    let at = line_uri_at(typed, typed.len());
+    at.start < at.end && uri_scan(&typed[at.start..]).1
+}
+
 fn handle_paste<W: Write>(
     state: &mut AppState,
     paste: &str,
@@ -13386,6 +13426,9 @@ fn handle_paste<W: Write>(
     reset_for_input(state, stdout, true, true, true)?;
 
     let inside_body = cursor_inside_brackets(&state.input, state.cursor_pos);
+    // In a quoted value or the parentheses of an operator of the URI, what
+    // is pasted is that value, whatever word it starts with.
+    let inside_uri = !inside_body && cursor_in_open_uri(&state.input, char_to_byte_idx(&state.input, state.cursor_pos));
 
     let normalized = normalize_paste_newlines(paste);
     // A copied line usually brings its newline along. Outside a body it would
@@ -13399,7 +13442,7 @@ fn handle_paste<W: Write>(
     // the cursor — so pasting "GET /people..." or "assert /x" over a "GET /"
     // prompt yields the pasted text, not "GET /assert /x". Detection is skipped
     // inside a body so a JSON string beginning with "GET " is pasted verbatim.
-    if !inside_body && paste_is_api_text(paste) {
+    if !inside_body && !inside_uri && paste_is_api_text(paste) {
         // Normalize the method to uppercase, like typed promotion does.
         state.stashed_body.clear();
         state.input = if paste_starts_with_method(paste) {
@@ -13467,7 +13510,7 @@ fn handle_paste<W: Write>(
     }
 
     // Verbatim insert (non-identifier paste, or paste inside a JSON body).
-    let insert_text = if !inside_body && paste.starts_with('/') && before_cursor.ends_with('/') {
+    let insert_text = if !inside_body && !inside_uri && paste.starts_with('/') && before_cursor.ends_with('/') {
         // Avoid a double slash when pasting "/products/..." right after an
         // existing trailing "/" (e.g. prompt "GET /"). JSON bodies are untouched.
         paste[1..].to_string()
@@ -13484,10 +13527,12 @@ fn handle_paste<W: Write>(
     // leading whitespace can serve as the URI/body separator. On an array
     // endpoint, a complete pasted JSON body is then wrapped in `[` … `]` (both
     // brackets — unlike typing, a pasted body isn't still being composed).
-    if !inside_body {
+    if !inside_body && !inside_uri {
         let lead_ws = insert_text.len() - insert_text.trim_start().len();
         if let Some(first) = insert_text.trim_start().chars().next() {
-            if first != '>' && first != '&' && first != '|' {
+            // What promotes when typed, and nothing else: see
+            // `auto_promote_method_on_body_start`.
+            if first == '@' || is_json_value_start(first) {
                 let delta = promote_method_prefix(state, byte_idx + lead_ws);
                 state.cursor_pos = (state.cursor_pos as i64 + delta).max(0) as usize;
                 // Method tokens are ASCII, so the char delta equals the byte
@@ -16646,11 +16691,23 @@ fn render<W: Write>(stdout: &mut W, state: &mut AppState) -> io::Result<()> {
         }
     } else if state.body_input_mode {
         // Show method + URI on first line, prompt on second, buffer with cursor below
-        let header = format!("{} {}", state.body_input_method, state.body_input_uri);
+        // The editor is the two rulers, the hint row, this header, the
+        // prompt and at least one row of the body. On a terminal too short
+        // for a header or a prompt of several rows, each is cut to one: a
+        // command area taller than the screen scrolls it at every redraw.
+        let rows = state.height.saturating_sub(3);
+        let mut header = format!("{} {}", state.body_input_method, state.body_input_uri);
+        let prompt = "Enter body, ctrl+d when done (esc to cancel)";
+        let mut prompt = prompt.to_string();
+        if visual_line_count(&header, width) + visual_line_count(&prompt, width) + 1 > rows {
+            prompt = fit_to_width(&prompt, width);
+        }
+        if visual_line_count(&header, width) + visual_line_count(&prompt, width) + 1 > rows {
+            header = fit_to_width(&header, width);
+        }
         let header_lines = visual_line_count(&header, width);
         queue!(stdout, Print(format!("{}\r\n", hard_wrap_ansi(&header, width))))?;
-        let prompt = "Enter body, ctrl+d when done (esc to cancel)";
-        let prompt_lines = visual_line_count(prompt, width);
+        let prompt_lines = visual_line_count(&prompt, width);
         queue!(stdout, Print(format!("{}\r\n", hard_wrap_ansi(&prompt.dimmed().to_string(), width))))?;
         let buf_lines: Vec<&str> = if state.body_input_buffer.is_empty() {
             vec![""]
@@ -16665,7 +16722,12 @@ fn render<W: Write>(stdout: &mut W, state: &mut AppState) -> io::Result<()> {
         let mut shown: Vec<String> = buf_lines.iter().map(|line| expand_tabs(line)).collect();
         let cursor_col = str_width(&shown[last_idx]);
         shown[last_idx].push_str("\x1b[48;5;247m\x1b[38;5;0m \x1b[0m");
-        let budget = state.height.saturating_sub(5 + header_lines + prompt_lines).max(3);
+        let budget = state
+            .height
+            .saturating_sub(5 + header_lines + prompt_lines)
+            .max(3)
+            .min(rows.saturating_sub(header_lines + prompt_lines))
+            .max(1);
         let (visible, total_buf_visual_lines) = clamp_input_viewport(&shown.join("\n"), width, budget, last_idx, cursor_col);
         queue!(stdout, Print(format!("{}\r\n", hard_wrap_ansi(&visible.replace('\n', "\r\n"), width))))?;
         state.prev_input_lines = header_lines + prompt_lines + total_buf_visual_lines;
@@ -20643,6 +20705,66 @@ mod tests {
         handle_paste(&mut state, "> out.json", &mut out).unwrap();
         assert_eq!(state.input, "GET /people > out.json");
         assert_eq!(state.method, "GET");
+    }
+
+    #[test]
+    fn a_paste_promotes_only_for_what_promotes_when_typed() {
+        for (pasted, line) in [
+            ("~count", "GET /people ~count"),
+            ("abc", "GET /people abc"),
+            ("&& GET /b", "GET /people && GET /b"),
+            ("|| PUT /b {}", "GET /people || PUT /b {}"),
+            (">> out.json", "GET /people >> out.json"),
+            ("\"a\"", "PUT /people \"a\""),
+            ("12", "PUT /people 12"),
+            ("true", "PUT /people true"),
+        ] {
+            let mut state = test_state();
+            state.input = "GET /people ".to_string();
+            state.cursor_pos = char_len(&state.input);
+            handle_paste(&mut state, pasted, &mut sink()).unwrap();
+            assert_eq!(state.input, line, "{pasted}");
+        }
+    }
+
+    #[test]
+    fn a_paste_into_an_open_value_of_the_uri_is_that_value() {
+        // Whatever word it starts with: a method, a directive, a comment, a
+        // file name, a slash. The line stays, and so does its method.
+        for (line, pasted, expected) in [
+            ("GET /c~where(name=\"", "Head Office\"", "GET /c~where(name=\"Head Office\""),
+            ("GET /c~where(name=\"", "put it there\")", "GET /c~where(name=\"put it there\")"),
+            ("GET /c~where(name=\"", "set up", "GET /c~where(name=\"set up"),
+            ("GET /c~where(name=\"a ", "# 1\"", "GET /c~where(name=\"a # 1\""),
+            ("GET /c~where(name=", "GET it", "GET /c~where(name=GET it"),
+            ("GET /c~where(path=\"a/", "/b\"", "GET /c~where(path=\"a//b\""),
+            ("GET /c~where(note=", "{x}", "GET /c~where(note={x}"),
+            ("GET /c~with(a, ", "seed.api", "GET /c~with(a, seed.api"),
+            ("/c~where(name=\"", "Delete me\"", "/c~where(name=\"Delete me\""),
+            ("GET /a && GET /c~where(name=\"", "sleep 2\"", "GET /a && GET /c~where(name=\"sleep 2\""),
+            ("GET /åä~where(name=\"ö ", "Url has\"", "GET /åä~where(name=\"ö Url has\""),
+        ] {
+            let mut state = test_state();
+            state.input = line.to_string();
+            state.cursor_pos = char_len(line);
+            handle_paste(&mut state, pasted, &mut sink()).unwrap();
+            assert_eq!(state.input, expected, "{line} + {pasted}");
+            assert_eq!(state.cursor_pos, char_len(expected), "{line} + {pasted}");
+        }
+        // With the cursor in the middle of the line, in the open value.
+        let mut state = test_state();
+        state.input = "GET /c~where(name=\"\") > out.json".to_string();
+        state.cursor_pos = char_len("GET /c~where(name=\"");
+        handle_paste(&mut state, "Head Office", &mut sink()).unwrap();
+        assert_eq!(state.input, "GET /c~where(name=\"Head Office\") > out.json");
+        // A value that is closed is behind the cursor: the paste is a line.
+        for line in ["GET /c~where(name=\"a\")", "GET /c~where(name=\"a\") ", "GET /", "GET /c~where(a=1) {\"b\": 2} "] {
+            let mut state = test_state();
+            state.input = line.to_string();
+            state.cursor_pos = char_len(line);
+            handle_paste(&mut state, "head /x", &mut sink()).unwrap();
+            assert_eq!(state.input, "HEAD /x", "{line}");
+        }
     }
 
     #[test]
@@ -29780,6 +29902,48 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The body editor is never taller than the terminal: a command area
+    /// that is scrolls it by a row at every redraw, and leaves a ruler in
+    /// the scrollback each time.
+    #[test]
+    fn the_body_editor_keeps_to_the_rows_the_terminal_has() {
+        let long_uri = format!("/people~where(name=\"{}\")", "日本語 ".repeat(40));
+        for height in 6..=12u16 {
+            for width in [1u16, 2, 7, 20, 21, 30, 43, 44, 45, 80, 200] {
+                for uri in ["/x", long_uri.as_str()] {
+                    for body in ["", "a", "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl", &"日本語👍 ".repeat(200)] {
+                        let mut state = test_state();
+                        state.width = width;
+                        state.height = height;
+                        state.body_input_mode = true;
+                        state.body_input_method = "PUT".to_string();
+                        state.body_input_uri = uri.to_string();
+                        state.body_input_buffer = body.to_string();
+                        let what = format!("{width}x{height}, {} columns of URI, {} of body", str_width(uri), str_width(body));
+                        assert_render_rows(&mut state, &what);
+                        assert!(3 + state.prev_input_lines <= height, "{what}: {} rows", 3 + state.prev_input_lines);
+                        // The end of the body, where the cursor is, has a row.
+                        assert!(state.prev_input_lines >= 3, "{what}");
+                        let mut out = Vec::new();
+                        render(&mut out, &mut state).unwrap();
+                        assert!(String::from_utf8(out).unwrap().contains("\x1b[48;5;247m"), "{what}: no cursor");
+                    }
+                }
+            }
+        }
+        // A terminal with room to spare shows the header and the prompt whole.
+        let mut state = test_state();
+        (state.width, state.height) = (30, 24);
+        state.body_input_mode = true;
+        state.body_input_method = "PUT".to_string();
+        state.body_input_uri = "/x".to_string();
+        let mut out = Vec::new();
+        render(&mut out, &mut state).unwrap();
+        let drawn = visible_text(&String::from_utf8(out).unwrap());
+        assert!(drawn.contains("Enter body") && drawn.contains("esc to cancel)"), "{drawn}");
+        assert_eq!(state.prev_input_lines, 4, "a header, a prompt of two rows and the body's row");
     }
 
     #[test]
