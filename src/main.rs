@@ -207,11 +207,35 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// The responses of a batch that had masked data left out of their export.
+static MASKED_RESPONSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The last line of a batch in which an export left masked data out, so
+/// that the warning under one request is not lost in a long log.
+fn masked_total_line(responses: usize) -> Option<String> {
+    let had = match responses {
+        0 => return None,
+        1 => "1 response had".to_string(),
+        n => format!("{} responses had", n),
+    };
+    Some(format!("warning: {} masked data left out of the export; read those members out with ~just or ~without", had))
+}
+
+/// Say `masked_total_line` for the batch that is ending, once.
+fn say_masked_total() {
+    let responses = MASKED_RESPONSES.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if let Some(line) = masked_total_line(responses) {
+        errln!("{}", line);
+    }
+}
+
 /// End the process, with the terminal restored first. `std::process::exit`
 /// runs no destructors, so an exit from inside the prompt would otherwise
 /// leave the shell in raw mode with bracketed paste on.
 fn exit_process(code: i32) -> ! {
     restore_terminal();
+    // A batch that ends here ends with its closing line all the same.
+    say_masked_total();
     // What is still buffered goes out as everything else did. A stdout that
     // has failed is not tried again (and does not lead back here).
     let _ = Out.flush();
@@ -6660,44 +6684,69 @@ const NAMESPACED_KEY_HELP: &str = "a namespaced key has three dot-separated segm
 /// `key?` is written where the name is made from the key and nowhere else,
 /// which is the rule of the platform's own export mode.
 ///
-/// Beyond that: a masked value becomes `null` (where it was is added to
-/// `masked`, so the caller can say what was lost), and `identifiers` is
-/// moved to the front of its object, behind `@type`, where a reader looks for
-/// it. Members otherwise keep the order the server gave them.
+/// Beyond that: a member whose value was masked is left out (where it was
+/// is added to `masked`, so the caller can say what is missing), and
+/// `identifiers` is moved to the front of its object, behind `@type`, where
+/// a reader looks for it. Members otherwise keep the order the server gave
+/// them.
+///
+/// A mask is not written back as `null`: a `null` in a `PUT` body clears the
+/// member, so an export sent back where it was read would empty every secret
+/// it touched. A member that is not written is kept as it is.
+///
+/// Returns whether the value itself is to be left out of what holds it: a
+/// masked value, and a list that held one (a list is written whole, and one
+/// with a hole in it is not the list that was read). The caller does that;
+/// an object leaves its own members out here.
 ///
 /// Children are rewritten before the object that holds them, so a masked
-/// `key` is `null` by the time its record is looked at and is left alone.
+/// `key` is gone by the time its record is looked at.
 /// `key` and `key?` are never both left in one object: the API refuses that.
-fn export_value(value: &mut Value, id_key: &str, path: &mut String, masked: &mut Vec<String>) {
+fn export_value(value: &mut Value, id_key: &str, path: &mut String, masked: &mut Vec<String>) -> bool {
     match value {
         Value::String(text) if MASKED_VALUES.contains(&text.as_str()) => {
             let at = if path.is_empty() { "(root)" } else { path.as_str() };
             if !masked.iter().any(|seen| seen == at) {
                 masked.push(at.to_string());
             }
-            *value = Value::Null;
+            true
         }
         // An item is at its list's path: `clients/secret` names the secret of
         // every client, once, however many there are.
         Value::Array(items) => {
+            let mut holds_a_mask = false;
             for item in items {
-                export_value(item, id_key, path, masked);
+                holds_a_mask |= export_value(item, id_key, path, masked);
             }
+            holds_a_mask
         }
         Value::Object(object) => {
             let parent = path.len();
-            for (name, member) in object.iter_mut() {
+            for (name, mut member) in std::mem::take(object) {
                 if parent > 0 {
                     path.push('/');
                 }
-                path.push_str(name);
-                export_value(member, id_key, path, masked);
+                path.push_str(&name);
+                let left_out = export_value(&mut member, id_key, path, masked);
                 path.truncate(parent);
+                if !left_out {
+                    object.insert(name, member);
+                }
             }
             export_identifiers(object, id_key);
             put_identifiers_first(object);
+            false
         }
-        _ => {}
+        _ => false,
+    }
+}
+
+/// `export_value` for a whole response. A response that is itself a masked
+/// value, or a list holding one, has nothing it could be left out of: it is
+/// `null`.
+fn export_response(value: &mut Value, id_key: &str, masked: &mut Vec<String>) {
+    if export_value(value, id_key, &mut String::new(), masked) {
+        *value = Value::Null;
     }
 }
 
@@ -6706,9 +6755,9 @@ fn export_value(value: &mut Value, id_key: &str, path: &mut String, masked: &mut
 /// place, `key?` first. One that has another identifier gets neither.
 ///
 /// An identifier that is `null` is not one the record has: with `-i` the
-/// server lists every identifier a record could have (`"clientID": null`),
-/// and a masked one has just been nulled. Neither can find the record, so
-/// neither stands in for the key. The member itself is left where it is.
+/// server lists every identifier a record could have (`"clientID": null`).
+/// It can't find the record, so it does not stand in for the key. The member
+/// itself is left where it is. A masked one has just been left out.
 fn export_identifiers(object: &mut Map<String, Value>, id_key: &str) {
     let Some(Value::Object(identifiers)) = object.get_mut("identifiers") else {
         return;
@@ -6763,7 +6812,7 @@ fn put_identifiers_first(object: &mut Map<String, Value>) {
 #[derive(Debug, PartialEq)]
 struct ExportedBody {
     text: String,
-    /// Where the masked values that became `null` were: paths from the top
+    /// Where the masked values that were left out stood: paths from the top
     /// of the response, without positions in lists, each once, in the order
     /// they were first met.
     masked: Vec<String>,
@@ -6782,7 +6831,7 @@ fn export_body(text: &str, id_key: &str, ndjson: bool, compact: bool) -> Exporte
     let whole = || -> Option<(String, Vec<String>)> {
         let mut value: Value = serde_json::from_str(text).ok()?;
         let mut masked = Vec::new();
-        export_value(&mut value, id_key, &mut String::new(), &mut masked);
+        export_response(&mut value, id_key, &mut masked);
         let out = if compact { serde_json::to_string(&value) } else { serde_json::to_string_pretty(&value) };
         Some((out.ok()?, masked))
     };
@@ -6792,7 +6841,7 @@ fn export_body(text: &str, id_key: &str, ndjson: bool, compact: bool) -> Exporte
         for line in text.lines() {
             if !line.trim().is_empty() {
                 let mut value: Value = serde_json::from_str(line).ok()?;
-                export_value(&mut value, id_key, &mut String::new(), &mut masked);
+                export_response(&mut value, id_key, &mut masked);
                 out.push_str(&serde_json::to_string(&value).ok()?);
             }
             out.push('\n');
@@ -6812,9 +6861,10 @@ fn export_body(text: &str, id_key: &str, ndjson: bool, compact: bool) -> Exporte
     }
 }
 
-/// What the user has to be told about an exported body, if anything: values
-/// that were masked are gone from the seed data, and a body that is not JSON
-/// was not exported at all.
+/// What the user has to be told about an exported body, if anything:
+/// members that were masked are not in the seed data, and a body that is not
+/// JSON was not exported at all. A secret in an export is a sign that the
+/// read asked for too much, so the first is a warning.
 fn export_warning(exported: &ExportedBody) -> Option<String> {
     if !exported.is_json {
         Some("WARNING: --export left a response that is not JSON unchanged".to_string())
@@ -6829,7 +6879,7 @@ fn export_warning(exported: &ExportedBody) -> Option<String> {
             1 => " and 1 other place".to_string(),
             n => format!(" and {} other places", n),
         };
-        Some(format!("Response had masked data, now null at {}{}", named, more))
+        Some(format!("warning: response had masked data, left out at {}{}", named, more))
     }
 }
 
@@ -10013,6 +10063,12 @@ fn confirm_preview(lines: &[String], base_uri: &str) -> bool {
 }
 
 fn run_bulk_from_str(config: &mut Config, contents: &str, base_dir: Option<&std::path::Path>) {
+    run_bulk_program(config, contents, base_dir);
+    say_masked_total();
+}
+
+/// `run_bulk_from_str`, up to where the program ends or is stopped.
+fn run_bulk_program(config: &mut Config, contents: &str, base_dir: Option<&std::path::Path>) {
     require_base_uri(config);
 
     // Silent + bulk: enable "silent bulk mode" — show request line + status, skip body.
@@ -11108,6 +11164,10 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
             );
             if let Some(warning) = export_warning(&exported) {
                 errln!("{}", warning);
+            }
+            // One request says it once. A batch says it again where it ends.
+            if !exported.masked.is_empty() && !config.one_shot {
+                MASKED_RESPONSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             exported.text
         }
@@ -24985,7 +25045,7 @@ mod tests {
     fn exported(json: &str) -> (String, Vec<String>) {
         let mut value: Value = serde_json::from_str(json).unwrap();
         let mut masked = Vec::new();
-        export_value(&mut value, SEED, &mut String::new(), &mut masked);
+        export_response(&mut value, SEED, &mut masked);
         (serde_json::to_string(&value).unwrap(), masked)
     }
 
@@ -25101,10 +25161,10 @@ mod tests {
             exported(r#"{"identifiers":{"key":"k2","clientID":"mock","userId":null}}"#),
             r#"{"identifiers":{"clientID":"mock","userId":null}}"#
         );
-        // An identifier that was masked is null by now and finds nothing either.
+        // An identifier that was masked is left out and finds nothing either.
         assert_eq!(
             exported(r#"{"identifiers":{"key":"k3","token":"********"}}"#),
-            r#"{"identifiers":{"key?":"k3","com.heads.seedID":"k3","token":null}}"#
+            r#"{"identifiers":{"key?":"k3","com.heads.seedID":"k3"}}"#
         );
         // `false` and an empty string are values the server gave, and count.
         assert_eq!(exported(r#"{"identifiers":{"key":"k4","flag":false}}"#), r#"{"identifiers":{"flag":false}}"#);
@@ -25407,15 +25467,14 @@ mod tests {
     }
 
     #[test]
-    fn export_nulls_masked_values_and_says_where_they_were() {
+    fn export_leaves_masked_members_out_and_says_where_they_were() {
         let (out, masked) = exported(
             r#"{"secret":"********","nested":{"password":"*******","apiKey":"********","fine":"*****"},
-                "list":["********","kept"],"secret2":"********x","name":"********"}"#,
+                "list":["********","kept"],"secret2":"********x","name":"********","last":1}"#,
         );
-        assert_eq!(
-            out,
-            r#"{"secret":null,"nested":{"password":null,"apiKey":null,"fine":"*****"},"list":[null,"kept"],"secret2":"********x","name":null}"#
-        );
+        // No member is `null` in its place: written back, a `null` would
+        // clear the secret. A list that held a mask is left out whole.
+        assert_eq!(out, r#"{"nested":{"fine":"*****"},"secret2":"********x","last":1}"#);
         // Paths from the top, in the order they were met; a value in a list
         // is at the list's path.
         assert_eq!(masked, ["secret", "nested/password", "nested/apiKey", "list", "name"]);
@@ -25427,23 +25486,50 @@ mod tests {
                 {"clients":[{"secret":"********"}],"creds":[]}]"#,
         );
         assert_eq!(masked, ["clients/secret", "clients/node/pin", "creds/apiKey"]);
-        assert!(!out.contains('*'), "{out}");
+        // The records stay, each without what was masked in it.
+        assert_eq!(out, r#"[{"clients":[{},{"node":{}}],"creds":[{}]},{"clients":[{}],"creds":[]}]"#);
         let (_, masked) = exported(r#"[{"secret":"********"},{"secret":"********"}]"#);
         assert_eq!(masked, ["secret"]);
         // The same name in two places is two paths.
         let (_, masked) = exported(r#"{"a":{"secret":"********"},"b":{"secret":"********"}}"#);
         assert_eq!(masked, ["a/secret", "b/secret"]);
-        // A body that is one masked value has no path below the top.
-        for body in [r#""********""#, r#"["********"]"#] {
-            assert_eq!(exported(body).1, ["(root)"], "{body}");
+        // A list in a list goes with the list that holds it.
+        let (out, masked) = exported(r#"{"rows":[["a","********"],["b"]],"n":1}"#);
+        assert_eq!((out.as_str(), &masked[..]), (r#"{"n":1}"#, &["rows".to_string()][..]));
+        // A body that is one masked value, or a list holding one, has no
+        // path below the top and nothing to be left out of: it is `null`.
+        for body in [r#""********""#, r#"["********"]"#, r#"["kept","*******"]"#] {
+            assert_eq!(exported(body), ("null".to_string(), vec!["(root)".to_string()]), "{body}");
         }
-        assert_eq!(exported(r#""********""#).0, "null");
 
-        // A masked key is nothing to write: it becomes null and stays, and
-        // neither `key?` nor an external identifier is made from it.
+        // A masked key is nothing to write: it is left out, and neither
+        // `key?` nor an external identifier is made from it.
         let (out, masked) = exported(r#"{"identifiers":{"key":"********"},"name":"x"}"#);
-        assert_eq!(out, r#"{"identifiers":{"key":null},"name":"x"}"#);
+        assert_eq!(out, r#"{"identifiers":{},"name":"x"}"#);
         assert_eq!(masked, ["identifiers/key"]);
+        // A record whose only other identifier was masked keeps its key, as
+        // one with no other identifier does, and so does one whose only
+        // other member was.
+        let (out, masked) = exported(r#"{"identifiers":{"key":"k","clientID":"********"},"secret":"********"}"#);
+        assert_eq!(out, r#"{"identifiers":{"key?":"k","com.heads.seedID":"k"}}"#);
+        assert_eq!(masked, ["identifiers/clientID", "secret"]);
+        // With `-i` an unset member arrives as `null` and stays; a masked one
+        // beside it is left out all the same.
+        let (out, _) = exported(r#"{"identifiers":{"key":"k","clientID":null},"secret":"********","note":null}"#);
+        assert_eq!(out, r#"{"identifiers":{"key?":"k","com.heads.seedID":"k","clientID":null},"note":null}"#);
+    }
+
+    #[test]
+    fn a_batch_says_once_more_how_many_responses_had_masked_data() {
+        assert_eq!(masked_total_line(0), None);
+        assert_eq!(
+            masked_total_line(1).as_deref(),
+            Some("warning: 1 response had masked data left out of the export; read those members out with ~just or ~without")
+        );
+        assert_eq!(
+            masked_total_line(12).as_deref(),
+            Some("warning: 12 responses had masked data left out of the export; read those members out with ~just or ~without")
+        );
     }
 
     #[test]
@@ -25463,7 +25549,7 @@ mod tests {
         // newline as they were, whatever `compact` says.
         let ndjson = "{\"identifiers\":{\"key\":\"a\"}}\n\n{\"identifiers\":{\"key\":\"b\",\"com.x.y\":\"1\"},\"secret\":\"********\"}\n";
         let by_line = export_body(ndjson, SEED, true, false);
-        assert_eq!(by_line.text, "{\"identifiers\":{\"key?\":\"a\",\"com.heads.seedID\":\"a\"}}\n\n{\"identifiers\":{\"com.x.y\":\"1\"},\"secret\":null}\n");
+        assert_eq!(by_line.text, "{\"identifiers\":{\"key?\":\"a\",\"com.heads.seedID\":\"a\"}}\n\n{\"identifiers\":{\"com.x.y\":\"1\"}}\n");
         assert_eq!(by_line.masked, ["secret"]);
         assert_eq!(export_body(ndjson.trim_end(), SEED, true, false).text, by_line.text.trim_end());
         // Lines of JSON are read as NDJSON also when nothing said they were.
@@ -25501,29 +25587,29 @@ mod tests {
         assert_eq!(export_warning(&export_body("[1]", SEED, false, false)), None);
         assert_eq!(
             export_warning(&export_body(r#"{"b":"********","a":{"c":"*******"}}"#, SEED, false, false)).as_deref(),
-            Some("Response had masked data, now null at b, a/c")
+            Some("warning: response had masked data, left out at b, a/c")
         );
         // Two places are named and the rest counted.
         let warned = |json: &str| export_warning(&export_body(json, SEED, false, false));
-        assert_eq!(warned(r#"{"a":"********"}"#).as_deref(), Some("Response had masked data, now null at a"));
+        assert_eq!(warned(r#"{"a":"********"}"#).as_deref(), Some("warning: response had masked data, left out at a"));
         assert_eq!(
             warned(r#"{"a":"********","b":"********","c":"********"}"#).as_deref(),
-            Some("Response had masked data, now null at a, b and 1 other place")
+            Some("warning: response had masked data, left out at a, b and 1 other place")
         );
         assert_eq!(
             warned(r#"{"a":"********","b":{"x":"********","y":"********"},"c":["********"],"d":"********"}"#).as_deref(),
-            Some("Response had masked data, now null at a, b/x and 3 other places")
+            Some("warning: response had masked data, left out at a, b/x and 3 other places")
         );
         // Places are counted, not values: one path in many records is one.
         assert_eq!(
             warned(r#"[{"a":"********","b":"********"},{"a":"********","b":"********"}]"#).as_deref(),
-            Some("Response had masked data, now null at a, b")
+            Some("warning: response had masked data, left out at a, b")
         );
         // NDJSON lines share one list: a path is named once across them.
         assert_eq!(
             export_warning(&export_body("{\"s\":\"********\"}\n{\"s\":\"********\",\"t\":\"********\"}\n", SEED, true, false))
                 .as_deref(),
-            Some("Response had masked data, now null at s, t")
+            Some("warning: response had masked data, left out at s, t")
         );
     }
 

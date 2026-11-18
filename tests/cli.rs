@@ -2555,10 +2555,10 @@ const SEED: &str = "com.heads.seedID";
 /// secret is masked.
 const USERS: &str = r#"[{"name":"Integration","@type":"user","identifiers":{"@type":"user identifiers","key":"2a196c5b"},"agent":{"@type":"agent","identifiers":{"key":"c59cf786","com.heads.seedID":"root-organization"},"name":"System"},"oauth2Clients":[{"identifiers":{"key":"6ac6a3b8","clientID":"mock"},"secret":"********"}]}]"#;
 /// The same as seed data, on one line.
-const USERS_EXPORTED: &str = r#"[{"@type":"user","identifiers":{"@type":"user identifiers","key?":"2a196c5b","com.heads.seedID":"2a196c5b"},"name":"Integration","agent":{"@type":"agent","identifiers":{"com.heads.seedID":"root-organization"},"name":"System"},"oauth2Clients":[{"identifiers":{"clientID":"mock"},"secret":null}]}]"#;
+const USERS_EXPORTED: &str = r#"[{"@type":"user","identifiers":{"@type":"user identifiers","key?":"2a196c5b","com.heads.seedID":"2a196c5b"},"name":"Integration","agent":{"@type":"agent","identifiers":{"com.heads.seedID":"root-organization"},"name":"System"},"oauth2Clients":[{"identifiers":{"clientID":"mock"}}]}]"#;
 /// What is said about `USERS`: where the masked value was, from the top of
 /// the response, without positions in lists.
-const MASKED_WARNING: &str = "Response had masked data, now null at oauth2Clients/secret";
+const MASKED_WARNING: &str = "warning: response had masked data, left out at oauth2Clients/secret";
 
 struct ExportRun {
     ok: bool,
@@ -2646,8 +2646,88 @@ fn export_names_two_masked_places_and_counts_the_rest() {
     const MASKED: &str = r#"[{"password":"********","clients":[{"secret":"********","pin":"*******"}],"apiKey":"********"},{"password":"********"}]"#;
     let run = run_export(&["--export", SEED, "-sr", "GET", "/users"], vec![("200 OK", MASKED)]);
     assert!(run.ok, "{}", run.stderr);
-    assert_eq!(run.stderr.trim(), "Response had masked data, now null at password, clients/secret and 2 other places");
-    assert_eq!(run.stdout.trim(), r#"[{"password":null,"clients":[{"secret":null,"pin":null}],"apiKey":null},{"password":null}]"#);
+    assert_eq!(run.stderr.trim(), "warning: response had masked data, left out at password, clients/secret and 2 other places");
+    // Each record is there, without what was masked in it. Nothing is `null`
+    // in a secret's place: written back, that would clear it.
+    assert_eq!(run.stdout.trim(), r#"[{"clients":[{}]},{}]"#);
+}
+
+/// A masked member is left out of an export with `-i` too, where every other
+/// member that is not set is `null`. A list that held a mask is left out
+/// whole, and a record whose only other member was masked keeps its
+/// identifiers.
+#[test]
+fn export_leaves_a_masked_member_out_with_and_without_include_nulls() {
+    const RECORDS: &str = r#"[{"identifiers":{"key":"k1"},"secret":"********"},{"identifiers":{"key":"k2","clientID":"********"},"note":null,"pins":["1","*******"],"name":"b"}]"#;
+    const EXPORTED: &str = r#"[{"identifiers":{"key?":"k1","com.heads.seedID":"k1"}},{"identifiers":{"key?":"k2","com.heads.seedID":"k2"},"note":null,"name":"b"}]"#;
+    for flags in [&["-sr"][..], &["-sri"], &["-r"]] {
+        let mut args = vec!["--export", SEED];
+        args.extend(flags);
+        args.extend(["GET", "/clients"]);
+        let run = run_export(&args, vec![("200 OK", RECORDS)]);
+        assert!(run.ok, "{flags:?}: {}", run.stderr);
+        assert_eq!(run.stdout.trim(), EXPORTED, "{flags:?}");
+        assert!(!run.stdout.contains('*'), "{flags:?}: {}", run.stdout);
+        // The warning names the places, under `-s` too, and one request
+        // says it once: the closing line is a batch's.
+        let warning = "warning: response had masked data, left out at secret, identifiers/clientID and 1 other place";
+        assert!(run.stderr.lines().any(|line| line == warning), "{flags:?}: {}", run.stderr);
+        assert!(!run.stderr.contains("responses had") && !run.stderr.contains("1 response had"), "{flags:?}: {}", run.stderr);
+    }
+}
+
+/// A batch in which an export left masked data out says so once more where
+/// it ends, with how many responses it was, and still exits 0: the warning
+/// under one request is easily lost in a long log.
+#[test]
+fn a_batch_ends_with_how_many_responses_had_masked_data_left_out() {
+    const MASKED: (&str, &str) = ("200 OK", r#"{"identifiers":{"key":"k"},"secret":"********"}"#);
+    const PLAIN: (&str, &str) = ("200 OK", r#"{"identifiers":{"key":"k"},"n":1}"#);
+    const TOTAL: &str = "masked data left out of the export; read those members out with ~just or ~without";
+    let run_batch = |flags: &[&str], batch: &str, answers: Vec<(&'static str, &'static str)>| {
+        let (port, server) = answering_server(answers);
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("batch.api"), batch).unwrap();
+        let out = api_against_port(port).env("NO_COLOR", "1").current_dir(dir.path()).args(flags).arg("batch.api").output().unwrap();
+        let written = |name: &str| std::fs::read_to_string(dir.path().join(name)).map(|text| compact(&text)).ok();
+        (out.status.code(), String::from_utf8_lossy(&out.stderr).to_string(), server.join().unwrap().len(), written("a.json"), written("c.json"))
+    };
+
+    // Two of three responses: the warning under each, and the closing line last.
+    let batch = "GET /a > a.json
+GET /b > b.json
+GET /c > c.json
+";
+    let (code, stderr, sent, a, c) = run_batch(&["--export", SEED, "-sa"], batch, vec![MASKED, PLAIN, MASKED]);
+    assert_eq!((code, sent), (Some(0), 3), "{stderr}");
+    assert_eq!(stderr.matches("warning: response had masked data, left out at secret").count(), 2, "{stderr}");
+    assert_eq!(stderr.trim_end().lines().last(), Some(format!("warning: 2 responses had {TOTAL}").as_str()), "{stderr}");
+    const EXPORTED: &str = r#"{"identifiers":{"key?":"k","com.heads.seedID":"k"}}"#;
+    assert_eq!((a.as_deref(), c.as_deref()), (Some(EXPORTED), Some(EXPORTED)));
+
+    // One: said in the singular. Under a `set export` line as under the option.
+    let (code, stderr, _, _, _) = run_batch(&["-sa"], "GET /a
+set export com.heads.seedID
+GET /b > a.json
+", vec![PLAIN, MASKED]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(stderr.trim_end().lines().last(), Some(format!("warning: 1 response had {TOTAL}").as_str()), "{stderr}");
+
+    // None: nothing is said, with export on or off.
+    let (code, stderr, _, _, _) = run_batch(&["--export", SEED, "-sa"], batch, vec![PLAIN]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(!stderr.contains("masked data"), "{stderr}");
+    let (_, stderr, _, _, _) = run_batch(&["-sa"], batch, vec![MASKED]);
+    assert!(!stderr.contains("masked data"), "{stderr}");
+
+    // A batch that is stopped ends with the line too, under the reason.
+    let (code, stderr, sent, _, _) =
+        run_batch(&["--export", SEED, "-sfa"], "GET /a > a.json
+GET /refused
+GET /never
+", vec![MASKED, ("409 Conflict", "{}")]);
+    assert_eq!((code, sent), (Some(1), 2), "{stderr}");
+    assert_eq!(stderr.trim_end().lines().last(), Some(format!("warning: 1 response had {TOTAL}").as_str()), "{stderr}");
 }
 
 #[test]
@@ -2690,7 +2770,9 @@ fn export_writes_seed_data_to_an_outfile_and_appends_it() {
     // `-sa` still prints no body, exported or not; the warning is once per response.
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(!stdout.contains("seedID") && !stdout.contains("2a196c5b"), "{stdout}");
-    assert_eq!(String::from_utf8_lossy(&out.stderr).matches(MASKED_WARNING).count(), 3);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stderr.matches(MASKED_WARNING).count(), 3);
+    assert!(stderr.trim_end().ends_with("warning: 3 responses had masked data left out of the export; read those members out with ~just or ~without"), "{stderr}");
 
     // One request, redirected.
     let run = run_export(&["--export", SEED, "GET", "/users", ">", "one.json"], vec![("200 OK", USERS)]);
@@ -2712,7 +2794,8 @@ fn export_leaves_an_error_body_as_the_server_sent_it() {
 
 #[test]
 fn a_chain_is_judged_on_what_the_server_said_not_on_the_seed_data() {
-    // A masked value is a "yes" from the server, and `null` once exported.
+    // A masked value is a "yes" from the server, and `null` once exported:
+    // a response that is nothing but a mask has nothing to be left out of.
     let run = run_export(
         &["--export", SEED, "-sr", "GET /secret && GET /users"],
         vec![("200 OK", r#""********""#), ("200 OK", USERS)],
@@ -2742,7 +2825,7 @@ fn an_assert_and_a_poll_are_judged_on_what_the_server_said_not_on_the_seed_data(
     assert!(out.status.success(), "{stderr}");
     assert_eq!(compact(&std::fs::read_to_string(dir.path().join("users.json")).unwrap()), USERS_EXPORTED);
     // A question's answer is not data: only the response that was written warns.
-    assert_eq!(stderr.matches("masked data").count(), 1, "{stderr}");
+    assert_eq!(stderr.matches("response had masked data, left out at").count(), 1, "{stderr}");
 
     // And the other way round: `assert not` on a masked value fails.
     let run = run_export(&["--export", SEED, "-s", "assert not GET /secret"], vec![("200 OK", r#""********""#)]);
@@ -2850,9 +2933,9 @@ fn export_rewrites_ndjson_by_line_and_leaves_csv_alone() {
     assert!(run.ok, "{}", run.stderr);
     assert_eq!(
         run.stdout,
-        "{\"identifiers\":{\"key?\":\"a\",\"com.heads.seedID\":\"a\"},\"n\":1}\n{\"identifiers\":{\"com.x.y\":\"1\"},\"secret\":null}\n"
+        "{\"identifiers\":{\"key?\":\"a\",\"com.heads.seedID\":\"a\"},\"n\":1}\n{\"identifiers\":{\"com.x.y\":\"1\"}}\n"
     );
-    assert_eq!(run.stderr.trim(), "Response had masked data, now null at secret");
+    assert_eq!(run.stderr.trim(), "warning: response had masked data, left out at secret");
 
     // One line asked for as NDJSON stays one line.
     let run = run_export(&["--export", SEED, "-s", "--ndjson", "GET", "/people"], vec![("200 OK", "{\"identifiers\":{\"key\":\"a\"}}\n")]);
@@ -3006,7 +3089,7 @@ fn under_a_set_export_line_a_chain_and_a_check_are_judged_on_what_the_server_sai
     assert_eq!(compact(&std::fs::read_to_string(dir.path().join("users.json")).unwrap()), USERS_EXPORTED);
     // The answer to an `assert` or a poll is not data. The three requests of
     // the chains and the one that was written are, and each is warned about.
-    assert_eq!(stderr.matches("masked data").count(), 4, "{stderr}");
+    assert_eq!(stderr.matches("response had masked data, left out at").count(), 4, "{stderr}");
 
     // And the other way round: `assert not` on a masked value fails, and a
     // poll that waits for a "no" does not take the exported `null` for one.
@@ -3212,9 +3295,9 @@ fn export_against_a_local_cos() {
     assert!(echoed.status.success(), "{}", String::from_utf8_lossy(&echoed.stderr));
     assert_eq!(
         String::from_utf8_lossy(&echoed.stdout).trim(),
-        r#"[{"identifiers":{"key?":"k1","com.heads.seedID":"k1"},"name":"Ann","secret":null,"boss":{"identifiers":{"com.mi6.id":"M"}}}]"#
+        r#"[{"identifiers":{"key?":"k1","com.heads.seedID":"k1"},"name":"Ann","boss":{"identifiers":{"com.mi6.id":"M"}}}]"#
     );
-    assert!(String::from_utf8_lossy(&echoed.stderr).contains("Response had masked data, now null at secret"));
+    assert!(String::from_utf8_lossy(&echoed.stderr).contains("warning: response had masked data, left out at secret"));
 
     // Real records: no `key` is left, each record has an identifier to be
     // found by, and `key?` stands only beside the name made from it.

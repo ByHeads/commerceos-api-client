@@ -1141,9 +1141,9 @@ api -c staging PUT /users @users.json
       "key": "27b65eb8…",                              "identifiers": {
       "com.heads.seedID": "ourcompany"                   "com.heads.seedID": "ourcompany"
     }                                                  }
-  },                                                 },
-  "password": "********"                             "password": null
-}                                                  }
+  },                                                 }
+  "password": "********"                           }
+}
 ```
 
 What it does to every object in the response, however deep:
@@ -1165,16 +1165,30 @@ What it does to every object in the response, however deep:
   record still has only its key and keeps it as `key?` and under the name.
   The `null` member stays in the output, since `-i` asked for it.
 - **Neither is an identifier that is masked.** A value the server sent as
-  `********` becomes `null` (below), and a record can't be found by it: a
+  `********` is left out (below), and a record can't be found by it: a
   record whose only other identifier is masked keeps its key as `key?` and
   under the name, like one that has none.
-- **A masked value (`********`) becomes `null`**, and a line on stderr says
-  where: `Response had masked data, now null at oauth2Clients/secret,
-  localCredentials/password and 1 other place`. A path is written from the
-  top of the response and leaves out positions in lists, so it is one place
-  however many records had it. Two places are named and the rest are
-  counted; search the export for `null` to find them all. The secret is not
-  in the export; set it some other way.
+- **A member whose value is masked (`********`) is left out**, and a warning
+  on stderr says where: `warning: response had masked data, left out at
+  oauth2Clients/secret, localCredentials/password and 1 other place`. A path
+  is written from the top of the response and leaves out positions in lists,
+  so it is one place however many records had it. Two places are named and
+  the rest are counted.
+  - It is not written as `null`: a `null` in a `PUT` body clears the member,
+    so an export sent back where it was read would empty every secret it
+    touched. A member that is not written is kept on a record that exists
+    and not set on one that is created. With `-i` it is left out too.
+  - A list that holds a masked value is left out whole. A response that is
+    nothing but a masked value, or a list of them, is `null`.
+  - The warning is printed under `-s` too. The run goes on and the exit code
+    does not change: `-f` is for what the server refused.
+  - **A batch says it once more where it ends**, so the warning is not lost
+    in a long log: `warning: 2 responses had masked data left out of the
+    export; read those members out with ~just or ~without`. Also when the
+    batch is stopped (`-f`, a failed `assert`). One request says it once.
+  - A secret in an export is a sign that the read asked for too much. Read
+    the members that are wanted (`~just(…)`), or leave the masked ones out
+    (`~without(…)`), and set a secret some other way.
 - **`identifiers` moves to the front of its object**, behind `@type`. Other
   members keep the order the server gave them.
 
@@ -1199,7 +1213,7 @@ Rules:
 - **At the interactive prompt, export mode is a row of the [settings
   menu](#the-settings-menu-ctrlt)** that `ctrl+t` opens, and `export` shows
   at the right of the hint line while it is on. `set export <name>` typed at
-  the prompt does the same. The masked-data line shows in the hint line.
+  the prompt does the same. The masked-data warning shows in the hint line.
 - Output is indented; `-r` prints it on one line. NDJSON (`--ndjson`, or a
   `> file.ndjson`) is rewritten line by line.
 - A response that is not JSON (a `> file.csv`, a `.sql`) is written unchanged,
@@ -1518,7 +1532,8 @@ Run it: `api -sa workshop.api`.
 - **`set nulls`, `set key …`** → `unknown setting`. A setting has the name of its long option (`include-nulls`), and only `export`, `include-nulls`, `fail-fast`, `ndjson`, `raw`, `stream` and `timeout` are settings.
 - **`export com.heads.seedID` as a line** → `not a request or .api file: export`. The line is `set export com.heads.seedID`.
 - **`set timeout off` to wait for ever** → `off` is the default of ten minutes. No timeout is `set timeout 0`.
-- **Expecting secrets in an export** → the API masks them (`********`) and `--export` turns that into `null`, and says where (`Response had masked data, now null at …`). A password, an API key or a client secret has to be set separately.
+- **Expecting secrets in an export** → the API masks them (`********`) and `--export` leaves the member out, and warns where (`warning: response had masked data, left out at …`). A password, an API key or a client secret has to be set separately. Read without the masked members (`~just`, `~without`) and the warning is gone.
+- **Expecting `null` where an export had a masked value** → up to 3.3.1 it was written as `null`, and a `PUT` of that export cleared the secret where it was read. The member is now not in the export at all, so a write leaves the secret as it is.
 - **`-p` or `confirm` without a terminal** → up to 3.3.1, end of input was read as Enter, so an unattended `api -spa file.api` or a `confirm` gate sent everything. From 3.3.2 it sends nothing and exits 1 with `aborted (could not read confirmation)`. Pipe the answer (`yes | …`, `echo n | …`); a program read from stdin (`api -a -`) has no stdin left to answer with.
 - **Collecting with `>>` and expecting the errors in the file** → a non-2xx body is not appended: the file keeps what it had, and `>> file (not appended)` is printed under the status line. A `> file` does take an error's body when the run has no `-f`.
 - **A `>` with nothing behind it** → `GET /x >` is an error (``a `>` or `>>` needs a path to write to``), not a request with the body `>`.

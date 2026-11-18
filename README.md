@@ -74,8 +74,8 @@ api seed.api                                                 # run a file, same 
 
 `--export <external-id>` turns a response into seed data that can be `PUT` back where it was read or
 to another environment: database keys are dropped, a record with no other identifier keeps its key
-under the name you give and as `key?` (a key that may name nothing), and masked values become `null`
-(it says where). The name is a namespaced key such as `com.heads.seedID`. At the prompt,
+under the name you give and as `key?` (a key that may name nothing), and a member whose value is
+masked is left out, with a warning that says where. The name is a namespaced key such as `com.heads.seedID`. At the prompt,
 `ctrl+t` opens the settings menu, where it is a row that asks for the name the first time. In a `.api` file, a line
 `set export com.heads.seedID` turns it on for the requests below it in that file, and `set export off` ends it.
 

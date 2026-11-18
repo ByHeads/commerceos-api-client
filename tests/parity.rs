@@ -4508,8 +4508,8 @@ fn the_prompt_reads_the_same_lines() {
 /// came in through.
 #[test]
 fn export_rewrites_the_same_way_in_a_file_from_stdin_and_as_arguments() {
-    const EXPORTED: &str = "{\n  \"identifiers\": {\n    \"key?\": \"k1\",\n    \"com.heads.seedID\": \"k1\"\n  },\n  \"name\": \"Ann\",\n  \"secret\": null\n}\n";
-    const WARNING: &str = "Response had masked data, now null at secret";
+    const EXPORTED: &str = "{\n  \"identifiers\": {\n    \"key?\": \"k1\",\n    \"com.heads.seedID\": \"k1\"\n  },\n  \"name\": \"Ann\"\n}\n";
+    const WARNING: &str = "warning: response had masked data, left out at secret";
     let server = RecordingServer::start();
     let dir = tempfile::tempdir().unwrap();
     prepare(dir.path());
@@ -4547,6 +4547,9 @@ fn export_rewrites_the_same_way_in_a_file_from_stdin_and_as_arguments() {
     for (door, (stdout, stderr)) in &doors {
         assert_eq!(stdout, EXPORTED, "{door}");
         assert_eq!(stderr.matches(WARNING).count(), 1, "{door}: {stderr}");
+        // A batch says it once more where it ends; one request has said it.
+        let batch = matches!(*door, "file" | "stdin");
+        assert_eq!(stderr.contains("warning: 1 response had masked data left out of the export"), batch, "{door}: {stderr}");
     }
 
     // To a file, the same bytes without the final newline, from each door.
@@ -4598,9 +4601,11 @@ fn export_at_the_prompt_shows_the_seed_data() {
     assert_eq!(sent, ["GET /keyed"]);
     assert!(shown.contains("\"key?\": \"k1\""), "{shown}");
     assert!(shown.contains("\"com.heads.seedID\": \"k1\""), "{shown}");
-    assert!(shown.contains("\"secret\": null"), "{shown}");
+    assert!(!shown.contains("\"secret\""), "{shown}");
     assert!(!shown.contains("\"key\"") && !shown.contains("********"), "{shown}");
-    assert!(shown.contains("Response had masked data, now null at secret"), "{shown}");
+    assert!(shown.contains("warning: response had masked data, left out at secret"), "{shown}");
+    // A session is no batch: nothing is counted up at its end.
+    assert!(!shown.contains("responses had") && !shown.contains("1 response had"), "{shown}");
     assert!(!shown.contains("WARNING"), "{shown}");
 
     // Written to a file from the prompt, it is the seed data too.
@@ -4610,7 +4615,7 @@ fn export_at_the_prompt_shows_the_seed_data() {
     let written: serde_json::Value = serde_json::from_str(&written).unwrap();
     assert_eq!(
         written,
-        serde_json::json!({ "identifiers": { "key?": "k1", "com.heads.seedID": "k1" }, "name": "Ann", "secret": null })
+        serde_json::json!({ "identifiers": { "key?": "k1", "com.heads.seedID": "k1" }, "name": "Ann" })
     );
 
     // A response without a key is shown as it came.
@@ -4701,7 +4706,7 @@ fn the_export_row_toggles_export_at_the_prompt_and_asks_for_the_name_once() {
     // On: the response is the seed data, under that name.
     let shown = get_keyed(&mut prompt, &server);
     assert!(shown.contains("\"key?\": \"k1\"") && shown.contains("\"com.example.exportID\": \"k1\""), "{shown}");
-    assert!(shown.contains("\"secret\": null") && !shown.contains("\"key\""), "{shown}");
+    assert!(!shown.contains("\"secret\"") && !shown.contains("\"key\""), "{shown}");
     // The marker sits at the right of the hint line while it is on.
     let shown = keys(&mut prompt, b"\x15");
     assert!(shown.trim_end().ends_with("export"), "{shown:?}");
@@ -9830,7 +9835,7 @@ fn a_request_under_a_set_export_line_is_not_streamed() {
     assert_eq!(streamed, [true, false, true], "{:?}", server.heads());
     let keyed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(d.join("keyed.json")).unwrap()).unwrap();
     assert_eq!(keyed["identifiers"], serde_json::json!({"key?": "k1", "com.heads.seedID": "k1"}));
-    assert_eq!(keyed["secret"], serde_json::Value::Null);
+    assert!(keyed.get("secret").is_none(), "{keyed}");
 }
 
 /// `set include-nulls` is `-i` for the requests under it in its own file:
