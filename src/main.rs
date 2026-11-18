@@ -175,7 +175,9 @@ fn restore_terminal() {
     if !(modes || raw) {
         return;
     }
-    let _ = execute!(io::stdout(), cursor::Show);
+    // Wrapping too: a frame is drawn with it off, and a panic or a signal
+    // in the middle of one would leave the shell without it.
+    let _ = execute!(io::stdout(), Print("\x1b[?7h"), cursor::Show);
     let _ = terminal::disable_raw_mode();
 }
 
@@ -1682,23 +1684,24 @@ fn reformat_json_multiline(json: &str, cursor_offset: usize) -> (String, usize) 
 fn find_body_start(input: &str) -> Option<usize> {
     let trimmed_start = input.len() - input.trim_start().len();
     let trimmed = input.trim_start();
+    // Behind the URI as the parser reads it (`uri_end`): a blank in a
+    // quoted value or in an operator's parentheses does not end it.
+    let behind_uri = |from: usize| {
+        let uri_len = uri_end(&trimmed[from..]);
+        let after_uri = &trimmed[from + uri_len..];
+        (!after_uri.is_empty()).then(|| trimmed_start + from + uri_len + (after_uri.len() - after_uri.trim_start().len()))
+    };
     // Skip method (first word)
     let first_end = trimmed.find(|c: char| c.is_whitespace())?;
     let after_first = &trimmed[first_end..];
-    let after_first_trimmed = after_first.trim_start();
-    let skip1 = first_end + (after_first.len() - after_first_trimmed.len());
+    let skip1 = first_end + (after_first.len() - after_first.trim_start().len());
     // If first word is a method, skip URI too
-    let methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
     let first_word = &trimmed[..first_end];
-    if methods.contains(&first_word.to_uppercase().as_str()) {
-        // Skip URI (second word)
-        let uri_end = after_first_trimmed.find(|c: char| c.is_whitespace())?;
-        let after_uri = &after_first_trimmed[uri_end..];
-        let body_offset = after_uri.len() - after_uri.trim_start().len();
-        Some(trimmed_start + skip1 + uri_end + body_offset)
+    if REQUEST_METHODS.contains(&first_word.to_uppercase().as_str()) {
+        behind_uri(skip1)
     } else if first_word.starts_with('/') {
         // URI only, body follows
-        Some(trimmed_start + skip1)
+        behind_uri(0)
     } else {
         None
     }
@@ -3334,8 +3337,17 @@ impl ConnectionFlow {
                     self.setup_status = "\x1b[32m✓ Connected\x1b[0m".to_string();
                     true
                 }
-                Err(_) => {
-                    self.setup_status = "\x1b[31m✗ connection could not be established, try again\x1b[0m".to_string();
+                Err(e) => {
+                    // A server that answered and gave no token is there: it
+                    // is the client it refused, as it refuses a key.
+                    let answered = e.strip_prefix("token endpoint returned ");
+                    self.setup_status = match answered {
+                        Some(status) if ["400", "401", "403"].iter().any(|code| status.starts_with(code)) => {
+                            "\x1b[31m✗ authentication failed, try again\x1b[0m".to_string()
+                        }
+                        Some(status) => format!("\x1b[33m⚠ server returned {}, try again\x1b[0m", status),
+                        None => "\x1b[31m✗ connection could not be established, try again\x1b[0m".to_string(),
+                    };
                     false
                 }
             }
@@ -4337,6 +4349,11 @@ fn main() {
     // Whether this run opens the prompt: no request, no file, no program
     // line. Only then may a dialog be shown; a batch never opens one.
     let wants_prompt = uri.is_empty() && args.all.is_none() && program_line.is_none();
+    // A `kill` at the prompt or in a dialog before it has to give the
+    // terminal back, not only one that comes during a streamed transfer.
+    if wants_prompt {
+        watch_for_interrupt();
+    }
 
     // A `-b` that names no host (`-b ""`, `-b http://`) is no `-b` at the
     // prompt: the session opens as it does without one, not on a form that
@@ -5212,6 +5229,12 @@ fn split_uri_outfile(uri: &str) -> (&str, &str) {
 /// that is outside quotes and parentheses, so `/x~where(name="a b")` is one
 /// URI. With unbalanced quotes or parentheses it ends at the first blank.
 fn uri_end(text: &str) -> usize {
+    uri_scan(text).0
+}
+
+/// Where the URI ends (`uri_end`), and whether it was left open: a quote or
+/// a parenthesis that is not closed, as while a value is still being typed.
+fn uri_scan(text: &str) -> (usize, bool) {
     let mut depth = 0i32;
     let mut in_string = false;
     let mut escape = false;
@@ -5232,14 +5255,14 @@ fn uri_end(text: &str) -> usize {
             '"' => in_string = true,
             '(' => depth += 1,
             ')' => depth -= 1,
-            c if c.is_whitespace() && depth <= 0 => return i,
+            c if c.is_whitespace() && depth <= 0 => return (i, false),
             _ => {}
         }
     }
     if in_string || depth > 0 {
-        return text.find(char::is_whitespace).unwrap_or(text.len());
+        return (text.find(char::is_whitespace).unwrap_or(text.len()), true);
     }
-    text.len()
+    (text.len(), false)
 }
 
 /// Whether the text ends in a ` >` or ` >>` that names no file. That is a
@@ -10192,8 +10215,9 @@ impl<R: IoRead> IoRead for UntilGivenUp<'_, R> {
     }
 }
 
-/// From the first partial file on, an interrupt removes what is half
-/// written before it ends the run: ctrl+c, and a `kill`. The run then ends
+/// From the first partial file on, and at the prompt from its start, an
+/// interrupt removes what is half written before it ends the run: ctrl+c,
+/// and a `kill`. The run then ends
 /// as it would have without this, killed by that signal, so a shell still
 /// reports 130 for ctrl+c. The terminal is restored first, as on every way
 /// out.
@@ -11952,8 +11976,14 @@ fn extract_identifier_pairs(s: &str) -> Vec<(String, String)> {
 /// The request is sent with these as they are: a `%XX` is not encoded again.
 fn identifier_segment(key: &str, value: &str) -> String {
     let mut out = format!("{}=", key);
-    for ch in value.chars() {
-        if ch.is_whitespace() || ch.is_control() || matches!(ch, '/' | '?' | '#' | '%') {
+    let chars: Vec<char> = value.chars().collect();
+    for (at, &ch) in chars.iter().enumerate() {
+        // A `"` opens a string to whoever reads the line, a `||` or a `&&`
+        // ends the request: the value would not stay in its segment. One
+        // `&` alone is nothing to the line and is left as it is.
+        let beside = |c: char| (at > 0 && chars[at - 1] == c) || chars.get(at + 1) == Some(&c);
+        let splits_line = ch == '"' || (matches!(ch, '&' | '|') && beside(ch));
+        if splits_line || ch.is_whitespace() || ch.is_control() || matches!(ch, '/' | '?' | '#' | '%') {
             let mut buf = [0u8; 4];
             for byte in ch.encode_utf8(&mut buf).bytes() {
                 out.push_str(&format!("%{:02X}", byte));
@@ -11980,6 +12010,12 @@ fn apply_identifier_index(before: &str, kv: &str) -> String {
     match before.rfind('/') {
         Some(p) => {
             let segment = &before[p + 1..];
+            // A query stays behind the path: the identifier goes in front
+            // of it, and its `=` does not make the collection a slot.
+            if let Some(query) = segment.find('?').filter(|at| !segment[..*at].contains(['~', '('])) {
+                let path_end = p + 1 + query;
+                return format!("{}{}", apply_identifier_index(&before[..path_end], kv), &before[path_end..]);
+            }
             // A segment counts as a replaceable identifier slot only when it's a
             // plain `key=value` — an `=` inside an operator expression (e.g.
             // `people~where(name=Joe)`) must not be replaced, only appended to.
@@ -12927,7 +12963,8 @@ fn looks_like_a_path(word: &str) -> bool {
 /// remaining steps; a plain line answered with an error status does not.
 fn run_program_line(state: &mut AppState, stdout: &mut io::Stdout, line: &str) -> io::Result<()> {
     // A fetch can take a moment; say what the prompt is busy with.
-    if matches!(classify_prompt_line(line, None), PromptLine::Program) && line.to_ascii_lowercase().contains("import") {
+    let imports = line.lines().any(|l| split_first_word(l.trim()).0.eq_ignore_ascii_case("import"));
+    if imports && matches!(classify_prompt_line(line, None), PromptLine::Program) {
         show_program_status(state, stdout, "importing…".to_string())?;
     }
     let program = match split_bulk_requests_in_session(line, typed_export(&state.config)) {
@@ -13614,21 +13651,27 @@ fn promote_method_prefix(state: &mut AppState, body_start: usize) -> i64 {
     if !segment.ends_with(char::is_whitespace) {
         return 0;
     }
-    let tokens: Vec<String> = segment.split_whitespace().map(str::to_string).collect();
     // Where the segment's first token begins, in absolute bytes.
     let token_start = seg_start + (segment.len() - segment.trim_start().len());
-    let (delta, promoted_uri): (i64, String) = match tokens.as_slice() {
-        [method, uri] if method.to_uppercase() == "GET" => {
-            // Replace the segment's method token (preserving its position) with PUT.
-            state.input.replace_range(token_start..token_start + method.len(), "PUT");
-            (3 - method.len() as i64, uri.clone())
-        }
-        [uri] if uri.starts_with('/') => {
-            // URI-only segment (implicit GET): prepend an explicit PUT.
-            state.input.insert_str(token_start, "PUT ");
-            (4, uri.clone())
-        }
-        _ => return 0,
+    let written = segment.trim();
+    let (first, rest) = split_first_word(written);
+    // The URI is what the parser reads as one: a blank in a quoted value or
+    // in the parentheses of an operator is part of it, and what is typed
+    // there is not the start of a body.
+    let whole_uri = |text: &str| !text.is_empty() && uri_scan(text) == (text.len(), false);
+    let (delta, promoted_uri): (i64, String) = if first.eq_ignore_ascii_case("GET") && whole_uri(rest) {
+        // Replace the segment's method token (preserving its position) with PUT.
+        let method_len = first.len();
+        let uri = rest.to_string();
+        state.input.replace_range(token_start..token_start + method_len, "PUT");
+        (3 - method_len as i64, uri)
+    } else if written.starts_with('/') && whole_uri(written) {
+        // URI-only segment (implicit GET): prepend an explicit PUT.
+        let uri = written.to_string();
+        state.input.insert_str(token_start, "PUT ");
+        (4, uri)
+    } else {
+        return 0;
     };
     state.method_auto_promoted = true;
     state.method_auto_promoted_uri = promoted_uri;
@@ -13682,28 +13725,30 @@ fn auto_revert_method_on_body_clear(state: &mut AppState) {
     }
     let seg_start = last_chain_segment_start(&state.input);
     let segment = &state.input[seg_start..];
-    let tokens: Vec<String> = segment.split_whitespace().map(str::to_string).collect();
-    if tokens.is_empty() {
+    let (first, rest) = split_first_word(segment.trim());
+    if first.is_empty() {
         state.method_auto_promoted = false;
         return;
     }
-    if tokens[0].to_uppercase() != "PUT" {
+    if !first.eq_ignore_ascii_case("PUT") {
         // The method changed some other way; the promotion no longer applies.
         state.method_auto_promoted = false;
         return;
     }
+    // The URI as the parser reads it, blanks inside it included.
+    let (uri, body) = rest.split_at(uri_end(rest));
     // The last segment no longer targets what was promoted — this PUT is not
     // the one the promotion created. Never touch it.
-    if tokens.len() < 2 || tokens[1] != state.method_auto_promoted_uri {
+    if uri.is_empty() || uri != state.method_auto_promoted_uri {
         state.method_auto_promoted = false;
         return;
     }
-    if tokens.len() > 2 {
+    if !body.trim().is_empty() {
         return; // body still present
     }
     // Replace the segment's PUT with GET (same length — cursor stays aligned).
     let token_start = seg_start + (segment.len() - segment.trim_start().len());
-    let put_len = tokens[0].len();
+    let put_len = first.len();
     state.input.replace_range(token_start..token_start + put_len, "GET");
     if seg_start == 0 {
         state.method = "GET".to_string();
@@ -14460,6 +14505,8 @@ fn handle_switch_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io
             // (`-i`, `--timeout`, `-f`, `--export`, streaming…). What it
             // holds now is the connection as it is stored.
             state.config.connection_overridden = false;
+            // A list still on its way is the other server's.
+            state.mapped_types_rx = None;
             if let Err(e) = connect(&mut state.config, &env, resolved_config) {
                 state.status_msg = e;
                 state.status_msg_at = Some(Instant::now());
@@ -14569,7 +14616,11 @@ fn build_curl(state: &AppState) -> Option<String> {
         accept.push_str(";skipNulls=false");
     }
 
-    let url = format!("{}{}", config.base_uri, resolve_request_path(&config.api_path, &state.prev_uri));
+    // The URL as the request had it: a `\` as `%5C`, and a blank or a quote
+    // encoded the way the client encodes it. curl takes a blank for the end
+    // of the URL.
+    let url = format!("{}{}", config.base_uri, backslashes_encoded(&resolve_request_path(&config.api_path, &state.prev_uri)));
+    let url = reqwest::Url::parse(&url).map(String::from).unwrap_or(url);
     let has_body = is_file_body || !state.prev_body.is_empty();
     // curl's HEAD is `-I`: after `-X HEAD` it waits for a body that never
     // comes. (With a body to send it has no HEAD at all; `-X` is the nearest.)
@@ -15216,15 +15267,16 @@ fn render<W: Write>(stdout: &mut W, state: &mut AppState) -> io::Result<()> {
         // to go missing on a narrow terminal. The standing hint is only
         // drawn where it fits ("ctrl+h for shortcuts" is 21 chars + 2 indent).
         if !state.status_msg.is_empty() {
-            let shown = if width >= 22 {
-                state.status_msg.clone()
-            } else {
-                fit_to_width(&visible_text(&state.status_msg), width.saturating_sub(2))
-            };
+            // One that fits is drawn as it is. One that does not is cut to
+            // the width at any width: drawn whole with wrapping off, its
+            // end would pile up in the last column.
+            let room = width.saturating_sub(2);
+            let fits = width >= 22 && visible_len(&state.status_msg) <= room;
+            let shown = if fits { state.status_msg.clone() } else { fit_to_width(&visible_text(&state.status_msg), room) };
             let msg_style = status_msg_styled(&shown, state.status_msg_at);
             queue!(stdout, Print(format!("  {}", msg_style)))?;
             if width >= 22 {
-                queue!(stdout, Print(streaming_indicator(state, visible_len(&state.status_msg))))?;
+                queue!(stdout, Print(streaming_indicator(state, visible_len(&shown))))?;
             }
         } else if width >= 22 {
             let hint = "ctrl+h for shortcuts";
@@ -16753,7 +16805,13 @@ fn pending_closer(input: &str, cursor_pos: usize) -> Option<(char, usize)> {
     // Only after a closing quote, a closing bracket, or a value that needs
     // neither: a literal or a number.
     if !before.ends_with(['"', '}', ']']) {
-        let word_start = before.rfind(|c: char| c.is_whitespace() || matches!(c, ',' | ':' | '[' | '{')).map_or(0, |at| at + 1);
+        // Behind the character, however many bytes it takes: a no-break
+        // space is a blank of two.
+        let word_start = before
+            .char_indices()
+            .rev()
+            .find(|(_, c)| c.is_whitespace() || matches!(c, ',' | ':' | '[' | '{'))
+            .map_or(0, |(at, c)| at + c.len_utf8());
         let word = &before[word_start..];
         if !matches!(word, "true" | "false" | "null") && serde_json::from_str::<serde_json::Number>(word).is_err() {
             return None;
@@ -20811,14 +20869,15 @@ mod tests {
         });
         assert_eq!(build_curl(&state), None, "nothing was sent yet");
 
-        // A body with an apostrophe, a URI with `$` and a backtick.
+        // A body with an apostrophe, a URI with `$` and a backtick. The
+        // backtick is in the URL as the request had it, encoded.
         state.prev_method = "PUT".to_string();
         state.prev_uri = "/people~where(name=$USER`id`)".to_string();
         state.prev_body = r#"{"name":"O'Brien"}"#.to_string();
         assert_eq!(
             build_curl(&state).unwrap(),
             concat!(
-                "curl -gfsSL -X PUT 'http://localhost:5000/api/v1/people~where(name=$USER`id`)'",
+                "curl -gfsSL -X PUT 'http://localhost:5000/api/v1/people~where(name=$USER%60id%60)'",
                 " -H 'Authorization: Basic Oms='",
                 " -H 'Accept: application/json'",
                 " -H 'Content-Type: application/json'",
@@ -21680,6 +21739,11 @@ mod tests {
             ("a\u{a0}b", "com.x.id=a%C2%A0b"),
             ("Åsa", "com.x.id=Åsa"),
             ("a=b&c", "com.x.id=a=b&c"),
+            // What would end the request or open a string on the line.
+            ("R&&D", "com.x.id=R%26%26D"),
+            ("a||b", "com.x.id=a%7C%7Cb"),
+            ("a|b", "com.x.id=a|b"),
+            ("6\" disc", "com.x.id=6%22%20disc"),
             ("", "com.x.id="),
         ];
         for (value, segment) in rows {
@@ -29114,5 +29178,110 @@ mod tests {
 
         // Something that is not a regular file is written as it stands.
         replace_outfile("/dev/null", "x").unwrap();
+    }
+
+    #[test]
+    fn a_blank_of_several_bytes_in_a_body_is_a_blank_to_the_closing_ghost() {
+        // A no-break space (option+space) and an ideographic space: the word
+        // behind one starts after all of its bytes.
+        for input in ["PUT /x {\u{a0}x", "PUT /x {\"a\":\u{a0}1", "PUT /x [\u{3000}true", "PUT /x {\"a\":\u{2003}nul"] {
+            let _ = pending_closer(input, char_len(input));
+            let _ = get_closing_brackets_ghost(input, char_len(input));
+        }
+        assert_eq!(pending_closer("PUT /x {\"a\":\u{a0}1", char_len("PUT /x {\"a\":\u{a0}1")), Some(('}', 1)));
+        assert_eq!(pending_closer("PUT /x [\u{3000}true", char_len("PUT /x [\u{3000}true")), Some((']', 1)));
+        assert_eq!(pending_closer("PUT /x {\u{a0}x", char_len("PUT /x {\u{a0}x")), None);
+    }
+
+    #[test]
+    fn a_blank_inside_a_uri_does_not_start_a_body() {
+        // Typed: the value of an operator, in quotes or in parentheses alone.
+        for (input, typed) in [
+            ("GET /people~where(name=\"Agent 0", '0'),
+            ("/people~where(name=\"a n", 'n'),
+            ("GET /people~where(name=a t", 't'),
+            ("GET /people~where(name=\"a b\" {", '{'),
+        ] {
+            let mut state = test_state();
+            state.input = input.to_string();
+            state.cursor_pos = char_len(input);
+            auto_promote_method_on_body_start(&mut state, typed);
+            assert_eq!(state.input, input);
+            assert!(!state.method_auto_promoted, "{input}");
+        }
+        // Behind the whole URI a body still makes it a PUT, and taking the
+        // body away makes it a GET again.
+        let mut state = test_state();
+        state.input = "GET /people~where(name=\"a b\") {".to_string();
+        state.cursor_pos = char_len(&state.input);
+        auto_promote_method_on_body_start(&mut state, '{');
+        assert_eq!(state.input, "PUT /people~where(name=\"a b\") {");
+        assert_eq!(state.method_auto_promoted_uri, "/people~where(name=\"a b\")");
+        state.input = "PUT /people~where(name=\"a b\") ".to_string();
+        auto_revert_method_on_body_clear(&mut state);
+        assert_eq!(state.input, "GET /people~where(name=\"a b\") ");
+        // With the body still there it stays a PUT.
+        let mut state = test_state();
+        state.method_auto_promoted = true;
+        state.method_auto_promoted_uri = "/people~where(name=\"a b\")".to_string();
+        state.input = "PUT /people~where(name=\"a b\") {\"x\":1}".to_string();
+        auto_revert_method_on_body_clear(&mut state);
+        assert_eq!(state.input, "PUT /people~where(name=\"a b\") {\"x\":1}");
+        assert!(state.method_auto_promoted);
+    }
+
+    #[test]
+    fn a_body_starts_behind_the_whole_uri() {
+        let line = r#"PUT /x~where(name="a b") {"k":1}"#;
+        assert_eq!(find_body_start(line), line.find('{'));
+        let line = r#"/x~where(name="a b") {"k":1}"#;
+        assert_eq!(find_body_start(line), line.find('{'));
+        let line = "PUT /people~where(a=b c) @bo";
+        assert_eq!(find_body_start(line), line.find('@'));
+        assert_eq!(find_body_start(r#"GET /x~where(name="a b")"#), None);
+        // While the value is still open the URI ends at its first blank, as
+        // the parser has it.
+        assert_eq!(find_body_start("GET /x~where(name=\"a b"), Some("GET /x~where(name=\"a ".len()));
+        // A file body behind such a URI is one to complete.
+        let line = r#"PUT /x~where(a="b c") @bo"#;
+        let ctx = extract_file_path_context(line, char_len(line)).expect("a file body");
+        assert_eq!(ctx.partial, "bo");
+    }
+
+    #[test]
+    fn an_identifier_is_placed_in_front_of_a_query() {
+        assert_eq!(apply_identifier_index("GET /people?active=true", "com.x.id=1"), "GET /people/com.x.id=1?active=true");
+        assert_eq!(apply_identifier_index("GET /people/?active=true", "com.x.id=1"), "GET /people/com.x.id=1?active=true");
+        assert_eq!(apply_identifier_index("GET /people/com.y.id=9?active=true", "com.x.id=1"), "GET /people/com.x.id=1?active=true");
+        // A `?` in an operator is not a query.
+        assert_eq!(apply_identifier_index("GET /people~where(name=a?b)", "com.x.id=1"), "GET /people~where(name=a?b)/com.x.id=1");
+    }
+
+    #[test]
+    fn a_pasted_identifier_stays_one_request() {
+        for value in ["R&&D", "a||b", "6\" disc", "a && b || c"] {
+            let line = apply_identifier_index("GET /people", &identifier_segment("com.x.id", value));
+            match classify_prompt_line(&line, None) {
+                PromptLine::Request(_) => {}
+                _ => panic!("{line} is not one request"),
+            }
+            let (method, uri, body) = parse_request_line(&line).unwrap();
+            assert_eq!((method.as_str(), body.as_str()), ("GET", ""), "{line}");
+            assert!(uri.starts_with("/people/com.x.id="), "{uri}");
+        }
+    }
+
+    #[test]
+    fn a_curl_command_has_the_url_the_request_had() {
+        let mut state = AppState::new(Config { base_uri: "http://localhost:5000".to_string(), api_key: "k".to_string(), ..Config::default() });
+        state.prev_method = "GET".to_string();
+        for uri in ["/people~where(name=\"James Bond\")", "/people~where(name=\"a \\\" b\")", "/people/com.x.id=Åsa", "/people?a=b c"] {
+            state.prev_uri = uri.to_string();
+            let parts = RequestParts { method: "GET".to_string(), uri: uri.to_string(), body: String::new(), outfile: None, streaming: false };
+            let sent = build_request(&state.config, &parts).unwrap().request.build().unwrap().url().to_string();
+            let curl = build_curl(&state).unwrap();
+            assert!(curl.contains(&format!(" {} ", sh_quote(&sent))), "{uri}: {curl}\nsent {sent}");
+            assert!(!sent.contains(' ') && !sent.contains('\\'), "{sent}");
+        }
     }
 }

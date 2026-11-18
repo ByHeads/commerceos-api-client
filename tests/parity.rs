@@ -232,7 +232,10 @@ fn answer(
         // used; every later one is good. The client `once` gets no second.
         let nth = tokens.fetch_add(1, Ordering::SeqCst);
         let token = if nth == 0 { "stale" } else { "fresh" };
-        if body.contains("client_id=nokey") {
+        if body.contains("client_id=refused") {
+            // A client the server does not know.
+            ("401 Unauthorized", r#"{"error":"invalid_client"}"#.to_string())
+        } else if body.contains("client_id=nokey") {
             // A client whose token is let in nowhere.
             ("200 OK", r#"{"access_token":"nokey","expires_in":3600}"#.to_string())
         } else if nth > 0 && body.contains("client_id=once") {
@@ -6766,6 +6769,13 @@ fn the_connection_form_takes_a_key_a_token_or_a_client() {
     keys_then(&mut prompt, "cidx\x7f\r", "Type your client secret");
     keys_then(&mut prompt, "\x1b", "Type your OAuth2 client ID");
     keys_then(&mut prompt, "\r", "Type your client secret");
+    // A client the server refuses is said to be that, not a server that
+    // is not there, and the secret is typed again from nothing.
+    keys_then(&mut prompt, "\x1b", "Type your OAuth2 client ID");
+    keys_then(&mut prompt, "\x7f\x7f\x7frefused\r", "Type your client secret");
+    keys_then(&mut prompt, "nope\r", "authentication failed, try again");
+    keys_then(&mut prompt, "\x1b", "Type your OAuth2 client ID");
+    keys_then(&mut prompt, "\x7f\x7f\x7f\x7f\x7f\x7f\x7fcid\r", "Type your client secret");
     keys_then(&mut prompt, "secret\r", "ctrl+s to save this connection");
     let authorization = get(&mut prompt, "GET /with-client");
     assert!(authorization.starts_with("Bearer "), "{authorization}");
@@ -9796,4 +9806,67 @@ fn a_piped_body_is_sent_as_it_is_and_a_body_argument_is_read() {
     }
     let got = run_in(&server, dir.path(), &["PUT", "/x", BODY]);
     assert_eq!((got.code, got.sent), (Some(0), vec!["PUT /x {\n  \n  \"name\": \"a # b\",\n  \"note\": \"two\\nlines\"\n}".to_string()]), "{}", got.stderr);
+}
+
+/// A `kill` at a prompt that is doing nothing gives the terminal back as
+/// the shell had it: cooked, bracketed paste off, wrapping on. Not only a
+/// kill during a streamed transfer does.
+#[cfg(unix)]
+#[test]
+fn a_kill_at_an_idle_prompt_gives_the_terminal_back() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = pty::Prompt::open(api(server.port, dir.path()));
+    prompt.wait_ready(Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(500));
+    assert!(!prompt.is_cooked(), "the prompt is not in raw mode");
+    prompt.signal(libc::SIGTERM);
+    assert_eq!(ended(&mut prompt), Some(false));
+    assert!(prompt.is_cooked(), "the terminal is left in raw mode");
+    let last = |code: &str| prompt.screen.rfind(code);
+    assert!(last("\x1b[?2004l") > last("\x1b[?2004h"), "bracketed paste is left on");
+    assert!(last("\x1b[?7h") > last("\x1b[?7l"), "wrapping is left off");
+    assert!(last("\x1b[?7h").is_some());
+}
+
+/// A notice that is wider than the terminal is cut to it, at any width: it
+/// ends in `…` inside the last column and takes one row.
+#[cfg(unix)]
+#[test]
+fn a_notice_wider_than_the_terminal_is_cut_to_it() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    for cols in [40usize, 60] {
+        let mut prompt = pty::Prompt::open_sized(api(server.port, dir.path()), cols as u16);
+        prompt.wait_ready(Duration::from_secs(15));
+        prompt.pump(Duration::from_millis(500));
+        let (sent, _) = run_pasted(&mut prompt, &server, "assert GET /missing/a-long-path-that-does-not-fit-the-row-at-all/and-more/and-more-of-it~count");
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let rows = pty::rows(&prompt.screen, cols);
+        let notice = rows.iter().rev().find(|row| row.contains("assertion failed")).unwrap_or_else(|| panic!("no notice:\n{}", rows.join("\n")));
+        assert!(notice.trim_end().ends_with('…'), "at {cols}: {notice:?}");
+        assert!(notice.trim_end().chars().count() <= cols, "at {cols}: {notice:?}");
+        assert_eq!(ruler_rows(&rows).len(), 2, "at {cols}:\n{}", rows.join("\n"));
+    }
+}
+
+/// `importing…` is said for a line that imports, not for one that merely
+/// holds the word.
+#[cfg(unix)]
+#[test]
+fn importing_is_said_only_for_an_import() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    prepare(dir.path());
+    let mut prompt = pty::Prompt::open(api(server.port, dir.path()));
+    prompt.wait_ready(Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(500));
+    let (sent, shown) = run_pasted(&mut prompt, &server, "sleep 100ms while not GET /imports~count");
+    assert_eq!(sent, ["GET /imports~count"]);
+    assert!(!shown.contains("importing"), "{shown}");
+    let (sent, shown) = run_pasted(&mut prompt, &server, "POST /imports {\"source\":\"erp\"}\rGET /b");
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert!(!shown.contains("importing"), "{shown}");
+    let (_, shown) = run_pasted(&mut prompt, &server, "import dir lib { \"path\": \"libdir\" }\rlib/d.api");
+    assert!(shown.contains("importing…"), "{shown}");
 }
