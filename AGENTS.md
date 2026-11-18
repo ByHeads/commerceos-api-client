@@ -419,6 +419,9 @@ import archive cl {
   never sent there, and the token is never sent to the API. Keep the token
   itself out of the file: `token_env` takes a variable name, and a missing
   variable is an error.
+- A redirect is followed to another host over `https` (a release is served
+  that way). Onto this machine (`localhost`, `127.0.0.1`) only when the `url`
+  itself names this machine: otherwise `redirected to this machine`.
 - Only files and directories are unpacked. Links are skipped, an entry named
   outside the archive (`../x`) is an error, and so is an archive that unpacks
   to more than 1 GB or to more than 100,000 files and directories. A download

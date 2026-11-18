@@ -7931,6 +7931,29 @@ impl io::Write for CappedDownload {
     }
 }
 
+/// Why a redirect of an archive download is not followed, if it is not.
+/// `asked` is the URL the import names, `to` where the server sends the
+/// client, `hops` how many requests were made so far.
+///
+/// Another host is fine when it is reached over https: that is how a
+/// release is served (`github.com` to `codeload.github.com`). This machine
+/// is only for a download that was asked of this machine: a server
+/// elsewhere may not point the client at what listens here, which is also
+/// what keeps a file imported from a host from importing "from this
+/// machine" through a redirect.
+fn archive_redirect_refusal(asked: Option<&reqwest::Url>, to: &reqwest::Url, hops: usize) -> Option<&'static str> {
+    if hops > 10 {
+        return Some("too many redirects");
+    }
+    if is_loopback_url(to) {
+        return match asked.is_some_and(is_loopback_url) {
+            true => None,
+            false => Some("redirected to this machine"),
+        };
+    }
+    (to.scheme() != "https").then_some("redirected to a url that is not https")
+}
+
 /// `download_archive` with the size the download may have given.
 fn download_archive_within(url: &str, token: Option<&str>, limit: u64) -> Result<Vec<u8>, FetchFailure> {
     let answered = |reason: String| FetchFailure { reason, unanswered: false };
@@ -7958,13 +7981,10 @@ fn download_archive_within(url: &str, token: Option<&str>, limit: u64) -> Result
     let client = client_builder()
         .timeout(Duration::from_secs(300))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            let secure = attempt.url().scheme() == "https" || is_loopback_url(attempt.url());
-            if attempt.previous().len() > 10 {
-                attempt.error("too many redirects")
-            } else if !secure {
-                attempt.error("redirected to a url that is not https")
-            } else {
-                attempt.follow()
+            let asked = attempt.previous().first().cloned();
+            match archive_redirect_refusal(asked.as_ref(), attempt.url(), attempt.previous().len()) {
+                Some(why) => attempt.error(why),
+                None => attempt.follow(),
             }
         }))
         .build()
@@ -8207,7 +8227,9 @@ fn fetch_git_import(url: &str, git_ref: &str) -> Result<FetchedImport, String> {
 /// Whether `url` is a `file://` repository that is not there: the remote
 /// that did not answer, for a disk that is not mounted or a share that is away.
 fn git_file_remote_is_gone(url: &str) -> bool {
-    url.strip_prefix("file://").is_some_and(|path| !std::path::Path::new(path).exists())
+    // `file://localhost/path` names the same file as `file:///path`.
+    let path_of = |rest: &'static str| url.strip_prefix(rest).filter(|path| path.starts_with('/'));
+    path_of("file://localhost").or(path_of("file://")).is_some_and(|path| !std::path::Path::new(path).exists())
 }
 
 /// `path` with its `.` and `..` components resolved by name alone.
@@ -29417,5 +29439,73 @@ mod tests {
         // follows is kept.
         assert_eq!(tabbed("GET /pe^~take(5)"), "GET /people^~take(5)");
         assert_eq!(tabbed("GET /pe^/find"), "GET /people^/find");
+    }
+
+    #[test]
+    fn an_archive_redirect_onto_this_machine_is_only_for_a_download_from_it() {
+        let url = |text: &str| reqwest::Url::parse(text).unwrap();
+        let refusal = |asked: &str, to: &str| archive_redirect_refusal(Some(&url(asked)), &url(to), 1);
+        // A release is served from another host, over https.
+        assert_eq!(refusal("https://github.com/a/b/archive/1.tar.gz", "https://codeload.github.com/a/b/tar.gz/1"), None);
+        assert_eq!(refusal("http://127.0.0.1:5000/moved", "http://127.0.0.1:5000/lib.tar.gz"), None);
+        assert_eq!(refusal("http://localhost:5000/moved", "https://example.com/lib.tar.gz"), None);
+        // A server elsewhere does not send the client to what listens here.
+        for here in ["http://127.0.0.1:8080/x.tar.gz", "https://localhost/x.tar.gz", "http://[::1]:9/x"] {
+            assert_eq!(refusal("https://example.com/r", here), Some("redirected to this machine"), "{here}");
+        }
+        assert_eq!(refusal("https://example.com/r", "http://example.com/r"), Some("redirected to a url that is not https"));
+        assert_eq!(refusal("http://127.0.0.1:5000/moved-off", "http://example.com/r"), Some("redirected to a url that is not https"));
+        assert_eq!(archive_redirect_refusal(Some(&url("https://a.example/r")), &url("https://a.example/r"), 11), Some("too many redirects"));
+        assert_eq!(archive_redirect_refusal(None, &url("http://127.0.0.1/x"), 1), Some("redirected to this machine"));
+    }
+
+    #[test]
+    fn a_file_remote_that_is_gone_is_one_in_either_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let there = dir.path().display().to_string();
+        assert!(!git_file_remote_is_gone(&format!("file://{there}")));
+        assert!(!git_file_remote_is_gone(&format!("file://localhost{there}")));
+        assert!(git_file_remote_is_gone(&format!("file://{there}/gone")));
+        assert!(git_file_remote_is_gone(&format!("file://localhost{there}/gone")));
+        // Not a file of this machine at all: nothing is said about it.
+        assert!(!git_file_remote_is_gone("https://example.com/repo"));
+        assert!(!git_file_remote_is_gone("file://otherhost/repo"));
+    }
+
+    #[test]
+    fn a_hard_link_and_a_device_in_a_tar_are_not_unpacked() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = tar_gz(&[("a.api", "GET /a\n")], |builder| {
+            let mut link = tar::Header::new_gnu();
+            link.set_entry_type(tar::EntryType::Link);
+            link.set_size(0);
+            builder.append_link(&mut link, "hosts", "/etc/hosts").unwrap();
+            for (kind, name) in [(tar::EntryType::Fifo, "pipe"), (tar::EntryType::Char, "tty")] {
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(kind);
+                header.set_size(0);
+                header.set_mode(0o644);
+                header.set_path(name).unwrap();
+                header.set_cksum();
+                builder.append(&header, io::empty()).unwrap();
+            }
+        });
+        let dest = dir.path().join("out");
+        unpack_archive(&bytes, &dest).unwrap();
+        assert!(dest.join("a.api").is_file());
+        for name in ["hosts", "pipe", "tty"] {
+            assert!(fs::symlink_metadata(dest.join(name)).is_err(), "{name} was unpacked");
+        }
+    }
+
+    #[test]
+    fn an_include_pattern_that_matches_nothing_is_said() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("lib")).unwrap();
+        let err = split_bulk_requests("GET /a\nnope/*.api\n", Some(dir.path())).unwrap_err();
+        assert!(err.contains("no files match include glob") && err.contains("nope/*.api"), "{err}");
+        // Through an alias too.
+        let err = split_bulk_requests("import dir cl { \"path\": \"lib\" }\ncl/none-*.api\n", Some(dir.path())).unwrap_err();
+        assert!(err.contains("no files match include glob"), "{err}");
     }
 }

@@ -2473,3 +2473,100 @@ fn a_tilde_path_of_an_import_is_in_the_home_directory() {
         assert!(ran.stdout.contains(&format!("import own {}", home.join("libs/own").display())), "{import}: {}", ran.stdout);
     }
 }
+
+/// A directory inside a repository that came from a host is of that host
+/// too: a file reached through `import dir` there imports from nowhere else
+/// and names no token, as the file that imported the directory could not.
+#[test]
+fn a_directory_inside_an_import_from_a_host_is_of_that_host() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", fixture_archive());
+    let repos = dir.join("repos");
+    let other = import_git("x", "https://other.invalid/team/repo", "main");
+    let token = "import archive x { \"url\": \"https://origin.invalid/lib.tar.gz\", \"token_env\": \"IMPORT_TEST_TOKEN\" }\n";
+    commit(
+        &repos.join("team/lib"),
+        &[
+            ("via-dir.api", b"import dir inner { \"path\": \"sub\" }\nGET /in-lib\ninner/ok.api\n" as &[u8]),
+            ("other.api", b"import dir inner { \"path\": \"sub\" }\ninner/other.api\n"),
+            ("token.api", b"import dir inner { \"path\": \"sub\" }\ninner/token.api\n"),
+            ("sub/ok.api", b"GET /in-sub\n"),
+            ("sub/other.api", format!("{other}GET /never\n").as_bytes()),
+            ("sub/token.api", format!("{token}GET /never\n").as_bytes()),
+        ],
+        None,
+    );
+    let run = |file: &str| {
+        let batch = format!("{}GET /own\nlib/{file}\n", import_git("lib", "https://origin.invalid/team/lib", "main"));
+        std::fs::write(dir.join("batch.api"), batch).unwrap();
+        let mut cmd = api(&dir, server.port);
+        cmd.args(["-sa", "batch.api"]).env("IMPORT_TEST_TOKEN", "s3cret-token");
+        origin_is(&mut cmd, &repos);
+        finish(cmd, "")
+    };
+
+    let ran = run("via-dir.api");
+    assert!(ran.ok, "{}", ran.stderr);
+    assert_eq!(server.sent(), ["GET /own", "GET /in-lib", "GET /in-sub"]);
+
+    let ran = run("other.api");
+    assert!(!ran.ok);
+    let says = "a file imported from origin.invalid can import only from origin.invalid, not https://other.invalid/team/repo";
+    assert!(ran.stderr.contains(says), "{}", ran.stderr);
+    assert_eq!(server.sent(), Vec::<String>::new());
+
+    let ran = run("token.api");
+    assert!(!ran.ok);
+    assert!(ran.stderr.contains("an imported file can't name a `token_env`"), "{}", ran.stderr);
+    assert_eq!(server.sent(), Vec::<String>::new());
+}
+
+/// A pattern can match `..` (`.?`, `.*`): what it finds above the import is
+/// outside it like anything else, for a body and for an include, in a
+/// directory, a repository and an archive.
+#[test]
+fn a_pattern_that_matches_the_directory_above_does_not_leave_the_import() {
+    let (_guard, dir) = temp();
+    let server = Server::start("1", Vec::new());
+    std::fs::write(dir.join("secret.json"), r#"{"secret":"outside"}"#).unwrap();
+    std::fs::write(dir.join("outside.api"), "GET /outside\n").unwrap();
+    let files = [
+        ("deep/body.api", "PUT /x @.?/.?/secret.json\n"),
+        ("deep/star.api", "PUT /x @.*/.*/secret.json\n"),
+        ("deep/include.api", ".?/.?/outside.api\n"),
+        ("deep/ok.api", "GET /ok\n"),
+    ];
+    let import = own_import(&dir, &files);
+    // The same files as a repository, checked out in a cache beside the
+    // files that are not its own.
+    let repo = dir.join("repo");
+    commit(&repo, &files.iter().map(|(name, text)| (*name, text.as_bytes())).collect::<Vec<_>>(), Some("1.0"));
+    let imports = [("dir", import), ("git", import_git("lib", &repo_url(&repo), "1.0"))];
+    for (kind, import) in &imports {
+        let run = |file: &str| run_batch(&dir, server.port, "-sa", &format!("{import}\nGET /first\nlib/deep/{file}.api\n"));
+        let ran = run("ok");
+        assert!(ran.ok, "{kind}: {}", ran.stderr);
+        assert_eq!(server.sent(), ["GET /first", "GET /ok"], "{kind}");
+        // A checkout is two directories down in the cache: the same files
+        // stand two above `deep/` there as they do beside the directory.
+        if *kind == "git" {
+            let checkouts: Vec<PathBuf> =
+                std::fs::read_dir(dir.join(".import-cache")).unwrap().map(|entry| entry.unwrap().path()).filter(|path| path.is_dir()).collect();
+            assert!(!checkouts.is_empty());
+            for above in checkouts {
+                std::fs::write(above.join("secret.json"), r#"{"secret":"outside"}"#).unwrap();
+                std::fs::write(above.join("outside.api"), "GET /outside\n").unwrap();
+            }
+        }
+        for (file, says) in [
+            ("body", "`@.?/.?/secret.json` must be a relative path inside the import"),
+            ("star", "`@.*/.*/secret.json` must be a relative path inside the import"),
+            ("include", "include leaves the import: .?/.?/outside.api"),
+        ] {
+            let ran = run(file);
+            assert!(!ran.ok, "{kind} {file}");
+            assert!(ran.stderr.contains(says), "{kind} {file}: {}", ran.stderr);
+            assert_eq!(server.sent(), Vec::<String>::new(), "{kind} {file}");
+        }
+    }
+}
