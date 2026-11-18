@@ -8335,6 +8335,80 @@ fn a_line_taller_than_the_terminal_is_shown_around_the_cursor() {
     prompt.send(END.as_bytes());
     prompt.pump(Duration::from_millis(150));
     assert_eq!(entered(&mut prompt, &server), [line]);
+    // The answer stands right over the command area: room is made for the
+    // rows the line is shown on, not for every row it would take whole.
+    prompt.pump(Duration::from_millis(400));
+    let rows = pty::rows(&prompt.screen, COLS);
+    let rulers = ruler_rows(&rows);
+    let top = rulers[rulers.len() - 2];
+    let answer = rows[..top].iter().rposition(|row| !row.trim().is_empty()).expect("an answer");
+    assert!(rows[..=answer].iter().any(|row| row.contains("HTTP/1.1 200")), "{}", rows.join("\n"));
+    assert_eq!(top - answer, 2, "the answer ends on row {answer}, the ruler is on row {top}\n{}", rows.join("\n"));
+}
+
+/// In a block of several lines the hint line belongs to the next request
+/// within the moment, so what a request has to say about its data is also
+/// a note under its status line, where it stays. One request alone says it
+/// in the hint line, once.
+#[cfg(unix)]
+#[test]
+fn a_warning_about_the_data_stays_under_its_request_in_a_block() {
+    const MASKED: &str = "↳ warning: response had masked data, left out at secret";
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = open_prompt(&server, dir.path(), &["--export", "a.b.c"]);
+
+    let (sent, shown) = run_pasted(&mut prompt, &server, "GET /keyed > k1.json\rGET /a > k2.json\rGET /notutf8\rGET /b");
+    assert_eq!(sent, ["GET /keyed", "GET /a", "GET /notutf8", "GET /b"]);
+    assert_eq!(shown.matches(MASKED).count(), 1, "{shown}");
+    assert_eq!(shown.matches("↳ response had bytes that are not valid").count(), 1, "{shown}");
+    // Each under the status line of the request it is about.
+    let rows = pty::rows(&prompt.screen, 200);
+    let under = |request: &str| {
+        let at = rows.iter().position(|row| row.trim_end() == request).unwrap_or_else(|| panic!("{request}\n{}", rows.join("\n")));
+        let status = (at..rows.len()).find(|&row| rows[row].contains("HTTP/1.1 200")).expect("a status line");
+        rows[status + 1..].iter().find(|row| row.starts_with('↳') || row.trim().is_empty()).cloned().unwrap_or_default()
+    };
+    assert_eq!(under("GET /keyed > k1.json").trim_end(), MASKED, "{}", rows.join("\n"));
+    assert!(under("GET /notutf8").starts_with("↳ response had bytes"), "{}", rows.join("\n"));
+    assert_eq!(under("GET /a > k2.json").trim(), "", "{}", rows.join("\n"));
+
+    // In a chain too, which is a program of one line.
+    let (sent, shown) = run_pasted(&mut prompt, &server, "GET /keyed > k3.json && GET /a");
+    assert_eq!(sent, ["GET /keyed", "GET /a"]);
+    assert_eq!(shown.matches(MASKED).count(), 1, "{shown}");
+    // One request alone: the hint line, and no note.
+    let (_, shown) = run_pasted(&mut prompt, &server, "GET /keyed > k4.json");
+    assert!(shown.contains("warning: response had masked data") && !shown.contains('↳'), "{shown}");
+}
+
+/// ctrl+y always answers: with what it copied, or with why it copied
+/// nothing. Before any request there is none, and a glob body is no one
+/// command.
+#[cfg(unix)]
+#[test]
+fn ctrl_y_says_why_it_copied_nothing() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.json"), "{}").unwrap();
+    let mut prompt = open_prompt(&server, dir.path(), &[]);
+
+    let mark = prompt.screen.len();
+    prompt.send(b"\x19");
+    let said = pump_until(&mut prompt, Duration::from_secs(4), |p| pty::plain(&p.screen[mark..]).contains("no request to copy yet"));
+    assert!(said, "{}", pty::plain(&prompt.screen[mark..]));
+
+    let (sent, _) = run_pasted(&mut prompt, &server, "PUT /x @*.json");
+    assert_eq!(sent, ["PUT /x [{}]"]);
+    let mark = prompt.screen.len();
+    prompt.send(b"\x19");
+    let said = pump_until(&mut prompt, Duration::from_secs(4), |p| {
+        pty::plain(&p.screen[mark..]).contains("a glob body can't be written as a curl command")
+    });
+    assert!(said, "{}", pty::plain(&prompt.screen[mark..]));
+    // The command area is as it was: two rulers, the hint under the second.
+    let rows = pty::rows(&prompt.screen, 200);
+    assert_eq!(ruler_rows(&rows).len(), 2, "{}", rows.join("\n"));
 }
 
 /// The last row of the screen that holds `text`.

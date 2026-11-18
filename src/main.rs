@@ -3048,8 +3048,12 @@ impl PickerState {
     fn move_down(&mut self) {
         // Find current position in filtered list and move down
         if let Some(pos) = self.filtered_indices.iter().position(|&i| i == self.selected) {
-            if pos < self.filtered_indices.len() - 1 {
-                self.selected = self.filtered_indices[pos + 1];
+            // While a search is typed its line stands where "+ Add new" is,
+            // and is not a row to move onto: Enter there would open the
+            // form for a new connection instead of connecting to a match.
+            let next = self.filtered_indices.get(pos + 1).copied();
+            if let Some(next) = next.filter(|&i| self.search_query.is_empty() || !self.is_add_row(i)) {
+                self.selected = next;
             }
         }
     }
@@ -10485,6 +10489,14 @@ fn print_output_and_rerender(
 
 /// `print_output_and_rerender`, first taking back `reclaim` rows of what was
 /// printed last — the blank line closing a block, when a note is to go there.
+/// The rows the input line is drawn on: the rows it wraps to, and no more
+/// than `render` shows of a line taller than the terminal. What is printed
+/// to make room for the command area is this many rows: more would stand
+/// as blank rows between an answer and the prompt.
+fn input_rows_shown(state: &AppState) -> u16 {
+    visual_line_count(&expand_tabs(&state.input), state.width as usize).min(state.height.saturating_sub(5).max(3))
+}
+
 fn print_above_input(
     state: &mut AppState,
     stdout: &mut io::Stdout,
@@ -10502,7 +10514,7 @@ fn print_above_input(
     // Raw mode needs \r\n line endings.
     let raw_output = display_output.replace('\n', "\r\n");
     queue!(stdout, Print(&raw_output))?;
-    let input_lines = visual_line_count(&expand_tabs(&state.input), state.width as usize);
+    let input_lines = input_rows_shown(state);
     for _ in 0..(2 + input_lines) {
         queue!(stdout, Print("\r\n"))?;
     }
@@ -12263,7 +12275,7 @@ fn redraw_after_resize(state: &mut AppState, stdout: &mut io::Stdout, w: u16, h:
 
     // Placeholder lines for input area (match actual input height). With
     // the shortcuts open it is their rows that the redraw moves up over.
-    let input_lines = state.input.split('\n').count() as u16;
+    let input_lines = input_rows_shown(state);
     let placeholder_count = if state.show_help {
         help_line_count(state)
     } else {
@@ -12569,15 +12581,12 @@ fn handle_key_event(
 
         // Copy curl
         (KeyModifiers::CONTROL, KeyCode::Char('y')) => {
-            let said = match curl_refusal(state) {
-                Some(why) => Some(why),
-                None => copy_curl(state).then_some("curl command copied to clipboard"),
+            state.status_msg = match copy_curl(state) {
+                Ok(()) => "curl command copied to clipboard".to_string(),
+                Err(why) => why,
             };
-            if let Some(said) = said {
-                state.status_msg = said.to_string();
-                state.status_msg_at = Some(std::time::Instant::now());
-                render(stdout, state)?;
-            }
+            state.status_msg_at = Some(std::time::Instant::now());
+            render(stdout, state)?;
         }
 
         // The settings menu (ctrl+t)
@@ -12601,7 +12610,7 @@ fn handle_key_event(
                 out!("\x1b[2J\x1b[3J\x1b[H");
                 io::stdout().flush().ok();
                 print_splash_with_width(&state.config, state.width);
-                let input_lines = state.input.split('\n').count() as u16;
+                let input_lines = input_rows_shown(state);
                 for _ in 0..(2 + input_lines) { outln!(); }
                 io::stdout().flush().ok();
                 terminal::enable_raw_mode()?;
@@ -12622,7 +12631,7 @@ fn handle_key_event(
                 for block in &state.output_history {
                     out!("{}", block.render(state.width as usize));
                 }
-                let input_lines = state.input.split('\n').count() as u16;
+                let input_lines = input_rows_shown(state);
                 for _ in 0..(2 + input_lines) { outln!(); }
                 io::stdout().flush().ok();
                 terminal::enable_raw_mode()?;
@@ -13848,13 +13857,24 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     }
 
     // Said last, so it is what the hint line shows under the response.
+    // In a file, a pasted block or a chain the next request has the hint
+    // line within the moment, so there it is also a note under this one's
+    // status line, where it stays.
+    let in_program = state.chain_input.is_some();
     if let Some(note) = export_note.filter(|_| !state.config.quiet && !state.config.check_only) {
+        if in_program {
+            block.push_note(&format!("↳ {}", note).dimmed().to_string());
+        }
         state.status_msg = note;
         state.status_msg_at = Some(Instant::now());
     }
     // And this after it: what is shown or written is not what was sent.
     if let Some(charset) = progress.replaced().filter(|_| !state.config.quiet && !state.config.check_only) {
-        state.status_msg = format!("response had bytes that are not valid {}, now U+FFFD", charset);
+        let note = format!("response had bytes that are not valid {}, now U+FFFD", charset);
+        if in_program {
+            block.push_note(&format!("↳ {}", note).dimmed().to_string());
+        }
+        state.status_msg = note;
         state.status_msg_at = Some(Instant::now());
     }
 
@@ -14121,6 +14141,13 @@ fn show_program_status(state: &mut AppState, stdout: &mut io::Stdout, msg: Strin
 /// Enter with the cursor inside the brackets of a body, under `-x`: a body on
 /// one line is laid out over several, and the cursor gets a line of its own
 /// at the depth it is at.
+/// How many brackets are open at the cursor, a bracket in a comment of the
+/// body being none: the depth Enter indents to. Never below zero, which a
+/// line with more closers than openers before the cursor would give.
+fn body_depth_at(input: &str, cursor_pos: usize) -> usize {
+    bracket_depth_at(&without_body_comments(input), cursor_pos).max(0) as usize
+}
+
 fn enter_inside_brackets(state: &mut AppState) {
     // The body the cursor is in, and nothing else of the line: a `> outfile`
     // behind it and the other requests of a chain are not JSON to lay out.
@@ -14129,7 +14156,9 @@ fn enter_inside_brackets(state: &mut AppState) {
         .filter(|span| span.start < span.end && (span.start..=span.end).contains(&cursor_byte));
     if let Some(span) = span {
         let body = &state.input[span.start..span.end];
-        if !body.contains('\n') {
+        // A body with a comment in it is not laid out anew: the layout reads
+        // JSON, and would break a comment's line at its first comma.
+        if !body.contains('\n') && without_body_comments(body) == body {
             // Body is single-line — reformat it to multi-line
             let prefix = state.input[..span.start].trim_end();
             let rest = state.input[span.end..].to_string();
@@ -14153,7 +14182,7 @@ fn enter_inside_brackets(state: &mut AppState) {
             let on_blank_indented_line = line_before_cursor.chars().all(|c| c == ' ');
 
             if !on_blank_indented_line {
-                let depth = bracket_depth_at(&state.input, state.cursor_pos) as usize;
+                let depth = body_depth_at(&state.input, state.cursor_pos);
                 let last_nws = state.input[..byte_idx].chars().rev()
                     .find(|c| !c.is_whitespace());
 
@@ -14173,7 +14202,7 @@ fn enter_inside_brackets(state: &mut AppState) {
 
             } else {
             // Body is already multi-line — normal Enter behavior
-            let depth = bracket_depth_at(&state.input, state.cursor_pos) as usize;
+            let depth = body_depth_at(&state.input, state.cursor_pos);
             let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
 
             let char_before = if state.cursor_pos > 0 {
@@ -14185,8 +14214,13 @@ fn enter_inside_brackets(state: &mut AppState) {
                 (Some('{'), Some('}')) | (Some('['), Some(']'))
             );
 
-            let last_nws = state.input[..byte_idx].chars().rev()
-                .find(|c| !c.is_whitespace());
+            // What the line ends in, a comment behind it not counted:
+            // `"a": 1, // note` ends in its comma.
+            let last_nws = without_body_comments(&state.input)
+                .chars()
+                .take(state.cursor_pos)
+                .filter(|c| !c.is_whitespace())
+                .last();
 
             if between_brackets {
                 let indent = "  ".repeat(depth);
@@ -14212,7 +14246,7 @@ fn enter_inside_brackets(state: &mut AppState) {
             }
     } else {
         // No body found — just insert newline
-        let depth = bracket_depth_at(&state.input, state.cursor_pos) as usize;
+        let depth = body_depth_at(&state.input, state.cursor_pos);
         let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
         let indent = "  ".repeat(depth);
         let insert = format!("\n{}", indent);
@@ -15902,8 +15936,22 @@ fn curl_refusal(state: &AppState) -> Option<&'static str> {
     is_glob.then_some("a glob body can't be written as a curl command")
 }
 
-fn copy_curl(state: &AppState) -> bool {
-    build_curl(state).is_some_and(|cmd| copy_to_clipboard(&cmd).is_ok())
+/// Copy the last request as a curl command, with `copy` as the clipboard.
+/// `Err` is what the hint line says in the place of "copied": that there is
+/// no request yet, that this one can't be written as a command, or why the
+/// clipboard did not take it.
+fn copy_curl_with(state: &AppState, copy: impl FnOnce(&str) -> Result<(), String>) -> Result<(), String> {
+    if let Some(why) = curl_refusal(state) {
+        return Err(why.to_string());
+    }
+    let Some(command) = build_curl(state) else {
+        return Err("no request to copy yet".to_string());
+    };
+    copy(&command).map_err(|e| format!("could not copy to the clipboard: {}", e))
+}
+
+fn copy_curl(state: &AppState) -> Result<(), String> {
+    copy_curl_with(state, copy_to_clipboard)
 }
 
 fn render_input_content(state: &mut AppState, width: usize) -> (String, u16, String) {
@@ -28749,8 +28797,12 @@ mod tests {
         assert_eq!(picker.selected, 1);
         picker.move_up();
         assert_eq!(picker.selected, 1);
-        picker.move_down();
-        assert_eq!(picker.selected, 2);
+        // Down stops at the last match: the search line is no row.
+        for _ in 0..3 {
+            picker.move_down();
+            assert_eq!(picker.selected, 2);
+        }
+        assert_eq!(picker.selected_env().unwrap().name, "staging-eu");
         picker.add_search_char('z');
         assert_eq!(picker.filtered_indices, [3]);
         assert_eq!(picker.selected, 3);
@@ -29110,6 +29162,58 @@ mod tests {
             let json = |body: &str| serde_json::from_str::<Value>(body).unwrap();
             assert_eq!((&before.0, &before.1, json(&before.2)), (&after.0, &after.1, json(&after.2)), "{line}");
         }
+    }
+
+    #[test]
+    fn enter_in_a_body_reads_no_bracket_in_a_comment() {
+        // More closers in a comment than the body has open: the indent is
+        // that of the brackets that are open, not a number below zero.
+        assert_eq!(entered_in_brackets("PUT /x {\n  \"a\": 1 // }}^"), "PUT /x {\n  \"a\": 1 // }}\n");
+        assert_eq!(entered_in_brackets("PUT /x {\n  \"a\": [ # ]]]\n    1,^"), "PUT /x {\n  \"a\": [ # ]]]\n    1,\n    ");
+        assert_eq!(entered_in_brackets("PUT /x {\n  /* }}} */ \"a\": {^"), "PUT /x {\n  /* }}} */ \"a\": {\n    ");
+        // An opener in a comment is none either.
+        assert_eq!(entered_in_brackets("PUT /x {\n  \"a\": 1, // {{{^"), "PUT /x {\n  \"a\": 1, // {{{\n  ");
+        // What the line ends in is what stands before its comment.
+        assert_eq!(entered_in_brackets("PUT /x {\n  \"a\": 1, // née^"), "PUT /x {\n  \"a\": 1, // née\n  ");
+        assert_eq!(entered_in_brackets("PUT /x {\n  \"a\": {\n    \"b\": 1 // last,^"), "PUT /x {\n  \"a\": {\n    \"b\": 1 // last,\n  ");
+        assert_eq!(body_depth_at("PUT /x {\"a\": 1 // }}", 99), 1);
+        assert_eq!(body_depth_at("}}} {", 99), 0);
+
+        // A body on one line with a comment in it is not laid out anew: the
+        // comment stays whole, and Enter is a new line where the cursor is.
+        assert_eq!(
+            entered_in_brackets(r#"PUT /x {"a":1, // first, then b^"#),
+            "PUT /x {\"a\":1, // first, then b\n  "
+        );
+        assert_eq!(entered_in_brackets(r#"PUT /x {"a":1,^ /* b, c */ "d":2}"#), "PUT /x {\"a\":1,\n   /* b, c */ \"d\":2}");
+    }
+
+    #[test]
+    fn copying_a_curl_command_says_why_it_did_not() {
+        let taken = std::cell::RefCell::new(String::new());
+        let take = |command: &str| {
+            *taken.borrow_mut() = command.to_string();
+            Ok(())
+        };
+        // Before any request there is none to copy.
+        let mut state = test_state();
+        assert_eq!(copy_curl_with(&state, take), Err("no request to copy yet".to_string()));
+        assert!(taken.borrow().is_empty());
+
+        state.config.base_uri = "http://localhost:5000".to_string();
+        state.prev_method = "GET".to_string();
+        state.prev_uri = "/people".to_string();
+        assert_eq!(copy_curl_with(&state, take), Ok(()));
+        assert!(taken.borrow().starts_with("curl ") && taken.borrow().contains("/api/v1/people"), "{}", taken.borrow());
+        // A clipboard that does not take it is said, with its reason.
+        assert_eq!(
+            copy_curl_with(&state, |_| Err("no display".to_string())),
+            Err("could not copy to the clipboard: no display".to_string())
+        );
+        // And a request that is no one command.
+        state.prev_method = "PUT".to_string();
+        state.prev_body = "@parts/*.json".to_string();
+        assert_eq!(copy_curl_with(&state, take), Err("a glob body can't be written as a curl command".to_string()));
     }
 
     /// The line and cursor after ctrl+space at `^`.

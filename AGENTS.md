@@ -1274,7 +1274,9 @@ Rules:
 - **At the interactive prompt, export mode is a row of the [settings
   menu](#the-settings-menu-ctrlt)** that `ctrl+t` opens, and `export` shows
   at the right of the hint line while it is on. `set export <name>` typed at
-  the prompt does the same. The masked-data warning shows in the hint line.
+  the prompt does the same. The masked-data warning shows in the hint line,
+  and in a file, a pasted block or a chain also as a `↳` note under the
+  request it is about, since the next request has the hint line at once.
 - Output is indented; `-r` prints it on one line. NDJSON (`--ndjson`, or a
   `> file.ndjson`) is rewritten line by line.
 - A response that is not JSON (a `> file.csv`, a `.sql`) is written unchanged,
@@ -1617,7 +1619,7 @@ Run it: `api -sa workshop.api`.
 - **A server that redirects a request round in circles** → `Too many redirects from <host>: the request was never answered.`, exit 1, in a batch as at the prompt. A redirect that ends is followed: a 307 or 308 arrives as the request it was, with its method, body and `Authorization`. A 301, 302 or 303 is followed for a `GET` or a `HEAD` only.
 - **A `PUT` logged with `301 Moved Permanently`** → the write was not done: the server (or a proxy in front of it) wants it somewhere else, often `https://` or without a trailing `/`. Send it to the address in the answer's `Location`. Run with `-f` to have a batch stop there.
 - **A `#` in an identifier** → `DELETE /people/com.x.id=A#1` deletes `A#1`: the `#` is sent as `%23`. With a blank in front it is a comment (`DELETE /people/com.x.id=A #1` deletes `A`).
-- **A response with bytes that are not of its charset** → the text shown and written has U+FFFD (`�`) in their place, and stderr says so once for that response: `WARNING: the response held bytes that are not valid UTF-8: each is now U+FFFD (�)`. It is said with `-s` and in `-sa` too, since it is about the data; not for an `assert` or a poll, whose body goes nowhere, nor for a `-sa` line without an outfile. At the prompt it shows in the hint line. `--stream` to a file writes the bytes as they came, so nothing is replaced there.
+- **A response with bytes that are not of its charset** → the text shown and written has U+FFFD (`�`) in their place, and stderr says so once for that response: `WARNING: the response held bytes that are not valid UTF-8: each is now U+FFFD (�)`. It is said with `-s` and in `-sa` too, since it is about the data; not for an `assert` or a poll, whose body goes nowhere, nor for a `-sa` line without an outfile. At the prompt it shows in the hint line, and for a request of a file, a block or a chain as a `↳` note under it too. `--stream` to a file writes the bytes as they came, so nothing is replaced there.
 - **`API_CREDENTIALS_FILE` without `--no-keychain`** → the variable is ignored and the keychain is read instead. A path that names no file fails as silently: no warning, just `Error: no base URL specified`. A file that is there but malformed is reported (`WARNING: could not read …`).
 
 ## 11. Tips for agents
