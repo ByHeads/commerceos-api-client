@@ -1043,8 +1043,10 @@ struct KeychainData {
     default: String,
 }
 
-fn keychain_entry() -> keyring::Entry {
-    keyring::Entry::new(KEYCHAIN_SERVICE, "data").expect("failed to create keyring entry")
+/// The keychain's entry for the store. Where there is no keychain to open
+/// (a container, a session without one) that is an error to say, not a panic.
+fn keychain_entry() -> Result<keyring::Entry, keyring::Error> {
+    keyring::Entry::new(KEYCHAIN_SERVICE, "data")
 }
 
 // When set, all credential I/O goes to this plaintext JSON file instead of the
@@ -1219,7 +1221,7 @@ fn read_store() -> Result<KeychainData, String> {
     if let Some(path) = no_keychain_file() {
         return read_store_file(&path);
     }
-    match keychain_entry().get_password() {
+    match keychain_entry().and_then(|entry| entry.get_password()) {
         Ok(json) => parse_store(&json).map_err(|e| format!("could not read the saved connections in the keychain: {}", e)),
         Err(keyring::Error::NoEntry) => Ok(KeychainData::default()),
         Err(e) => Err(format!("could not read the keychain: {}", e)),
@@ -1267,7 +1269,9 @@ fn save_keychain_data(data: &KeychainData) -> Result<(), String> {
         write_store_file(&path, data)?;
     } else {
         let json = serde_json::to_string(data).map_err(|e| e.to_string())?;
-        keychain_entry().set_password(&json).map_err(|e| format!("keychain error: {}", e))?;
+        keychain_entry()
+            .and_then(|entry| entry.set_password(&json))
+            .map_err(|e| format!("keychain error: {}", e))?;
     }
     KEYCHAIN_CACHE.with(|cache| {
         *cache.borrow_mut() = Some(data.clone());
@@ -1382,6 +1386,8 @@ fn oauth2_token_exchange(base_uri: &str, client_id: &str, client_secret: &str) -
     let body: Value = resp.json().map_err(|e| format!("invalid token response: {}", e))?;
     let access_token = body["access_token"]
         .as_str()
+        // An empty token is none: it would be sent as no credential at all.
+        .filter(|token| !token.is_empty())
         .ok_or("missing access_token in response")?
         .to_string();
     let expires_in = body["expires_in"].as_u64().unwrap_or(3600);
@@ -4382,11 +4388,19 @@ fn base_url_of(text: &str) -> (String, bool) {
 /// credential of their own, beside the one the client was given, and the
 /// URL is printed at the top of every log.
 fn base_url_has_userinfo(text: &str) -> bool {
-    let authority = text.split_once("://").map_or(text, |(_, rest)| rest);
+    // Behind a scheme that is not written whole too (`http:/svc:secret@host`):
+    // that is no base URL, and what says so must not repeat a password.
+    let authority = match text.split_once(":/") {
+        Some((scheme, rest)) if !scheme.is_empty() && scheme.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c)) => {
+            rest.trim_start_matches('/')
+        }
+        _ => text,
+    };
     authority.split(['/', '?', '#']).next().unwrap_or("").contains('@')
 }
 
 const USERINFO_REFUSED: &str = "a base URL holds no user or password (user@host)";
+const QUERY_REFUSED: &str = "a base URL holds no `?` or `#`: it ends at the host, or at a path below it";
 
 /// Why what was given as a base URL can't be one, if it can't: it names a
 /// scheme that is not `http` or `https` (`ftp://host`), or its scheme is not
@@ -4396,6 +4410,11 @@ fn base_url_problem(text: &str) -> Option<String> {
     let text = text.trim();
     if base_url_has_userinfo(text) {
         return Some(USERINFO_REFUSED.to_string());
+    }
+    // A query or a fragment (`https://host/#/orders`, copied from a browser):
+    // every request's path would be put behind it, and be sent as part of it.
+    if text.contains(['?', '#']) {
+        return Some(QUERY_REFUSED.to_string());
     }
     let (scheme, rest) = text.split_once(':')?;
     // A scheme, and not the host of `localhost:5000`: a word, then `:/`.
@@ -4427,13 +4446,17 @@ fn known_auth_type(auth_type: &str) -> Option<&'static str> {
 /// connection is not used at all: its credential is not sent as a kind it
 /// was not saved as.
 fn connection_problem(env: &SavedConnection) -> Option<String> {
-    base_url_problem(&env.url)
-        .or_else(|| normalize_base_uri(&env.url).is_empty().then(|| "its URL names no host".to_string()))
+    connection_url_problem(&env.url)
         .or_else(|| {
             known_auth_type(&env.auth_type)
                 .is_none()
                 .then(|| format!("its auth_type \"{}\" is not \"key\", \"token\" or \"oauth2\"", env.auth_type))
         })
+}
+
+/// Why the URL of a saved connection can't be used, if it can't.
+fn connection_url_problem(url: &str) -> Option<String> {
+    base_url_problem(url).or_else(|| normalize_base_uri(url).is_empty().then(|| "its URL names no host".to_string()))
 }
 
 /// Whether a host written without a scheme is one to reach over plain
@@ -4733,6 +4756,11 @@ fn main() {
         // Not repeated: what was given holds a password.
         if base_url_has_userinfo(uri) {
             errln!("error: invalid value for -b: {}. Give the credential with -k or --token.", USERINFO_REFUSED);
+            exit_process(1);
+        }
+        // Not repeated either: a query may hold a token.
+        if uri.contains(['?', '#']) {
+            errln!("error: invalid value for -b: {}", QUERY_REFUSED);
             exit_process(1);
         }
         if let Some(problem) = base_url_problem(uri) {
@@ -5063,7 +5091,7 @@ fn main() {
                     // With a credential from the command line only the URL
                     // is taken, so only the URL has to be one.
                     let problem = match has_explicit_auth {
-                        true => base_url_problem(&env.url),
+                        true => connection_url_problem(&env.url),
                         false => connection_problem(&env),
                     };
                     if let Some(problem) = problem {
@@ -31781,12 +31809,26 @@ mod tests {
         assert_eq!(base_url_problem("HTTPS:/h/api"), broken("HTTPS:/h/api"));
         assert_eq!(base_url_problem("ftp:/h"), broken("ftp:/h"));
         // A user or a password in front of the host, with a scheme or without.
-        for held in ["https://svc:pw@h", "http://svc@h:5000/api/v1", "svc:pw@h", "svc@localhost:5000", " HTTPS://a:b@h/x "] {
+        for held in [
+            "https://svc:pw@h",
+            "http://svc@h:5000/api/v1",
+            "svc:pw@h",
+            "svc@localhost:5000",
+            " HTTPS://a:b@h/x ",
+            // Behind a scheme that is not written whole, the password is
+            // not repeated by the message that says so.
+            "http:/svc:pw@h",
+            "https:///svc:pw@h/x",
+        ] {
             assert_eq!(base_url_problem(held), Some(USERINFO_REFUSED.to_string()), "{held}");
             assert!(base_url_has_userinfo(held.trim()), "{held}");
         }
-        for fine in ["https://h/people/a@b", "h/x@y", "http://h?mail=a@b", "h#a@b"] {
+        for fine in ["https://h/people/a@b", "h/x@y", "http://h?mail=a@b", "h#a@b", "http:/h/a@b"] {
             assert!(!base_url_has_userinfo(fine), "{fine}");
+        }
+        // A query or a fragment: every request would be sent as part of it.
+        for cut in ["https://h/#/orders", "http://h?x=1", "h#top", "localhost:5000/?tenant=a", " https://h/api/v1?x "] {
+            assert_eq!(base_url_problem(cut), Some(QUERY_REFUSED.to_string()), "{cut}");
         }
         // A host with a port, a path, or nothing at all is not a scheme.
         for fine in [

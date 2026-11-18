@@ -259,6 +259,9 @@ fn answer(
         if body.contains("client_id=tokenless") {
             // An answer that is no token.
             ("200 OK", "{}".to_string())
+        } else if body.contains("client_id=emptytoken") {
+            // An answer whose token is empty.
+            ("200 OK", r#"{"access_token":"","expires_in":3600}"#.to_string())
         } else if body.contains("client_id=refused") {
             // A client the server does not know.
             ("401 Unauthorized", r#"{"error":"invalid_client"}"#.to_string())
@@ -10222,6 +10225,19 @@ fn what_names_no_method_or_no_host_is_refused() {
         refused(&["-c", "good", "-b", &base, "GET", "/a"], &format!("error: invalid value for -b: {held}. Give the credential with -k or --token."));
     }
     refused(&["-c", "held", "GET", "/a"], &format!("The connection \"held\" can't be used: {held}."));
+    // Behind a scheme that is not written whole it is not repeated either.
+    refused(
+        &["-b", &format!("http:/svc:hunter2@{host}"), "-k", "k", "GET", "/a"],
+        &format!("error: invalid value for -b: {held}. Give the credential with -k or --token."),
+    );
+
+    // A query or a fragment in a base URL: the request is not sent to what
+    // stands in front of it (`GET /` for a URL copied from a browser).
+    let cut = "error: invalid value for -b: a base URL holds no `?` or `#`: it ends at the host, or at a path below it";
+    for base in [format!("{url}/#/orders"), format!("{url}?token=hunter2"), format!("{host}#top")] {
+        refused(&["-b", &base, "-k", "k", "GET", "/a"], cut);
+        refused(&["-c", "good", "-b", &base, "PUT", "/a", "{\"a\":1}"], cut);
+    }
 
     // A saved URL that names no host is that connection's problem.
     refused(&["-c", "empty", "GET", "/a"], "The connection \"empty\" can't be used: its URL names no host.");
@@ -10237,6 +10253,19 @@ fn what_names_no_method_or_no_host_is_refused() {
     // The same connections with their own URL still work.
     let got = run_bare(&server, d, &["-c", "good", "GET", "/a"]);
     assert_eq!((got.code, &got.sent[..]), (Some(0), &["GET /a".to_string()][..]), "{}", got.stderr);
+
+    // A default connection whose URL names no host is said to be that with
+    // a credential from the command line too, where only its URL is taken.
+    write_credentials(d, &[("empty", String::new(), "key", "STOREDKEY", ""), ("cut", format!("{url}/#/x"), "key", "STOREDKEY", "")], "empty");
+    let got = run_bare(&server, d, &["-k", "k", "GET", "/a"]);
+    assert_eq!((got.code, got.sent.len()), (Some(1), 0), "{}", got.stderr);
+    assert!(
+        got.stderr.starts_with("WARNING: the default connection \"empty\" can't be used: its URL names no host. No saved connection is used."),
+        "{}",
+        got.stderr
+    );
+    assert!(got.stderr.contains(none), "{}", got.stderr);
+    refused(&["-c", "cut", "GET", "/a"], "The connection \"cut\" can't be used: a base URL holds no `?` or `#`: it ends at the host, or at a path below it.");
 }
 
 /// A body that starts with `-` is a body, and an argument clap can't read is
@@ -11512,9 +11541,13 @@ fn an_answer_without_a_token_is_no_token() {
     let server = RecordingServer::start();
     let dir = tempfile::tempdir().unwrap();
     let url = format!("http://127.0.0.1:{}", server.port);
-    write_credentials(dir.path(), &[("c", url, "oauth2", "secret", "tokenless")], "c");
+    write_credentials(
+        dir.path(),
+        &[("c", url.clone(), "oauth2", "secret", "tokenless"), ("e", url, "oauth2", "secret", "emptytoken")],
+        "c",
+    );
     std::fs::write(dir.path().join("one.api"), "GET /from-file\n").unwrap();
-    for args in [&["GET", "/a"][..], &["-sa", "one.api"]] {
+    for args in [&["GET", "/a"][..], &["-sa", "one.api"], &["-c", "e", "GET", "/a"], &["-c", "e", "-sa", "one.api"]] {
         let got = run_bare(&server, dir.path(), args);
         assert_eq!(got.code, Some(1), "{args:?}: {}", got.stderr);
         assert!(got.stderr.contains("OAuth2 token exchange failed"), "{args:?}: {}", got.stderr);
