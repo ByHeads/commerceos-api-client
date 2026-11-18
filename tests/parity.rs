@@ -304,9 +304,13 @@ fn answer(
             }
             _ => ("200 OK", format!("[{base}]")),
         }
+    } else if path.contains("/about") && header("authorization") == Some("Basic OnNsb3dhYm91dA==") {
+        // For a session with the key `slowabout`: a server slow to answer at all.
+        std::thread::sleep(Duration::from_secs(4));
+        ("200 OK", r#"{"feature-flags":[]}"#.to_string())
     } else if path.contains("/openapi") && header("authorization") == Some("Basic OnNsb3dzcGVj") {
         // For a session with the key `slowspec`: the spec takes its time.
-        std::thread::sleep(Duration::from_secs(4));
+        std::thread::sleep(Duration::from_secs(8));
         ("200 OK", PROMPT_SPEC.to_string())
     } else if path.contains("/about") && header("authorization") == Some("Basic OnNsb3dzcGVj") {
         ("200 OK", r#"{"feature-flags":[],"openapi-metadata-version":"1.2"}"#.to_string())
@@ -5372,7 +5376,11 @@ fn the_connection_picker_reads_the_store_afresh() {
     prompt.send(b"\x11");
     let listed = pump_until(&mut prompt, Duration::from_secs(5), |p| pty::plain(&p.screen[mark..]).contains("fixed-one"));
     assert!(listed, "{}", pty::plain(&prompt.screen[mark..]));
-    assert!(!pty::plain(&prompt.screen[mark..]).contains("could not read"), "{}", pty::plain(&prompt.screen[mark..]));
+    // In the picker, that is: the notice of the first ctrl+q may still be
+    // drawn in the hint line until the picker takes its place.
+    let shown = pty::plain(&prompt.screen[mark..]);
+    let picker = shown.rsplit("Choose a connection").next().unwrap();
+    assert!(!picker.contains("could not read"), "{shown}");
     // Wait until the picker is gone: an esc the client has not read yet
     // when the next key arrives would be read together with it, as one key.
     let mark = prompt.screen.len();
@@ -6140,6 +6148,92 @@ fn open_completing(server: &RecordingServer, dir: &Path, flags: &[&str]) -> pty:
     }
     server.take();
     prompt
+}
+
+/// The prompt opens when the server has answered `/about`. The API spec is
+/// read behind it: meanwhile a request is sent as typed and `GET /` offers
+/// `/about`, and Tab completes from the spec once it is there.
+#[cfg(unix)]
+#[test]
+fn the_prompt_is_open_while_the_spec_is_on_its_way() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    let mut cmd = api_bare(dir.path());
+    // The spec of the key `slowspec` takes eight seconds: long enough for
+    // what is checked before it arrives, with every other test running.
+    cmd.args(["-b", &url, "-k", "slowspec"]);
+    let start = Instant::now();
+    let mut prompt = pty::Prompt::open(cmd);
+    prompt.wait_ready(Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(300));
+
+    // The first frame offers `/about`, and Tab writes it.
+    let rows = pty::rows(&prompt.screen, 200);
+    assert!(rows.iter().any(|row| row.trim_end() == "GET /about"), "{}", rows.join("\n"));
+    assert!(press(&mut prompt, &["GET /", "\t", "?"]).contains("GET /about?"), "{}", screen_tail(&prompt));
+    // Nothing else is known yet.
+    assert!(!press(&mut prompt, &["GET /pe", "\t"]).contains("GET /people"), "{}", screen_tail(&prompt));
+    // A request does not wait for the spec.
+    press(&mut prompt, &["GET /early"]);
+    assert_eq!(entered(&mut prompt, &server), ["GET /early"], "{}", screen_tail(&prompt));
+    assert!(start.elapsed() < Duration::from_secs(7), "the prompt waited for the spec: {:?}", start.elapsed());
+
+    // When the spec is there, Tab completes from it.
+    let arrived = pump_until(&mut prompt, Duration::from_secs(15), |_| start.elapsed() > Duration::from_secs(8));
+    assert!(arrived);
+    let start = Instant::now();
+    while !press(&mut prompt, &["GET /pe", "\t"]).contains("GET /people") {
+        assert!(start.elapsed() < Duration::from_secs(10), "the spec was never read:\n{}", screen_tail(&prompt));
+    }
+}
+
+/// The requests of a run that follow each other are sent over one
+/// connection: a batch does not open one per line.
+#[test]
+fn a_batch_sends_its_requests_over_one_connection() {
+    use std::io::{Read, Write};
+    use std::sync::atomic::AtomicUsize;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (connections, requests) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let (connections2, requests2) = (Arc::clone(&connections), Arc::clone(&requests));
+    // A server that keeps a connection open for the next request, as COS does.
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            connections2.fetch_add(1, Ordering::SeqCst);
+            let requests = Arc::clone(&requests2);
+            std::thread::spawn(move || {
+                let mut pending: Vec<u8> = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    // The requests here have no body: a head ends one.
+                    while let Some(end) = pending.windows(4).position(|w| w == b"\r\n\r\n") {
+                        pending.drain(..end + 4);
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        let reply = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4\r\n\r\ntrue";
+                        if stream.write_all(reply).is_err() {
+                            return;
+                        }
+                    }
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => pending.extend_from_slice(&chunk[..n]),
+                    }
+                }
+            });
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("lines.api"), "GET /one\nGET /two && GET /three\nassert GET /four\nGET /five\n").unwrap();
+    let mut cmd = api_bare(dir.path());
+    cmd.args(["-b", &url, "-k", "k", "-sa", "lines.api"]);
+    let out = cmd.output().expect("spawn api");
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(requests.load(Ordering::SeqCst), 5, "{}", String::from_utf8_lossy(&out.stdout));
+    assert_eq!(connections.load(Ordering::SeqCst), 1);
 }
 
 /// Clear the line and press `keys`, one after the other. Returns what the
@@ -8462,7 +8556,7 @@ fn ctrl_c_leaves_while_a_connection_is_loading_and_other_keys_are_dropped() {
         prompt.wait_for("Type the API base URL", Duration::from_secs(15));
         keys_then(prompt, &format!("{host}\r"), "Use ← → to choose auth method");
         keys_then(prompt, "\r", "Type your API key");
-        keys_then(prompt, "slowspec\r", "loading...");
+        keys_then(prompt, "slowabout\r", "loading...");
         prompt.pump(Duration::from_millis(300));
     };
 

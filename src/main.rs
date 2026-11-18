@@ -663,18 +663,34 @@ fn client_builder() -> reqwest::blocking::ClientBuilder {
     Client::builder().tls_backend_preconfigured(tls_config())
 }
 
-/// Build the HTTP client. The timeout is always passed explicitly, so reqwest's
-/// hidden default can never apply; `0` disables it (`--timeout 0`).
-fn build_request_client(timeout_secs: u64) -> Client {
-    let timeout = if timeout_secs == 0 {
-        None
-    } else {
-        Some(Duration::from_secs(timeout_secs))
-    };
-    client_builder()
-        .timeout(timeout)
-        .build()
-        .expect("could not set up the HTTP client")
+/// How long a connection that is not in use is kept for the next request.
+/// Shorter than a server keeps its end open (COS: 5 seconds), so that a
+/// request is never written to a connection the server is just closing: a
+/// `sleep while` poll comes round every 5 seconds by default.
+const IDLE_CONNECTION_SECS: u64 = 3;
+
+/// The HTTP client of the process. Every request to the API goes through
+/// this one, so a request that follows another within `IDLE_CONNECTION_SECS`
+/// is sent on the connection that is already open, with no new TCP and TLS
+/// handshake: the calls a session starts with, and the lines of a batch.
+///
+/// It has no timeout of its own, and reqwest's hidden 30s default can never
+/// apply: each request is given its own with `timed`.
+fn http_client() -> &'static Client {
+    static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        client_builder()
+            .timeout(None)
+            .pool_idle_timeout(Duration::from_secs(IDLE_CONNECTION_SECS))
+            .build()
+            .expect("could not set up the HTTP client")
+    })
+}
+
+/// `request` with its timeout, from the start of the request to the end of
+/// the response body. `0` is no timeout (`--timeout 0`).
+fn timed(request: reqwest::blocking::RequestBuilder, timeout_secs: u64) -> reqwest::blocking::RequestBuilder {
+    if timeout_secs == 0 { request } else { request.timeout(Duration::from_secs(timeout_secs)) }
 }
 
 /// How a request timeout should be described in errors and help text.
@@ -1017,13 +1033,7 @@ fn form_encode(value: &str) -> String {
 // OAuth2 client credentials token exchange
 fn oauth2_token_exchange(base_uri: &str, client_id: &str, client_secret: &str) -> Result<(String, u64), String> {
     let token_url = format!("{}/oauth2/v1/token", base_uri.trim_end_matches('/'));
-    let client = client_builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let resp = client
-        .post(&token_url)
+    let resp = timed(http_client().post(&token_url), 10)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(format!(
             "grant_type=client_credentials&client_id={}&client_secret={}",
@@ -1360,6 +1370,9 @@ struct AppState {
     mapped_types: Vec<String>,  // mapped type names for ~map() completion
     /// Where the list arrives that is being read again after a write to `/mapped-types`.
     mapped_types_rx: Option<std::sync::mpsc::Receiver<Option<Vec<String>>>>,
+    /// Where the API spec of this connection arrives. The prompt is open
+    /// before it is there (`load_spec_behind`, `take_spec`).
+    spec_rx: Option<std::sync::mpsc::Receiver<BackgroundLoadResult>>,
     completions: Vec<String>,
     completion_idx: usize,
     last_tab_input: String,
@@ -1450,6 +1463,7 @@ impl AppState {
             parent_types: HashMap::new(),
             mapped_types: Vec::new(),
             mapped_types_rx: None,
+            spec_rx: None,
             completions: Vec::new(),
             completion_idx: 0,
             last_tab_input: String::new(),
@@ -3353,10 +3367,10 @@ impl ConnectionFlow {
             }
         } else {
             // API key or Bearer token
-            let client = client_builder().timeout(Duration::from_secs(10)).build().ok();
+            let client = Some(http_client());
             if let Some(client) = client {
                 let test_url = format!("{}/api/v1", url.trim_end_matches('/'));
-                let mut req = client.get(&test_url);
+                let mut req = timed(client.get(&test_url), 10);
                 // The header every later request gets, so a key that works
                 // there works here: a key shaped like a JWT is Bearer.
                 let mut tried = Config::default();
@@ -4875,9 +4889,6 @@ mod load_phase {
     pub const RESOLVING_1P: u8 = 0;
     /// Waiting on the server's `/about`.
     pub const CONNECTING: u8 = 1;
-    /// Waiting on the OpenAPI spec and mapped types.
-    pub const LOADING_SPEC: u8 = 2;
-
     static PHASE: AtomicU8 = AtomicU8::new(RESOLVING_1P);
 
     pub fn set(phase: u8) {
@@ -5103,14 +5114,9 @@ fn metadata_version_has_spec(version: &str) -> bool {
 /// - streaming: true if response:streaming feature flag is present
 /// Err(status) for auth errors (401/403)
 fn check_connection(config: &Config) -> Result<(bool, bool, bool), u16> {
-    let client = client_builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("could not set up the HTTP client");
-
     let url = format!("{}{}/about", config.base_uri, config.api_path);
 
-    let mut request = client.get(&url);
+    let mut request = timed(http_client().get(&url), 5);
 
     if let Some(authorization) = auth_header(config) {
         request = request.header("Authorization", authorization);
@@ -10062,10 +10068,10 @@ struct BuiltRequest {
 /// body. The batch, the prompt and the retry after a renewed token all build
 /// here. `Err` is an `@file` body that could not be read; nothing is sent.
 fn build_request(config: &Config, parts: &RequestParts) -> Result<BuiltRequest, String> {
-    let client = build_request_client(config.timeout_secs);
+    let client = http_client();
     let url = format!("{}{}", config.base_uri, backslashes_encoded(&resolve_request_path(&config.api_path, &parts.uri)));
 
-    let mut request = match parts.method.as_str() {
+    let request = match parts.method.as_str() {
         "GET" => client.get(&url),
         "POST" => client.post(&url),
         "PUT" => client.put(&url),
@@ -10075,6 +10081,7 @@ fn build_request(config: &Config, parts: &RequestParts) -> Result<BuiltRequest, 
         "OPTIONS" => client.request(reqwest::Method::OPTIONS, &url),
         _ => client.get(&url),
     };
+    let mut request = timed(request, config.timeout_secs);
 
     if let Some(authorization) = auth_header(config) {
         request = request.header("Authorization", authorization);
@@ -10970,7 +10977,7 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
 
     // Apply preloaded results if available (non-1P mode)
     if let Some(result) = preloaded {
-        apply_background_result(&mut state, result);
+        apply_connection(&mut state, result);
     }
 
     // Print initial placeholder lines so first render can move up
@@ -11091,7 +11098,7 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
                     state.status_msg_at = Some(Instant::now());
                 }
                 state.loading_connection_name = None;
-                apply_background_result(&mut state, result);
+                apply_connection(&mut state, result);
             }
 
             // Update the splash URL line after the background load completes:
@@ -11139,6 +11146,9 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
         }
         }
         take_mapped_types(&mut state);
+        if take_spec(&mut state) {
+            render(&mut stdout, &mut state)?;
+        }
         // Animate loading spinner
         if state.loading {
             state.loading_frame += 1;
@@ -14542,7 +14552,7 @@ fn handle_switch_connection(state: &mut AppState, stdout: &mut io::Stdout) -> io
 
             // Use preloaded result if available, otherwise load now
             let result = preloaded.unwrap_or_else(|| background_load(&state.config, None));
-            apply_background_result(state, result);
+            apply_connection(state, result);
 
             // Full screen clear and fresh start for new connection. The last
             // request was sent to the connection before: nothing to copy as
@@ -15237,12 +15247,8 @@ fn render<W: Write>(stdout: &mut W, state: &mut AppState) -> io::Result<()> {
             (Some(env_name), load_phase::RESOLVING_1P) => {
                 format!(" {} Loading connection {} from 1P...", frame, env_name)
             }
-            (Some(env_name), load_phase::LOADING_SPEC) => {
-                format!(" {} Loading API spec from {}...", frame, env_name)
-            }
             (Some(env_name), _) => format!(" {} Connecting to {}...", frame, env_name),
             (None, load_phase::RESOLVING_1P) => format!(" {} Loading environment from 1P...", frame),
-            (None, load_phase::LOADING_SPEC) => format!(" {} Loading API spec...", frame),
             (None, _) => format!(" {} Connecting...", frame),
         };
         queue!(stdout, Print(format!("{}\r\n", msg.dimmed())))?;
@@ -15491,38 +15497,75 @@ fn background_load(config: &Config, op_selector: Option<String>) -> BackgroundLo
         }
     };
 
-    let mut result = BackgroundLoadResult { streaming, complete, connected, base_uri, api_key, ..Default::default() };
+    // The API spec and the mapped types are not read here: they are megabytes
+    // that only completion asks for, and the prompt does not wait for them
+    // (`load_spec_behind`).
+    BackgroundLoadResult { streaming, complete, connected, base_uri, api_key, ..Default::default() }
+}
 
-    if complete {
-        load_phase::set(load_phase::LOADING_SPEC);
+/// The one endpoint completion knows while the spec is on its way: every
+/// server has it, and it is the first of a spec's, so `GET /` offers the
+/// same before the spec is there as after.
+const FIRST_ENDPOINT: &str = "/about";
 
-        // Parallelize OpenAPI spec and mapped types fetches
-        let config_clone = config.clone();
-        let mapped_types_handle = std::thread::spawn(move || {
-            fetch_mapped_type_names(&config_clone)
-        });
+/// Take the answer of a connection that was just made, and start reading
+/// what completion goes by: the API spec and the mapped types, each on a
+/// thread of its own. The prompt takes them when they are there (`take_spec`,
+/// `take_mapped_types`) and is open meanwhile.
+///
+/// What was on its way for the connection before is dropped: its receivers
+/// are replaced, so a spec that arrives late is never another server's.
+fn apply_connection(state: &mut AppState, result: BackgroundLoadResult) {
+    apply_background_result(state, result);
+    load_spec_behind(state);
+}
 
-        load_openapi_spec_into(&config, &mut result);
-
-        if let Ok(names) = mapped_types_handle.join() {
-            result.mapped_types = names.unwrap_or_default();
-        }
+fn load_spec_behind(state: &mut AppState) {
+    state.spec_rx = None;
+    state.mapped_types_rx = None;
+    if !state.config.complete {
+        return;
     }
+    state.endpoints = vec![FIRST_ENDPOINT.to_string()];
 
-    result
+    let config = state.config.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut result = BackgroundLoadResult::default();
+        load_openapi_spec_into(&config, &mut result);
+        let _ = tx.send(result);
+    });
+    state.spec_rx = Some(rx);
+
+    let config = state.config.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || { let _ = tx.send(fetch_mapped_type_names(&config)); });
+    state.mapped_types_rx = Some(rx);
+}
+
+/// Take the API spec once it has arrived. `true` when it did, and the
+/// prompt is to be drawn again: its ghost may have more to show.
+fn take_spec(state: &mut AppState) -> bool {
+    let Some(rx) = &state.spec_rx else { return false };
+    let result = match rx.try_recv() {
+        Ok(result) => result,
+        Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+        // The thread ended without a word: as a spec that could not be read.
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            BackgroundLoadResult { spec_unreadable: true, ..Default::default() }
+        }
+    };
+    state.spec_rx = None;
+    apply_spec(state, result);
+    true
 }
 
 /// The names of the server's mapped types, for `~map(` to complete from.
 /// `None` when they could not be had: no answer, an error status, or an
 /// answer that is not a list.
 fn fetch_mapped_type_names(config: &Config) -> Option<Vec<String>> {
-    let client = client_builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .expect("could not set up the HTTP client");
-
     let url = format!("{}{}/mapped-types", config.base_uri, config.api_path);
-    let mut request = client.get(&url);
+    let mut request = timed(http_client().get(&url), 10);
 
     if let Some(authorization) = auth_header(config) {
         request = request.header("Authorization", authorization);
@@ -15571,11 +15614,11 @@ fn take_mapped_types(state: &mut AppState) {
     state.mapped_types_rx = None;
 }
 
-fn apply_background_result(state: &mut AppState, result: BackgroundLoadResult) {
-    if let Some(uri) = result.base_uri {
+fn apply_background_result(state: &mut AppState, mut result: BackgroundLoadResult) {
+    if let Some(uri) = result.base_uri.take() {
         state.config.base_uri = uri;
     }
-    if let Some(key) = result.api_key {
+    if let Some(key) = result.api_key.take() {
         state.config.api_key = key;
     }
     // The TUI learns the server's capability from /about, so it can AND it with
@@ -15586,8 +15629,15 @@ fn apply_background_result(state: &mut AppState, result: BackgroundLoadResult) {
         state.streaming_flash_at = Some(Instant::now());
         show_streaming_info(state);
     }
-    state.config.complete = result.complete && !result.spec_unreadable;
+    state.config.complete = result.complete;
+    state.mapped_types = std::mem::take(&mut result.mapped_types);
+    apply_spec(state, result);
+}
+
+/// What completion goes by, as `index_spec` read it out of the server's spec.
+fn apply_spec(state: &mut AppState, result: BackgroundLoadResult) {
     if result.spec_unreadable {
+        state.config.complete = false;
         // Said once, where everything is said: the regular notification. It
         // takes the place of `connected to: <name>`: it is the more useful
         // of the two, and the prompt has nowhere to keep a notice waiting.
@@ -15612,18 +15662,12 @@ fn apply_background_result(state: &mut AppState, result: BackgroundLoadResult) {
     state.subtypes = result.subtypes;
     state.parent_types = result.parent_types;
     state.spec = result.spec;
-    state.mapped_types = result.mapped_types;
 }
 
 fn load_openapi_spec_into(config: &Config, result: &mut BackgroundLoadResult) {
-    let client = client_builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .expect("could not set up the HTTP client");
-
     let url = format!("{}/openapi/spec.json", config.base_uri);
 
-    let mut request = client.get(&url);
+    let mut request = timed(http_client().get(&url), 30);
 
     if let Some(authorization) = auth_header(config) {
         request = request.header("Authorization", authorization);
@@ -15632,7 +15676,7 @@ fn load_openapi_spec_into(config: &Config, result: &mut BackgroundLoadResult) {
     // A server without a spec (a 404) simply has none. One that fails to
     // answer, answers with an error, or with something that is not a spec is
     // worth a word, or Tab would do nothing all session without one: see
-    // `apply_background_result`.
+    // `apply_spec`.
     match request.send() {
         Ok(resp) if resp.status().is_success() => match resp.json::<ApiSpec>() {
             Ok(spec) => index_spec(spec, result),
@@ -25835,6 +25879,65 @@ mod tests {
         "number": { "type": "number" }
       } }
     }"##;
+
+    /// The spec is read behind the prompt: it is taken when it has arrived,
+    /// and one that was on its way for the connection before never is.
+    #[test]
+    fn the_spec_is_taken_when_it_arrives_and_only_for_its_own_connection() {
+        let mut state = test_state();
+        assert!(!take_spec(&mut state), "none was asked for");
+
+        // On its way: `GET /` offers the one endpoint every server has.
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.config.complete = true;
+        state.endpoints = vec![FIRST_ENDPOINT.to_string()];
+        state.spec_rx = Some(rx);
+        assert!(!take_spec(&mut state));
+        assert!(state.spec_rx.is_some(), "still on its way");
+        state.input = "GET /".to_string();
+        state.cursor_pos = 5;
+        assert_eq!(get_completion_ghost(&state), "about");
+
+        // There: completion has all of it, and the same first endpoint.
+        tx.send(indexed_spec()).unwrap();
+        assert!(take_spec(&mut state));
+        assert!(state.spec_rx.is_none());
+        assert!(state.config.complete);
+        assert!(state.endpoints.contains(&"/people".to_string()), "{:?}", state.endpoints);
+        assert_eq!(get_completion_ghost(&state), "about");
+
+        // A spec that could not be read is said, and nothing is offered.
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.endpoints = vec![FIRST_ENDPOINT.to_string()];
+        state.spec_rx = Some(rx);
+        tx.send(BackgroundLoadResult { spec_unreadable: true, ..Default::default() }).unwrap();
+        assert!(take_spec(&mut state));
+        assert!(!state.config.complete);
+        assert!(state.endpoints.is_empty());
+        assert!(state.status_msg.contains("completion unavailable"), "{}", state.status_msg);
+        // So is a reader that went away without an answer.
+        let (tx, rx) = std::sync::mpsc::channel::<BackgroundLoadResult>();
+        state.config.complete = true;
+        state.status_msg.clear();
+        state.spec_rx = Some(rx);
+        drop(tx);
+        assert!(take_spec(&mut state));
+        assert!(!state.config.complete);
+        assert!(state.status_msg.contains("completion unavailable"), "{}", state.status_msg);
+
+        // Another connection is made while a spec is on its way, to a
+        // server that has none: the late spec is the other server's.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (types_tx, types_rx) = std::sync::mpsc::channel();
+        state.spec_rx = Some(rx);
+        state.mapped_types_rx = Some(types_rx);
+        apply_connection(&mut state, BackgroundLoadResult { connected: true, ..Default::default() });
+        assert!(tx.send(indexed_spec()).is_err(), "nothing waits for it");
+        assert!(types_tx.send(Some(vec!["com.heads.csv".to_string()])).is_err());
+        assert!(!take_spec(&mut state));
+        take_mapped_types(&mut state);
+        assert!(state.endpoints.is_empty() && state.mapped_types.is_empty());
+    }
 
     /// What `index_spec` reads out of `COMPLETION_SPEC`.
     fn indexed_spec() -> BackgroundLoadResult {
