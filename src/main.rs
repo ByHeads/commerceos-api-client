@@ -6735,6 +6735,10 @@ fn take_append_note() -> Option<String> {
 /// target's header is no duplicate of it (another map, or an answer that
 /// is no CSV at all): the payload is added whole, and that is noted.
 fn csv_rows_to_append<'a>(path: &str, header: Option<&str>, payload: &'a str) -> &'a str {
+    // An empty answer adds nothing, and has no first line to speak of.
+    if payload.trim().is_empty() {
+        return "";
+    }
     let (first, rest) = payload.split_once('\n').unwrap_or((payload, ""));
     let same = |header: &str| header.trim_end_matches('\r').trim() == first.trim_end_matches('\r').trim();
     if header.is_none_or(same) {
@@ -8934,7 +8938,9 @@ fn download_archive_within(url: &str, token: Option<&str>, limit: u64) -> Result
     // or it took too long, an answer otherwise (a refused redirect is one).
     let failed = |e: reqwest::Error| FetchFailure {
         reason: describe_download_error(&e),
-        unanswered: e.is_connect() || e.is_timeout(),
+        // A connection that was made and then refused over its certificate
+        // is an answer: the host is there, and is not who was asked for.
+        unanswered: (e.is_connect() && tls_failure(&e).is_none()) || e.is_timeout(),
     };
     let mut download = CappedDownload { bytes: Vec::new(), limit, over: false };
     if url.starts_with("file://") {
@@ -27618,6 +27624,20 @@ mod tests {
         // A file that is not there is the disk that is not mounted.
         let err = download_archive("file:///no/such/dir/lib.tar.gz", None).err().unwrap();
         assert!(err.unanswered, "{}", err.reason);
+        // A host that is there and does not answer with TLS the client
+        // accepts gave an answer: no cached copy stands in for it.
+        // (`serve_once` waits for the end of a request's head, which a
+        // TLS hello never holds.)
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("https://127.0.0.1:{}/lib.tar.gz", listener.local_addr().unwrap().port());
+        let served = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.read(&mut [0u8; 1024]);
+            let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+        });
+        let err = download_archive(&url, None).err().unwrap();
+        assert!(!err.unanswered, "{}", err.reason);
+        served.join().unwrap();
 
         // git, in the words it uses with `LC_ALL=C`.
         for silent in [
@@ -32557,6 +32577,16 @@ mod tests {
         append_to_outfile(&p, "x,y\n1,2\n").unwrap();
         append_to_outfile(&p, "id,name\n5,Eve\n").unwrap();
         assert_eq!(note(), None);
+
+        // An empty answer adds nothing, and there is nothing to say of it.
+        for empty in ["", "\n", "  \r\n"] {
+            let before = fs::read(&p).unwrap();
+            append_to_outfile(&p, empty).unwrap();
+            assert_eq!((fs::read(&p).unwrap(), note()), (before, None), "{empty:?}");
+        }
+        fs::write(&p, b"id,name\n1,caf\xe9\n").unwrap();
+        append_to_outfile(&p, "").unwrap();
+        assert_eq!((fs::read(&p).unwrap(), note()), (b"id,name\n1,caf\xe9\n".to_vec(), None));
 
         // Behind a byte order mark the header is still the header.
         fs::write(&p, "\u{feff}id,name\n1,Ann\n").unwrap();

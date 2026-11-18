@@ -202,7 +202,9 @@ GET /people > clipboard                  # system clipboard, case-insensitive
   that is no CSV) is added whole, with a warning on stderr: `warning: the
   first line of the response is not the header row of rows.csv: it was
   appended too`. A byte order mark in front of the target stays there, and
-  what is behind it is added to as if it were not. `>> clipboard` is rejected
+  what is behind it is added to as if it were not. (A target that holds
+  nothing but the mark is written anew, without it.) An empty answer adds
+  nothing to a `.csv` and is not warned about. `>> clipboard` is rejected
   when the line is read, before anything is sent. A target that is not UTF-8
   (a CSV saved as Latin-1) keeps its bytes and gets the addition behind them,
   and one that is not a regular file (a fifo, `/dev/stdout`) is written to
