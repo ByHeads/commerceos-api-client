@@ -232,7 +232,10 @@ fn answer(
         // used; every later one is good. The client `once` gets no second.
         let nth = tokens.fetch_add(1, Ordering::SeqCst);
         let token = if nth == 0 { "stale" } else { "fresh" };
-        if body.contains("client_id=refused") {
+        if body.contains("client_id=tokenless") {
+            // An answer that is no token.
+            ("200 OK", "{}".to_string())
+        } else if body.contains("client_id=refused") {
             // A client the server does not know.
             ("401 Unauthorized", r#"{"error":"invalid_client"}"#.to_string())
         } else if body.contains("client_id=nokey") {
@@ -9887,4 +9890,146 @@ fn a_key_typed_in_a_chain_is_offered_the_keys_of_its_own_segment() {
     assert!(shown.contains("ivenName"), "{shown}");
     let shown = press(&mut prompt, &["GET /pets && PUT /people {", "\"", "g", "\t"]);
     assert!(shown.contains("\"givenName\":"), "{shown}");
+}
+
+/// A token endpoint that answers without a token gave none: the run says so
+/// and sends no request with an empty one.
+#[test]
+fn an_answer_without_a_token_is_no_token() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    write_credentials(dir.path(), &[("c", url, "oauth2", "secret", "tokenless")], "c");
+    std::fs::write(dir.path().join("one.api"), "GET /from-file\n").unwrap();
+    for args in [&["GET", "/a"][..], &["-sa", "one.api"]] {
+        let got = run_bare(&server, dir.path(), args);
+        assert_eq!(got.code, Some(1), "{args:?}: {}", got.stderr);
+        assert!(got.stderr.contains("OAuth2 token exchange failed"), "{args:?}: {}", got.stderr);
+        assert!(got.sent.iter().all(|line| line.contains("/oauth2/v1/token")), "{args:?}: {:?}", got.sent);
+    }
+}
+
+/// What can be said without a server is said without one: a body that is
+/// not closed, two documents asked for at once, an `export` line alone.
+#[test]
+fn a_command_line_that_cannot_be_run_sends_nothing() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("one.api"), "GET /from-file\n").unwrap();
+    for (args, says) in [
+        (&["PUT", "/x", "{\"a\":1"][..], "unclosed body"),
+        (&["PUT /x [{\"a\":1}"], "unclosed body"),
+        (&["--describe", "one.api", "--assert", "one.api"], "--describe and --assert each print a document of their own: use one"),
+        (&["export", "com.heads.seedID"], "`export` alone sends nothing"),
+        (&["export", "off"], "`export` alone sends nothing"),
+        (&["DELETE"], "DELETE needs a URI"),
+    ] {
+        let got = run_in(&server, dir.path(), args);
+        assert_eq!((got.code, got.sent.len()), (Some(1), 0), "{args:?}: {}", got.stderr);
+        assert!(got.stderr.contains(says), "{args:?}: {}", got.stderr);
+        assert_eq!(got.stdout, "", "{args:?}");
+    }
+}
+
+/// The first ctrl+c asks for a second, and stops asking when its notice
+/// goes: a ctrl+c long after it is a first one again, not the end.
+#[cfg(unix)]
+#[test]
+fn a_first_ctrl_c_is_forgotten_with_its_notice() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = open_prompt(&server, dir.path(), &[]);
+    prompt.send(b"\x03");
+    prompt.wait_for("ctrl+c again to exit", Duration::from_secs(3));
+    prompt.pump(Duration::from_millis(3800));
+    let mark = prompt.screen.len();
+    prompt.send(b"\x03");
+    let asked = pump_until(&mut prompt, Duration::from_secs(3), |p| pty::plain(&p.screen[mark..]).contains("ctrl+c again to exit"));
+    assert!(asked, "{}", pty::plain(&prompt.screen[mark..]));
+    assert_eq!(prompt.exited(), None, "the second ctrl+c ended the session");
+    prompt.send(b"\x03");
+    assert_eq!(ended(&mut prompt), Some(true));
+}
+
+/// A `sleep while` at the prompt is logged as one line with how long it
+/// waited: its polls are not requests anyone sent by hand.
+#[cfg(unix)]
+#[test]
+fn a_wait_at_the_prompt_is_logged_as_one_line() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = open_prompt(&server, dir.path(), &[]);
+    let (sent, shown) = run_pasted(&mut prompt, &server, "sleep 100ms while GET /zero\rGET /after");
+    assert_eq!(sent, ["GET /zero", "GET /after"]);
+    assert!(shown.contains("sleep 100ms while GET /zero"), "{shown}");
+    assert!(shown.contains("↳ waited") && shown.contains("(1 check)"), "{shown}");
+    // The poll has no block of its own: one status line, the request's.
+    assert_eq!(shown.matches("200 OK").count(), 1, "{shown}");
+}
+
+/// ctrl+q with nothing saved says so and leaves the line as it is. ctrl+s
+/// with a store that can't be written says why and leaves the session on
+/// the connection it had. ctrl+c at the overwrite question ends the session
+/// and writes nothing.
+#[cfg(unix)]
+#[test]
+fn the_store_dialogs_say_what_they_could_not_do() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = RecordingServer::start();
+    let url = format!("http://127.0.0.1:{}", server.port);
+
+    // Nothing saved.
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = open_prompt(&server, dir.path(), &[]);
+    prompt.paste("GET /kept");
+    prompt.pump(Duration::from_millis(100));
+    let mark = prompt.screen.len();
+    prompt.send(b"\x11");
+    let said = pump_until(&mut prompt, Duration::from_secs(5), |p| pty::plain(&p.screen[mark..]).contains("no saved connections"));
+    assert!(said, "{}", pty::plain(&prompt.screen[mark..]));
+    let rows = pty::rows(&prompt.screen, 200);
+    assert_eq!(ruler_rows(&rows).len(), 2, "{}", rows.join("\n"));
+    assert_eq!(entered(&mut prompt, &server), ["GET /kept"]);
+
+    // A store that can't be written: a file that is read-only, in a
+    // directory that takes no new file.
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let locked = d.join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    let file = locked.join("credentials.json");
+    std::fs::write(&file, r#"{"connections":[],"default":""}"#).unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let mut cmd = api_bare(d);
+    cmd.env("API_CREDENTIALS_FILE", &file).args(["-b", &url, "-k", "k"]);
+    let mut prompt = pty::Prompt::open(cmd);
+    prompt.wait_ready(Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(500));
+    let shown = save_as(&mut prompt, "mine", "save failed:");
+    assert!(!shown.contains("connection mine saved"), "{shown}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), r#"{"connections":[],"default":""}"#);
+    let rows = pty::rows(&prompt.screen, 200);
+    assert_eq!(ruler_rows(&rows).len(), 2, "{}", rows.join("\n"));
+    // The session goes on, on the connection it had.
+    prompt.send(b"\x15");
+    prompt.paste("GET /still");
+    prompt.pump(Duration::from_millis(100));
+    assert_eq!(entered(&mut prompt, &server), ["GET /still"]);
+    drop(prompt);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // ctrl+c at the overwrite question.
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write_credentials(d, &[("a", url.clone(), "key", "AKEY", ""), ("b", url.clone(), "key", "BKEY", "")], "a");
+    let before = stored(d);
+    let mut prompt = pty::Prompt::open(api_bare(d));
+    prompt.wait_ready(Duration::from_secs(15));
+    prompt.pump(Duration::from_millis(500));
+    save_as(&mut prompt, "b", "already exists. Overwrite?");
+    prompt.send(b"\x03");
+    assert_eq!(ended(&mut prompt), Some(true));
+    assert_eq!(stored(d), before);
 }

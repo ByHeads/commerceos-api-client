@@ -4757,7 +4757,9 @@ fn main() {
 /// dot-separated segments, no slashes) that could never be an HTTP method.
 fn looks_like_bearer_token(method: &str) -> bool {
     let methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
-    if method.is_empty() || methods.contains(&method) || method.starts_with('/') {
+    // A file to run is no token, however long its name and whatever dots
+    // it has (`seeds-for-the-whole-catalogue.v2.api`).
+    if method.is_empty() || methods.contains(&method) || method.starts_with('/') || names_api_file(method) {
         return false;
     }
     method.len() > 40
@@ -29507,5 +29509,106 @@ mod tests {
         // Through an alias too.
         let err = split_bulk_requests("import dir cl { \"path\": \"lib\" }\ncl/none-*.api\n", Some(dir.path())).unwrap_err();
         assert!(err.contains("no files match include glob"), "{err}");
+    }
+
+    #[test]
+    fn a_store_written_by_an_older_client_is_read() {
+        // `environments` was the name of the list.
+        let store = r#"{"environments":[{"name":"a","url":"http://x","auth_type":"key","credential":"k"}],"default":"a"}"#;
+        let data = parse_store(store).unwrap();
+        assert_eq!(data.connections.len(), 1);
+        assert_eq!(data.connections[0].name, "a");
+        // And is written back under the name it has now.
+        let written = serde_json::to_string(&data).unwrap();
+        assert!(written.contains("\"connections\":") && !written.contains("environments"), "{written}");
+    }
+
+    #[test]
+    fn a_write_that_is_told_not_now_is_carried_on_where_it_stopped() {
+        /// A writer that answers each call with the next of `script`.
+        struct Scripted {
+            script: std::collections::VecDeque<io::Result<usize>>,
+            taken: Vec<u8>,
+        }
+        impl Write for Scripted {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                match self.script.pop_front() {
+                    Some(Ok(n)) => {
+                        let n = n.min(buf.len());
+                        self.taken.extend_from_slice(&buf[..n]);
+                        Ok(n)
+                    }
+                    Some(Err(e)) => Err(e),
+                    None => {
+                        self.taken.extend_from_slice(buf);
+                        Ok(buf.len())
+                    }
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                match self.script.pop_front() {
+                    Some(Err(e)) => Err(e),
+                    _ => Ok(()),
+                }
+            }
+        }
+        let scripted = |script: Vec<io::Result<usize>>| Scripted { script: script.into(), taken: Vec::new() };
+        let kind = |kind: io::ErrorKind| Err(io::Error::from(kind));
+
+        // Interrupted, a part taken, a full pipe, then the rest: every byte once.
+        let mut to = scripted(vec![kind(io::ErrorKind::Interrupted), Ok(2), kind(io::ErrorKind::WouldBlock), Ok(1)]);
+        write_through(&mut to, Some(b"abcdef")).unwrap();
+        assert_eq!(to.taken, b"abcdef");
+        // A writer that takes nothing is not asked for ever.
+        let mut to = scripted(vec![Ok(0)]);
+        assert_eq!(write_through(&mut to, Some(b"abc")).unwrap_err().kind(), io::ErrorKind::WriteZero);
+        // Any other error is the answer, with what was taken before it.
+        let mut to = scripted(vec![Ok(1), kind(io::ErrorKind::BrokenPipe)]);
+        assert_eq!(write_through(&mut to, Some(b"abc")).unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(to.taken, b"a");
+        // Nothing to write writes nothing; a flush waits out a "not now" too.
+        let mut to = scripted(vec![]);
+        write_through(&mut to, Some(b"")).unwrap();
+        assert!(to.taken.is_empty());
+        let mut to = scripted(vec![kind(io::ErrorKind::WouldBlock), kind(io::ErrorKind::Interrupted)]);
+        write_through(&mut to, None).unwrap();
+        let mut to = scripted(vec![kind(io::ErrorKind::BrokenPipe)]);
+        assert_eq!(write_through(&mut to, None).unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn only_a_token_looks_like_a_token() {
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
+        assert!(looks_like_bearer_token(jwt));
+        for not_one in [
+            "",
+            "GET",
+            "/a.b.c",
+            // An include with a long name and two dots.
+            "some-very-long-directory-name-for-seeds.v2.api",
+            "seeds/some-very-long-directory-name-for-seeds.v2.api",
+            "short.v2.api",
+            "four.parts.of-a-name-that-is-long-enough-to-count.api",
+            "a name with blanks that is long enough to count.v2.api",
+        ] {
+            assert!(!looks_like_bearer_token(not_one), "{not_one}");
+        }
+    }
+
+    #[test]
+    fn a_glob_of_json_and_ndjson_is_one_or_the_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().display().to_string();
+        fs::write(dir.path().join("a.json"), r#"{"a":1}"#).unwrap();
+        fs::write(dir.path().join("b.json"), r#"[{"b":1},{"b":2}]"#).unwrap();
+        // All JSON: one array, sent as JSON.
+        let body = resolve_at_file_body(&format!("{d}/*.json")).unwrap();
+        assert_eq!(String::from_utf8(body.contents).unwrap(), r#"[{"a":1},{"b":1},{"b":2}]"#);
+        assert_eq!(body.content_type.as_deref(), Some("application/json"));
+        // With an NDJSON file of several lines among them it is not one
+        // JSON value per file: said, with the file, and nothing to send.
+        fs::write(dir.path().join("c.ndjson"), "{\"c\":1}\n{\"c\":2}\n").unwrap();
+        let err = resolve_at_file_body(&format!("{d}/*")).err().expect("a mixed glob");
+        assert!(err.contains("invalid JSON in") && err.contains("c.ndjson"), "{err}");
     }
 }
