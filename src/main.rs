@@ -655,6 +655,11 @@ struct Args {
     #[arg(long = "imports", value_name = "FILE")]
     imports: Option<String>,
 
+    /// Install syntax highlighting for .api files in an editor (sublime,
+    /// vscode, cursor, rider, vim or nvim) and send nothing
+    #[arg(long = "install-syntax", value_name = "EDITOR")]
+    install_syntax: Option<String>,
+
     /// Stream the response body instead of buffering it (also: API_STREAMING=1)
     #[arg(short = 't', long = "stream")]
     stream: bool,
@@ -4410,6 +4415,23 @@ fn main() {
     let document = [("--imports", &args.imports), ("--describe", &args.describe), ("--assert", &args.assert)]
         .into_iter()
         .find_map(|(option, file)| file.as_ref().map(|file| format!("{} {}", option, file)));
+    // `--install-syntax` writes files for an editor and sends nothing. What
+    // stands beside it is not dropped without a word either.
+    if let Some(editor) = &args.install_syntax {
+        let request: Vec<&str> =
+            [&args.method, &args.uri].into_iter().flatten().chain(args.body.iter()).map(String::as_str).collect();
+        let beside = match (&document, &args.all) {
+            (Some(document), _) => Some(format!("{} prints a document", document)),
+            (None, Some(file)) => Some(format!("-a {} runs a file", file)),
+            (None, None) if !request.is_empty() => Some(format!("{} is a request", request.join(" "))),
+            (None, None) => None,
+        };
+        if let Some(beside) = beside {
+            errln!("error: --install-syntax {} installs files and {}: give one of the two", editor, beside);
+            exit_process(1);
+        }
+        exit_process(install_syntax(editor));
+    }
     if let Some(document) = document {
         let request: Vec<&str> =
             [&args.method, &args.uri].into_iter().flatten().chain(args.body.iter()).map(String::as_str).collect();
@@ -9404,6 +9426,265 @@ fn read_api_file(file: &str) -> Result<(String, Option<PathBuf>), String> {
 fn print_json_document(value: &serde_json::Value, raw: bool) {
     let text = if raw { serde_json::to_string(value) } else { serde_json::to_string_pretty(value) };
     outln!("{}", text.unwrap_or_else(|_| "null".to_string()));
+}
+
+// ---------------------------------------------------------------------------
+// `--install-syntax <editor>`: syntax highlighting for `.api` files.
+//
+// The grammars are the files of `editors/`, compiled in, so the highlighting
+// a client installs is the one for the syntax that client reads.
+// ---------------------------------------------------------------------------
+
+const SUBLIME_SYNTAX: &str = include_str!("../editors/sublime/API.sublime-syntax");
+
+/// The VS Code extension, less its `package.json`. A JetBrains IDE reads the
+/// same folder as a TextMate bundle.
+const VSCODE_PACKAGE_JSON: &str = include_str!("../editors/vscode/package.json");
+const VSCODE_FILES: [(&str, &str); 2] = [
+    ("language-configuration.json", include_str!("../editors/vscode/language-configuration.json")),
+    ("syntaxes/api.tmLanguage.json", include_str!("../editors/vscode/syntaxes/api.tmLanguage.json")),
+];
+
+/// A Vim package: `syntax/`, `ftdetect/` and `ftplugin/` under one directory
+/// of the `packpath`.
+const VIM_FILES: [(&str, &str); 3] = [
+    ("syntax/api.vim", include_str!("../editors/vim/syntax/api.vim")),
+    ("ftdetect/api.vim", include_str!("../editors/vim/ftdetect/api.vim")),
+    ("ftplugin/api.vim", include_str!("../editors/vim/ftplugin/api.vim")),
+];
+
+/// What `--install-syntax` takes.
+const SYNTAX_EDITORS: [&str; 6] = ["sublime", "vscode", "cursor", "rider", "vim", "nvim"];
+
+/// An editor that installs a `.vsix` from its command line.
+struct VsixEditor {
+    name: &'static str,
+    command: &'static str,
+}
+
+const VSCODE: VsixEditor = VsixEditor { name: "VS Code", command: "code" };
+const CURSOR: VsixEditor = VsixEditor { name: "Cursor", command: "cursor" };
+
+/// `--install-syntax <editor>`: write the highlighting for `.api` files where
+/// the editor reads it. Each path written is a line on stdout; what is left
+/// to do, if anything, is said on stderr. Returns the exit code.
+fn install_syntax(editor: &str) -> i32 {
+    let installed = match editor.to_ascii_lowercase().as_str() {
+        "sublime" => install_sublime_syntax(),
+        "vscode" => install_vsix(&VSCODE),
+        "cursor" => install_vsix(&CURSOR),
+        "rider" => install_textmate_bundle(),
+        "vim" => install_vim_package(vim_package_dir(), "Vim"),
+        "nvim" => install_vim_package(nvim_package_dir(), "Neovim"),
+        _ => Err(format!("unknown editor `{}` (one of {})", editor, SYNTAX_EDITORS.join(", "))),
+    };
+    match installed {
+        Ok(note) => {
+            errln!("{}", note);
+            0
+        }
+        Err(e) => {
+            errln!("error: {}", e);
+            1
+        }
+    }
+}
+
+/// Write `contents` to `path`, making the directories above it, and print
+/// the path.
+fn write_syntax_file(path: &std::path::Path, contents: &[u8]) -> Result<(), String> {
+    let written = match path.parent() {
+        Some(parent) => fs::create_dir_all(parent).and_then(|_| fs::write(path, contents)),
+        None => fs::write(path, contents),
+    };
+    written.map_err(|e| format!("could not write {}: {}", path.display(), e))?;
+    outln!("{}", path.display());
+    Ok(())
+}
+
+fn home_for_syntax() -> Result<PathBuf, String> {
+    dirs::home_dir().ok_or_else(|| "no home directory to install into".to_string())
+}
+
+/// Where the client keeps the files an editor reads from a place of the
+/// client's own: the `.vsix` and the TextMate bundle. Not under `~/.cache`,
+/// which may be emptied: an IDE reads the bundle where it is.
+fn editor_files_dir() -> Result<PathBuf, String> {
+    Ok(home_for_syntax()?.join(".local").join("share").join("api").join("editors"))
+}
+
+/// Sublime Text reads a syntax from `Packages/User` of its data directory.
+/// The directory is the editor's to make: one that is not there means there
+/// is no Sublime Text to install into.
+fn install_sublime_syntax() -> Result<String, String> {
+    let config = dirs::config_dir().ok_or_else(|| "no home directory to install into".to_string())?;
+    let names: [&str; 2] = if cfg!(any(target_os = "macos", windows)) {
+        ["Sublime Text", "Sublime Text 3"]
+    } else {
+        ["sublime-text", "sublime-text-3"]
+    };
+    let packages = names.iter().map(|name| config.join(name).join("Packages")).find(|dir| dir.is_dir());
+    let Some(packages) = packages else {
+        return Err(format!(
+            "Sublime Text has no folder at {}. Start Sublime Text once and run this again.",
+            config.join(names[0]).join("Packages").display()
+        ));
+    };
+    write_syntax_file(&packages.join("User").join("API.sublime-syntax"), SUBLIME_SYNTAX.as_bytes())?;
+    Ok("Installed in Sublime Text. A .api file that is open picks it up at once.".to_string())
+}
+
+fn vim_package_dir() -> Result<PathBuf, String> {
+    let vim = if cfg!(windows) { "vimfiles" } else { ".vim" };
+    Ok(home_for_syntax()?.join(vim).join("pack").join("commerceos").join("start").join("api"))
+}
+
+/// Neovim's data directory: `$XDG_DATA_HOME/nvim`, `~/.local/share/nvim` on
+/// macOS too, and `nvim-data` under the local application data on Windows.
+fn nvim_package_dir() -> Result<PathBuf, String> {
+    let data = if cfg!(windows) {
+        dirs::data_local_dir().ok_or_else(|| "no home directory to install into".to_string())?.join("nvim-data")
+    } else {
+        match std::env::var_os("XDG_DATA_HOME").filter(|dir| !dir.is_empty()) {
+            Some(dir) => PathBuf::from(dir).join("nvim"),
+            None => home_for_syntax()?.join(".local").join("share").join("nvim"),
+        }
+    };
+    Ok(data.join("site").join("pack").join("commerceos").join("start").join("api"))
+}
+
+fn install_vim_package(dir: Result<PathBuf, String>, name: &str) -> Result<String, String> {
+    let dir = dir?;
+    for (file, contents) in VIM_FILES {
+        write_syntax_file(&dir.join(file), contents.as_bytes())?;
+    }
+    Ok(format!("Installed in {}. Start it again to see it; it needs `syntax on`.", name))
+}
+
+/// The extension's `package.json` with the client's version in it: an editor
+/// then takes the extension of a newer client for an update.
+fn vscode_manifest() -> Result<serde_json::Value, String> {
+    let mut manifest: serde_json::Value = serde_json::from_str(VSCODE_PACKAGE_JSON)
+        .map_err(|e| format!("the extension's package.json can't be read: {}", e))?;
+    manifest["version"] = VERSION.into();
+    Ok(manifest)
+}
+
+/// The files of the extension, by their path in it.
+fn vscode_extension_files() -> Result<Vec<(&'static str, String)>, String> {
+    let manifest = serde_json::to_string_pretty(&vscode_manifest()?).map_err(|e| e.to_string())?;
+    let mut files = vec![("package.json", manifest + "\n")];
+    files.extend(VSCODE_FILES.iter().map(|(name, contents)| (*name, contents.to_string())));
+    Ok(files)
+}
+
+/// `text` as the value of an XML attribute or as XML text.
+fn xml_escaped(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+/// The extension as a `.vsix`: a zip with the extension under `extension/`
+/// and a manifest that names it, which is what `vsce package` writes.
+fn vsix() -> Result<Vec<u8>, String> {
+    let manifest = vscode_manifest()?;
+    let field = |name: &str| xml_escaped(manifest[name].as_str().unwrap_or_default());
+    let engine = xml_escaped(manifest["engines"]["vscode"].as_str().unwrap_or("*"));
+    let vsix_manifest = format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011" xmlns:d="http://schemas.microsoft.com/developer/vsx-schema-design/2011">
+  <Metadata>
+    <Identity Language="en-US" Id="{name}" Version="{version}" Publisher="{publisher}" />
+    <DisplayName>{display_name}</DisplayName>
+    <Description xml:space="preserve">{description}</Description>
+    <Categories>Programming Languages</Categories>
+    <Properties>
+      <Property Id="Microsoft.VisualStudio.Code.Engine" Value="{engine}" />
+    </Properties>
+  </Metadata>
+  <Installation>
+    <InstallationTarget Id="Microsoft.VisualStudio.Code" />
+  </Installation>
+  <Dependencies />
+  <Assets>
+    <Asset Type="Microsoft.VisualStudio.Code.Manifest" Path="extension/package.json" Addressable="true" />
+  </Assets>
+</PackageManifest>
+"#,
+        name = field("name"),
+        version = field("version"),
+        publisher = field("publisher"),
+        display_name = field("displayName"),
+        description = field("description"),
+        engine = engine,
+    );
+    let content_types = r#"<?xml version="1.0" encoding="utf-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension=".json" ContentType="application/json" /><Default Extension=".vsixmanifest" ContentType="text/xml" /></Types>
+"#;
+    let mut entries = vec![
+        ("extension.vsixmanifest".to_string(), vsix_manifest),
+        ("[Content_Types].xml".to_string(), content_types.to_string()),
+    ];
+    entries.extend(vscode_extension_files()?.into_iter().map(|(name, contents)| (format!("extension/{}", name), contents)));
+
+    let mut writer = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default();
+    for (name, contents) in entries {
+        writer
+            .start_file(name, options)
+            .and_then(|_| writer.write_all(contents.as_bytes()).map_err(zip::result::ZipError::Io))
+            .map_err(|e| format!("could not pack the extension: {}", e))?;
+    }
+    writer.finish().map(io::Cursor::into_inner).map_err(|e| format!("could not pack the extension: {}", e))
+}
+
+/// VS Code and Cursor: write the `.vsix` and have the editor's own command
+/// install it. Without that command on the `PATH` the file is still there to
+/// install by hand, and the error says how.
+fn install_vsix(editor: &VsixEditor) -> Result<String, String> {
+    let path = editor_files_dir()?.join("commerceos-api.vsix");
+    write_syntax_file(&path, &vsix()?)?;
+    let by_hand = format!(
+        "To install it by hand, run \"Extensions: Install from VSIX…\" from the command palette of {} and choose that file.",
+        editor.name
+    );
+    let command = if cfg!(windows) { format!("{}.cmd", editor.command) } else { editor.command.to_string() };
+    let ran = std::process::Command::new(&command)
+        .arg("--install-extension")
+        .arg(&path)
+        .arg("--force")
+        .stdin(std::process::Stdio::null())
+        .output();
+    match ran {
+        Ok(output) if output.status.success() => {
+            Ok(format!("Installed in {}. A .api file that is open picks it up when its window is reloaded.", editor.name))
+        }
+        Ok(output) => {
+            let said = String::from_utf8_lossy(&output.stderr);
+            let said = said.trim();
+            let reason = if said.is_empty() { output.status.to_string() } else { said.to_string() };
+            Err(format!("`{}` could not install the extension: {}\n{}", editor.command, reason, by_hand))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(format!(
+            "`{}` is not on the PATH, so the extension was written and not installed.\n{}",
+            editor.command, by_hand
+        )),
+        Err(e) => Err(format!("could not run `{}`: {}\n{}", editor.command, e, by_hand)),
+    }
+}
+
+/// Rider, and any other JetBrains IDE: the extension's folder is a TextMate
+/// bundle to it. Which bundles an IDE reads is a setting of the IDE, in a
+/// file of its own per version that it rewrites while it runs, so adding the
+/// folder there is left to the user: one step, said here.
+fn install_textmate_bundle() -> Result<String, String> {
+    let dir = editor_files_dir()?.join("commerceos-api");
+    for (file, contents) in vscode_extension_files()? {
+        write_syntax_file(&dir.join(file), contents.as_bytes())?;
+    }
+    Ok(format!(
+        "One step is left, once: in Rider (or another JetBrains IDE) open Settings → Editor → TextMate Bundles, press + and choose {}",
+        dir.display()
+    ))
 }
 
 /// `--describe <file>`: the file's describe block on stdout, `null` when it

@@ -1,0 +1,559 @@
+%YAML 1.2
+---
+# Sublime Text syntax for .api batch files. Follows the grammar in AGENTS.md.
+name: API
+file_extensions: [api]
+scope: source.api
+
+variables:
+  method: '(?i:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)'
+  directive: '(?i:sleep|url|assert|confirm|set|import)'
+  word_end: '(?=\s|$)'
+  # end of what a line says: the line's end, or a ` # comment`
+  line_end: '(?=\s*$|\s+#)'
+
+contexts:
+  # The top of a file. Only comments, blank lines and `url` lines may stand
+  # above a describe block; the first other line moves on to `statements`,
+  # where a `{` that starts a line is an error.
+  main:
+    - include: comment
+    - include: url_directive
+    - match: '^\s*(?=\{)'
+      push: [statements, describe_block]
+    - match: '^(?=\s*[^\s#])'
+      push: statements
+
+  statements:
+    - include: comment
+    - match: '^\s*(?=[\{\[])'
+      push: misplaced_body
+    - match: '^\s*((?i:GET|HEAD|OPTIONS)){{word_end}}'
+      captures:
+        1: keyword.control.http.read.api
+      push: path
+    - match: '^\s*((?i:PUT|POST|PATCH)){{word_end}}'
+      captures:
+        1: keyword.control.http.write.api
+      push: path
+    - match: '^\s*((?i:DELETE)){{word_end}}'
+      captures:
+        1: keyword.control.http.delete.api
+      push: path
+    # `/people` is `GET /people`; `/tmp/seed.api` is an include
+    - match: '^\s*(?=/)(?!\S*(?i:\.api){{line_end}})'
+      push: path
+    # a chain is one line: it can't start with a separator
+    - match: '^\s*(&&|\|\|)'
+      captures:
+        1: invalid.illegal.chain.api
+      push: segment
+    - include: url_directive
+    - match: '^\s*((?i:sleep)){{word_end}}'
+      captures:
+        1: keyword.control.command.api
+      push: sleep_line
+    - match: '^\s*((?i:assert)){{word_end}}'
+      captures:
+        1: keyword.control.command.api
+      push: condition
+    - match: '^\s*((?i:confirm)){{word_end}}'
+      captures:
+        1: keyword.control.command.api
+      push: confirm_message
+    - match: '^\s*((?i:set)){{word_end}}'
+      captures:
+        1: keyword.control.command.api
+      push: set_name
+    - match: '^\s*((?i:import)){{word_end}}'
+      captures:
+        1: keyword.control.import.api
+      push: import_kind
+    # anything else is an include: the whole line, less a trailing comment
+    - match: '^\s*(?=[^\s#])'
+      push: [line_end, include_path]
+
+  # ---------------------------------------------------------------- comments
+
+  comment:
+    - match: '(#)\s*(@basedir)\b\s+(.+?)\s*$'
+      scope: comment.line.number-sign.api
+      captures:
+        1: punctuation.definition.comment.api
+        2: keyword.other.directive.api
+        3: string.unquoted.path.directive.api
+    - match: '#.*$'
+      scope: comment.line.number-sign.api
+
+  # ` # …` behind a request, a directive or an include. The `#` needs a blank
+  # in front of it: `GET /people#x` has no comment.
+  trailing_comment:
+    - match: '(?:^|(?<=\s))#.*$'
+      scope: comment.line.number-sign.api
+
+  line_end:
+    - match: '\s*$'
+      pop: true
+    - include: trailing_comment
+    - match: '\S+'
+      scope: invalid.illegal.trailing.api
+
+  # -------------------------------------------------------------- directives
+
+  url_directive:
+    - match: '^\s*((?i:url))\s+((?i:has|is)){{word_end}}'
+      captures:
+        1: keyword.control.command.api
+        2: keyword.operator.api
+      push: url_value
+    - match: '^\s*((?i:url)){{word_end}}'
+      captures:
+        1: keyword.control.command.api
+      push: line_end
+
+  url_value:
+    - match: '\s*$'
+      pop: true
+    - include: trailing_comment
+    - match: '\S+'
+      scope: string.unquoted.value.api
+
+  sleep_line:
+    - match: '\s*$'
+      pop: true
+    - include: trailing_comment
+    - match: '((?i:while))\b'
+      captures:
+        1: keyword.control.loop.api
+      set: condition
+    - match: '\d*\.?\d+(?:ms|s)?{{word_end}}'
+      scope: constant.numeric.api
+    - match: '\S'
+      scope: invalid.illegal.condition.api
+
+  # `[not] <request>`, behind `assert` and `sleep while`
+  condition:
+    - match: '\s*$'
+      pop: true
+    - include: trailing_comment
+    - match: '((?i:not)){{word_end}}'
+      captures:
+        1: keyword.control.loop.api
+    - match: '((?i:GET|HEAD|OPTIONS)){{word_end}}'
+      captures:
+        1: keyword.control.http.read.api
+      set: condition_path
+    - match: '((?i:PUT|POST|PATCH)){{word_end}}'
+      captures:
+        1: keyword.control.http.write.api
+      set: condition_path
+    - match: '((?i:DELETE)){{word_end}}'
+      captures:
+        1: keyword.control.http.delete.api
+      set: condition_path
+    - match: '(?=/)'
+      set: condition_path
+    - match: '\S'
+      scope: invalid.illegal.condition.api
+
+  # no chain and no outfile in a condition
+  condition_path:
+    - meta_scope: meta.url.api
+    - match: '\s*$'
+      pop: true
+    - include: trailing_comment
+    - match: '&&|\|\||\s+>>?(?=\s|$)'
+      scope: invalid.illegal.condition.api
+    - match: '\s+(?=[\{\[])'
+      set: json_body
+    - match: '\s+(?=")'
+      set: string_body
+    - include: uri_parts
+
+  # everything behind `confirm` is the question: no comment, no chain
+  confirm_message:
+    - meta_content_scope: string.unquoted.message.api
+    - match: '$'
+      pop: true
+
+  set_name:
+    - match: '\s*$'
+      pop: true
+    - include: trailing_comment
+    - match: '(?i:export){{word_end}}'
+      scope: variable.parameter.setting.api
+      set: set_export_value
+    - match: '(?i:timeout){{word_end}}'
+      scope: variable.parameter.setting.api
+      set: set_timeout_value
+    - match: '(?i:include-nulls|fail-fast|ndjson|raw|stream){{word_end}}'
+      scope: variable.parameter.setting.api
+      set: set_switch_value
+    - match: '\S+'
+      scope: invalid.illegal.setting.api
+      set: line_end
+
+  set_switch_value:
+    - match: '(?i:on|off){{word_end}}'
+      scope: constant.language.api
+      set: line_end
+    - include: line_end
+
+  set_export_value:
+    - match: '(?i:off){{word_end}}'
+      scope: constant.language.api
+      set: line_end
+    - match: '\s*$'
+      pop: true
+    - include: trailing_comment
+    - match: '\S+'
+      scope: string.unquoted.value.api
+      set: line_end
+
+  set_timeout_value:
+    - match: '\d+{{word_end}}'
+      scope: constant.numeric.api
+      set: line_end
+    - match: '(?i:off){{word_end}}'
+      scope: constant.language.api
+      set: line_end
+    - include: line_end
+
+  # ----------------------------------------------------------------- imports
+
+  # import git|dir|archive <alias> { … }   or   … @file.json
+  import_kind:
+    - match: '\s*$'
+      pop: true
+    - match: '(?i:git|dir|archive){{word_end}}'
+      scope: storage.type.import.api
+      set: import_alias
+    - match: '\S+'
+      scope: invalid.illegal.import.api
+      set: import_alias
+
+  import_alias:
+    - match: '\s*$'
+      pop: true
+    # an alias can't be a method or a directive
+    - match: '(?:{{method}}|{{directive}}){{word_end}}'
+      scope: invalid.illegal.import.api
+      set: import_source
+    - match: '[A-Za-z0-9_-]+{{word_end}}'
+      scope: entity.name.namespace.import.api
+      set: import_source
+    - match: '\S+'
+      scope: invalid.illegal.import.api
+      set: import_source
+
+  import_source:
+    - match: '\s*$'
+      pop: true
+    - match: '(@)\s*'
+      captures:
+        1: keyword.operator.infile.api
+      set: import_file
+    - match: '\{'
+      scope: punctuation.section.mapping.begin.json
+      set:
+        - meta_scope: meta.import.api meta.embedded.block.json meta.mapping.json
+        - match: '\}'
+          scope: punctuation.section.mapping.end.json
+          pop: true
+        - match: '(")(url|ref|path|sha256|token_env)(")(?=\s*:)'
+          scope: meta.mapping.key.json string.quoted.double.json
+          captures:
+            2: support.type.property-name.import.api
+        - include: json_members
+    - include: trailing_comment
+    - match: '\S+'
+      scope: invalid.illegal.import.api
+
+  # one JSON file: no glob, no ~map(…)
+  import_file:
+    - meta_scope: meta.path.infile.api
+    - match: '\s*$'
+      pop: true
+    - include: trailing_comment
+    - match: '~\w+\([^)]*\)|[*?\[]'
+      scope: invalid.illegal.import.api
+
+  include_path:
+    - meta_content_scope: meta.include.api
+    - match: '{{line_end}}'
+      pop: true
+    - match: '[*?]'
+      scope: constant.character.wildcard.api
+
+  # ---------------------------------------------------------- describe block
+
+  describe_block:
+    - match: '\{'
+      scope: punctuation.section.mapping.begin.json
+      set:
+        - meta_scope: meta.describe.api meta.mapping.json
+        - match: '\}'
+          scope: punctuation.section.mapping.end.json
+          pop: true
+        - match: '(")(title|description|docsLink)(")(?=\s*:)'
+          scope: meta.mapping.key.json string.quoted.double.json
+          captures:
+            2: support.type.property-name.describe.api
+        - include: json_members
+
+  # A `{` or `[` that starts a line below the top of the file: a second
+  # describe block, or a body on the line under its request. Both stop a batch.
+  misplaced_body:
+    - match: '\{'
+      scope: invalid.illegal.misplaced-body.api
+      set: json_object_body
+    - match: '\['
+      scope: invalid.illegal.misplaced-body.api
+      set: json_array_body
+
+  # ---------------------------------------------------------------- requests
+
+  # `&&` / `||` between requests of one line
+  chain:
+    - match: '(?:&&|\|\|){{line_end}}'
+      scope: invalid.illegal.chain.api
+    - match: '&&|\|\|'
+      scope: keyword.operator.logical.api
+      set: segment
+
+  # ` > file`, ` >> file`: a blank in front, a path behind
+  redirect:
+    - match: '\s+(>>?){{line_end}}'
+      captures:
+        1: invalid.illegal.outfile.api
+    - match: '\s+(>>?)\s*'
+      captures:
+        1: keyword.operator.outfile.api
+      set: outfile_path
+
+  segment:
+    - match: '\s*$'
+      pop: true
+    - include: chain
+    - match: '((?i:GET|HEAD|OPTIONS)){{word_end}}'
+      captures:
+        1: keyword.control.http.read.api
+      set: path
+    - match: '((?i:PUT|POST|PATCH)){{word_end}}'
+      captures:
+        1: keyword.control.http.write.api
+      set: path
+    - match: '((?i:DELETE)){{word_end}}'
+      captures:
+        1: keyword.control.http.delete.api
+      set: path
+    - match: '(?=/)'
+      set: path
+    # a directive or an include in a chain is an error
+    - match: '(?=\S)'
+      set: segment_error
+
+  segment_error:
+    - meta_scope: invalid.illegal.segment.api
+    - match: '(?=&&|\|\|)'
+      set: segment
+    - match: '$'
+      pop: true
+
+  path:
+    - meta_scope: meta.url.api
+    - match: '\s*$'
+      pop: true
+    - include: trailing_comment
+    - include: chain
+    - match: '\s+(?=[\{\[])'
+      set: json_body
+    - match: '\s+(?=")'
+      set: string_body
+    - include: redirect
+    - match: '\s+(@)\s*'
+      captures:
+        1: keyword.operator.infile.api
+      set: infile_path
+    - include: uri_parts
+
+  uri_parts:
+    - match: '\('
+      scope: punctuation.separator.path.api
+      push: uri_parens
+    - match: '(?<=[./])\*'
+      scope: constant.character.wildcard.api
+    - match: '[/~){}:?#=&@.;,<>+*!\-]'
+      scope: punctuation.separator.path.api
+
+  # Inside the parentheses of a URI operator nothing ends the request:
+  # `~where(a=1||b=2)` and `~where(name="a > b # c")` are sent as written.
+  uri_parens:
+    - match: '\)'
+      scope: punctuation.separator.path.api
+      pop: true
+    - match: '$'
+      pop: true
+    - match: '"'
+      scope: punctuation.definition.string.begin.api
+      push:
+        - meta_scope: string.quoted.double.api
+        - match: '"'
+          scope: punctuation.definition.string.end.api
+          pop: true
+        - match: '$'
+          pop: true
+    - match: '\|'
+      scope: punctuation.separator.path.api
+    - include: uri_parts
+
+  outfile_path:
+    - meta_scope: meta.path.outfile.api
+    - match: '\s*$'
+      pop: true
+    - include: trailing_comment
+    - include: chain
+    - match: '(?<=[>\s])(?i:clipboard)(?=\s*$|\s+#|\s*&&|\s*\|\|)'
+      scope: support.constant.clipboard.api
+
+  infile_path:
+    - meta_scope: meta.path.infile.api
+    - match: '\s*$'
+      pop: true
+    - include: trailing_comment
+    - include: chain
+    - include: redirect
+    # ~map(type) is the only function an @file body takes
+    - match: '(~)(map)(\()([^)\s]*)(\))'
+      captures:
+        1: punctuation.separator.path.api
+        2: support.function.map.api
+        3: punctuation.separator.path.api
+        4: string.unquoted.value.api
+        5: punctuation.separator.path.api
+    - match: '~\w+\([^)]*\)'
+      scope: invalid.illegal.body-function.api
+    - match: '[*?]'
+      scope: constant.character.wildcard.api
+
+  # what may follow a body on its last line
+  body_tail:
+    - match: '\s*$'
+      pop: true
+    - include: trailing_comment
+    - include: chain
+    - include: redirect
+
+  json_body:
+    - meta_scope: meta.embedded.block.json
+    - meta_include_prototype: false
+    - match: '(?=^\s*{{method}}{{word_end}}|^\s*{{directive}}{{word_end}}|^\s*#)'
+      pop: true
+    - include: body_tail
+    - include: json_value
+
+  string_body:
+    - match: '"'
+      scope: punctuation.definition.string.begin.api
+      set: string_inner
+
+  string_inner:
+    - meta_scope: string.quoted.double.api
+    - match: '"'
+      scope: punctuation.definition.string.end.api
+      set: after_body
+    - match: '\\.'
+      scope: constant.character.escape.api
+
+  after_body:
+    - include: body_tail
+
+  # -------------------------------------------------------------------- JSON
+
+  json_value:
+    - include: json_object
+    - include: json_array
+    - include: json_string
+    - include: json_number
+    - include: json_constant
+
+  json_object:
+    - match: '\{'
+      scope: punctuation.section.mapping.begin.json
+      push: json_object_body
+
+  json_object_body:
+    - meta_scope: meta.mapping.json
+    - match: '\}'
+      scope: punctuation.section.mapping.end.json
+      pop: true
+    - include: json_members
+
+  json_members:
+    - match: '"'
+      scope: punctuation.definition.string.begin.json
+      push:
+        - meta_scope: meta.mapping.key.json string.quoted.double.json
+        - match: '"'
+          scope: punctuation.definition.string.end.json
+          pop: true
+        - match: '\\.'
+          scope: constant.character.escape.json
+    - match: ':'
+      scope: punctuation.separator.key-value.json
+      push:
+        - meta_scope: meta.mapping.value.json
+        - match: '(?=[\},])'
+          pop: true
+        - include: json_comment
+        - include: json_value
+    - match: ','
+      scope: punctuation.separator.sequence.json
+    - include: json_comment
+
+  json_array:
+    - match: '\['
+      scope: punctuation.section.sequence.begin.json
+      push: json_array_body
+
+  json_array_body:
+    - meta_scope: meta.sequence.json
+    - match: '\]'
+      scope: punctuation.section.sequence.end.json
+      pop: true
+    - match: ','
+      scope: punctuation.separator.sequence.json
+    - include: json_comment
+    - include: json_value
+
+  json_string:
+    - match: '"'
+      scope: punctuation.definition.string.begin.json
+      push:
+        - meta_scope: string.quoted.double.json
+        - match: '"'
+          scope: punctuation.definition.string.end.json
+          pop: true
+        - match: '\\.'
+          scope: constant.character.escape.json
+
+  json_number:
+    - match: '(?<![\w.])-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?(?![\w.])'
+      scope: constant.numeric.json
+
+  json_constant:
+    - match: '\b(?:true|false|null)\b'
+      scope: constant.language.json
+
+  json_comment:
+    - match: '//.*$'
+      scope: comment.line.double-slash.json
+    - match: '#.*$'
+      scope: comment.line.number-sign.json
+    - match: '/\*'
+      scope: punctuation.definition.comment.begin.json
+      push:
+        - meta_scope: comment.block.json
+        - match: '\*/'
+          scope: punctuation.definition.comment.end.json
+          pop: true

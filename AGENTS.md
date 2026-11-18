@@ -737,6 +737,43 @@ omnium/omnium.api
   ref that does not exist) is `error: …` on stderr with exit 1 and nothing on
   stdout.
 
+## Syntax highlighting: `--install-syntax <editor>`
+
+```sh
+api --install-syntax sublime
+```
+
+Installs highlighting for `.api` files in an editor: `sublime`, `vscode`,
+`cursor`, `rider`, `vim` or `nvim`, in any case. The grammars are part of the
+client, so what is installed is the one for the syntax this client reads.
+Nothing is sent and no connection is needed.
+
+- **Each path written is a line on stdout.** What is left to do, if anything,
+  is said on stderr.
+- `sublime` writes `API.sublime-syntax` to `Packages/User` of Sublime Text's
+  data folder. Where Sublime Text has no folder it is an error, and none is
+  made.
+- `vim` and `nvim` write a package (`syntax/`, `ftdetect/`, `ftplugin/`) to
+  `~/.vim/pack/commerceos/start/api` and
+  `~/.local/share/nvim/site/pack/commerceos/start/api`.
+- `vscode` and `cursor` write `~/.local/share/api/editors/commerceos-api.vsix`
+  and install it with the editor's own command (`code --install-extension`,
+  `cursor --install-extension`). Without that command on the `PATH` the file
+  is still written, the exit code is 1 and stderr says how to install it by
+  hand.
+- `rider` writes a TextMate bundle to
+  `~/.local/share/api/editors/commerceos-api`, for any JetBrains IDE. Adding
+  it under *Settings → Editor → TextMate Bundles* is a step in the IDE, said
+  on stderr, and needed once.
+- **A file that is there is replaced.** Running it again after an update of
+  the client is how the highlighting is updated.
+- An editor that is not one of the six is `error: unknown editor …` with exit
+  1. A file to run, a request or a `--describe` beside it is an error too:
+  `--install-syntax vim installs files and GET /people is a request: give one
+  of the two`.
+
+The grammars and what each covers are in `editors/`.
+
 ## 7. Directives: `sleep`, `sleep while`, `assert`, `confirm`, `set`, `url`
 
 Besides requests and includes, a few control lines are recognised. `sleep while`
@@ -1579,5 +1616,6 @@ Run it: `api -sa workshop.api`.
 - Add `-f` (`-sfa`) so a failed request stops the batch: check the exit code, and on failure read the error body from the end of stdout (everything after the last `└─HTTP/1.1 …` line; it is usually several lines of JSON). Without it a batch exits 0 however many plain requests failed.
 - Open a file with a [describe block](#describe-block) (`title`, `description`, `docsLink`) so a tool or a person can tell what it does; read one with `api --describe file.api`, which sends nothing.
 - To see what a file checks without running it, `api --assert file.api` prints every `PUT /assert` body it sends as one JSON array.
+- When someone asks for `.api` highlighting in their editor, it is `api --install-syntax <editor>`. Don't copy a grammar out of `editors/` by hand: the client holds the one that matches it.
 - To read a file of an import yourself, ask `api --imports file.api` for the directory its alias stands for. Don't rebuild a path into the import cache: its layout is the client's own.
 - Run with `--no-keychain` and an absolute `API_CREDENTIALS_FILE` so nothing depends on an unlocked keychain or on the working directory.

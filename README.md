@@ -235,6 +235,21 @@ GET /people~take(5) > /tmp/people.json
 
 `AGENTS.md` is the full reference for the file format.
 
+### Syntax highlighting
+
+The client installs highlighting for `.api` files in the editor you name:
+
+```sh
+api --install-syntax sublime    # or vscode, cursor, rider, vim, nvim
+```
+
+It writes the grammar that belongs to this version of the client where the editor reads
+it, prints each path it wrote, and sends nothing. Sublime Text, Vim and Neovim need
+nothing more. VS Code and Cursor are handed a `.vsix` through their own command (`code`,
+`cursor`), which has to be on the `PATH`. Rider gets a TextMate bundle and asks for one
+step, once: *Settings → Editor → TextMate Bundles*, `+`, and the folder the command
+printed. Run it again after an update of the client. `editors/README.md` has the details.
+
 ## Interactive mode
 
 Start `api` without a URI. The prompt takes the same `METHOD URI [BODY] [> file]` line as
@@ -344,6 +359,7 @@ Usage: api [OPTIONS] [METHOD] [URI] [BODY]
       --describe <FILE>           Print the describe block of FILE as JSON; sends nothing
       --assert <FILE>             Print every `PUT /assert` body FILE sends as one JSON array; sends nothing
       --imports <FILE>            Print every import FILE reads and where it resolved to, as one JSON array; sends nothing
+      --install-syntax <EDITOR>   Install .api syntax highlighting in sublime, vscode, cursor, rider, vim or nvim; sends nothing
       --export <EXTERNAL_ID>      Rewrite responses as seed data: keys dropped, a lone one kept as `key?` and EXTERNAL_ID
   -r, --raw                       No pretty-printing
   -i, --include-nulls             Include null values in the response
@@ -367,6 +383,7 @@ Usage: api [OPTIONS] [METHOD] [URI] [BODY]
 cargo test --bin api                                     # unit tests
 perl -e 'alarm 900; exec @ARGV' cargo test --test parity # what is sent, printed and written, from a file, arguments and the prompt
 cargo test --test imports                                # import git/dir/archive
+cargo test --test editors                                # the grammars of editors/ and --install-syntax
 cargo test --test cli -- --skip clipboard                # end-to-end, most of it against a local COS
 cargo test --test cli -- clipboard --test-threads=1      # the tests that copy to the clipboard
 ```
@@ -378,6 +395,7 @@ What each suite needs:
 | `--bin api` | This machine only, and `git` on the `PATH`. |
 | `--test parity` | This machine only, and `git`. It drives the binary, prompt included (through a pseudo-terminal, unix only), against a recording server of its own on `127.0.0.1`. Run it under a time limit: a prompt test that hangs takes the suite with it. |
 | `--test imports` | `git`. Five of its tests fetch this repository from github.com and need the network; `API_TEST_OFFLINE=1` skips them. One of the five goes over ssh and also needs an ssh key GitHub accepts; without one it skips itself. A skipped test prints a line starting with `SKIPPED` on stderr (`-- --nocapture` shows it). |
+| `--test editors` | This machine only. An install goes to a home directory of the test's own, and the `code` it runs is a script of the test's: no editor is touched. |
 | `--test cli` | A local COS with the `/assert` endpoint, and credentials for it, for about fifty of its tests: they fail with instructions when either is missing. The rest start a small server of their own. The four tests named `…clipboard…` copy to the system clipboard, overwriting what it held, and are run on their own, one at a time. |
 
 No test sends anything to a host other than this machine, apart from the five that read

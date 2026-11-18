@@ -1,0 +1,59 @@
+# Sample exercising every construct of the proposed syntax
+url has localhost:5000   # gate
+{
+  "title": { "en-US": "Sample" },
+  "docsLink": "https://link-to-docs.com",
+  "owner": "unknown member"
+}
+
+import git cl {
+  "url": "https://github.com/Polyjuice/cloddy",
+  "ref": "2.1.0"
+}
+import dir p @parts.json   # from a file
+import archive get { "url": "x" }
+import svn cl2 { "url": "x" }
+
+cl/sv.api
+cl/seeds/*.api     # glob include
+~/seeds/seed.api
+/tmp/seed.api
+
+set export com.heads.seedID
+set include-nulls
+set fail-fast off   # back off
+set timeout 30
+set nulls
+set raw maybe
+
+assert GET /companies/com.heads.seedID=ours
+assert not /people~where(givenName=Test)~count   # implied GET
+sleep 500ms
+sleep 20 while GET /imports~where(state=running)~count
+sleep while not GET /people~count
+confirm Seed a && b? # all of it is the question
+
+/people~take(5)
+get /people#x                    # the #x is no comment
+GET /x~where(a=1||b=2) > out.json   # one request
+GET /x~where(name="a > b # c") >> people.json
+GET /people > clipboard
+GET /x >
+PUT /people @people/*.json
+PUT /sync-webhooks @data.csv~map(com.heads.csv-product) > /tmp/r.json
+PUT /x @backup~old(1)
+PUT /people/com.mi6.id=007 { "name": "James Bond" } > /tmp/bond.json  # tail
+PUT /things {
+  // JS-style line comment
+  "note": "a # b",
+  "line2": "
+    raw newline
+  ",
+  "n": 1.5, "ok": true
+} || POST /things [1, 2]
+GET /a && PATCH /b { "seen": true } || POST /c { "seen": false }
+GET /a && sleep 2
+GET /a ||
+PUT /people/x
+{ "name": "body on the line under its request" }
+DELETE /people/com.mi6.id=006

@@ -1,0 +1,522 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "CommerceOS API",
+  "scopeName": "source.api",
+  "comment": "TextMate grammar for .api batch files: a port of editors/sublime/API.sublime-syntax, which follows AGENTS.md. Change the two together, and check both against editors/sample.api.",
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#url" },
+    { "include": "#describe" },
+    { "include": "#statements" }
+  ],
+  "repository": {
+    "statements": {
+      "comment": "From the first line that is not a comment, a `url` line or a describe block, to the end of the file. In here a `{` that starts a line is an error.",
+      "begin": "^(?=\\s*(?!(?i:url)(?=\\s|$))[^\\s#{])",
+      "end": "(?!)",
+      "patterns": [
+        { "include": "#comment" },
+        { "include": "#misplaced-body" },
+        { "include": "#request" },
+        { "include": "#chain-start" },
+        { "include": "#url" },
+        { "include": "#sleep" },
+        { "include": "#assert" },
+        { "include": "#confirm" },
+        { "include": "#set" },
+        { "include": "#import" },
+        { "include": "#include" }
+      ]
+    },
+
+    "comment": {
+      "match": "^\\s*(#.*)$",
+      "captures": { "1": { "name": "comment.line.number-sign.api" } }
+    },
+    "trailing-comment": {
+      "comment": "` # …` behind a line. The `#` needs a blank in front: `GET /people#x` has no comment.",
+      "match": "(?<=\\s)#.*$",
+      "name": "comment.line.number-sign.api"
+    },
+
+    "url": {
+      "patterns": [
+        {
+          "begin": "^\\s*((?i:url))\\s+((?i:has|is))(?=\\s|$)",
+          "beginCaptures": {
+            "1": { "name": "keyword.control.command.api" },
+            "2": { "name": "keyword.operator.api" }
+          },
+          "end": "$",
+          "patterns": [
+            { "include": "#trailing-comment" },
+            { "match": "\\S+", "name": "string.unquoted.value.api" }
+          ]
+        },
+        {
+          "begin": "^\\s*((?i:url))(?=\\s|$)",
+          "beginCaptures": { "1": { "name": "keyword.control.command.api" } },
+          "end": "$",
+          "patterns": [
+            { "include": "#trailing-comment" },
+            { "match": "\\S+", "name": "invalid.illegal.trailing.api" }
+          ]
+        }
+      ]
+    },
+
+    "sleep": {
+      "begin": "^\\s*((?i:sleep))(?=\\s|$)",
+      "beginCaptures": { "1": { "name": "keyword.control.command.api" } },
+      "end": "$",
+      "patterns": [
+        {
+          "begin": "(?<=\\s)((?i:while))(?=\\s|$)(?:\\s+((?i:not))(?=\\s|$))?(?:\\s+(?:(?i:(GET|HEAD|OPTIONS)|(PUT|POST|PATCH)|(DELETE))(?=\\s|$)|(?=/)|(\\S+)))?",
+          "beginCaptures": {
+            "1": { "name": "keyword.control.loop.api" },
+            "2": { "name": "keyword.control.loop.api" },
+            "3": { "name": "keyword.control.http.read.api" },
+            "4": { "name": "keyword.control.http.write.api" },
+            "5": { "name": "keyword.control.http.delete.api" },
+            "6": { "name": "invalid.illegal.condition.api" }
+          },
+          "end": "(?=$)",
+          "patterns": [{ "include": "#condition-parts" }]
+        },
+        { "include": "#trailing-comment" },
+        { "match": "(?<=\\s)\\d*\\.?\\d+(?:ms|s)?(?=\\s|$)", "name": "constant.numeric.api" },
+        { "match": "\\S+", "name": "invalid.illegal.condition.api" }
+      ]
+    },
+
+    "assert": {
+      "begin": "^\\s*((?i:assert))(?=\\s|$)(?:\\s+((?i:not))(?=\\s|$))?(?:\\s+(?:(?i:(GET|HEAD|OPTIONS)|(PUT|POST|PATCH)|(DELETE))(?=\\s|$)|(?=/)|(\\S+)))?",
+      "beginCaptures": {
+        "1": { "name": "keyword.control.command.api" },
+        "2": { "name": "keyword.control.loop.api" },
+        "3": { "name": "keyword.control.http.read.api" },
+        "4": { "name": "keyword.control.http.write.api" },
+        "5": { "name": "keyword.control.http.delete.api" },
+        "6": { "name": "invalid.illegal.condition.api" }
+      },
+      "end": "$",
+      "patterns": [{ "include": "#condition-parts" }]
+    },
+
+    "condition-parts": {
+      "comment": "The request of an `assert` or a `sleep while`: one request, no chain and no outfile.",
+      "patterns": [
+        { "include": "#trailing-comment" },
+        { "match": "&&|\\|\\|", "name": "invalid.illegal.condition.api" },
+        { "match": "(?<=\\s)>>?(?=\\s|$)", "name": "invalid.illegal.condition.api" },
+        { "include": "#body" },
+        { "include": "#uri-parts" }
+      ]
+    },
+
+    "confirm": {
+      "comment": "Everything behind `confirm` is the question: no comment, no chain.",
+      "match": "^\\s*((?i:confirm))(?=\\s|$)\\s*(.*)$",
+      "captures": {
+        "1": { "name": "keyword.control.command.api" },
+        "2": { "name": "string.unquoted.message.api" }
+      }
+    },
+
+    "set": {
+      "patterns": [
+        {
+          "begin": "^\\s*((?i:set))\\s+((?i:include-nulls|fail-fast|ndjson|raw|stream))(?=\\s|$)",
+          "beginCaptures": {
+            "1": { "name": "keyword.control.command.api" },
+            "2": { "name": "variable.parameter.setting.api" }
+          },
+          "end": "$",
+          "patterns": [
+            { "include": "#trailing-comment" },
+            { "match": "\\G\\s+((?i:on|off))(?=\\s|$)", "captures": { "1": { "name": "constant.language.api" } } },
+            { "match": "\\S+", "name": "invalid.illegal.trailing.api" }
+          ]
+        },
+        {
+          "begin": "^\\s*((?i:set))\\s+((?i:export))(?=\\s|$)",
+          "beginCaptures": {
+            "1": { "name": "keyword.control.command.api" },
+            "2": { "name": "variable.parameter.setting.api" }
+          },
+          "end": "$",
+          "patterns": [
+            { "include": "#trailing-comment" },
+            { "match": "\\G\\s+((?i:off))(?=\\s|$)", "captures": { "1": { "name": "constant.language.api" } } },
+            { "match": "\\G\\s+(\\S+)", "captures": { "1": { "name": "string.unquoted.value.api" } } },
+            { "match": "\\S+", "name": "invalid.illegal.trailing.api" }
+          ]
+        },
+        {
+          "begin": "^\\s*((?i:set))\\s+((?i:timeout))(?=\\s|$)",
+          "beginCaptures": {
+            "1": { "name": "keyword.control.command.api" },
+            "2": { "name": "variable.parameter.setting.api" }
+          },
+          "end": "$",
+          "patterns": [
+            { "include": "#trailing-comment" },
+            { "match": "\\G\\s+(\\d+)(?=\\s|$)", "captures": { "1": { "name": "constant.numeric.api" } } },
+            { "match": "\\G\\s+((?i:off))(?=\\s|$)", "captures": { "1": { "name": "constant.language.api" } } },
+            { "match": "\\S+", "name": "invalid.illegal.trailing.api" }
+          ]
+        },
+        {
+          "begin": "^\\s*((?i:set))(?=\\s|$)(?:\\s+(?!#)(\\S+))?",
+          "beginCaptures": {
+            "1": { "name": "keyword.control.command.api" },
+            "2": { "name": "invalid.illegal.setting.api" }
+          },
+          "end": "$",
+          "patterns": [
+            { "include": "#trailing-comment" },
+            { "match": "\\S+", "name": "invalid.illegal.trailing.api" }
+          ]
+        }
+      ]
+    },
+
+    "import": {
+      "comment": "import git|dir|archive <alias> { … }   or   … @file.json",
+      "begin": "^\\s*((?i:import))(?=\\s|$)(?:\\s+(?:((?i:git|dir|archive))|(\\S+))(?=\\s|$))?(?:\\s+(?:((?i:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|sleep|url|assert|confirm|set|import))|([A-Za-z0-9_-]+)|([^\\s{@]\\S*))(?=\\s|$))?",
+      "beginCaptures": {
+        "1": { "name": "keyword.control.import.api" },
+        "2": { "name": "storage.type.import.api" },
+        "3": { "name": "invalid.illegal.import.api" },
+        "4": { "name": "invalid.illegal.import.api" },
+        "5": { "name": "entity.name.namespace.import.api" },
+        "6": { "name": "invalid.illegal.import.api" }
+      },
+      "end": "$",
+      "patterns": [
+        {
+          "begin": "\\{",
+          "beginCaptures": { "0": { "name": "punctuation.section.mapping.begin.json" } },
+          "end": "\\}",
+          "endCaptures": { "0": { "name": "punctuation.section.mapping.end.json" } },
+          "name": "meta.import.api meta.embedded.block.json meta.mapping.json",
+          "patterns": [
+            {
+              "match": "(\")(url|ref|path|sha256|token_env)(\")(?=\\s*:)",
+              "name": "meta.mapping.key.json string.quoted.double.json",
+              "captures": { "2": { "name": "support.type.property-name.import.api keyword.other.member.api" } }
+            },
+            { "include": "#json-members" }
+          ]
+        },
+        {
+          "comment": "one JSON file: no glob, no ~map(…)",
+          "begin": "(?<=\\s)(@)\\s*",
+          "beginCaptures": { "1": { "name": "keyword.operator.infile.api" } },
+          "end": "(?=\\s*$|\\s+#)",
+          "contentName": "meta.path.infile.api",
+          "patterns": [{ "match": "~\\w+\\([^)]*\\)|[*?\\[]", "name": "invalid.illegal.import.api" }]
+        },
+        { "include": "#trailing-comment" },
+        { "match": "\\S+", "name": "invalid.illegal.import.api" }
+      ]
+    },
+
+    "include": {
+      "comment": "Anything else is an include: the whole line, less a trailing comment.",
+      "match": "^\\s*([^\\s#].*?)(?:\\s+(#.*))?$",
+      "captures": {
+        "1": {
+          "name": "meta.include.api",
+          "patterns": [{ "match": "[*?]", "name": "constant.character.wildcard.api" }]
+        },
+        "2": { "name": "comment.line.number-sign.api" }
+      }
+    },
+
+    "describe": {
+      "begin": "^\\s*(\\{)",
+      "beginCaptures": { "1": { "name": "punctuation.section.mapping.begin.json" } },
+      "end": "\\}",
+      "endCaptures": { "0": { "name": "punctuation.section.mapping.end.json" } },
+      "name": "meta.describe.api meta.mapping.json",
+      "patterns": [
+        {
+          "match": "(\")(title|description|docsLink)(\")(?=\\s*:)",
+          "name": "meta.mapping.key.json string.quoted.double.json",
+          "captures": { "2": { "name": "support.type.property-name.describe.api keyword.other.member.api" } }
+        },
+        { "include": "#json-members" }
+      ]
+    },
+
+    "misplaced-body": {
+      "comment": "A `{` or `[` that starts a line below the top of the file: a second describe block, or a body on the line under its request. Both stop a batch.",
+      "patterns": [
+        {
+          "begin": "^\\s*(\\{)",
+          "beginCaptures": { "1": { "name": "invalid.illegal.misplaced-body.api" } },
+          "end": "\\}",
+          "endCaptures": { "0": { "name": "punctuation.section.mapping.end.json" } },
+          "name": "meta.mapping.json",
+          "patterns": [{ "include": "#json-members" }]
+        },
+        {
+          "begin": "^\\s*(\\[)",
+          "beginCaptures": { "1": { "name": "invalid.illegal.misplaced-body.api" } },
+          "end": "\\]",
+          "endCaptures": { "0": { "name": "punctuation.section.sequence.end.json" } },
+          "name": "meta.sequence.json",
+          "patterns": [{ "include": "#json-items" }]
+        }
+      ]
+    },
+
+    "request": {
+      "comment": "METHOD URI [BODY] [> OUTFILE], or a line that starts with `/` and is no `.api` path. It ends with its line; a body carries it over the lines the body spans.",
+      "begin": "^\\s*(?:(?i:(GET|HEAD|OPTIONS)|(PUT|POST|PATCH)|(DELETE))(?=\\s|$)|(?=/)(?!\\S*(?i:\\.api)(?=\\s*$|\\s+#)))",
+      "beginCaptures": {
+        "1": { "name": "keyword.control.http.read.api" },
+        "2": { "name": "keyword.control.http.write.api" },
+        "3": { "name": "keyword.control.http.delete.api" }
+      },
+      "end": "$",
+      "name": "meta.request.api",
+      "patterns": [{ "include": "#request-parts" }]
+    },
+
+    "chain-start": {
+      "comment": "A chain is one line: it can't start with a separator.",
+      "begin": "^\\s*(&&|\\|\\|)",
+      "beginCaptures": { "1": { "name": "invalid.illegal.chain.api" } },
+      "end": "$",
+      "patterns": [
+        {
+          "match": "\\G\\s*(?i:(GET|HEAD|OPTIONS)|(PUT|POST|PATCH)|(DELETE))(?=\\s|$)",
+          "captures": {
+            "1": { "name": "keyword.control.http.read.api" },
+            "2": { "name": "keyword.control.http.write.api" },
+            "3": { "name": "keyword.control.http.delete.api" }
+          }
+        },
+        { "include": "#request-parts" }
+      ]
+    },
+
+    "request-parts": {
+      "patterns": [
+        { "include": "#trailing-comment" },
+        { "include": "#chain" },
+        { "include": "#body" },
+        { "include": "#redirect" },
+        { "include": "#infile" },
+        { "include": "#uri-parts" }
+      ]
+    },
+
+    "chain": {
+      "comment": "`&&` / `||` between the requests of one line.",
+      "patterns": [
+        { "match": "(?:&&|\\|\\|)(?=\\s*$|\\s+#)", "name": "invalid.illegal.chain.api" },
+        {
+          "match": "(&&|\\|\\|)\\s*(?:(?i:(GET|HEAD|OPTIONS)|(PUT|POST|PATCH)|(DELETE))(?=\\s|$)|(?=/))",
+          "captures": {
+            "1": { "name": "keyword.operator.logical.api" },
+            "2": { "name": "keyword.control.http.read.api" },
+            "3": { "name": "keyword.control.http.write.api" },
+            "4": { "name": "keyword.control.http.delete.api" }
+          }
+        },
+        {
+          "comment": "a directive or an include in a chain is an error",
+          "match": "(&&|\\|\\|)\\s*(\\S.*?)(?=\\s*(?:&&|\\|\\||$))",
+          "captures": {
+            "1": { "name": "keyword.operator.logical.api" },
+            "2": { "name": "invalid.illegal.segment.api" }
+          }
+        }
+      ]
+    },
+
+    "redirect": {
+      "comment": "` > file`, ` >> file`: a blank in front, a path behind.",
+      "patterns": [
+        { "match": "(?<=\\s)>>?(?=\\s*$|\\s+#)", "name": "invalid.illegal.outfile.api" },
+        {
+          "begin": "(?<=\\s)(>>?)\\s*",
+          "beginCaptures": { "1": { "name": "keyword.operator.outfile.api" } },
+          "end": "(?=\\s*$|\\s+#|\\s*&&|\\s*\\|\\|)",
+          "contentName": "meta.path.outfile.api",
+          "patterns": [
+            {
+              "match": "(?<=[>\\s])(?i:clipboard)(?=\\s*$|\\s+#|\\s*&&|\\s*\\|\\|)",
+              "name": "support.constant.clipboard.api"
+            }
+          ]
+        }
+      ]
+    },
+
+    "infile": {
+      "begin": "(?<=\\s)(@)\\s*",
+      "beginCaptures": { "1": { "name": "keyword.operator.infile.api" } },
+      "end": "(?=\\s*$|\\s+#|\\s*&&|\\s*\\|\\||\\s+>)",
+      "contentName": "meta.path.infile.api",
+      "patterns": [
+        {
+          "comment": "~map(type) is the only function an @file body takes",
+          "match": "(~)(map)(\\()([^)\\s]*)(\\))",
+          "captures": {
+            "1": { "name": "punctuation.separator.path.api" },
+            "2": { "name": "support.function.map.api" },
+            "3": { "name": "punctuation.separator.path.api" },
+            "4": { "name": "string.unquoted.value.api" },
+            "5": { "name": "punctuation.separator.path.api" }
+          }
+        },
+        { "match": "~\\w+\\([^)]*\\)", "name": "invalid.illegal.body-function.api" },
+        { "match": "[*?]", "name": "constant.character.wildcard.api" }
+      ]
+    },
+
+    "uri-parts": {
+      "patterns": [
+        { "include": "#uri-parens" },
+        { "match": "(?<=[./])\\*", "name": "constant.character.wildcard.api" },
+        { "match": "[/~){}:?#=&@.;,<>+*!\\-]", "name": "punctuation.separator.path.api" }
+      ]
+    },
+
+    "uri-parens": {
+      "comment": "Inside the parentheses of a URI operator nothing ends the request: `~where(a=1||b=2)` and `~where(name=\"a > b # c\")` are sent as written.",
+      "begin": "\\(",
+      "beginCaptures": { "0": { "name": "punctuation.separator.path.api" } },
+      "end": "\\)|$",
+      "endCaptures": { "0": { "name": "punctuation.separator.path.api" } },
+      "patterns": [
+        {
+          "begin": "\"",
+          "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.api" } },
+          "end": "\"|$",
+          "endCaptures": { "0": { "name": "punctuation.definition.string.end.api" } },
+          "name": "string.quoted.double.api"
+        },
+        { "match": "\\|", "name": "punctuation.separator.path.api" },
+        { "include": "#uri-parts" }
+      ]
+    },
+
+    "body": {
+      "comment": "A body starts behind a blank: a JSON object or array, or a string.",
+      "patterns": [
+        {
+          "begin": "(?<=\\s)\\{",
+          "beginCaptures": { "0": { "name": "punctuation.section.mapping.begin.json" } },
+          "end": "\\}",
+          "endCaptures": { "0": { "name": "punctuation.section.mapping.end.json" } },
+          "name": "meta.embedded.block.json meta.mapping.json",
+          "patterns": [{ "include": "#json-members" }]
+        },
+        {
+          "begin": "(?<=\\s)\\[",
+          "beginCaptures": { "0": { "name": "punctuation.section.sequence.begin.json" } },
+          "end": "\\]",
+          "endCaptures": { "0": { "name": "punctuation.section.sequence.end.json" } },
+          "name": "meta.embedded.block.json meta.sequence.json",
+          "patterns": [{ "include": "#json-items" }]
+        },
+        {
+          "begin": "(?<=\\s)\"",
+          "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.api" } },
+          "end": "\"",
+          "endCaptures": { "0": { "name": "punctuation.definition.string.end.api" } },
+          "name": "string.quoted.double.api",
+          "patterns": [{ "match": "\\\\.", "name": "constant.character.escape.api" }]
+        }
+      ]
+    },
+
+    "json-value": {
+      "patterns": [
+        { "include": "#json-object" },
+        { "include": "#json-array" },
+        { "include": "#json-string" },
+        { "include": "#json-number" },
+        { "include": "#json-constant" }
+      ]
+    },
+    "json-object": {
+      "begin": "\\{",
+      "beginCaptures": { "0": { "name": "punctuation.section.mapping.begin.json" } },
+      "end": "\\}",
+      "endCaptures": { "0": { "name": "punctuation.section.mapping.end.json" } },
+      "name": "meta.mapping.json",
+      "patterns": [{ "include": "#json-members" }]
+    },
+    "json-members": {
+      "patterns": [
+        {
+          "begin": "\"",
+          "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.json" } },
+          "end": "\"",
+          "endCaptures": { "0": { "name": "punctuation.definition.string.end.json" } },
+          "name": "meta.mapping.key.json string.quoted.double.json support.type.property-name.json",
+          "patterns": [{ "match": "\\\\.", "name": "constant.character.escape.json" }]
+        },
+        {
+          "begin": ":",
+          "beginCaptures": { "0": { "name": "punctuation.separator.key-value.json" } },
+          "end": "(?=[\\},])",
+          "name": "meta.mapping.value.json",
+          "patterns": [{ "include": "#json-comment" }, { "include": "#json-value" }]
+        },
+        { "match": ",", "name": "punctuation.separator.sequence.json" },
+        { "include": "#json-comment" }
+      ]
+    },
+    "json-array": {
+      "begin": "\\[",
+      "beginCaptures": { "0": { "name": "punctuation.section.sequence.begin.json" } },
+      "end": "\\]",
+      "endCaptures": { "0": { "name": "punctuation.section.sequence.end.json" } },
+      "name": "meta.sequence.json",
+      "patterns": [{ "include": "#json-items" }]
+    },
+    "json-items": {
+      "patterns": [
+        { "match": ",", "name": "punctuation.separator.sequence.json" },
+        { "include": "#json-comment" },
+        { "include": "#json-value" }
+      ]
+    },
+    "json-string": {
+      "begin": "\"",
+      "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.json" } },
+      "end": "\"",
+      "endCaptures": { "0": { "name": "punctuation.definition.string.end.json" } },
+      "name": "string.quoted.double.json",
+      "patterns": [{ "match": "\\\\.", "name": "constant.character.escape.json" }]
+    },
+    "json-number": {
+      "match": "(?<![\\w.])-?(?:0|[1-9]\\d*)(?:\\.\\d+)?(?:[eE][+-]?\\d+)?(?![\\w.])",
+      "name": "constant.numeric.json"
+    },
+    "json-constant": {
+      "match": "\\b(?:true|false|null)\\b",
+      "name": "constant.language.json"
+    },
+    "json-comment": {
+      "patterns": [
+        { "match": "//.*$", "name": "comment.line.double-slash.json" },
+        { "match": "#.*$", "name": "comment.line.number-sign.json" },
+        {
+          "begin": "/\\*",
+          "beginCaptures": { "0": { "name": "punctuation.definition.comment.begin.json" } },
+          "end": "\\*/",
+          "endCaptures": { "0": { "name": "punctuation.definition.comment.end.json" } },
+          "name": "comment.block.json"
+        }
+      ]
+    }
+  }
+}

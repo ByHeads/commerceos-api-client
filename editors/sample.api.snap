@@ -1,0 +1,547 @@
+># Sample exercising every construct of the proposed syntax
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.api comment.line.number-sign.api
+>url has localhost:5000   # gate
+#^^^ source.api keyword.control.command.api
+#   ^ source.api
+#    ^^^ source.api keyword.operator.api
+#       ^ source.api
+#        ^^^^^^^^^^^^^^ source.api string.unquoted.value.api
+#                      ^^^ source.api
+#                         ^^^^^^ source.api comment.line.number-sign.api
+>{
+#^ source.api meta.describe.api meta.mapping.json punctuation.section.mapping.begin.json
+>  "title": { "en-US": "Sample" },
+#^^ source.api meta.describe.api meta.mapping.json
+#  ^ source.api meta.describe.api meta.mapping.json meta.mapping.key.json string.quoted.double.json
+#   ^^^^^ source.api meta.describe.api meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.describe.api keyword.other.member.api
+#        ^ source.api meta.describe.api meta.mapping.json meta.mapping.key.json string.quoted.double.json
+#         ^ source.api meta.describe.api meta.mapping.json meta.mapping.value.json punctuation.separator.key-value.json
+#          ^ source.api meta.describe.api meta.mapping.json meta.mapping.value.json
+#           ^ source.api meta.describe.api meta.mapping.json meta.mapping.value.json meta.mapping.json punctuation.section.mapping.begin.json
+#            ^ source.api meta.describe.api meta.mapping.json meta.mapping.value.json meta.mapping.json
+#             ^ source.api meta.describe.api meta.mapping.json meta.mapping.value.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json punctuation.definition.string.begin.json
+#              ^^^^^ source.api meta.describe.api meta.mapping.json meta.mapping.value.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
+#                   ^ source.api meta.describe.api meta.mapping.json meta.mapping.value.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json punctuation.definition.string.end.json
+#                    ^ source.api meta.describe.api meta.mapping.json meta.mapping.value.json meta.mapping.json meta.mapping.value.json punctuation.separator.key-value.json
+#                     ^ source.api meta.describe.api meta.mapping.json meta.mapping.value.json meta.mapping.json meta.mapping.value.json
+#                      ^ source.api meta.describe.api meta.mapping.json meta.mapping.value.json meta.mapping.json meta.mapping.value.json string.quoted.double.json punctuation.definition.string.begin.json
+#                       ^^^^^^ source.api meta.describe.api meta.mapping.json meta.mapping.value.json meta.mapping.json meta.mapping.value.json string.quoted.double.json
+#                             ^ source.api meta.describe.api meta.mapping.json meta.mapping.value.json meta.mapping.json meta.mapping.value.json string.quoted.double.json punctuation.definition.string.end.json
+#                              ^ source.api meta.describe.api meta.mapping.json meta.mapping.value.json meta.mapping.json meta.mapping.value.json
+#                               ^ source.api meta.describe.api meta.mapping.json meta.mapping.value.json meta.mapping.json punctuation.section.mapping.end.json
+#                                ^ source.api meta.describe.api meta.mapping.json punctuation.separator.sequence.json
+>  "docsLink": "https://link-to-docs.com",
+#^^ source.api meta.describe.api meta.mapping.json
+#  ^ source.api meta.describe.api meta.mapping.json meta.mapping.key.json string.quoted.double.json
+#   ^^^^^^^^ source.api meta.describe.api meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.describe.api keyword.other.member.api
+#           ^ source.api meta.describe.api meta.mapping.json meta.mapping.key.json string.quoted.double.json
+#            ^ source.api meta.describe.api meta.mapping.json meta.mapping.value.json punctuation.separator.key-value.json
+#             ^ source.api meta.describe.api meta.mapping.json meta.mapping.value.json
+#              ^ source.api meta.describe.api meta.mapping.json meta.mapping.value.json string.quoted.double.json punctuation.definition.string.begin.json
+#               ^^^^^^^^^^^^^^^^^^^^^^^^ source.api meta.describe.api meta.mapping.json meta.mapping.value.json string.quoted.double.json
+#                                       ^ source.api meta.describe.api meta.mapping.json meta.mapping.value.json string.quoted.double.json punctuation.definition.string.end.json
+#                                        ^ source.api meta.describe.api meta.mapping.json punctuation.separator.sequence.json
+>  "owner": "unknown member"
+#^^ source.api meta.describe.api meta.mapping.json
+#  ^ source.api meta.describe.api meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json punctuation.definition.string.begin.json
+#   ^^^^^ source.api meta.describe.api meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
+#        ^ source.api meta.describe.api meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json punctuation.definition.string.end.json
+#         ^ source.api meta.describe.api meta.mapping.json meta.mapping.value.json punctuation.separator.key-value.json
+#          ^ source.api meta.describe.api meta.mapping.json meta.mapping.value.json
+#           ^ source.api meta.describe.api meta.mapping.json meta.mapping.value.json string.quoted.double.json punctuation.definition.string.begin.json
+#            ^^^^^^^^^^^^^^ source.api meta.describe.api meta.mapping.json meta.mapping.value.json string.quoted.double.json
+#                          ^ source.api meta.describe.api meta.mapping.json meta.mapping.value.json string.quoted.double.json punctuation.definition.string.end.json
+>}
+#^ source.api meta.describe.api meta.mapping.json punctuation.section.mapping.end.json
+>
+>import git cl {
+#^^^^^^ source.api keyword.control.import.api
+#      ^ source.api
+#       ^^^ source.api storage.type.import.api
+#          ^ source.api
+#           ^^ source.api entity.name.namespace.import.api
+#             ^ source.api
+#              ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json punctuation.section.mapping.begin.json
+>  "url": "https://github.com/Polyjuice/cloddy",
+#^^ source.api meta.import.api meta.embedded.block.json meta.mapping.json
+#  ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
+#   ^^^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.import.api keyword.other.member.api
+#      ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
+#       ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json punctuation.separator.key-value.json
+#        ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json
+#         ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json string.quoted.double.json punctuation.definition.string.begin.json
+#          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json string.quoted.double.json
+#                                             ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json string.quoted.double.json punctuation.definition.string.end.json
+#                                              ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json punctuation.separator.sequence.json
+>  "ref": "2.1.0"
+#^^ source.api meta.import.api meta.embedded.block.json meta.mapping.json
+#  ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
+#   ^^^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.import.api keyword.other.member.api
+#      ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
+#       ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json punctuation.separator.key-value.json
+#        ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json
+#         ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json string.quoted.double.json punctuation.definition.string.begin.json
+#          ^^^^^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json string.quoted.double.json
+#               ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json string.quoted.double.json punctuation.definition.string.end.json
+>}
+#^ source.api meta.import.api meta.embedded.block.json meta.mapping.json punctuation.section.mapping.end.json
+>import dir p @parts.json   # from a file
+#^^^^^^ source.api keyword.control.import.api
+#      ^ source.api
+#       ^^^ source.api storage.type.import.api
+#          ^ source.api
+#           ^ source.api entity.name.namespace.import.api
+#            ^ source.api
+#             ^ source.api keyword.operator.infile.api
+#              ^^^^^^^^^^ source.api meta.path.infile.api
+#                        ^^^ source.api
+#                           ^^^^^^^^^^^^^ source.api comment.line.number-sign.api
+>import archive get { "url": "x" }
+#^^^^^^ source.api keyword.control.import.api
+#      ^ source.api
+#       ^^^^^^^ source.api storage.type.import.api
+#              ^ source.api
+#               ^^^ source.api invalid.illegal.import.api
+#                  ^ source.api
+#                   ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json punctuation.section.mapping.begin.json
+#                    ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json
+#                     ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
+#                      ^^^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.import.api keyword.other.member.api
+#                         ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
+#                          ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json punctuation.separator.key-value.json
+#                           ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json
+#                            ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json string.quoted.double.json punctuation.definition.string.begin.json
+#                             ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json string.quoted.double.json
+#                              ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json string.quoted.double.json punctuation.definition.string.end.json
+#                               ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json
+#                                ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json punctuation.section.mapping.end.json
+>import svn cl2 { "url": "x" }
+#^^^^^^ source.api keyword.control.import.api
+#      ^ source.api
+#       ^^^ source.api invalid.illegal.import.api
+#          ^ source.api
+#           ^^^ source.api entity.name.namespace.import.api
+#              ^ source.api
+#               ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json punctuation.section.mapping.begin.json
+#                ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json
+#                 ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
+#                  ^^^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.import.api keyword.other.member.api
+#                     ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
+#                      ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json punctuation.separator.key-value.json
+#                       ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json
+#                        ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json string.quoted.double.json punctuation.definition.string.begin.json
+#                         ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json string.quoted.double.json
+#                          ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json string.quoted.double.json punctuation.definition.string.end.json
+#                           ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json
+#                            ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json punctuation.section.mapping.end.json
+>
+>cl/sv.api
+#^^^^^^^^^ source.api meta.include.api
+>cl/seeds/*.api     # glob include
+#^^^^^^^^^ source.api meta.include.api
+#         ^ source.api meta.include.api constant.character.wildcard.api
+#          ^^^^ source.api meta.include.api
+#              ^^^^^ source.api
+#                   ^^^^^^^^^^^^^^ source.api comment.line.number-sign.api
+>~/seeds/seed.api
+#^^^^^^^^^^^^^^^^ source.api meta.include.api
+>/tmp/seed.api
+#^^^^^^^^^^^^^ source.api meta.include.api
+>
+>set export com.heads.seedID
+#^^^ source.api keyword.control.command.api
+#   ^ source.api
+#    ^^^^^^ source.api variable.parameter.setting.api
+#          ^ source.api
+#           ^^^^^^^^^^^^^^^^ source.api string.unquoted.value.api
+>set include-nulls
+#^^^ source.api keyword.control.command.api
+#   ^ source.api
+#    ^^^^^^^^^^^^^ source.api variable.parameter.setting.api
+>set fail-fast off   # back off
+#^^^ source.api keyword.control.command.api
+#   ^ source.api
+#    ^^^^^^^^^ source.api variable.parameter.setting.api
+#             ^ source.api
+#              ^^^ source.api constant.language.api
+#                 ^^^ source.api
+#                    ^^^^^^^^^^ source.api comment.line.number-sign.api
+>set timeout 30
+#^^^ source.api keyword.control.command.api
+#   ^ source.api
+#    ^^^^^^^ source.api variable.parameter.setting.api
+#           ^ source.api
+#            ^^ source.api constant.numeric.api
+>set nulls
+#^^^ source.api keyword.control.command.api
+#   ^ source.api
+#    ^^^^^ source.api invalid.illegal.setting.api
+>set raw maybe
+#^^^ source.api keyword.control.command.api
+#   ^ source.api
+#    ^^^ source.api variable.parameter.setting.api
+#       ^ source.api
+#        ^^^^^ source.api invalid.illegal.trailing.api
+>
+>assert GET /companies/com.heads.seedID=ours
+#^^^^^^ source.api keyword.control.command.api
+#      ^ source.api
+#       ^^^ source.api keyword.control.http.read.api
+#          ^ source.api
+#           ^ source.api punctuation.separator.path.api
+#            ^^^^^^^^^ source.api
+#                     ^ source.api punctuation.separator.path.api
+#                      ^^^ source.api
+#                         ^ source.api punctuation.separator.path.api
+#                          ^^^^^ source.api
+#                               ^ source.api punctuation.separator.path.api
+#                                ^^^^^^ source.api
+#                                      ^ source.api punctuation.separator.path.api
+#                                       ^^^^ source.api
+>assert not /people~where(givenName=Test)~count   # implied GET
+#^^^^^^ source.api keyword.control.command.api
+#      ^ source.api
+#       ^^^ source.api keyword.control.loop.api
+#          ^ source.api
+#           ^ source.api punctuation.separator.path.api
+#            ^^^^^^ source.api
+#                  ^ source.api punctuation.separator.path.api
+#                   ^^^^^ source.api
+#                        ^ source.api punctuation.separator.path.api
+#                         ^^^^^^^^^ source.api
+#                                  ^ source.api punctuation.separator.path.api
+#                                   ^^^^ source.api
+#                                       ^ source.api punctuation.separator.path.api
+#                                        ^ source.api punctuation.separator.path.api
+#                                         ^^^^^^^^ source.api
+#                                                 ^^^^^^^^^^^^^ source.api comment.line.number-sign.api
+>sleep 500ms
+#^^^^^ source.api keyword.control.command.api
+#     ^ source.api
+#      ^^^^^ source.api constant.numeric.api
+>sleep 20 while GET /imports~where(state=running)~count
+#^^^^^ source.api keyword.control.command.api
+#     ^ source.api
+#      ^^ source.api constant.numeric.api
+#        ^ source.api
+#         ^^^^^ source.api keyword.control.loop.api
+#              ^ source.api
+#               ^^^ source.api keyword.control.http.read.api
+#                  ^ source.api
+#                   ^ source.api punctuation.separator.path.api
+#                    ^^^^^^^ source.api
+#                           ^ source.api punctuation.separator.path.api
+#                            ^^^^^ source.api
+#                                 ^ source.api punctuation.separator.path.api
+#                                  ^^^^^ source.api
+#                                       ^ source.api punctuation.separator.path.api
+#                                        ^^^^^^^ source.api
+#                                               ^ source.api punctuation.separator.path.api
+#                                                ^ source.api punctuation.separator.path.api
+#                                                 ^^^^^ source.api
+>sleep while not GET /people~count
+#^^^^^ source.api keyword.control.command.api
+#     ^ source.api
+#      ^^^^^ source.api keyword.control.loop.api
+#           ^ source.api
+#            ^^^ source.api keyword.control.loop.api
+#               ^ source.api
+#                ^^^ source.api keyword.control.http.read.api
+#                   ^ source.api
+#                    ^ source.api punctuation.separator.path.api
+#                     ^^^^^^ source.api
+#                           ^ source.api punctuation.separator.path.api
+#                            ^^^^^ source.api
+>confirm Seed a && b? # all of it is the question
+#^^^^^^^ source.api keyword.control.command.api
+#       ^ source.api
+#        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.api string.unquoted.message.api
+>
+>/people~take(5)
+#^ source.api meta.request.api punctuation.separator.path.api
+# ^^^^^^ source.api meta.request.api
+#       ^ source.api meta.request.api punctuation.separator.path.api
+#        ^^^^ source.api meta.request.api
+#            ^ source.api meta.request.api punctuation.separator.path.api
+#             ^ source.api meta.request.api
+#              ^ source.api meta.request.api punctuation.separator.path.api
+>get /people#x                    # the #x is no comment
+#^^^ source.api meta.request.api keyword.control.http.read.api
+#   ^ source.api meta.request.api
+#    ^ source.api meta.request.api punctuation.separator.path.api
+#     ^^^^^^ source.api meta.request.api
+#           ^ source.api meta.request.api punctuation.separator.path.api
+#            ^^^^^^^^^^^^^^^^^^^^^ source.api meta.request.api
+#                                 ^^^^^^^^^^^^^^^^^^^^^^ source.api meta.request.api comment.line.number-sign.api
+>GET /x~where(a=1||b=2) > out.json   # one request
+#^^^ source.api meta.request.api keyword.control.http.read.api
+#   ^ source.api meta.request.api
+#    ^ source.api meta.request.api punctuation.separator.path.api
+#     ^ source.api meta.request.api
+#      ^ source.api meta.request.api punctuation.separator.path.api
+#       ^^^^^ source.api meta.request.api
+#            ^ source.api meta.request.api punctuation.separator.path.api
+#             ^ source.api meta.request.api
+#              ^ source.api meta.request.api punctuation.separator.path.api
+#               ^ source.api meta.request.api
+#                ^ source.api meta.request.api punctuation.separator.path.api
+#                 ^ source.api meta.request.api punctuation.separator.path.api
+#                  ^ source.api meta.request.api
+#                   ^ source.api meta.request.api punctuation.separator.path.api
+#                    ^ source.api meta.request.api
+#                     ^ source.api meta.request.api punctuation.separator.path.api
+#                      ^ source.api meta.request.api
+#                       ^ source.api meta.request.api keyword.operator.outfile.api
+#                        ^ source.api meta.request.api
+#                         ^^^^^^^^ source.api meta.request.api meta.path.outfile.api
+#                                 ^^^ source.api meta.request.api
+#                                    ^^^^^^^^^^^^^ source.api meta.request.api comment.line.number-sign.api
+>GET /x~where(name="a > b # c") >> people.json
+#^^^ source.api meta.request.api keyword.control.http.read.api
+#   ^ source.api meta.request.api
+#    ^ source.api meta.request.api punctuation.separator.path.api
+#     ^ source.api meta.request.api
+#      ^ source.api meta.request.api punctuation.separator.path.api
+#       ^^^^^ source.api meta.request.api
+#            ^ source.api meta.request.api punctuation.separator.path.api
+#             ^^^^ source.api meta.request.api
+#                 ^ source.api meta.request.api punctuation.separator.path.api
+#                  ^ source.api meta.request.api string.quoted.double.api punctuation.definition.string.begin.api
+#                   ^^^^^^^^^ source.api meta.request.api string.quoted.double.api
+#                            ^ source.api meta.request.api string.quoted.double.api punctuation.definition.string.end.api
+#                             ^ source.api meta.request.api punctuation.separator.path.api
+#                              ^ source.api meta.request.api
+#                               ^^ source.api meta.request.api keyword.operator.outfile.api
+#                                 ^ source.api meta.request.api
+#                                  ^^^^^^^^^^^ source.api meta.request.api meta.path.outfile.api
+>GET /people > clipboard
+#^^^ source.api meta.request.api keyword.control.http.read.api
+#   ^ source.api meta.request.api
+#    ^ source.api meta.request.api punctuation.separator.path.api
+#     ^^^^^^^ source.api meta.request.api
+#            ^ source.api meta.request.api keyword.operator.outfile.api
+#             ^ source.api meta.request.api
+#              ^^^^^^^^^ source.api meta.request.api meta.path.outfile.api support.constant.clipboard.api
+>GET /x >
+#^^^ source.api meta.request.api keyword.control.http.read.api
+#   ^ source.api meta.request.api
+#    ^ source.api meta.request.api punctuation.separator.path.api
+#     ^^ source.api meta.request.api
+#       ^ source.api meta.request.api invalid.illegal.outfile.api
+>PUT /people @people/*.json
+#^^^ source.api meta.request.api keyword.control.http.write.api
+#   ^ source.api meta.request.api
+#    ^ source.api meta.request.api punctuation.separator.path.api
+#     ^^^^^^^ source.api meta.request.api
+#            ^ source.api meta.request.api keyword.operator.infile.api
+#             ^^^^^^^ source.api meta.request.api meta.path.infile.api
+#                    ^ source.api meta.request.api meta.path.infile.api constant.character.wildcard.api
+#                     ^^^^^ source.api meta.request.api meta.path.infile.api
+>PUT /sync-webhooks @data.csv~map(com.heads.csv-product) > /tmp/r.json
+#^^^ source.api meta.request.api keyword.control.http.write.api
+#   ^ source.api meta.request.api
+#    ^ source.api meta.request.api punctuation.separator.path.api
+#     ^^^^ source.api meta.request.api
+#         ^ source.api meta.request.api punctuation.separator.path.api
+#          ^^^^^^^^^ source.api meta.request.api
+#                   ^ source.api meta.request.api keyword.operator.infile.api
+#                    ^^^^^^^^ source.api meta.request.api meta.path.infile.api
+#                            ^ source.api meta.request.api meta.path.infile.api punctuation.separator.path.api
+#                             ^^^ source.api meta.request.api meta.path.infile.api support.function.map.api
+#                                ^ source.api meta.request.api meta.path.infile.api punctuation.separator.path.api
+#                                 ^^^^^^^^^^^^^^^^^^^^^ source.api meta.request.api meta.path.infile.api string.unquoted.value.api
+#                                                      ^ source.api meta.request.api meta.path.infile.api punctuation.separator.path.api
+#                                                       ^ source.api meta.request.api
+#                                                        ^ source.api meta.request.api keyword.operator.outfile.api
+#                                                         ^ source.api meta.request.api
+#                                                          ^^^^^^^^^^^ source.api meta.request.api meta.path.outfile.api
+>PUT /x @backup~old(1)
+#^^^ source.api meta.request.api keyword.control.http.write.api
+#   ^ source.api meta.request.api
+#    ^ source.api meta.request.api punctuation.separator.path.api
+#     ^^ source.api meta.request.api
+#       ^ source.api meta.request.api keyword.operator.infile.api
+#        ^^^^^^ source.api meta.request.api meta.path.infile.api
+#              ^^^^^^^ source.api meta.request.api meta.path.infile.api invalid.illegal.body-function.api
+>PUT /people/com.mi6.id=007 { "name": "James Bond" } > /tmp/bond.json  # tail
+#^^^ source.api meta.request.api keyword.control.http.write.api
+#   ^ source.api meta.request.api
+#    ^ source.api meta.request.api punctuation.separator.path.api
+#     ^^^^^^ source.api meta.request.api
+#           ^ source.api meta.request.api punctuation.separator.path.api
+#            ^^^ source.api meta.request.api
+#               ^ source.api meta.request.api punctuation.separator.path.api
+#                ^^^ source.api meta.request.api
+#                   ^ source.api meta.request.api punctuation.separator.path.api
+#                    ^^ source.api meta.request.api
+#                      ^ source.api meta.request.api punctuation.separator.path.api
+#                       ^^^^ source.api meta.request.api
+#                           ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json punctuation.section.mapping.begin.json
+#                            ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json
+#                             ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json punctuation.definition.string.begin.json
+#                              ^^^^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
+#                                  ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json punctuation.definition.string.end.json
+#                                   ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json punctuation.separator.key-value.json
+#                                    ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json
+#                                     ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json string.quoted.double.json punctuation.definition.string.begin.json
+#                                      ^^^^^^^^^^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json string.quoted.double.json
+#                                                ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json string.quoted.double.json punctuation.definition.string.end.json
+#                                                 ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json
+#                                                  ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json punctuation.section.mapping.end.json
+#                                                   ^ source.api meta.request.api
+#                                                    ^ source.api meta.request.api keyword.operator.outfile.api
+#                                                     ^ source.api meta.request.api
+#                                                      ^^^^^^^^^^^^^^ source.api meta.request.api meta.path.outfile.api
+#                                                                    ^^ source.api meta.request.api
+#                                                                      ^^^^^^ source.api meta.request.api comment.line.number-sign.api
+>PUT /things {
+#^^^ source.api meta.request.api keyword.control.http.write.api
+#   ^ source.api meta.request.api
+#    ^ source.api meta.request.api punctuation.separator.path.api
+#     ^^^^^^^ source.api meta.request.api
+#            ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json punctuation.section.mapping.begin.json
+>  // JS-style line comment
+#^^ source.api meta.request.api meta.embedded.block.json meta.mapping.json
+#  ^^^^^^^^^^^^^^^^^^^^^^^^ source.api meta.request.api meta.embedded.block.json meta.mapping.json comment.line.double-slash.json
+>  "note": "a # b",
+#^^ source.api meta.request.api meta.embedded.block.json meta.mapping.json
+#  ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json punctuation.definition.string.begin.json
+#   ^^^^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
+#       ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json punctuation.definition.string.end.json
+#        ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json punctuation.separator.key-value.json
+#         ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json
+#          ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json string.quoted.double.json punctuation.definition.string.begin.json
+#           ^^^^^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json string.quoted.double.json
+#                ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json string.quoted.double.json punctuation.definition.string.end.json
+#                 ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json punctuation.separator.sequence.json
+>  "line2": "
+#^^ source.api meta.request.api meta.embedded.block.json meta.mapping.json
+#  ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json punctuation.definition.string.begin.json
+#   ^^^^^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
+#        ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json punctuation.definition.string.end.json
+#         ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json punctuation.separator.key-value.json
+#          ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json
+#           ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json string.quoted.double.json punctuation.definition.string.begin.json
+>    raw newline
+#^^^^^^^^^^^^^^^^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json string.quoted.double.json
+>  ",
+#^^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json string.quoted.double.json
+#  ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json string.quoted.double.json punctuation.definition.string.end.json
+#   ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json punctuation.separator.sequence.json
+>  "n": 1.5, "ok": true
+#^^ source.api meta.request.api meta.embedded.block.json meta.mapping.json
+#  ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json punctuation.definition.string.begin.json
+#   ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
+#    ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json punctuation.definition.string.end.json
+#     ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json punctuation.separator.key-value.json
+#      ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json
+#       ^^^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json constant.numeric.json
+#          ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json punctuation.separator.sequence.json
+#           ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json
+#            ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json punctuation.definition.string.begin.json
+#             ^^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
+#               ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json punctuation.definition.string.end.json
+#                ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json punctuation.separator.key-value.json
+#                 ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json
+#                  ^^^^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json constant.language.json
+>} || POST /things [1, 2]
+#^ source.api meta.request.api meta.embedded.block.json meta.mapping.json punctuation.section.mapping.end.json
+# ^ source.api meta.request.api
+#  ^^ source.api meta.request.api keyword.operator.logical.api
+#    ^ source.api meta.request.api
+#     ^^^^ source.api meta.request.api keyword.control.http.write.api
+#         ^ source.api meta.request.api
+#          ^ source.api meta.request.api punctuation.separator.path.api
+#           ^^^^^^^ source.api meta.request.api
+#                  ^ source.api meta.request.api meta.embedded.block.json meta.sequence.json punctuation.section.sequence.begin.json
+#                   ^ source.api meta.request.api meta.embedded.block.json meta.sequence.json constant.numeric.json
+#                    ^ source.api meta.request.api meta.embedded.block.json meta.sequence.json punctuation.separator.sequence.json
+#                     ^ source.api meta.request.api meta.embedded.block.json meta.sequence.json
+#                      ^ source.api meta.request.api meta.embedded.block.json meta.sequence.json constant.numeric.json
+#                       ^ source.api meta.request.api meta.embedded.block.json meta.sequence.json punctuation.section.sequence.end.json
+>GET /a && PATCH /b { "seen": true } || POST /c { "seen": false }
+#^^^ source.api meta.request.api keyword.control.http.read.api
+#   ^ source.api meta.request.api
+#    ^ source.api meta.request.api punctuation.separator.path.api
+#     ^^ source.api meta.request.api
+#       ^^ source.api meta.request.api keyword.operator.logical.api
+#         ^ source.api meta.request.api
+#          ^^^^^ source.api meta.request.api keyword.control.http.write.api
+#               ^ source.api meta.request.api
+#                ^ source.api meta.request.api punctuation.separator.path.api
+#                 ^^ source.api meta.request.api
+#                   ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json punctuation.section.mapping.begin.json
+#                    ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json
+#                     ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json punctuation.definition.string.begin.json
+#                      ^^^^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
+#                          ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json punctuation.definition.string.end.json
+#                           ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json punctuation.separator.key-value.json
+#                            ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json
+#                             ^^^^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json constant.language.json
+#                                 ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json
+#                                  ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json punctuation.section.mapping.end.json
+#                                   ^ source.api meta.request.api
+#                                    ^^ source.api meta.request.api keyword.operator.logical.api
+#                                      ^ source.api meta.request.api
+#                                       ^^^^ source.api meta.request.api keyword.control.http.write.api
+#                                           ^ source.api meta.request.api
+#                                            ^ source.api meta.request.api punctuation.separator.path.api
+#                                             ^^ source.api meta.request.api
+#                                               ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json punctuation.section.mapping.begin.json
+#                                                ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json
+#                                                 ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json punctuation.definition.string.begin.json
+#                                                  ^^^^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
+#                                                      ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json punctuation.definition.string.end.json
+#                                                       ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json punctuation.separator.key-value.json
+#                                                        ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json
+#                                                         ^^^^^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json constant.language.json
+#                                                              ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json
+#                                                               ^ source.api meta.request.api meta.embedded.block.json meta.mapping.json punctuation.section.mapping.end.json
+>GET /a && sleep 2
+#^^^ source.api meta.request.api keyword.control.http.read.api
+#   ^ source.api meta.request.api
+#    ^ source.api meta.request.api punctuation.separator.path.api
+#     ^^ source.api meta.request.api
+#       ^^ source.api meta.request.api keyword.operator.logical.api
+#         ^ source.api meta.request.api
+#          ^^^^^^^ source.api meta.request.api invalid.illegal.segment.api
+>GET /a ||
+#^^^ source.api meta.request.api keyword.control.http.read.api
+#   ^ source.api meta.request.api
+#    ^ source.api meta.request.api punctuation.separator.path.api
+#     ^^ source.api meta.request.api
+#       ^^ source.api meta.request.api invalid.illegal.chain.api
+>PUT /people/x
+#^^^ source.api meta.request.api keyword.control.http.write.api
+#   ^ source.api meta.request.api
+#    ^ source.api meta.request.api punctuation.separator.path.api
+#     ^^^^^^ source.api meta.request.api
+#           ^ source.api meta.request.api punctuation.separator.path.api
+#            ^ source.api meta.request.api
+>{ "name": "body on the line under its request" }
+#^ source.api meta.mapping.json invalid.illegal.misplaced-body.api
+# ^ source.api meta.mapping.json
+#  ^ source.api meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json punctuation.definition.string.begin.json
+#   ^^^^ source.api meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
+#       ^ source.api meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json punctuation.definition.string.end.json
+#        ^ source.api meta.mapping.json meta.mapping.value.json punctuation.separator.key-value.json
+#         ^ source.api meta.mapping.json meta.mapping.value.json
+#          ^ source.api meta.mapping.json meta.mapping.value.json string.quoted.double.json punctuation.definition.string.begin.json
+#           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.api meta.mapping.json meta.mapping.value.json string.quoted.double.json
+#                                             ^ source.api meta.mapping.json meta.mapping.value.json string.quoted.double.json punctuation.definition.string.end.json
+#                                              ^ source.api meta.mapping.json meta.mapping.value.json
+#                                               ^ source.api meta.mapping.json punctuation.section.mapping.end.json
+>DELETE /people/com.mi6.id=006
+#^^^^^^ source.api meta.request.api keyword.control.http.delete.api
+#      ^ source.api meta.request.api
+#       ^ source.api meta.request.api punctuation.separator.path.api
+#        ^^^^^^ source.api meta.request.api
+#              ^ source.api meta.request.api punctuation.separator.path.api
+#               ^^^ source.api meta.request.api
+#                  ^ source.api meta.request.api punctuation.separator.path.api
+#                   ^^^ source.api meta.request.api
+#                      ^ source.api meta.request.api punctuation.separator.path.api
+#                       ^^ source.api meta.request.api
+#                         ^ source.api meta.request.api punctuation.separator.path.api
+#                          ^^^ source.api meta.request.api
+>

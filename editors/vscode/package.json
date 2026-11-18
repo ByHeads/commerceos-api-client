@@ -1,0 +1,40 @@
+{
+  "name": "commerceos-api",
+  "displayName": "CommerceOS .api files",
+  "description": "Syntax highlighting for the .api batch files of the CommerceOS API client",
+  "version": "0.0.0",
+  "publisher": "heads",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/byheads/commerceos-api-client"
+  },
+  "engines": {
+    "vscode": "^1.60.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "commerceos-api",
+        "aliases": [
+          "CommerceOS API",
+          "api"
+        ],
+        "extensions": [
+          ".api"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "commerceos-api",
+        "scopeName": "source.api",
+        "path": "./syntaxes/api.tmLanguage.json"
+      }
+    ]
+  }
+}
