@@ -194,7 +194,12 @@ GET /people > clipboard                  # system clipboard, case-insensitive
 - `~/` expands to the home directory (on Windows `~\` does too).
 - `>> file` appends by content: JSON is spliced into one array, `.ndjson`/`.njson`
   targets get one compact object per line, `.csv` appends drop the duplicate
-  header row, anything else is text-appended. `>> clipboard` is rejected
+  header row, anything else is text-appended. An addition to a `.csv` whose
+  first line is not the file's header row (another `~map`, or an answer
+  that is no CSV) is added whole, with a warning on stderr: `warning: the
+  first line of the response is not the header row of rows.csv: it was
+  appended too`. A byte order mark in front of the target stays there, and
+  what is behind it is added to as if it were not. `>> clipboard` is rejected
   when the line is read, before anything is sent. A target that is not UTF-8
   (a CSV saved as Latin-1) keeps its bytes and gets the addition behind them,
   and one that is not a regular file (a fifo, `/dev/stdout`) is written to

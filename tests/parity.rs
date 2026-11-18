@@ -1671,7 +1671,7 @@ fn zero_is_falsy_however_it_is_spelled() {
     let server = RecordingServer::start();
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
-    for zero in ["0", "-0", "0.0", "0e0", "0E0", "0.00e-3", "-0.0"] {
+    for zero in ["0", "-0", "0.0", "0e0", "0E0", "0.00e-3", "-0.0", "0e-400"] {
         let chain = run_in(&server, d, &[&format!("GET /zero/{zero} && GET /never")]);
         assert_eq!((chain.code, &chain.sent[..]), (Some(0), &[format!("GET /zero/{zero}")][..]), "{zero}: {}", chain.stderr);
         let or = run_in(&server, d, &[&format!("GET /zero/{zero} || GET /then")]);
@@ -1685,9 +1685,29 @@ fn zero_is_falsy_however_it_is_spelled() {
         let polled = run_in(&server, d, &[&format!("sleep 100ms while GET /zero/{zero}\nGET /after")]);
         assert_eq!(polled.sent, [format!("GET /zero/{zero}"), "GET /after".to_string()], "{zero}: {}", polled.stderr);
     }
-    for other in ["1", "0.1", "1e-9", "0.0000000000000000000001", "12345678901234567890123"] {
+    for other in ["1", "0.1", "1e-9", "0.0000000000000000000001", "12345678901234567890123", "1e-400"] {
         let chain = run_in(&server, d, &[&format!("GET /zero/{other} && GET /then")]);
         assert_eq!(chain.sent, [format!("GET /zero/{other}"), "GET /then".to_string()], "{other}: {}", chain.stderr);
+    }
+}
+
+/// A `>>` to a `.csv` drops the first line of what it adds only when that is
+/// the file's header row. Anything else is added whole, with a warning on
+/// stderr, in `-sa` and under `-s` too: it is about the data.
+#[test]
+fn a_csv_append_that_is_not_under_the_files_header_is_said() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let warning = "warning: the first line of the response is not the header row of rows.csv: it was appended too";
+    for args in [&["GET /zero/7 >> rows.csv"][..], &["-s", "GET /zero/7 >> rows.csv"], &["-sa", "f.api"], &["-a", "f.api"]] {
+        std::fs::write(d.join("rows.csv"), "id,name\n1,Ann\n").unwrap();
+        std::fs::write(d.join("f.api"), "GET /zero/7 >> rows.csv\nGET /zero/id,name >> rows.csv\n").unwrap();
+        let got = run_in(&server, d, args);
+        assert_eq!(got.code, Some(0), "{args:?}: {}", got.stderr);
+        assert_eq!(got.stderr.matches(warning).count(), 1, "{args:?}: {}", got.stderr);
+        // The answer is all there, and one that is only the header adds nothing.
+        assert_eq!(std::fs::read_to_string(d.join("rows.csv")).unwrap(), "id,name\n1,Ann\n7", "{args:?}");
     }
 }
 

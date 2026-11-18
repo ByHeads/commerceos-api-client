@@ -6578,7 +6578,9 @@ fn stream_to_sink(mut resp: impl IoRead, sink: &mut dyn Write) -> Result<Streame
     sink.flush().map_err(StreamFailure::Write)?;
 
     Ok(StreamedBody {
-        prefix: String::from_utf8_lossy(&prefix).into_owned(),
+        // Read as a buffered body is (`decode_body`): a byte order mark in
+        // front is not part of the value, so `0` behind one is still zero.
+        prefix: encoding_rs::UTF_8.decode(&prefix).0.into_owned(),
         overflowed,
         last_byte,
         bytes,
@@ -6624,6 +6626,33 @@ fn write_outfile(path: &str, content: &str) -> io::Result<u64> {
     fs::write(path, content).map(|()| content.len() as u64)
 }
 
+// What the last `>>` has to say about what it did, for whoever asked for
+// the append to say where it says such things: a batch on stderr, the
+// prompt in its hint line.
+thread_local! {
+    static APPEND_NOTE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+fn take_append_note() -> Option<String> {
+    APPEND_NOTE.with(|note| note.borrow_mut().take())
+}
+
+/// The rows a CSV payload adds to a target whose first line is `header`:
+/// without its own header row when that is the target's, which is what a
+/// second answer of the same request has. A first line that is not the
+/// target's header is no duplicate of it (another map, or an answer that
+/// is no CSV at all): the payload is added whole, and that is noted.
+fn csv_rows_to_append<'a>(path: &str, header: Option<&str>, payload: &'a str) -> &'a str {
+    let (first, rest) = payload.split_once('\n').unwrap_or((payload, ""));
+    let same = |header: &str| header.trim_end_matches('\r').trim() == first.trim_end_matches('\r').trim();
+    if header.is_none_or(same) {
+        return rest;
+    }
+    let said = format!("the first line of the response is not the header row of {}: it was appended too", path);
+    APPEND_NOTE.with(|note| *note.borrow_mut() = Some(said));
+    payload
+}
+
 /// - target missing or empty → plain write, identical to `>`
 /// - `.ndjson`/`.njson` target → a JSON-array payload is exploded to one compact
 ///   object per line, a single JSON value becomes one compact line, and
@@ -6640,6 +6669,8 @@ fn write_outfile(path: &str, content: &str) -> io::Result<u64> {
 /// No path ever rewrites existing content bytes. An unparseable target is
 /// always text-appended — appending must never destroy what's already there.
 fn append_to_outfile(path: &str, new_content: &str) -> io::Result<()> {
+    // A note is about this append, not about one before it.
+    take_append_note();
     // A target that is no regular file (a fifo, `/dev/stdout`) holds nothing
     // to read and add to: reading it would wait for a writer that is this
     // process. It is written as it stands, as a `>` writes it.
@@ -6655,6 +6686,12 @@ fn append_to_outfile(path: &str, new_content: &str) -> io::Result<()> {
     let existing = match String::from_utf8(existing) {
         Ok(text) => text,
         Err(not_text) => return append_to_bytes(path, not_text.as_bytes(), new_content),
+    };
+    // A byte order mark stays in front of the file and is no part of what
+    // the file holds: behind one, a JSON array is still the array to add to.
+    let (mark, existing) = match existing.strip_prefix('\u{feff}') {
+        Some(rest) => ("\u{feff}", rest.to_string()),
+        None => ("", existing),
     };
     if existing.trim().is_empty() {
         // The first append is a plain write, in the shape the target takes.
@@ -6684,11 +6721,8 @@ fn append_to_outfile(path: &str, new_content: &str) -> io::Result<()> {
         }
     } else if path_lower.ends_with(".csv") {
         // CSV: the target already has a header row — drop the payload's.
-        let body = match new_content.split_once('\n') {
-            Some((_header, rest)) => rest,
-            // Header-only payload (empty result set): nothing to add.
-            None => return Ok(()),
-        };
+        // A header-only payload (an empty result set) has nothing to add.
+        let body = csv_rows_to_append(path, existing.trim_start().lines().next(), new_content);
         if body.trim().is_empty() {
             return Ok(());
         }
@@ -6732,7 +6766,7 @@ fn append_to_outfile(path: &str, new_content: &str) -> io::Result<()> {
         }
     };
 
-    replace_outfile(path, &merged)
+    replace_outfile(path, &format!("{}{}", mark, merged))
 }
 
 /// Append to a target that is not UTF-8 (a CSV another program saved as
@@ -6743,10 +6777,17 @@ fn append_to_bytes(path: &str, existing: &[u8], new_content: &str) -> io::Result
     let lines = if is_ndjson_path(path) { ndjson_lines(new_content) } else { None };
     let addition = match &lines {
         Some(lines) => lines.as_str(),
-        None if path.to_lowercase().ends_with(".csv") => match new_content.split_once('\n') {
-            Some((_header, rest)) => rest,
-            None => "",
-        },
+        // The header of a file in another encoding is compared where both
+        // are plain ASCII, which reads the same in all of them.
+        None if path.to_lowercase().ends_with(".csv") => {
+            let first = existing.split(|b| *b == b'\n').next().unwrap_or_default();
+            let header = std::str::from_utf8(first).ok().filter(|header| header.is_ascii());
+            let payload_is_ascii = new_content.lines().next().is_some_and(str::is_ascii);
+            match header.filter(|_| payload_is_ascii) {
+                Some(header) => csv_rows_to_append(path, Some(header), new_content),
+                None => new_content.split_once('\n').map_or("", |(_header, rest)| rest),
+            }
+        }
         None => new_content,
     };
     if addition.trim().is_empty() {
@@ -7457,12 +7498,20 @@ fn classify_response(status: u16, body: &str) -> RequestOutcome {
 
     match serde_json::from_str::<Value>(trimmed) {
         Ok(Value::Bool(false)) | Ok(Value::Null) => RequestOutcome::Falsy,
-        Ok(Value::Number(n)) if n.as_f64() == Some(0.0) => RequestOutcome::Falsy,
+        Ok(Value::Number(n)) if number_is_zero(&n) => RequestOutcome::Falsy,
         Ok(Value::String(s)) if s.is_empty() => RequestOutcome::Falsy,
         // Arrays and objects are truthy in JS however empty they are, as is any
         // non-JSON payload (CSV, NDJSON) that reached a 2xx.
         _ => RequestOutcome::Truthy,
     }
+}
+
+/// Whether a number is zero, by its digits: `0`, `-0.00`, `0e5`. A number
+/// too small for a double (`1e-400`) only rounds to zero, and is not.
+fn number_is_zero(n: &serde_json::Number) -> bool {
+    let written = n.to_string();
+    let digits = written.split(['e', 'E']).next().unwrap_or("");
+    digits.chars().all(|c| matches!(c, '0' | '-' | '+' | '.')) && digits.contains('0')
 }
 
 /// The separator that introduced a chain segment.
@@ -11979,6 +12028,10 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
                 if !config.silent && !config.bulk_silent {
                     errln!("{}", target.marker(written).dimmed());
                 }
+                // About the data, so with `-s` and in `-sa` too.
+                if let Some(note) = take_append_note() {
+                    errln!("warning: {}", note);
+                }
             }
             Err(e) => {
                 errln!("{}", target.failure(&e));
@@ -14041,6 +14094,14 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     // status line, where it stays.
     let in_program = state.chain_input.is_some();
     if let Some(note) = export_note.filter(|_| !state.config.quiet && !state.config.check_only) {
+        if in_program {
+            block.push_note(&format!("↳ {}", note).dimmed().to_string());
+        }
+        state.status_msg = note;
+        state.status_msg_at = Some(Instant::now());
+    }
+    // What a `>>` did that was not asked for in so many words.
+    if let Some(note) = take_append_note() {
         if in_program {
             block.push_note(&format!("↳ {}", note).dimmed().to_string());
         }
@@ -32320,6 +32381,112 @@ mod tests {
         fs::write(at("out.json"), b"[\"caf\xe9\"]").unwrap();
         append_to_outfile(&at("out.json"), "[1]").unwrap();
         assert_eq!(fs::read(at("out.json")).unwrap(), b"[\"caf\xe9\"]\n[1]");
+    }
+
+    #[test]
+    fn a_csv_append_drops_only_a_header_row_that_is_the_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let at = |name: &str| dir.path().join(name).to_str().unwrap().to_string();
+        let p = at("rows.csv");
+        let note = || take_append_note();
+
+        // The same header, also with other line ends and blanks at its end.
+        fs::write(&p, "id,name\r\n1,Ann\r\n").unwrap();
+        append_to_outfile(&p, "id,name\n2,Bob\n").unwrap();
+        append_to_outfile(&p, "id,name \r\n3,Cy\r\n").unwrap();
+        assert_eq!(fs::read_to_string(&p).unwrap(), "id,name\r\n1,Ann\r\n2,Bob\n3,Cy\r\n");
+        assert_eq!(note(), None);
+
+        // Another header: the rows would stand under columns they are not
+        // of. The payload is added whole, and that is said.
+        append_to_outfile(&p, "id,email\n4,d@x\n").unwrap();
+        assert!(fs::read_to_string(&p).unwrap().ends_with("3,Cy\r\nid,email\n4,d@x\n"));
+        assert_eq!(note(), Some(format!("the first line of the response is not the header row of {p}: it was appended too")));
+        assert_eq!(note(), None, "said once");
+
+        // An answer that is no CSV at all loses no first line.
+        fs::write(&p, "id,name\n1,Ann\n").unwrap();
+        append_to_outfile(&p, "[\n  { \"id\": 2 }\n]").unwrap();
+        assert_eq!(fs::read_to_string(&p).unwrap(), "id,name\n1,Ann\n[\n  { \"id\": 2 }\n]");
+        assert!(note().is_some());
+        // The note of one append is not said for the next.
+        append_to_outfile(&p, "x,y\n1,2\n").unwrap();
+        append_to_outfile(&p, "id,name\n5,Eve\n").unwrap();
+        assert_eq!(note(), None);
+
+        // Behind a byte order mark the header is still the header.
+        fs::write(&p, "\u{feff}id,name\n1,Ann\n").unwrap();
+        append_to_outfile(&p, "id,name\n2,Bob\n").unwrap();
+        assert_eq!(fs::read_to_string(&p).unwrap(), "\u{feff}id,name\n1,Ann\n2,Bob\n");
+        assert_eq!(note(), None);
+
+        // A target in another encoding: headers of plain ASCII are compared,
+        // and one that is not is taken to be the same, as it was.
+        fs::write(&p, b"id,name\n1,caf\xe9\n").unwrap();
+        append_to_outfile(&p, "id,name\n2,Bob\n").unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"id,name\n1,caf\xe9\n2,Bob\n");
+        assert_eq!(note(), None);
+        append_to_outfile(&p, "id,email\n3,c@x\n").unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"id,name\n1,caf\xe9\n2,Bob\nid,email\n3,c@x\n");
+        assert!(note().is_some());
+        fs::write(&p, b"id,pr\xe9nom\n1,Ann\n").unwrap();
+        append_to_outfile(&p, "id,prénom\n2,Bob\n").unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"id,pr\xe9nom\n1,Ann\n2,Bob\n");
+        assert_eq!(note(), None);
+    }
+
+    #[test]
+    fn an_append_adds_to_the_array_behind_a_byte_order_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("out.json").to_str().unwrap().to_string();
+        // As PowerShell and some Windows editors save it. It used to be
+        // text-appended: two documents in one file.
+        fs::write(&p, "\u{feff}[\n  { \"id\": 1 }\n]\n").unwrap();
+        append_to_outfile(&p, "[{ \"id\": 2 }]").unwrap();
+        let text = fs::read_to_string(&p).unwrap();
+        assert_eq!(text, "\u{feff}[{ \"id\": 1 },{ \"id\": 2 }]");
+        assert_eq!(serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')).unwrap().as_array().unwrap().len(), 2);
+        // A single value behind one, and an NDJSON file with one.
+        fs::write(&p, "\u{feff}{ \"id\": 1 }").unwrap();
+        append_to_outfile(&p, "{ \"id\": 2 }").unwrap();
+        assert_eq!(fs::read_to_string(&p).unwrap(), "\u{feff}[{ \"id\": 1 },{ \"id\": 2 }]");
+        let nd = dir.path().join("out.ndjson").to_str().unwrap().to_string();
+        fs::write(&nd, "\u{feff}{\"id\":1}\n").unwrap();
+        append_to_outfile(&nd, "[{\"id\":2}]").unwrap();
+        assert_eq!(fs::read_to_string(&nd).unwrap(), "\u{feff}{\"id\":1}\n{\"id\":2}\n");
+        // A file that is nothing but the mark is an empty one.
+        fs::write(&p, "\u{feff}").unwrap();
+        append_to_outfile(&p, "[1]").unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&fs::read_to_string(&p).unwrap()).unwrap(), serde_json::json!([1]));
+    }
+
+    #[test]
+    fn zero_is_told_by_its_digits() {
+        use RequestOutcome::*;
+        for zero in ["0", "-0", "0.0", "0e0", "0E5", "0.00e-3", "-0.0", "0e-400", "0.0E+400"] {
+            assert_eq!(classify_response(200, zero), Falsy, "{zero}");
+        }
+        // Too small for a double, which rounds it to zero: it is not zero.
+        for other in ["1e-400", "-1E-400", "0.1e-999", "1", "10", "0.01", "1e400", "12345678901234567890123"] {
+            assert_eq!(classify_response(200, other), Truthy, "{other}");
+        }
+    }
+
+    #[test]
+    fn a_streamed_body_is_judged_behind_its_byte_order_mark() {
+        use RequestOutcome::*;
+        for (body, verdict) in [("0", Falsy), ("false", Falsy), ("null", Falsy), ("\"\"", Falsy), ("1", Truthy), ("[]", Truthy)] {
+            let marked = format!("{}{body}", '\u{feff}');
+            let streamed = stream_to_sink(marked.as_bytes(), &mut Vec::new()).ok().unwrap();
+            assert_eq!(classify_streamed(200, &streamed.prefix, false), verdict, "{body}");
+            // As a buffered read of the same bytes is.
+            let (text, _) = decode_body(marked.as_bytes(), Some("application/json"));
+            assert_eq!(classify_response(200, &text), verdict, "{body}");
+        }
+        // The file still gets the bytes as they came.
+        let mut sink = Vec::new();
+        let _ = stream_to_sink("\u{feff}0".as_bytes(), &mut sink);
+        assert_eq!(sink, "\u{feff}0".as_bytes());
     }
 
     /// A fifo holds nothing to read and add to: `>>` writes to it as `>`
