@@ -219,7 +219,9 @@ GET /people > clipboard                  # system clipboard, case-insensitive
   `1e+2`).
 - A `.ndjson`/`.njson` target holds one compact JSON value per line, after
   `>` and after any number of `>>`: a single record is one line, and a list
-  is one line per element. Other JSON targets are indented. Not under
+  is one line per element. Other JSON targets are indented by `>`; a `>>`
+  splices each answer in as it is laid out, between the `[`, `,` and `]` of
+  the one array, without laying the whole out again. Not under
   `--stream`, where a `> file` of either kind holds the bytes the server
   sent (see below).
 - Under the status line the client prints the target and the size written, on
@@ -598,7 +600,9 @@ still with exit 0; a block that would stop a run (out of place, invalid) is
 ### Showing it before a run: `-m`
 
 `-m` (`--describe-first`) prints the block of the file being run, on stderr,
-before anything else, so above the `-p` preview when both are given:
+before anything is sent or asked, so above the `-p` preview when both are
+given. The file has been read by then: its imports are fetched and its `url`
+gate has passed, and a run that stops at one of those prints no block.
 
 ```sh
 api -spma catalog.api
@@ -1231,7 +1235,8 @@ What it does to every object in the response, however deep:
   `********` is left out (below), and a record can't be found by it: a
   record whose only other identifier is masked keeps its key as `key?` and
   under the name, like one that has none.
-- **A member whose value is masked (`********`) is left out**, and a warning
+- **A member whose value is masked (`********`, or the seven `*******` some
+  members are masked with) is left out**, and a warning
   on stderr says where: `warning: response had masked data, left out at
   oauth2Clients/secret, localCredentials/password and 1 other place`. A path
   is written from the top of the response and leaves out positions in lists,
@@ -1386,7 +1391,9 @@ ignores the variable entirely.
 ```
 
 - `auth_type` is `"key"` (Basic), `"token"` (Bearer), or `"oauth2"`, read in
-  any case (`"Token"`). A connection with any other `auth_type` is not used:
+  any case (`"Token"`). A key that has the shape of a JWT (it starts with
+  `ey` and is longer than 180 characters) is a token whatever it was saved
+  as, or given with `-k`, and is sent as Bearer. A connection with any other `auth_type` is not used:
   its credential is not sent as a kind it was not saved as.
 - For `"oauth2"`, put the client secret in `credential` and the client ID in
   `client_id`; the client exchanges them for a token at startup, and again
@@ -1471,7 +1478,8 @@ the saved connections (none)`).
 A connection that can't be used as it is written is named with the reason.
 As the default it is a warning and no saved connection is used (the
 interactive prompt then opens on the connection picker, as it does when
-there is no default); asked for with `-c` it ends the run with exit 1:
+there is no default); asked for with `-c` it ends a request or a batch with
+exit 1, and at a terminal the prompt says why and opens:
 
 ```
 WARNING: the default connection "local" can't be used: its auth_type "bearer" is not "key", "token" or "oauth2". No saved connection is used.
