@@ -1356,7 +1356,8 @@ the way `ctrl+h` opens the shortcuts:
   setting is at. On one too short for every row the blank rows go first,
   then the settings are shown as many as there is room for, moved along
   with the cursor. The row the cursor is on and the last row are always
-  there.
+  there. A value too long for its column (an export name of 128
+  characters) is cut in front, and the labels stay.
 - **What is on is marked at the right of the hint line**, one word each:
   `nulls · fail-fast · ndjson · raw · timeout 45s`, and last `export` or
   `streaming`. On a line too narrow for all of them the ones on the left go

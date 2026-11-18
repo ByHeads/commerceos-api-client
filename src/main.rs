@@ -538,13 +538,18 @@ fn settings_rows(state: &AppState, fits: usize) -> Vec<String> {
     // `› label  value`: two columns in front of the label, two behind it.
     let longest = |of: fn(&(&'static str, String, Setting)) -> usize| menu.iter().map(of).max().unwrap_or(0);
     let label_width = longest(|(label, _, _)| str_width(label));
-    let value_width = longest(|(_, value, _)| str_width(value));
+    // A long value (an export name of 128 characters) gets the room the
+    // labels leave, and is cut in front: a row still ends in what the
+    // setting is at, and the other rows keep their labels.
+    let value_room = width.saturating_sub(4 + label_width).max(SETTINGS_VALUE_MIN);
+    let value_width = longest(|(_, value, _)| str_width(value)).min(value_room);
     let label_width = label_width.min(width.saturating_sub(4 + value_width).max(SETTINGS_LABEL_MIN));
     let setting_rows: Vec<String> = menu
         .iter()
         .enumerate()
         .map(|(at, (label, value, _))| {
             let label = pad_to_width(&fit_to_width(label, label_width), label_width);
+            let value = fit_tail_to_width(value, value_width);
             let row = format!("{} {}  {}", if at == chosen { "›" } else { " " }, label, value);
             let row = fit_to_width(&row, width);
             if at == chosen { row } else { row.dimmed().to_string() }
@@ -577,6 +582,8 @@ fn settings_rows(state: &AppState, fits: usize) -> Vec<String> {
 /// The fewest columns a label of the settings menu is cut to: under that a
 /// row is its marker and what is left of the terminal.
 const SETTINGS_LABEL_MIN: usize = 4;
+/// The columns a value is given before the labels give way to it.
+const SETTINGS_VALUE_MIN: usize = 16;
 
 /// Rows from the ctrl+h panel's ruler down to the cursor under its last
 /// row: the ruler and the rows of `help_rows`. It is how far up the clear
@@ -16342,6 +16349,16 @@ fn copy_curl(state: &AppState) -> Result<(), String> {
     copy_curl_with(state, copy_to_clipboard)
 }
 
+/// Whether the next Tab goes on to the next of the list it holds, which is
+/// what the `(1/3)` counter says. In a body under `-x` a list is kept that
+/// Tab does not walk: of the keys that start as the one it wrote, of a value
+/// in its quotes. There the counter would count what can't be reached.
+fn tab_goes_to_the_next(state: &AppState) -> bool {
+    let in_body = state.config.experimental
+        && (state.last_tab_input.starts_with("json:") || state.last_tab_input.starts_with("json_ghost:"));
+    !in_body || cycling_json_value(state) || cycling_json_type(state)
+}
+
 fn render_input_content(state: &mut AppState, width: usize) -> (String, u16, String) {
     // Ghost text is computed per `&&` segment, FIRST — the view mutates
     // `state.input` in place, so it must run before any slices are taken.
@@ -16371,7 +16388,12 @@ fn render_input_content(state: &mut AppState, width: usize) -> (String, u16, Str
         // in front of an outfile), Tab completes the path: so is it shown.
         let at_path_end = file_ctx
             .as_ref()
-            .is_some_and(|ctx| char_to_byte_idx(&state.input, state.cursor_pos) == ctx.path_end && !ctx.partial.is_empty());
+            .is_some_and(|ctx| {
+                // An `@` with nothing behind it yet is a path too, of which
+                // Tab writes the first: not so a line that is still empty.
+                let begun = !ctx.partial.is_empty() || !(ctx.is_include || ctx.is_setting);
+                char_to_byte_idx(&state.input, state.cursor_pos) == ctx.path_end && begun
+            });
         let ghost = if at_path_end || at_segment_end
             && (in_file_mode || (state.config.complete && !state.endpoints.is_empty()))
         {
@@ -16507,7 +16529,7 @@ fn render_input_content(state: &mut AppState, width: usize) -> (String, u16, Str
             final_line.push_str(&" ".repeat(padding));
             final_line.push_str(&format!("\x1b[38;5;240m{}\x1b[0m", param_hint));
         }
-    } else if state.completions.len() > 1 {
+    } else if state.completions.len() > 1 && tab_goes_to_the_next(state) {
         let counter = format!("({}/{})", state.completion_idx + 1, state.completions.len());
         let padding = width.saturating_sub(last_line_len).saturating_sub(counter.len());
         if padding > 0 {
@@ -18775,7 +18797,15 @@ fn tab_pressed(state: &mut AppState) -> bool {
         // choosing among the subtypes of the `@type` it has just written.
         // Closed in the cursor's segment, where the ghost was read: on the
         // line when that segment has no line break, whatever the others have.
-        if cycling_json_type(state) || cycling_json_value(state) || !with_chain_segment_view(state, close_pending_bracket) {
+        // Not where the ghost shows more of the value itself (`2` of an enum
+        // that has `200`): that is what Tab writes, and the bracket waits.
+        let more_of_the_value =
+            with_chain_segment_view(state, |state| get_json_completion_ghost(state).is_some_and(|ghost| !ghost.is_empty()));
+        if cycling_json_type(state)
+            || cycling_json_value(state)
+            || more_of_the_value
+            || !with_chain_segment_view(state, close_pending_bracket)
+        {
             // JSON body tab completion — viewed per segment, so a chain's
             // second body completes against its own text, not segment 1's.
             with_chain_segment_view(state, |state| handle_json_tab_completion(state, false, true));
@@ -19011,15 +19041,23 @@ fn get_body_bracket_ghost(state: &AppState, parts: &[&str], uri: &str) -> String
 
 fn get_completion_ghost_at_cursor(state: &AppState) -> String {
     if state.config.experimental && cursor_inside_brackets(&state.input, state.cursor_pos) && !in_or_behind_file_path(state) {
-        // Only show JSON ghost if cursor is on a line with no content after it
-        // (prevents ghost text from overlapping with existing content and causing visual artifacts)
+        // With text behind the cursor too: Tab writes there (the rest of a
+        // value in front of its closing quote, a closer in front of an outer
+        // one), and the ghost is drawn in front of what stands behind.
         let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
-        let line_end = state.input[byte_idx..].find('\n').map_or(state.input.len(), |p| byte_idx + p);
-        let after_on_line = &state.input[byte_idx..line_end];
-        if after_on_line.chars().any(|c| !c.is_whitespace()) {
+        if let Some(ghost) = get_json_completion_ghost(state) {
+            // A closing quote that is there already is the one Tab keeps:
+            // what is shown is what is added in front of it.
+            let behind = &state.input[byte_idx..];
+            return match ghost.strip_suffix('"') {
+                Some(added) if behind.starts_with('"') => added.to_string(),
+                _ => ghost,
+            };
+        }
+        if cycling_json_type(state) {
             return String::new();
         }
-        return get_json_completion_ghost(state).unwrap_or_default();
+        return get_closing_brackets_ghost(&state.input, state.cursor_pos);
     }
 
     if state.endpoints.is_empty() {
@@ -19028,11 +19066,18 @@ fn get_completion_ghost_at_cursor(state: &AppState) -> String {
 
     // Only with the cursor at the end of the URI: in the middle of it the
     // ghost would splice into the text, and anywhere else it is not in it.
-    let at = line_uri_at(&state.input, char_to_byte_idx(&state.input, state.cursor_pos));
-    let uri = &state.input[at.start..at.end];
-    if uri.is_empty() || state.cursor_pos != char_len(&state.input[..at.end]) {
+    let cursor_byte = char_to_byte_idx(&state.input, state.cursor_pos);
+    let at = line_uri_at(&state.input, cursor_byte);
+    if cursor_byte <= at.start || cursor_byte > at.end {
         return String::new();
     }
+    // In front of a delimiter of the URI too (`/pe^~take(5)`), where Tab
+    // completes what is typed up to the cursor. Not in the middle of a word.
+    let in_a_word = |c: char| !(c.is_whitespace() || matches!(c, '/' | '~' | '(' | ')' | '?' | '&' | ',' | '='));
+    if state.input[cursor_byte..at.end].chars().next().is_some_and(in_a_word) {
+        return String::new();
+    }
+    let uri = &state.input[at.start..cursor_byte];
 
     // Only show ghost text if the URI contains a delimiter
     if uri.rfind(|c: char| c == '/' || c == '(' || c == '~').is_none() || cycling_uri(state, uri) {
@@ -19286,7 +19331,9 @@ fn get_file_completions_with(partial: &str, backslash_separates: bool) -> Vec<St
         if !name.starts_with(&file_prefix) {
             continue;
         }
-        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        // A link to a directory is one to complete into, as a path through
+        // it is one to include.
+        let is_dir = entry.path().is_dir();
         // Build the completion using the original partial's directory prefix (preserving ~)
         let dir_prefix = match partial.rfind(separates) {
             Some(last_separator) => partial[..=last_separator].to_string(),
@@ -26895,6 +26942,19 @@ mod tests {
         for row in help_rows(&state) {
             assert!(str_width(&visible_text(&row)) < 40, "{row:?}");
         }
+        // It is cut in front, so a row still ends in what the setting is
+        // at, and it does not take the other rows' labels: an export name
+        // of the 128 characters one may have left four columns of each.
+        let name = format!("com.heads.{}seedID", "x".repeat(112));
+        state.config.given.export = Some(name.clone());
+        state.config.apply_settings();
+        for (width, label) in [(80u16, "Export mode (responses as seed data)"), (60, "Export mode (responses as seed data)"), (40, "Export mode (respo…")] {
+            state.width = width;
+            let rows: Vec<String> = help_rows(&state).iter().map(|row| visible_text(row)).collect();
+            assert!(rows[2].starts_with(&format!("  {label}  …")) && rows[2].ends_with("xseedID"), "{width}: {:?}", rows[2]);
+            assert!(rows[1].starts_with("› Response streaming") && rows[1].ends_with("  off"), "{width}: {:?}", rows[1]);
+            assert!(rows.iter().all(|row| str_width(row) < width as usize), "{width}: {rows:?}");
+        }
     }
 
     /// A terminal too short for the whole menu still shows the row the
@@ -28309,7 +28369,8 @@ mod tests {
             "codes": { "type": "array", "items": { "$ref": "#/components/schemas/strict string" } },
             "odd": { "type": "array" },
             "code": { "enum": ["1", "2", "true"] },
-            "size": { "enum": [1, "2"] } } },
+            "size": { "enum": [1, "2"] },
+            "http": { "enum": [200, 404] } } },
         "company": { "allOf": [{ "$ref": "#/components/schemas/legal entity" }, { "$ref": "elsewhere" }] },
         "zoo": { "type": ["object", "null"], "additionalProperties": false,
           "properties": {
@@ -31199,6 +31260,10 @@ mod tests {
         tab_pressed(&mut state);
         let after = shown(&state);
         let (written, behind) = after.split_once('^').unwrap();
+        // Tab may step over a closing quote that was there already: the
+        // ghost shows what is added in front of it.
+        let stepped = written.strip_suffix('"').filter(|_| rest.starts_with('"') && !ghost.is_empty() && behind == &rest[1..]);
+        let written = stepped.unwrap_or(written);
         assert_eq!(written.trim_end(), format!("{before}{ghost}").trim_end(), "what Tab wrote on {marked:?}");
         if ghost.is_empty() {
             assert_eq!(behind, rest, "{marked:?}");
@@ -31502,6 +31567,16 @@ mod tests {
         assert_eq!(complete("sub/.h"), under(&["sub/.hidden"]));
         let here = get_file_completions_with(".", false);
         assert!(!here.is_empty() && here.iter().all(|name| name.starts_with('.')), "{here:?}");
+        // A link to a directory is a directory to complete into, and one
+        // to offer for an include: it was a name with nothing behind it.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.path().join("sub"), dir.path().join("linked")).unwrap();
+            assert_eq!(complete("li"), under(&["linked/"]));
+            assert_eq!(complete("linked/"), under(&["linked/b.json"]));
+            assert_eq!(get_include_completions(&format!("{base}/li")), under(&["linked/"]));
+            fs::remove_file(dir.path().join("linked")).unwrap();
+        }
         // Anything else as before.
         assert_eq!(complete(""), under(&["sub/", "a.json"]));
         assert_eq!(complete("sub/b"), under(&["sub/b.json"]));
@@ -31646,6 +31721,113 @@ mod tests {
                 backtab_pressed(&mut state);
                 assert!(state.cursor_pos <= char_len(&state.input), "cursor {cursor}");
             }
+        }
+    }
+
+    /// With the cursor anywhere in a line, in a URI, a body or a path, Tab
+    /// writes exactly where a ghost is drawn: a ghost that Tab does not
+    /// write and a Tab that writes unannounced are both found here.
+    #[test]
+    fn tab_writes_where_a_ghost_is_drawn_and_nowhere_else() {
+        for line in [
+            "PUT /å {\"n\": \"日本\"} && GET /people~where(name=\"Åsa 👍\")~co > /tmp/åä.json",
+            "PUT /people [{\"status\": \"n\", \"gi\": \"Ann\", \"active\": t}] > out.json",
+            "PUT /yard {\"code\": 1, \"size\": 1, \"http\": 2} && GET /pe~take(5)",
+            "PUT /people [\n  {\n    \"na\": \"b\"\n  }\n]",
+            "GET /pe/7f3a/na~wh(ac) || PUT /x @ > out.json",
+        ] {
+            for cursor in 0..=char_len(line) {
+                let at = char_to_byte_idx(line, cursor);
+                for experimental in [false, true] {
+                    let marked = format!("{}^{}", &line[..at], &line[at..]);
+                    let mut state = completing(&marked);
+                    state.config.experimental = experimental;
+                    let ghost = render_input_content(&mut state, 200).2;
+                    tab_pressed(&mut state);
+                    let after = shown(&state);
+                    assert_eq!(after.replace('^', "") != line, !ghost.is_empty(), "-x {experimental}: {marked:?} with ghost {ghost:?} became {after:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_ghost_is_drawn_in_the_middle_of_a_line_where_tab_writes() {
+        // In front of a delimiter of the URI.
+        for (line, ghost, after) in [
+            ("GET /pe^~take(5)", "ople", "GET /people^~take(5)"),
+            ("GET /pe^/7f3a/name", "ople", "GET /people^/7f3a/name"),
+            ("GET /about && GET /pe^~take(5) > out.json", "ople", "GET /about && GET /people^~take(5) > out.json"),
+        ] {
+            for experimental in [false, true] {
+                assert_eq!(ghost_then_tab(line, experimental), (ghost.to_string(), after.to_string()), "{line}");
+            }
+        }
+        // In the middle of a word of it there is none, and Tab writes nothing.
+        assert_eq!(ghost_then_tab("GET /pe^ople~take(5)", false), (String::new(), "GET /pe^ople~take(5)".to_string()));
+        // In a body: the rest of a value or a key in front of its closing
+        // quote, which Tab keeps, and a closer in front of an outer one.
+        for (line, ghost, after) in [
+            (r#"PUT /people [{"status": "n^"}]"#, "ew", r#"PUT /people [{"status": "new"^}]"#),
+            (r#"PUT /people [{"gi^": "Ann"}]"#, "venName", r#"PUT /people [{"givenName"^: "Ann"}]"#),
+            (r#"PUT /people [{"name": "b"^]"#, "}", r#"PUT /people [{"name": "b"}^]"#),
+            ("PUT /people [{\"name\": \"b\"^\n]", "}", "PUT /people [{\"name\": \"b\"}^\n]"),
+        ] {
+            assert_eq!(ghost_then_tab(line, true), (ghost.to_string(), after.to_string()), "{line}");
+        }
+        // An `@` with no path yet, in front of an outfile: the first entry.
+        let (ghost, after) = ghost_then_tab("PUT /x @^ > out.json", false);
+        assert!(!ghost.is_empty() && after == format!("PUT /x @{ghost}^ > out.json"), "{ghost:?} {after:?}");
+    }
+
+    #[test]
+    fn tab_writes_more_of_a_value_before_it_closes_the_bracket() {
+        // A number typed for an enum that has a longer one: the ghost shows
+        // the rest, and Tab used to close the bracket behind the `2`.
+        assert_eq!(ghost_then_tab(r#"PUT /yard {"http": 2^"#, true), ("00".to_string(), r#"PUT /yard {"http": 200^"#.to_string()));
+        assert_eq!(ghost_then_tab(r#"PUT /yard {"http": 200^"#, true), ("}".to_string(), r#"PUT /yard {"http": 200}^"#.to_string()));
+        // A number or a literal typed for a value the spec has as a string
+        // gets its quotes, as the ghost's closing quote says.
+        for (line, after) in [(r#"PUT /yard {"code": 1^"#, r#"PUT /yard {"code": "1"^"#), (r#"PUT /yard {"code": true^"#, r#"PUT /yard {"code": "true"^"#)] {
+            let mut state = completing(line);
+            state.config.experimental = true;
+            assert_eq!(render_input_content(&mut state, 200).2, "\"", "{line}");
+            tab_pressed(&mut state);
+            assert_eq!(shown(&state), after);
+        }
+        // A value that is whole is closed behind, as before.
+        assert_eq!(body_tabbed(r#"PUT /people [{"rank": 1"#), r#"PUT /people [{"rank": 1}^"#);
+        assert_eq!(body_tabbed(r#"PUT /people [{"active": true"#), r#"PUT /people [{"active": true}^"#);
+    }
+
+    #[test]
+    fn the_counter_counts_only_a_list_tab_walks() {
+        let counted = |state: &mut AppState| visible_text(&render_input_content(state, 80).0).contains("(1/");
+        let after_tab = |marked: &str, experimental: bool| {
+            let mut state = completing(marked);
+            state.config.experimental = experimental;
+            tab_pressed(&mut state);
+            state
+        };
+        // Two keys start with `g`, and the next Tab does not reach the
+        // second: the key is written whole, with its colon.
+        let mut state = after_tab(r#"PUT /people [{"g^"#, true);
+        assert_eq!((shown(&state).as_str(), state.completions.len()), (r#"PUT /people [{"gdprForgotten":^"#, 2));
+        assert!(!counted(&mut state));
+        tab_pressed(&mut state);
+        assert!(!shown(&state).contains("givenName"), "{}", shown(&state));
+        // A value in its quotes is one of several, and is closed behind.
+        let mut state = after_tab(r#"PUT /people [{"status": ^"#, true);
+        assert!(state.completions.len() > 1 && !counted(&mut state), "{}", shown(&state));
+        // A value without quotes is walked, and so is a list of the URI.
+        let mut state = after_tab(r#"PUT /people [{"active": ^"#, true);
+        assert_eq!(shown(&state), r#"PUT /people [{"active": true^"#);
+        assert!(counted(&mut state));
+        tab_pressed(&mut state);
+        assert_eq!(shown(&state), r#"PUT /people [{"active": false^"#);
+        for experimental in [false, true] {
+            let mut state = after_tab("GET /pe^", experimental);
+            assert!(counted(&mut state), "-x {experimental}");
         }
     }
 
