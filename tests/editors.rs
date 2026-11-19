@@ -894,6 +894,153 @@ fn format_prints_a_file_laid_out_and_stands_alone() {
     assert!(output.stdout.is_empty());
 }
 
+// -------------------------------------------------------------------- --lsp
+
+/// A session with the client as a language server: what the editor says in
+/// `messages`, in order, and every answer the client gave, with its exit code.
+fn lsp_session(dir: &Path, messages: &[serde_json::Value]) -> (Vec<serde_json::Value>, Option<i32>) {
+    let said: Vec<u8> = messages
+        .iter()
+        .flat_map(|message| {
+            let body = serde_json::to_string(message).unwrap();
+            format!("Content-Length: {}\r\n\r\n{}", body.len(), body).into_bytes()
+        })
+        .collect();
+    let output = Command::cargo_bin("api")
+        .unwrap()
+        .current_dir(dir)
+        .env("API_IMPORT_CACHE", dir.join(".imports"))
+        .arg("--lsp")
+        .write_stdin(said)
+        .output()
+        .unwrap();
+    assert_eq!(stderr(&output), "");
+    let mut answers = Vec::new();
+    let mut rest = &output.stdout[..];
+    while !rest.is_empty() {
+        let head_end = rest.windows(4).position(|w| w == b"\r\n\r\n").expect("an answer has headers");
+        let head = String::from_utf8_lossy(&rest[..head_end]);
+        let length: usize = head.strip_prefix("Content-Length: ").expect("a Content-Length").trim().parse().unwrap();
+        let body = &rest[head_end + 4..head_end + 4 + length];
+        answers.push(serde_json::from_slice(body).unwrap());
+        rest = &rest[head_end + 4 + length..];
+    }
+    (answers, output.status.code())
+}
+
+fn lsp_request(id: u64, method: &str, params: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+}
+
+fn lsp_note(method: &str, params: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({ "jsonrpc": "2.0", "method": method, "params": params })
+}
+
+#[test]
+fn the_language_server_completes_and_formats_what_the_editor_has_open() {
+    let dir = completion_fixture();
+    let root = dir.path().canonicalize().unwrap();
+    let uri = format!("file://{}/shared/main.api", root.display());
+    let document = serde_json::json!({ "uri": uri });
+    let at = |line: u64, character: u64| serde_json::json!({ "textDocument": { "uri": uri }, "position": { "line": line, "character": character } });
+    let open = |text: &str| lsp_note("textDocument/didOpen", serde_json::json!({ "textDocument": { "uri": uri, "languageId": "commerceos-api", "version": 1, "text": text } }));
+    let change = |text: &str| lsp_note("textDocument/didChange", serde_json::json!({ "textDocument": { "uri": uri, "version": 2 }, "contentChanges": [{ "text": text }] }));
+    let (answers, code) = lsp_session(
+        dir.path(),
+        &[
+            lsp_request(1, "initialize", serde_json::json!({ "processId": null, "rootUri": format!("file://{}", root.display()), "capabilities": {} })),
+            lsp_note("initialized", serde_json::json!({})),
+            // an editor counts a character in the units of UTF-16: two for 😀
+            open("# 😀\nset { \"😀\": 1, \"in\n"),
+            lsp_request(2, "textDocument/completion", at(1, 18)),
+            // an `@file` is read from the folder the editor has open, an include from the file's
+            change("GET /a\r\nPUT /x @sh\r\nus\r\n"),
+            lsp_request(3, "textDocument/completion", at(1, 10)),
+            lsp_request(4, "textDocument/completion", at(2, 2)),
+            // a request's body is the editor's own
+            change("PUT /x { \"na\n"),
+            lsp_request(5, "textDocument/completion", at(0, 12)),
+            change(UNFORMATTED),
+            lsp_request(6, "textDocument/formatting", serde_json::json!({ "textDocument": document, "options": { "tabSize": 4, "insertSpaces": true } })),
+            change(FORMATTED),
+            lsp_request(7, "textDocument/formatting", serde_json::json!({ "textDocument": document, "options": {} })),
+            // what the client has not: said so, and the session goes on
+            lsp_request(8, "textDocument/hover", at(0, 0)),
+            lsp_note("workspace/didChangeConfiguration", serde_json::json!({ "settings": {} })),
+            lsp_note("textDocument/didClose", serde_json::json!({ "textDocument": document })),
+            lsp_request(9, "textDocument/completion", at(0, 0)),
+            lsp_request(10, "shutdown", serde_json::Value::Null),
+            lsp_note("exit", serde_json::Value::Null),
+        ],
+    );
+    assert_eq!(code, Some(0));
+    assert_eq!(answers.iter().map(|answer| answer["id"].as_u64().unwrap()).collect::<Vec<_>>(), (1..=10).collect::<Vec<_>>());
+    let result = |id: usize| &answers[id - 1]["result"];
+    let labels = |id: usize| -> Vec<&str> { result(id)["items"].as_array().unwrap().iter().map(|item| item["label"].as_str().unwrap()).collect() };
+
+    let capabilities = &result(1)["capabilities"];
+    assert_eq!(capabilities["textDocumentSync"], serde_json::json!({ "openClose": true, "change": 1 }));
+    assert_eq!(capabilities["completionProvider"]["triggerCharacters"], serde_json::json!(["\"", "/", "~", "@"]));
+    assert_eq!(capabilities["documentFormattingProvider"], true);
+    assert_eq!(result(1)["serverInfo"]["version"], env!("CARGO_PKG_VERSION"));
+
+    assert_eq!(labels(2), SETTINGS);
+    assert_eq!(
+        result(2)["items"][1],
+        serde_json::json!({
+            "label": "include-nulls", "kind": 10, "detail": "setting", "filterText": "include-nulls", "sortText": "0001",
+            "insertTextFormat": 2,
+            // `in` is what the item takes the place of
+            "textEdit": { "range": { "start": { "line": 1, "character": 16 }, "end": { "line": 1, "character": 18 } }, "newText": "include-nulls" }
+        })
+    );
+    assert_eq!(result(2)["isIncomplete"], true);
+    assert_eq!(labels(3), ["shared/"]);
+    assert_eq!(result(3)["items"][0]["kind"], 19);
+    assert_eq!(result(3)["items"][0]["textEdit"]["range"]["start"]["character"], 8);
+    assert_eq!(labels(4), ["users.api"]);
+    assert!(result(5).is_null(), "{}", result(5));
+
+    assert_eq!(
+        *result(6),
+        serde_json::json!([{ "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 5, "character": 0 } }, "newText": FORMATTED }])
+    );
+    assert_eq!(*result(7), serde_json::json!([]));
+    assert_eq!(answers[7]["error"]["code"], -32601);
+    assert!(answers[7].get("result").is_none());
+    // a file that is closed is none the client has
+    assert!(result(9).is_null());
+    assert!(result(10).is_null());
+}
+
+#[test]
+fn the_language_server_ends_with_the_editor_and_stands_alone() {
+    let dir = tempdir().unwrap();
+    // `exit` with no `shutdown` in front of it, and an editor that just goes
+    let (answers, code) = lsp_session(dir.path(), &[lsp_note("exit", serde_json::Value::Null)]);
+    assert_eq!((answers.len(), code), (0, Some(1)));
+    let (answers, code) = lsp_session(dir.path(), &[lsp_request(1, "initialize", serde_json::json!({ "capabilities": {} }))]);
+    assert_eq!((answers.len(), code), (1, Some(1)));
+    let (answers, code) = lsp_session(dir.path(), &[lsp_request(1, "shutdown", serde_json::Value::Null)]);
+    assert_eq!((answers.len(), code), (1, Some(0)));
+    // a file that is kept nowhere (`untitled:`) completes what needs no directory
+    let (answers, _) = lsp_session(
+        dir.path(),
+        &[
+            lsp_request(1, "initialize", serde_json::json!({ "capabilities": {} })),
+            lsp_note("textDocument/didOpen", serde_json::json!({ "textDocument": { "uri": "untitled:Untitled-1", "text": "import " } })),
+            lsp_request(2, "textDocument/completion", serde_json::json!({ "textDocument": { "uri": "untitled:Untitled-1" }, "position": { "line": 0, "character": 7 } })),
+        ],
+    );
+    let kinds: Vec<&str> = answers[1]["result"]["items"].as_array().unwrap().iter().map(|item| item["label"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["git", "dir", "archive"]);
+
+    let output = Command::cargo_bin("api").unwrap().args(["--lsp", "GET", "/people"]).write_stdin("").output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stderr(&output), "error: --lsp serves an editor and GET /people is a request: give one of the two\n");
+    assert!(output.stdout.is_empty());
+}
+
 // ------------------------------------------------------ the editors' callers
 
 /// Run `script` with the `python3` of the machine, the Sublime plugin on its
@@ -1385,13 +1532,31 @@ fn install_syntax_for_rider_writes_a_bundle_and_says_the_step_that_is_left() {
     let output = api(home.path(), bin.path()).args(["--install-syntax", "rider"]).output().unwrap();
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     let bundle = home.path().join(".local/share/api/editors/commerceos-api");
-    assert_eq!(
-        stdout_lines(&output),
+    let server = home.path().join(".local/share/api/editors/commerceos-api-lsp");
+    let mut written: Vec<String> =
         ["package.json", "extension.js", "language-configuration.json", "syntaxes/api.tmLanguage.json"]
             .map(|file| bundle.join(file).display().to_string())
+            .to_vec();
+    written.push(server.join("template.json").display().to_string());
+    assert_eq!(stdout_lines(&output), written);
+    // the two steps that are left, each with the folder to choose
+    let said = stderr(&output);
+    assert!(said.contains(&format!("TextMate Bundles, press + and choose {}\n", bundle.display())), "{}", said);
+    assert!(said.contains("LSP4IJ") && said.contains("Import from custom template"), "{}", said);
+    assert!(said.trim_end().ends_with(&server.display().to_string()), "{}", said);
+    // The server LSP4IJ is given is this client as a language server, by
+    // the path it has: an IDE has no PATH to find `api` on.
+    let template: serde_json::Value = serde_json::from_str(&fs::read_to_string(server.join("template.json")).unwrap()).unwrap();
+    assert_eq!(template["name"], "CommerceOS API");
+    assert_eq!(template["fileTypeMappings"], serde_json::json!([{ "fileType": { "patterns": ["*.api"] }, "languageId": "commerceos-api" }]));
+    let command = template["programArgs"]["default"].as_str().unwrap();
+    let client = command.strip_suffix(" --lsp").unwrap_or_else(|| panic!("{}", command)).trim_matches('"');
+    assert_eq!(
+        Path::new(client).canonicalize().unwrap(),
+        assert_cmd::cargo::cargo_bin("api").canonicalize().unwrap(),
+        "{}",
+        command
     );
-    assert!(stderr(&output).contains("TextMate Bundles"), "{}", stderr(&output));
-    assert!(stderr(&output).trim_end().ends_with(&bundle.display().to_string()), "{}", stderr(&output));
     assert_eq!(
         fs::read_to_string(bundle.join("syntaxes/api.tmLanguage.json")).unwrap(),
         read("editors/vscode/syntaxes/api.tmLanguage.json")

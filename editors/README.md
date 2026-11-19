@@ -27,7 +27,7 @@ Run it again after the client is updated: it replaces what it wrote before.
 |---|---|---|
 | Sublime Text | `API.sublime-syntax`, `api_completions.py` and `API.sublime-commands` in `Packages/User` of Sublime's data folder | nothing |
 | VS Code, Cursor | `~/.local/share/api/editors/commerceos-api.vsix`, then installed with `code --install-extension` (`cursor --install-extension`) | nothing when the editor's command is on the `PATH`. Otherwise: *Extensions: Install from VSIX…* in the command palette, and choose that file |
-| Rider | the extension's folder, `~/.local/share/api/editors/commerceos-api` | once: *Settings → Editor → TextMate Bundles*, `+`, and choose that folder. The IDE reads it where it is, so a later install needs no second visit |
+| Rider | the extension's folder, `~/.local/share/api/editors/commerceos-api`, and a language server for LSP4IJ, `~/.local/share/api/editors/commerceos-api-lsp/template.json` | once each: *Settings → Editor → TextMate Bundles*, `+`, and choose the first folder; then the steps under [Rider](#rider). The IDE reads the bundle where it is, so a later install needs no second visit |
 | Vim | `~/.vim/pack/commerceos/start/api/` (`~/vimfiles/…` on Windows) | nothing; it needs `syntax on` |
 | Neovim | `~/.local/share/nvim/site/pack/commerceos/start/api/` (under `$XDG_DATA_HOME` when set; `nvim-data` on Windows) | nothing |
 
@@ -70,7 +70,7 @@ alone, and an editor offers what the client that is installed reads.
 | Sublime Text | `sublime/api_completions.py` | as you type, and `ctrl+space` | the setting `api_binary` |
 | VS Code, Cursor | `vscode/extension.js` | as you type, and `ctrl+space` | the setting `commerceosApi.binary` |
 | Vim, Neovim | `ApiComplete` in `vim/ftplugin/api.vim`, the `omnifunc` | `ctrl+x ctrl+o` | `g:api_binary` |
-| Rider | nothing: a TextMate bundle is highlighting only | | |
+| Rider | the client itself, as a language server (`api --lsp`), through LSP4IJ | as you type, and `ctrl+space` | the command of the server, in the IDE's settings |
 
 - An editor that was not started from a shell may have no `PATH` to speak
   of. The Sublime plugin and the extension then look where a client is
@@ -101,7 +101,7 @@ a file runs as it ran.
 | Sublime Text | *API: Format* in the command palette; the command is `api_format`, for a key binding | *API: Format, a line for each member* (`"args": { "expanded": true }`) |
 | VS Code, Cursor | *Format Document*, and format on save when that is on | *CommerceOS API: Format, a line for each member* in the command palette |
 | Vim, Neovim | `:ApiFormat`; `gq` for the lines it is given (`gggqG` for the file) | `:ApiFormat!` |
-| Rider | nothing: a TextMate bundle is highlighting only | |
+| Rider | *Reformat Code*, through the language server | not there |
 
 A key binding in Sublime Text:
 
@@ -111,6 +111,31 @@ A key binding in Sublime Text:
 
 A client from before `--format` changes nothing: Sublime Text says so in its
 status bar, Vim under the window, and VS Code makes no edit.
+
+## Rider
+
+A TextMate bundle colours a file and does nothing else, and the client has
+no JetBrains plugin. Completions and *Reformat Code* come from the client as
+a language server (`api --lsp`, see `AGENTS.md`), through
+[LSP4IJ](https://plugins.jetbrains.com/plugin/23257-lsp4ij), a free plugin
+that runs a language server it is given. Once:
+
+1. Install LSP4IJ: *Settings → Plugins → Marketplace*.
+2. *Settings → Languages & Frameworks → Language Servers*, `+`.
+3. Under *Template* choose *Import from custom template...* and the folder
+   `~/.local/share/api/editors/commerceos-api-lsp`, and confirm.
+
+The folder holds one file, `template.json`: the name of the server, the
+command that starts it and the files it is for (`*.api`, by name, so that
+the TextMate bundle goes on colouring them). The command is the client by
+the path `--install-syntax rider` was run as, since an IDE that is started
+from the Dock has no `PATH` to find `api` on. When the client has moved, run
+the install again and import the folder again, or change the command in the
+server's settings.
+
+`cargo test --test editors` holds a session with the language server, message
+by message. It has not been run inside a JetBrains IDE by the tests: what
+LSP4IJ makes of it is seen in the IDE.
 
 ## Changing a grammar
 
@@ -124,7 +149,8 @@ cargo test --test editors
 holds the Sublime syntax to `sample.api` (through `syntect`, which reads the
 same format), checks that it finds no error in any `.api` file of this
 repository, and holds `--install-syntax`, `--complete` and `--format`. Each
-caller of the two is run where its interpreter is on the `PATH`: the Sublime
+caller of the two is run where its interpreter is on the `PATH`, and a
+session is held with `--lsp`: the Sublime
 plugin by `python3`, the extension by `node` against a `vscode` module of
 the test's own, and the omni completion in `vim` itself. The TextMate grammar has no parser
 in Rust. Its tokens for `sample.api` are kept in `sample.api.snap`, and Node

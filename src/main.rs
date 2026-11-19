@@ -728,6 +728,11 @@ struct Args {
     #[arg(long = "expand", requires = "format")]
     expand: bool,
 
+    /// Serve an editor as a language server (LSP) on stdin and stdout:
+    /// completion and formatting for .api files. Sends nothing
+    #[arg(long = "lsp")]
+    lsp: bool,
+
     /// Install syntax highlighting for .api files in an editor (sublime,
     /// vscode, cursor, rider, vim or nvim) and send nothing
     #[arg(long = "install-syntax", value_name = "EDITOR")]
@@ -4731,7 +4736,7 @@ fn main() {
         }
         exit_process(install_syntax(editor));
     }
-    if let Some(document) = document {
+    if let Some(document) = &document {
         let request: Vec<&str> =
             [&args.method, &args.uri].into_iter().flatten().chain(args.body.iter()).map(String::as_str).collect();
         let beside = match &args.all {
@@ -4743,6 +4748,22 @@ fn main() {
             errln!("error: {} prints a document and {}: give one of the two", document, beside);
             exit_process(1);
         }
+    }
+    // `--lsp` serves an editor until it is done, and is no request either.
+    if args.lsp {
+        let request: Vec<&str> =
+            [&args.method, &args.uri].into_iter().flatten().chain(args.body.iter()).map(String::as_str).collect();
+        let beside = match (&document, &args.all) {
+            (Some(document), _) => Some(format!("{} prints a document", document)),
+            (None, Some(file)) => Some(format!("-a {} runs a file", file)),
+            (None, None) if !request.is_empty() => Some(format!("{} is a request", request.join(" "))),
+            (None, None) => None,
+        };
+        if let Some(beside) = beside {
+            errln!("error: --lsp serves an editor and {}: give one of the two", beside);
+            exit_process(1);
+        }
+        exit_process(run_language_server());
     }
     if let Some(file) = &args.imports {
         exit_process(print_imports(file, args.raw));
@@ -10786,8 +10807,8 @@ fn editor_aliases(text: &str, file_dir: Option<&std::path::Path>) -> Vec<(String
 /// The directory an `@file` and an outfile are relative to in an editor. It
 /// is the working directory of a run, which an editor does not know: a
 /// `# @basedir <path>` comment of the file says it, relative to the file,
-/// and without one it is the directory the editor ran the client in.
-fn editor_base_dir(text: &str, file_dir: Option<&std::path::Path>) -> Option<PathBuf> {
+/// and without one it is `working_dir`, the directory the editor asks in.
+fn editor_base_dir(text: &str, file_dir: Option<&std::path::Path>, working_dir: Option<&std::path::Path>) -> Option<PathBuf> {
     let named = text.lines().find_map(|line| {
         let comment = line.trim().strip_prefix('#')?;
         behind_keyword(comment, "@basedir").map(str::trim).filter(|path| !path.is_empty())
@@ -10800,8 +10821,21 @@ fn editor_base_dir(text: &str, file_dir: Option<&std::path::Path>) -> Option<Pat
                 _ => path,
             })
         }
-        None => std::env::current_dir().ok(),
+        None => working_dir.map(|dir| dir.to_path_buf()),
     }
+}
+
+/// What can stand at `offset` of `text`, the text of a file in `file_dir`,
+/// for an editor that asks in `working_dir`.
+fn completion_for(
+    text: &str,
+    offset: usize,
+    file_dir: Option<&std::path::Path>,
+    working_dir: Option<&std::path::Path>,
+) -> EditorCompletion {
+    let base_dir = editor_base_dir(text, file_dir, working_dir);
+    let aliases = editor_aliases(text, file_dir);
+    editor_completion(text, offset, file_dir, base_dir.as_deref(), &aliases)
 }
 
 /// `--complete <file>`: what can stand at byte `at` of the file's text,
@@ -10825,9 +10859,8 @@ fn print_completions(file: &str, at: Option<usize>, raw: bool) -> i32 {
         };
         path.parent().map(|dir| dir.to_path_buf()).unwrap_or(path)
     });
-    let base_dir = editor_base_dir(&text, file_dir.as_deref());
-    let aliases = editor_aliases(&text, file_dir.as_deref());
-    let document = match editor_completion(&text, offset, file_dir.as_deref(), base_dir.as_deref(), &aliases) {
+    let working_dir = std::env::current_dir().ok();
+    let document = match completion_for(&text, offset, file_dir.as_deref(), working_dir.as_deref()) {
         EditorCompletion::Nothing => Value::Null,
         EditorCompletion::Uri => serde_json::json!({ "uri": true }),
         EditorCompletion::Items { typed, items } => {
@@ -11388,6 +11421,254 @@ fn print_formatted(file: &str, expanded: bool) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// `--lsp`: a language server for `.api` files, for an editor that speaks the
+// Language Server Protocol and has no plugin of the client's own (Rider and
+// the other JetBrains IDEs, through LSP4IJ). It answers what `--complete`
+// and `--format` answer, on stdin and stdout. Nothing is sent to a server
+// of CommerceOS, and no connection is needed.
+// ---------------------------------------------------------------------------
+
+/// The next message of the editor: its headers, then as many bytes of JSON
+/// as `Content-Length` says. None when the editor has gone.
+fn read_lsp_message(input: &mut impl BufRead) -> Option<Value> {
+    let mut length = None;
+    loop {
+        let mut line = String::new();
+        if input.read_line(&mut line).ok()? == 0 {
+            return None;
+        }
+        let line = line.trim_end();
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("Content-Length") {
+                length = value.trim().parse::<usize>().ok();
+            }
+        }
+    }
+    let mut body = vec![0; length?];
+    input.read_exact(&mut body).ok()?;
+    // A message that is no JSON is passed over, not the end of the session.
+    Some(serde_json::from_slice(&body).unwrap_or(Value::Null))
+}
+
+fn write_lsp_message(output: &mut impl Write, message: &Value) -> io::Result<()> {
+    let body = serde_json::to_string(message).unwrap_or_else(|_| "null".to_string());
+    write!(output, "Content-Length: {}\r\n\r\n{}", body.len(), body)?;
+    output.flush()
+}
+
+/// The file a `file://` URI of the editor names.
+fn lsp_file_path(uri: &str) -> Option<PathBuf> {
+    if !uri.starts_with("file://") {
+        return None;
+    }
+    let path = archive_file_path(uri).ok()?;
+    // `file:///C:/seeds/a.api` is `C:/seeds/a.api`
+    let text = path.to_string_lossy();
+    let drive = text.as_bytes();
+    if cfg!(windows) && drive.len() > 2 && drive[0] == b'/' && drive[2] == b':' {
+        return Some(PathBuf::from(&text[1..]));
+    }
+    Some(path)
+}
+
+/// The place in `text` that an editor calls line `line`, character
+/// `character`: it counts a character in the units of UTF-16.
+fn lsp_offset(text: &str, line: usize, character: usize) -> usize {
+    let mut start = 0;
+    for _ in 0..line {
+        match text[start..].find('\n') {
+            Some(n) => start += n + 1,
+            None => return text.len(),
+        }
+    }
+    let mut units = 0;
+    for (n, ch) in text[start..].char_indices() {
+        if units >= character || ch == '\n' || ch == '\r' {
+            return start + n;
+        }
+        units += ch.len_utf16();
+    }
+    text.len()
+}
+
+/// The place behind the last character of `text`, as an editor calls it.
+fn lsp_end(text: &str) -> Value {
+    let last = text.rsplit('\n').next().unwrap_or_default();
+    serde_json::json!({ "line": text.matches('\n').count(), "character": last.encode_utf16().count() })
+}
+
+/// What kind of thing an item is, as the protocol numbers them.
+fn lsp_item_kind(note: &str) -> u8 {
+    match note {
+        "setting" | "describe" => 10,                    // Property
+        "import" => 9,                                    // Module
+        "locale" | "system clipboard" => 21,              // Constant
+        "value" => 12,                                    // Value
+        "operator" | "X-Request-Map" => 3,                // Function
+        "directory" => 19,                                // Folder
+        "file" => 17,                                     // File
+        _ => 14,                                          // Keyword
+    }
+}
+
+/// What the language server knows of the editor.
+#[derive(Default)]
+struct LanguageServer {
+    /// The text of each file that is open, by its URI, as the editor has it.
+    documents: HashMap<String, String>,
+    /// The folder the editor has open, which an `@file` is relative to.
+    root: Option<PathBuf>,
+    /// The editor has said it is done: `exit` then ends with 0.
+    shutting_down: bool,
+}
+
+impl LanguageServer {
+    /// `textDocument/completion`: what `--complete` says, as items that take
+    /// the place of the text typed so far.
+    fn completion(&self, params: &Value) -> Value {
+        let uri = params["textDocument"]["uri"].as_str().unwrap_or_default();
+        let Some(text) = self.documents.get(uri) else { return Value::Null };
+        let (line, character) = (&params["position"]["line"], &params["position"]["character"]);
+        let (line, character) = (line.as_u64().unwrap_or(0) as usize, character.as_u64().unwrap_or(0) as usize);
+        let offset = lsp_offset(text, line, character);
+        let file_dir = lsp_file_path(uri).and_then(|path| path.parent().map(|dir| dir.to_path_buf()));
+        let working_dir = self.root.as_deref().or(file_dir.as_deref());
+        let EditorCompletion::Items { typed, items } = completion_for(text, offset, file_dir.as_deref(), working_dir) else {
+            return Value::Null;
+        };
+        let typed_units = typed.encode_utf16().count();
+        if typed.contains('\n') || typed_units > character {
+            return Value::Null;
+        }
+        let range = serde_json::json!({
+            "start": { "line": line, "character": character - typed_units },
+            "end": { "line": line, "character": character },
+        });
+        let items: Vec<Value> = items
+            .iter()
+            .enumerate()
+            .map(|(n, item)| {
+                serde_json::json!({
+                    "label": item.name,
+                    "kind": lsp_item_kind(item.note),
+                    "detail": item.note,
+                    "filterText": item.name,
+                    // in the order the client has them
+                    "sortText": format!("{:04}", n),
+                    "insertTextFormat": 2,
+                    "textEdit": { "range": range, "newText": item.snippet },
+                })
+            })
+            .collect();
+        // Not the whole list for every text that may still be typed: the
+        // paths are the ones of the directory typed so far.
+        serde_json::json!({ "isIncomplete": true, "items": items })
+    }
+
+    /// `textDocument/formatting`: one edit that puts what `--format` prints
+    /// in the place of the whole text, or none when that is the text.
+    fn formatting(&self, params: &Value) -> Value {
+        let uri = params["textDocument"]["uri"].as_str().unwrap_or_default();
+        let Some(text) = self.documents.get(uri) else { return Value::Null };
+        let formatted = format_api_text(text, false);
+        if formatted == *text {
+            return serde_json::json!([]);
+        }
+        serde_json::json!([{
+            "range": { "start": { "line": 0, "character": 0 }, "end": lsp_end(text) },
+            "newText": formatted,
+        }])
+    }
+
+    /// Takes one message of the editor. `Ok` with the answer to send, if it
+    /// asks for one; `Err` with the exit code when the editor says `exit`.
+    fn handle(&mut self, message: &Value) -> Result<Option<Value>, i32> {
+        let method = message["method"].as_str().unwrap_or_default();
+        let params = &message["params"];
+        let result = match method {
+            "initialize" => {
+                let folder = params["workspaceFolders"][0]["uri"].as_str().or(params["rootUri"].as_str());
+                self.root = folder.and_then(lsp_file_path).or_else(|| params["rootPath"].as_str().map(PathBuf::from));
+                Ok(serde_json::json!({
+                    "capabilities": {
+                        // the whole text with every change
+                        "textDocumentSync": { "openClose": true, "change": 1 },
+                        "completionProvider": { "triggerCharacters": ["\"", "/", "~", "@"] },
+                        "documentFormattingProvider": true,
+                    },
+                    "serverInfo": { "name": "CommerceOS API client", "version": VERSION },
+                }))
+            }
+            "shutdown" => {
+                self.shutting_down = true;
+                Ok(Value::Null)
+            }
+            "exit" => return Err(if self.shutting_down { 0 } else { 1 }),
+            "textDocument/didOpen" => {
+                let document = &params["textDocument"];
+                if let (Some(uri), Some(text)) = (document["uri"].as_str(), document["text"].as_str()) {
+                    self.documents.insert(uri.to_string(), text.to_string());
+                }
+                return Ok(None);
+            }
+            "textDocument/didChange" => {
+                let changes = params["contentChanges"].as_array();
+                let text = changes.and_then(|changes| changes.last()).and_then(|change| change["text"].as_str());
+                if let (Some(uri), Some(text)) = (params["textDocument"]["uri"].as_str(), text) {
+                    self.documents.insert(uri.to_string(), text.to_string());
+                }
+                return Ok(None);
+            }
+            "textDocument/didClose" => {
+                if let Some(uri) = params["textDocument"]["uri"].as_str() {
+                    self.documents.remove(uri);
+                }
+                return Ok(None);
+            }
+            "textDocument/completion" => Ok(self.completion(params)),
+            "textDocument/formatting" => Ok(self.formatting(params)),
+            _ => Err(serde_json::json!({ "code": -32601, "message": format!("the client has no `{}`", method) })),
+        };
+        // Only a request has an id, and only a request is answered: what
+        // the editor merely says (`initialized`, a setting that changed) is
+        // heard and passed over.
+        let Some(id) = message.get("id").filter(|id| !id.is_null()) else { return Ok(None) };
+        if method.is_empty() {
+            // an answer of the editor's to something never asked
+            return Ok(None);
+        }
+        Ok(Some(match result {
+            Ok(result) => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+            Err(error) => serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": error }),
+        }))
+    }
+}
+
+/// `--lsp`: serve an editor until it says `exit` or goes away. Returns the
+/// exit code.
+fn run_language_server() -> i32 {
+    let mut input = io::BufReader::new(io::stdin().lock());
+    let mut output = io::stdout().lock();
+    let mut server = LanguageServer::default();
+    while let Some(message) = read_lsp_message(&mut input) {
+        match server.handle(&message) {
+            Ok(Some(answer)) => {
+                if write_lsp_message(&mut output, &answer).is_err() {
+                    return 0;
+                }
+            }
+            Ok(None) => {}
+            Err(code) => return code,
+        }
+    }
+    // The editor closed the pipe without a word: that is how one is killed.
+    if server.shutting_down { 0 } else { 1 }
+}
+
+// ---------------------------------------------------------------------------
 // `--install-syntax <editor>`: syntax highlighting for `.api` files.
 //
 // The grammars are the files of `editors/`, compiled in, so the highlighting
@@ -11641,18 +11922,43 @@ fn install_vsix(editor: &VsixEditor) -> Result<String, String> {
     }
 }
 
+/// What the plugin LSP4IJ reads a language server from: a folder with a
+/// `template.json`. The command is this client, by the path it was run as:
+/// an IDE that was not started from a shell has no `PATH` to find `api` on.
+fn lsp4ij_template() -> Result<String, String> {
+    let client = std::env::current_exe().map_err(|e| format!("could not tell where the client is: {}", e))?;
+    let client = client.display().to_string();
+    let quoted = if client.contains(' ') { format!("\"{}\"", client) } else { client };
+    let template = serde_json::json!({
+        "id": "commerceos-api",
+        "name": "CommerceOS API",
+        "programArgs": { "default": format!("{} --lsp", quoted) },
+        "fileTypeMappings": [{ "fileType": { "patterns": ["*.api"] }, "languageId": "commerceos-api" }],
+    });
+    serde_json::to_string_pretty(&template).map(|text| text + "\n").map_err(|e| e.to_string())
+}
+
 /// Rider, and any other JetBrains IDE: the extension's folder is a TextMate
-/// bundle to it. Which bundles an IDE reads is a setting of the IDE, in a
-/// file of its own per version that it rewrites while it runs, so adding the
-/// folder there is left to the user: one step, said here.
+/// bundle to it, which colours a file. Completions and formatting come from
+/// the client as a language server (`--lsp`), through the plugin LSP4IJ,
+/// which reads a server from a folder. Which bundles and servers an IDE has
+/// are settings of the IDE, in files of its own per version that it rewrites
+/// while it runs, so adding the two is left to the user: said here, once.
 fn install_textmate_bundle() -> Result<String, String> {
     let dir = editor_files_dir()?.join("commerceos-api");
     for (file, contents) in vscode_extension_files()? {
         write_syntax_file(&dir.join(file), contents.as_bytes())?;
     }
+    let server = editor_files_dir()?.join("commerceos-api-lsp");
+    write_syntax_file(&server.join("template.json"), lsp4ij_template()?.as_bytes())?;
     Ok(format!(
-        "One step is left, once: in Rider (or another JetBrains IDE) open Settings → Editor → TextMate Bundles, press + and choose {}",
-        dir.display()
+        "Two steps are left in Rider (or another JetBrains IDE), each once:\n\
+         1. Highlighting: Settings → Editor → TextMate Bundles, press + and choose {}\n\
+         2. Completions and formatting: install the plugin LSP4IJ (Settings → Plugins → Marketplace), then \
+         Settings → Languages & Frameworks → Language Servers, press +, and under Template choose \
+         \"Import from custom template...\" and the folder {}",
+        dir.display(),
+        server.display()
     ))
 }
 

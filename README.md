@@ -249,9 +249,9 @@ nothing more. Sublime Text, VS Code, Cursor, Vim and Neovim get completions too
 (settings, import keys, methods, directives, URI operators and paths, by where the
 cursor is) and a format command: what is installed asks the client, `api --complete`
 and `api --format`, which `AGENTS.md` describes. VS Code and Cursor are handed a `.vsix` through their own command (`code`,
-`cursor`), which has to be on the `PATH`. Rider gets a TextMate bundle and asks for one
-step, once: *Settings → Editor → TextMate Bundles*, `+`, and the folder the command
-printed. Run it again after an update of the client. `editors/README.md` has the details.
+`cursor`), which has to be on the `PATH`. Rider gets a TextMate bundle and the client
+as a language server (`api --lsp`, through the plugin LSP4IJ), and asks for two steps,
+once each, which the command says. Run it again after an update of the client. `editors/README.md` has the details.
 
 ## Interactive mode
 
@@ -366,6 +366,7 @@ Usage: api [OPTIONS] [METHOD] [URI] [BODY]
       --at <BYTES>                With --complete: the place, as the bytes in front of it (the end when not given)
       --format <FILE>             Print FILE laid out one way: bodies indented, words a blank apart (- reads stdin); sends nothing
       --expand                    With --format: a line for each member of every object and array
+      --lsp                       Serve an editor as a language server on stdin and stdout: completion and formatting; sends nothing
       --install-syntax <EDITOR>   Install .api syntax highlighting in sublime, vscode, cursor, rider, vim or nvim; sends nothing
       --export <EXTERNAL_ID>      Rewrite responses as seed data: keys dropped, a lone one kept as `key?` and EXTERNAL_ID
   -r, --raw                       No pretty-printing

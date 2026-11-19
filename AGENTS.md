@@ -884,6 +884,33 @@ needed, and the file itself is not written to.
 - A file to run, a request or another document beside it is an error, as for
   `--imports`. `--expand` without `--format` is an error too.
 
+## A language server for an editor: `--lsp`
+
+```sh
+api --lsp
+```
+
+Serves an editor that speaks the Language Server Protocol, on stdin and
+stdout, until the editor says it is done. It is for an editor that the
+client has no plugin of its own for: Rider and the other JetBrains IDEs,
+through the plugin LSP4IJ. Nothing is sent to CommerceOS and no connection
+is needed.
+
+- **Completion** (`textDocument/completion`) is what
+  [`--complete`](#completing-a-file-for-an-editor---complete-file) answers,
+  as items that take the place of the text typed so far. An `@file` and an
+  outfile are completed from the folder the editor has open.
+- **Formatting** (`textDocument/formatting`) is what
+  [`--format`](#laying-a-file-out---format-file) prints, as one edit of the
+  whole text. The editor's own indent settings are not used: a `.api` file
+  has one layout.
+- The editor sends the whole text with every change, and the text it has is
+  the text that is completed and laid out, saved or not.
+- Anything else an editor asks for is answered with an error
+  (`-32601`), and the session goes on.
+- A request, a file to run or a document beside it is an error: `--lsp
+  serves an editor and GET /people is a request: give one of the two`.
+
 ## Syntax highlighting and completions: `--install-syntax <editor>`
 
 ```sh
@@ -895,11 +922,13 @@ Installs highlighting for `.api` files in an editor: `sublime`, `vscode`,
 client, so what is installed is the one for the syntax this client reads.
 Nothing is sent and no connection is needed.
 
-Sublime Text, VS Code, Cursor, Vim and Neovim get completions and a format
-command too: what is installed asks the client what can stand where the
-cursor is ([`api --complete`](#completing-a-file-for-an-editor---complete-file))
-and how the file is laid out ([`api --format`](#laying-a-file-out---format-file)),
-so it needs the `api` on the `PATH`, or the one a setting of the editor names.
+Every editor gets completions and a format command too. In Sublime Text,
+VS Code, Cursor, Vim and Neovim what is installed asks the client what can
+stand where the cursor is
+([`api --complete`](#completing-a-file-for-an-editor---complete-file)) and
+how the file is laid out ([`api --format`](#laying-a-file-out---format-file)),
+so it needs the `api` on the `PATH`, or the one a setting of the editor
+names. A JetBrains IDE asks the client as a language server.
 
 - **Each path written is a line on stdout.** What is left to do, if anything,
   is said on stderr.
@@ -920,11 +949,17 @@ so it needs the `api` on the `PATH`, or the one a setting of the editor names.
   is still written, the exit code is 1 and stderr says how to install it by
   hand. *Format Document* lays the file out. The setting
   `commerceosApi.binary` names another client.
-- `rider` writes a TextMate bundle to
-  `~/.local/share/api/editors/commerceos-api`, for any JetBrains IDE. Adding
-  it under *Settings → Editor → TextMate Bundles* is a step in the IDE, said
-  on stderr, and needed once. A TextMate bundle is highlighting only: a
-  JetBrains IDE gets no completions from it.
+- `rider` writes two folders under `~/.local/share/api/editors`, for any
+  JetBrains IDE, and says on stderr the step each needs in the IDE, once:
+  - `commerceos-api`, a TextMate bundle, for the highlighting: add it under
+    *Settings → Editor → TextMate Bundles*.
+  - `commerceos-api-lsp`, the client as a language server
+    ([`api --lsp`](#a-language-server-for-an-editor---lsp)), for completions
+    and *Reformat Code*. It is read by the plugin LSP4IJ, from the
+    Marketplace: *Settings → Languages & Frameworks → Language Servers*,
+    `+`, and under *Template* choose *Import from custom template...* and
+    that folder. The server is the client by the path it was run as, so run
+    `--install-syntax rider` again when the client has moved.
 - **A file that is there is replaced.** Running it again after an update of
   the client is how the highlighting is updated.
 - An editor that is not one of the six is `error: unknown editor …` with exit
