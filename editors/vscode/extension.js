@@ -22,12 +22,30 @@ function expanded(file) {
   return file.startsWith('~/') ? path.join(os.homedir(), file.slice(2)) : file;
 }
 
+// The client that packed and installed this extension, which wrote its path
+// to `client.json` beside this file. Undefined when the file or the client
+// is gone.
+function installedClient() {
+  try {
+    const file = JSON.parse(fs.readFileSync(path.join(__dirname, 'client.json'), 'utf8')).client;
+    return file && fs.existsSync(file) ? file : undefined;
+  } catch (e) {
+    return undefined;
+  }
+}
+
 // The client to ask: the one the setting `commerceosApi.binary` names, else
-// one where a client is usually installed, else the `api` on the `PATH`.
+// the one that installed this extension, else the `api` on the `PATH`, else
+// one where a client is usually installed. The installing client goes before
+// the `PATH`: what is there may be an older client, without what is asked.
 function client() {
   const named = vscode.workspace.getConfiguration('commerceosApi').get('binary');
   if (named) {
     return expanded(named);
+  }
+  const installed = installedClient();
+  if (installed) {
+    return installed;
   }
   const onPath = (process.env.PATH || '').split(path.delimiter).some((dir) => {
     return dir && ['api', 'api.exe'].some((name) => fs.existsSync(path.join(dir, name)));

@@ -25,7 +25,7 @@ Run it again after the client is updated: it replaces what it wrote before.
 
 | Editor | What is written | What is left to do |
 |---|---|---|
-| Sublime Text | `API.sublime-syntax`, `api_completions.py` and `API.sublime-commands` in `Packages/User` of Sublime's data folder | nothing |
+| Sublime Text | `API.sublime-syntax`, `api_completions.py`, `API.sublime-commands` and `api_client.json` in `Packages/User` of Sublime's data folder | nothing |
 | VS Code, Cursor | `~/.local/share/api/editors/commerceos-api.vsix`, then installed with `code --install-extension` (`cursor --install-extension`) | nothing when the editor's command is on the `PATH`. Otherwise: *Extensions: Install from VSIX…* in the command palette, and choose that file |
 | Rider | the extension's folder, `~/.local/share/api/editors/commerceos-api`, and a language server for LSP4IJ, `~/.local/share/api/editors/commerceos-api-lsp/template.json` | once each: *Settings → Editor → TextMate Bundles*, `+`, and choose the first folder; then the steps under [Rider](#rider). The IDE reads the bundle where it is, so a later install needs no second visit |
 | Vim | `~/.vim/pack/commerceos/start/api/` (`~/vimfiles/…` on Windows) | nothing; it needs `syntax on` |
@@ -65,17 +65,27 @@ api -r --complete seed.api --at 42 < seed.api
 A change to what a `.api` file can hold is therefore a change in the client
 alone, and an editor offers what the client that is installed reads.
 
-| Editor | What asks | How it is asked for | Another client than the `api` on the `PATH` |
+| Editor | What asks | How it is asked for | Another client than the one that installed |
 |---|---|---|---|
 | Sublime Text | `sublime/api_completions.py` | as you type, and `ctrl+space` | the setting `api_binary` |
 | VS Code, Cursor | `vscode/extension.js` | as you type, and `ctrl+space` | the setting `commerceosApi.binary` |
 | Vim, Neovim | `ApiComplete` in `vim/ftplugin/api.vim`, the `omnifunc` | `ctrl+x ctrl+o` | `g:api_binary` |
 | Rider | the client itself, as a language server (`api --lsp`), through LSP4IJ | as you type, and `ctrl+space` | the command of the server, in the IDE's settings |
 
+- **Which client is asked.** The one the editor's setting names; else the
+  one that installed, whose path the install writes beside what it installs
+  (`api_client.json` for Sublime Text, `client.json` in the extension,
+  `g:api_installed_client` in `plugin/api.vim` of the Vim package); else,
+  where that one is gone, the `api` on the `PATH`. The installing client
+  goes before the `PATH` because what is there may be an older client that
+  lacks `--complete` or `--format`, and an editor falls back without a word
+  when it gets no answer. So: install with the client the editor should
+  use. A client built in this repository (`target/debug/api
+  --install-syntax sublime`) is asked until it is cleaned away.
 - An editor that was not started from a shell may have no `PATH` to speak
-  of. The Sublime plugin and the extension then look where a client is
-  usually installed (`/opt/homebrew/bin`, `/usr/local/bin`, `~/.cargo/bin`,
-  `~/.local/bin`).
+  of. Where the installing client is gone, the Sublime plugin and the
+  extension look where a client is usually installed (`/opt/homebrew/bin`,
+  `/usr/local/bin`, `~/.cargo/bin`, `~/.local/bin`).
 - The client is asked in the project (workspace) folder the file is in, and
   without one in the directory of the file: that is what an `@file` and an
   outfile are completed from. Vim asks in its own working directory.
@@ -180,5 +190,7 @@ open `sample.api`, or ask for the group under the cursor:
 `vscode/package.json` has version `0.0.0`: `--install-syntax` puts the
 client's version in, so that an editor takes the extension of a newer client
 for an update. The `.vsix` that `api --install-syntax vscode` writes is a
-complete extension and can be attached to a release as it is. It is not
+complete extension and can be attached to a release as it is: the
+`client.json` in it names a client of the machine that packed it, and on a
+machine that has no client there the extension asks the `api` on the `PATH`. It is not
 published to the VS Code Marketplace or to Open VSX.

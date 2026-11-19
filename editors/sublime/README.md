@@ -11,7 +11,8 @@ api --install-syntax sublime
 ```
 
 writes them to Sublime's `Packages/User` folder, with `API.sublime-commands`
-for the command palette. Files ending in `.api` pick them up. By hand: copy
+for the command palette and `api_client.json`, the path of the client that
+installed. Files ending in `.api` pick them up. By hand: copy
 the three files to that folder
 (*Preferences → Browse Packages…*).
 
@@ -62,9 +63,11 @@ as it is written. It answers in `.api` files only. What can stand where the
 cursor is, is the client's to say: the plugin asks it (`api --complete`, see
 `AGENTS.md` for what is offered where) and hands the answer to Sublime Text.
 
-- The client is the `api` on the `PATH`, or where one is usually installed
-  when Sublime Text was not started from a shell. The setting `api_binary`
-  names another.
+- The client that is asked is the one that installed the plugin, whose path
+  is in `api_client.json` beside it, and not the `api` on the `PATH`, which
+  may be an older one. The setting `api_binary` names another, and where the
+  installing client is gone it is the `api` on the `PATH`, or where one is
+  usually installed when Sublime Text was not started from a shell.
 - It is asked in the project folder the file is in, and without a project in
   the directory of the file. That is what an `@file` and an outfile are
   completed from; a `# @basedir <path>` comment in the file names another
@@ -96,7 +99,8 @@ of the scope `source.api`:
 ```
 
 With a client from before `--format` nothing changes, and the status bar
-says so.
+says so, with the client that was asked. A plugin of your own can ask for
+that client too: `api_completions.client(view.settings().get("api_binary"))`.
 
 ## Checking a change
 

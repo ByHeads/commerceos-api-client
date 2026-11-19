@@ -926,18 +926,28 @@ Every editor gets completions and a format command too. In Sublime Text,
 VS Code, Cursor, Vim and Neovim what is installed asks the client what can
 stand where the cursor is
 ([`api --complete`](#completing-a-file-for-an-editor---complete-file)) and
-how the file is laid out ([`api --format`](#laying-a-file-out---format-file)),
-so it needs the `api` on the `PATH`, or the one a setting of the editor
-names. A JetBrains IDE asks the client as a language server.
+how the file is laid out ([`api --format`](#laying-a-file-out---format-file)).
+A JetBrains IDE asks the client as a language server.
+
+**The client that is asked is the one that installed**, by the path it was
+run as, which the install writes beside what it installs. So an editor does
+not ask an older `api` that happens to be on the `PATH` and lacks what is
+asked for, and an editor that was not started from a shell needs no `PATH`.
+A setting of the editor names another client, and where the installing
+client is gone (a build that was cleaned away) it is the `api` on the
+`PATH`. Run the install with the client the editor should use, and again
+after that client has moved.
 
 - **Each path written is a line on stdout.** What is left to do, if anything,
   is said on stderr.
-- `sublime` writes `API.sublime-syntax`, `api_completions.py` (a plugin) and
-  `API.sublime-commands` to `Packages/User` of Sublime Text's data folder.
+- `sublime` writes `API.sublime-syntax`, `api_completions.py` (a plugin),
+  `API.sublime-commands` and `api_client.json` (the installing client) to
+  `Packages/User` of Sublime Text's data folder.
   Where Sublime Text has no folder it is an error, and none is made. The
   format command is `API: Format` in the command palette (`api_format` for a
   key binding). The setting `api_binary` names another client.
-- `vim` and `nvim` write a package (`syntax/`, `ftdetect/`, `ftplugin/`) to
+- `vim` and `nvim` write a package (`syntax/`, `ftdetect/`, `ftplugin/`, and
+  `plugin/api.vim`, which names the installing client) to
   `~/.vim/pack/commerceos/start/api` and
   `~/.local/share/nvim/site/pack/commerceos/start/api`. Completion is omni
   completion, `ctrl+x ctrl+o`. `:ApiFormat` lays the file out (`:ApiFormat!`
@@ -948,7 +958,8 @@ names. A JetBrains IDE asks the client as a language server.
   `cursor --install-extension`). Without that command on the `PATH` the file
   is still written, the exit code is 1 and stderr says how to install it by
   hand. *Format Document* lays the file out. The setting
-  `commerceosApi.binary` names another client.
+  `commerceosApi.binary` names another client than the one that packed the
+  extension.
 - `rider` writes two folders under `~/.local/share/api/editors`, for any
   JetBrains IDE, and says on stderr the step each needs in the IDE, once:
   - `commerceos-api`, a TextMate bundle, for the highlighting: add it under

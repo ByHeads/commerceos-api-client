@@ -28,11 +28,28 @@ except ImportError:  # the tests run this file without an editor
 _BINARIES = ['/opt/homebrew/bin/api', '/usr/local/bin/api', '~/.cargo/bin/api', '~/.local/bin/api']
 
 
+def installed_client():
+    """The client that installed this plugin, which wrote its path to
+    `api_client.json` beside it. None when that file or the client is gone."""
+    try:
+        beside = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'api_client.json')
+        with open(beside, encoding='utf-8') as named:
+            path = json.load(named).get('client')
+    except (OSError, ValueError, AttributeError, NameError):
+        return None
+    return path if path and os.path.isfile(path) else None
+
+
 def client(named=None):
-    """The client to ask: the one the setting `api_binary` names, the `api`
-    on the `PATH`, or one where a client is usually installed."""
+    """The client to ask: the one the setting `api_binary` names, else the
+    one that installed this plugin, else the `api` on the `PATH`, else one
+    where a client is usually installed. The installing client goes before
+    the `PATH`: what is there may be an older client, without what is asked."""
     if named:
         return os.path.expanduser(named)
+    installed = installed_client()
+    if installed:
+        return installed
     try:
         from shutil import which
         found = which('api')
@@ -210,6 +227,7 @@ if sublime_plugin is not None:
             text = view.substr(whole)
             laid_out = formatted(binary, text, expanded) if binary else None
             if laid_out is None:
-                sublime.status_message('API: the client could not format this file (it needs an api with --format)')
+                sublime.status_message(
+                    'API: %s could not format this file: it needs a client with --format' % (binary or 'api'))
             elif laid_out != text:
                 view.replace(edit, whole, laid_out)

@@ -48,7 +48,7 @@
         "commerceosApi.binary": {
           "type": "string",
           "default": "",
-          "description": "The CommerceOS API client that is asked what can stand at the cursor and how a file is laid out. Empty: the `api` on the PATH."
+          "description": "The CommerceOS API client that is asked what can stand at the cursor and how a file is laid out. Empty: the client that installed this extension, else the `api` on the PATH."
         }
       }
     },

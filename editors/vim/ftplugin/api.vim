@@ -4,12 +4,26 @@ if exists('b:did_ftplugin')
 endif
 let b:did_ftplugin = 1
 
+" The client to ask: the one `g:api_binary` names, else the one that
+" installed this package (`g:api_installed_client`, from `plugin/api.vim`),
+" else the `api` on the PATH. The installing client goes before the PATH:
+" what is there may be an older client, without what is asked.
+if !exists('*ApiClient')
+  function ApiClient() abort
+    if exists('g:api_binary')
+      return g:api_binary
+    endif
+    let l:installed = get(g:, 'api_installed_client', '')
+    return executable(l:installed) ? l:installed : 'api'
+  endfunction
+endif
+
 setlocal commentstring=#\ %s
 setlocal comments=:#
 setlocal omnifunc=ApiComplete
 " `gq` lays out what it is given as the client does (`api --format`): `gggqG`
 " for the whole file. A motion that cuts a body in two is left as it is.
-let &l:formatprg = shellescape(get(g:, 'api_binary', 'api')) . ' --format -'
+let &l:formatprg = shellescape(ApiClient()) . ' --format -'
 " :ApiFormat lays the whole file out and leaves the cursor where it is;
 " :ApiFormat! gives every member of an object or an array a line.
 command! -buffer -bang ApiFormat call ApiFormat(<bang>0)
@@ -22,15 +36,14 @@ endif
 
 " Omni completion (ctrl+x ctrl+o): what can stand where the cursor is, is the
 " client's to say. It is asked (`api --complete`) with the text of the buffer
-" and the bytes in front of the cursor. `g:api_binary` names another client
-" than the `api` on the PATH.
+" and the bytes in front of the cursor.
 function! ApiComplete(findstart, base) abort
   if a:findstart
     let s:items = []
     let l:before = getline(1, line('.') - 1)
     let l:at = len(join(l:before, "\n")) + (empty(l:before) ? 0 : 1) + col('.') - 1
     let l:file = expand('%:p')
-    let l:command = shellescape(get(g:, 'api_binary', 'api')) . ' -r --complete '
+    let l:command = shellescape(ApiClient()) . ' -r --complete '
           \ . shellescape(empty(l:file) ? '-' : l:file) . ' --at ' . l:at
     silent let l:answer = system(l:command, join(getline(1, '$'), "\n"))
     if v:shell_error
@@ -59,7 +72,7 @@ endfunction
 " The whole buffer as the client lays a `.api` file out. A client that
 " can't be asked (one from before `--format`) changes nothing.
 function! ApiFormat(expanded) abort
-  let l:command = shellescape(get(g:, 'api_binary', 'api')) . ' --format -' . (a:expanded ? ' --expand' : '')
+  let l:command = shellescape(ApiClient()) . ' --format -' . (a:expanded ? ' --expand' : '')
   let l:text = join(getline(1, '$'), "\n") . "\n"
   silent let l:answer = system(l:command, l:text)
   if v:shell_error

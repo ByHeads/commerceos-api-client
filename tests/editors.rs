@@ -1214,7 +1214,7 @@ module.exports = {
     )
     .unwrap();
     let driver = r#"
-const [extensionPath, binary, root, cases, unformatted] = process.argv.slice(1);
+const [extensionPath, binary, root, cases, unformatted, installedPath] = process.argv.slice(1);
 const vscode = require('vscode');
 const extension = require(extensionPath);
 const subscriptions = [];
@@ -1259,6 +1259,18 @@ const documentOf = (marked) => {
     const { document } = documentOf(unformatted + '|');
     out.format.push(plain(await formatter.provider.provideDocumentFormattingEdits(document, {}, undefined)));
   }
+  // An extension as it is installed, with the client that installed it
+  // named beside it: asked with no setting, and not when the setting names
+  // another.
+  require(installedPath).activate({ subscriptions: [] });
+  const installed = vscode.state.providers[1].provider;
+  out.installed = [];
+  for (const client of ['', root + '/no-such-client']) {
+    vscode.state.binary = client;
+    const at = documentOf('import |');
+    const items = await installed.provideCompletionItems(at.document, at.position, undefined);
+    out.installed.push(items === undefined ? null : items.map((item) => item.label));
+  }
   vscode.state.binary = binary;
   const { document } = documentOf(unformatted + '|');
   const replaced = [];
@@ -1268,14 +1280,26 @@ const documentOf = (marked) => {
   console.log(JSON.stringify(out));
 })();
 "#;
+    let installed = modules.path().join("installed");
+    fs::create_dir_all(&installed).unwrap();
+    fs::write(installed.join("extension.js"), read("editors/vscode/extension.js")).unwrap();
+    let named = serde_json::json!({ "client": assert_cmd::cargo::cargo_bin("api") });
+    fs::write(installed.join("client.json"), named.to_string()).unwrap();
+    let node_dir = std::env::var_os("PATH")
+        .and_then(|path| std::env::split_paths(&path).find(|dir| dir.join("node").is_file()))
+        .unwrap_or_default();
     let cases = ["set {\n  \"in|\"\n}\n", "# é å ö\nset {\n  |", "shared/us|", "GET /people~wh|", "PUT /x { \"na|\" }", "GET /people/|", "sh|"];
-    let output = std::process::Command::new("node")
+    let output = std::process::Command::new(node_dir.join("node"))
         .args(["-e", driver, "--"])
         .arg(repo().join("editors/vscode/extension.js"))
         .arg(assert_cmd::cargo::cargo_bin("api"))
         .arg(dir.path())
         .arg(serde_json::to_string(&cases).unwrap())
         .arg(UNFORMATTED)
+        .arg(installed.join("extension.js"))
+        // a PATH with no `api` on it: only the client named beside the
+        // extension can answer
+        .env("PATH", node_dir)
         .env("NODE_PATH", modules.path().join("node_modules"))
         .output();
     let Ok(output) = output else {
@@ -1304,6 +1328,7 @@ const documentOf = (marked) => {
     // a client that is not there: no edit, and no error
     assert_eq!(got["format"][1], serde_json::json!([]));
     assert_eq!(got["expanded"], serde_json::json!([EXPANDED]));
+    assert_eq!(got["installed"], serde_json::json!([["git", "dir", "archive"], null]));
 
     let answers = got["answers"].as_array().unwrap();
     let labels = |n: usize| -> Vec<&str> { answers[n].as_array().unwrap().iter().map(|item| item["label"].as_str().unwrap()).collect() };
@@ -1378,7 +1403,9 @@ fn the_vim_package_completes_with_what_the_client_offers() {
         .arg("--cmd")
         .arg("filetype plugin on")
         .arg("--cmd")
-        .arg(format!("let g:api_binary='{}'", assert_cmd::cargo::cargo_bin("api").display()))
+        // as `plugin/api.vim` of an install names it; no `g:api_binary`, and
+        // no `api` on the PATH that could answer in its place
+        .arg(format!("let g:api_installed_client='{}'", assert_cmd::cargo::cargo_bin("api").display()))
         .arg("--cmd")
         .arg(format!("let g:api_written='{}'", written.display()))
         .arg(dir.path().join("main.api"))
@@ -1482,13 +1509,51 @@ fn install_syntax_for_sublime_writes_the_syntax_into_its_user_package() {
     let target = sublime_packages(home.path()).join("User/API.sublime-syntax");
     let plugin = sublime_packages(home.path()).join("User/api_completions.py");
     let commands = sublime_packages(home.path()).join("User/API.sublime-commands");
+    let client = sublime_packages(home.path()).join("User/api_client.json");
     for _ in 0..2 {
         let output = api(home.path(), bin.path()).args(["--install-syntax", "Sublime"]).output().unwrap();
         assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-        assert_eq!(stdout_lines(&output), [&target, &plugin, &commands].map(|path| path.display().to_string()));
+        assert_eq!(stdout_lines(&output), [&target, &plugin, &commands, &client].map(|path| path.display().to_string()));
         assert_eq!(fs::read_to_string(&target).unwrap(), read("editors/sublime/API.sublime-syntax"));
         assert_eq!(fs::read_to_string(&plugin).unwrap(), read("editors/sublime/api_completions.py"));
         assert_eq!(fs::read_to_string(&commands).unwrap(), read("editors/sublime/API.sublime-commands"));
+    }
+    // The client that installed is the one the plugin asks, before the
+    // `api` on the PATH, which may be an older one without what is asked.
+    let named: serde_json::Value = serde_json::from_str(&fs::read_to_string(&client).unwrap()).unwrap();
+    let this_client = assert_cmd::cargo::cargo_bin("api");
+    assert_eq!(Path::new(named["client"].as_str().unwrap()).canonicalize().unwrap(), this_client.canonicalize().unwrap());
+    // An `api` on the PATH that is another one: asked only when the one
+    // that installed is gone, and never when the setting names a client.
+    fs::write(bin.path().join("api"), "#!/bin/sh\nexit 1\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(bin.path().join("api"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // by its whole path: the PATH it runs with has only that other `api`
+    let python = std::env::var_os("PATH")
+        .and_then(|path| std::env::split_paths(&path).map(|dir| dir.join("python3")).find(|file| file.is_file()))
+        .unwrap_or_else(|| PathBuf::from("python3"));
+    let asked = |script: &str| {
+        let output = std::process::Command::new(&python)
+            .args(["-I", "-B", "-c", &format!("import sys\nsys.path.insert(0, sys.argv[1])\nimport api_completions as plugin\n{}", script)])
+            .arg(sublime_packages(home.path()).join("User"))
+            .env("PATH", bin.path())
+            .output()
+            .ok()?;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    };
+    if let Some(found) = asked("print(plugin.client())") {
+        assert_eq!(Path::new(&found).canonicalize().unwrap(), this_client.canonicalize().unwrap());
+        assert_eq!(asked("print(plugin.client('/opt/other/api'))").unwrap(), "/opt/other/api");
+        fs::write(&client, "{ \"client\": \"/no/such/api\" }").unwrap();
+        assert_eq!(asked("print(plugin.client())").unwrap(), bin.path().join("api").display().to_string());
+        fs::remove_file(&client).unwrap();
+        assert_eq!(asked("print(plugin.client())").unwrap(), bin.path().join("api").display().to_string());
+    } else {
+        eprintln!("skipped: no python3 on the PATH");
     }
     // the palette names the command the plugin has
     let palette: serde_json::Value = serde_json::from_str(&read("editors/sublime/API.sublime-commands")).unwrap();
@@ -1508,10 +1573,19 @@ fn install_syntax_for_vim_and_neovim_writes_a_package() {
         let output = api(home.path(), bin.path()).args(["--install-syntax", editor]).output().unwrap();
         assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
         let package = home.path().join(package);
-        assert_eq!(stdout_lines(&output), files.map(|file| package.join(file).display().to_string()));
+        let mut written = files.map(|file| package.join(file).display().to_string()).to_vec();
+        written.push(package.join("plugin/api.vim").display().to_string());
+        assert_eq!(stdout_lines(&output), written);
         for file in files {
             assert_eq!(fs::read_to_string(package.join(file)).unwrap(), read(&format!("editors/vim/{}", file)));
         }
+        // loaded when the editor starts: the client that installed the package
+        let named = fs::read_to_string(package.join("plugin/api.vim")).unwrap();
+        let path = named.lines().find_map(|line| line.strip_prefix("let g:api_installed_client = '")).unwrap_or_else(|| panic!("{}", named));
+        assert_eq!(
+            Path::new(path.trim_end_matches('\'')).canonicalize().unwrap(),
+            assert_cmd::cargo::cargo_bin("api").canonicalize().unwrap()
+        );
     }
 
     // Neovim's data directory may be somewhere else.
@@ -1534,7 +1608,7 @@ fn install_syntax_for_rider_writes_a_bundle_and_says_the_step_that_is_left() {
     let bundle = home.path().join(".local/share/api/editors/commerceos-api");
     let server = home.path().join(".local/share/api/editors/commerceos-api-lsp");
     let mut written: Vec<String> =
-        ["package.json", "extension.js", "language-configuration.json", "syntaxes/api.tmLanguage.json"]
+        ["package.json", "extension.js", "language-configuration.json", "syntaxes/api.tmLanguage.json", "client.json"]
             .map(|file| bundle.join(file).display().to_string())
             .to_vec();
     written.push(server.join("template.json").display().to_string());
@@ -1602,6 +1676,7 @@ fn install_syntax_for_vscode_and_cursor_hands_a_vsix_to_the_editors_command() {
             [
                 "[Content_Types].xml",
                 "extension.vsixmanifest",
+                "extension/client.json",
                 "extension/extension.js",
                 "extension/language-configuration.json",
                 "extension/package.json",
@@ -1620,6 +1695,12 @@ fn install_syntax_for_vscode_and_cursor_hands_a_vsix_to_the_editors_command() {
         assert!(manifest.contains(r#"Path="extension/package.json""#), "{}", manifest);
         assert_eq!(files["extension/syntaxes/api.tmLanguage.json"], read("editors/vscode/syntaxes/api.tmLanguage.json"));
         assert_eq!(files["extension/extension.js"], read("editors/vscode/extension.js"));
+        // the client that packed the extension is the one it asks first
+        let named: serde_json::Value = serde_json::from_str(&files["extension/client.json"]).unwrap();
+        assert_eq!(
+            Path::new(named["client"].as_str().unwrap()).canonicalize().unwrap(),
+            assert_cmd::cargo::cargo_bin("api").canonicalize().unwrap()
+        );
         assert!(files["[Content_Types].xml"].contains(r#"Extension=".js""#), "{}", files["[Content_Types].xml"]);
 
         // The command is there: it is asked to install that file.

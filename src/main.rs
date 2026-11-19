@@ -11736,6 +11736,24 @@ fn install_syntax(editor: &str) -> i32 {
     }
 }
 
+/// The client that installs, by the path it was run as. What it installs
+/// asks this client first: the `api` on the `PATH` may be an older one, that
+/// does not have what the plugin asks for, and an editor that was not
+/// started from a shell has no `PATH` to speak of. Not resolved: a link that
+/// a package manager keeps pointing at its newest version stays that link.
+fn installing_client() -> Result<String, String> {
+    std::env::current_exe()
+        .map(|path| path.display().to_string())
+        .map_err(|e| format!("could not tell where the client is: {}", e))
+}
+
+/// `{ "client": "<path>" }`: the file a plugin reads the installing client
+/// from, beside itself.
+fn installing_client_json() -> Result<String, String> {
+    let named = serde_json::json!({ "client": installing_client()? });
+    serde_json::to_string_pretty(&named).map(|text| text + "\n").map_err(|e| e.to_string())
+}
+
 /// Write `contents` to `path`, making the directories above it, and print
 /// the path.
 fn write_syntax_file(path: &std::path::Path, contents: &[u8]) -> Result<(), String> {
@@ -11780,6 +11798,7 @@ fn install_sublime_syntax() -> Result<String, String> {
     write_syntax_file(&packages.join("User").join("API.sublime-syntax"), SUBLIME_SYNTAX.as_bytes())?;
     write_syntax_file(&packages.join("User").join("api_completions.py"), SUBLIME_COMPLETIONS.as_bytes())?;
     write_syntax_file(&packages.join("User").join("API.sublime-commands"), SUBLIME_COMMANDS.as_bytes())?;
+    write_syntax_file(&packages.join("User").join("api_client.json"), installing_client_json()?.as_bytes())?;
     Ok("Installed in Sublime Text: highlighting, completions and the command \"API: Format\". A .api file that is open picks them up at once."
         .to_string())
 }
@@ -11808,6 +11827,13 @@ fn install_vim_package(dir: Result<PathBuf, String>, name: &str) -> Result<Strin
     for (file, contents) in VIM_FILES {
         write_syntax_file(&dir.join(file), contents.as_bytes())?;
     }
+    // Loaded when the editor starts: the client that installed the package,
+    // which the package asks unless `g:api_binary` names another.
+    let named = format!(
+        "\" Written by `api --install-syntax`: the client that installed this package.\nlet g:api_installed_client = '{}'\n",
+        installing_client()?.replace('\'', "''")
+    );
+    write_syntax_file(&dir.join("plugin").join("api.vim"), named.as_bytes())?;
     Ok(format!("Installed in {}. Start it again to see it; it needs `syntax on`.", name))
 }
 
@@ -11825,6 +11851,8 @@ fn vscode_extension_files() -> Result<Vec<(&'static str, String)>, String> {
     let manifest = serde_json::to_string_pretty(&vscode_manifest()?).map_err(|e| e.to_string())?;
     let mut files = vec![("package.json", manifest + "\n")];
     files.extend(VSCODE_FILES.iter().map(|(name, contents)| (*name, contents.to_string())));
+    // The client that packed the extension, which the extension asks first.
+    files.push(("client.json", installing_client_json()?));
     Ok(files)
 }
 
@@ -11926,8 +11954,7 @@ fn install_vsix(editor: &VsixEditor) -> Result<String, String> {
 /// `template.json`. The command is this client, by the path it was run as:
 /// an IDE that was not started from a shell has no `PATH` to find `api` on.
 fn lsp4ij_template() -> Result<String, String> {
-    let client = std::env::current_exe().map_err(|e| format!("could not tell where the client is: {}", e))?;
-    let client = client.display().to_string();
+    let client = installing_client()?;
     let quoted = if client.contains(' ') { format!("\"{}\"", client) } else { client };
     let template = serde_json::json!({
         "id": "commerceos-api",
