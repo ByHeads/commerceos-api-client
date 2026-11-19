@@ -64,7 +64,7 @@ contexts:
     - match: '^\s*((?i:set)){{word_end}}'
       captures:
         1: keyword.control.command.api
-      push: set_name
+      push: set_source
     - match: '^\s*((?i:import)){{word_end}}'
       captures:
         1: keyword.control.import.api
@@ -176,48 +176,30 @@ contexts:
     - match: '$'
       pop: true
 
-  set_name:
+  # set { … }   or   set @file.json
+  set_source:
     - match: '\s*$'
       pop: true
+    - match: '(@)\s*'
+      captures:
+        1: keyword.operator.infile.api
+      set: import_file
+    - match: '\{'
+      scope: punctuation.section.mapping.begin.json
+      set:
+        - meta_scope: meta.set.api meta.embedded.block.json meta.mapping.json
+        - match: '\}'
+          scope: punctuation.section.mapping.end.json
+          set: line_end
+        - match: '(")(export|include-nulls|fail-fast|ndjson|raw|stream|timeout)(")(?=\s*:)'
+          scope: meta.mapping.key.json string.quoted.double.json
+          captures:
+            2: support.type.property-name.setting.api
+        - include: json_members
     - include: trailing_comment
-    - match: '(?i:export){{word_end}}'
-      scope: variable.parameter.setting.api
-      set: set_export_value
-    - match: '(?i:timeout){{word_end}}'
-      scope: variable.parameter.setting.api
-      set: set_timeout_value
-    - match: '(?i:include-nulls|fail-fast|ndjson|raw|stream){{word_end}}'
-      scope: variable.parameter.setting.api
-      set: set_switch_value
+    # the line in words (`set include-nulls`) is no longer read
     - match: '\S+'
       scope: invalid.illegal.setting.api
-      set: line_end
-
-  set_switch_value:
-    - match: '(?i:on|off){{word_end}}'
-      scope: constant.language.api
-      set: line_end
-    - include: line_end
-
-  set_export_value:
-    - match: '(?i:off){{word_end}}'
-      scope: constant.language.api
-      set: line_end
-    - match: '\s*$'
-      pop: true
-    - include: trailing_comment
-    - match: '\S+'
-      scope: string.unquoted.value.api
-      set: line_end
-
-  set_timeout_value:
-    - match: '\d+{{word_end}}'
-      scope: constant.numeric.api
-      set: line_end
-    - match: '(?i:off){{word_end}}'
-      scope: constant.language.api
-      set: line_end
-    - include: line_end
 
   # ----------------------------------------------------------------- imports
 
@@ -269,7 +251,7 @@ contexts:
     - match: '\S+'
       scope: invalid.illegal.import.api
 
-  # one JSON file: no glob, no ~map(…)
+  # one JSON file, of an `import` or a `set`: no glob, no ~map(…)
   import_file:
     - meta_scope: meta.path.infile.api
     - match: '\s*$'

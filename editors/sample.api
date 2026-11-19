@@ -27,15 +27,16 @@ cl/seeds/*.api     # glob include
 ~/seeds/seed.api
 /tmp/seed.api
 
-set export com.heads.seedID
+set { "export": "com.heads.seedID" }
+set {
+  "include-nulls": true,   // nulls too
+  "fail-fast": false,
+  "timeout": 30
+}   # back off
+set { "stream": true, "ndjson": null }
+set @settings.json   # from a file
 set include-nulls
-set fail-fast off   # back off
-set timeout 30
-set ndjson
-set stream on
-set raw
-set nulls
-set raw maybe
+set { "raw": true } maybe
 
 assert GET /companies/com.heads.seedID=ours
 assert not /people~where(givenName=Test)~count   # implied GET

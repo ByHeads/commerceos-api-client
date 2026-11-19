@@ -22,7 +22,7 @@ pick it up. By hand: copy `API.sublime-syntax` to that folder
 | `while`, `not` | `keyword.control.loop.api` |
 | `url has` / `url is` and the value | `keyword.operator.api`, `string.unquoted.value.api` |
 | `confirm` message | `string.unquoted.message.api` |
-| `set` name, `on`/`off`, export name, timeout | `variable.parameter.setting.api`, `constant.language.api`, `string.unquoted.value.api`, `constant.numeric.api` |
+| `set { … }`, the names of its settings; `set @file.json` | `meta.set.api`, `support.type.property-name.setting.api`; `keyword.operator.infile.api`, `meta.path.infile.api` |
 | `import`, its kind, its alias, its keys | `keyword.control.import.api`, `storage.type.import.api`, `entity.name.namespace.import.api`, `support.type.property-name.import.api` |
 | Describe block and its `title`, `description`, `docsLink` | `meta.describe.api`, `support.type.property-name.describe.api` |
 | Include line | `meta.include.api` |
@@ -34,14 +34,16 @@ pick it up. By hand: copy `API.sublime-syntax` to that folder
 
 Marked `invalid.illegal.*`, since each stops a batch: a `&&`/`||` with nothing
 on one side, a directive or include in a chain, a `>` with no path, a chain or
-outfile in an `assert` or `sleep while`, an unknown setting or value, an unknown
+outfile in an `assert` or `sleep while`, a `set` line in words (`set
+include-nulls`) or with anything behind its object, an unknown
 import kind, an alias that is a method or directive, a body function other than
 `~map(…)`, and a `{` or `[` that starts a line below the top of the file.
 
 ## Not covered
 
-- An unknown member of a describe block or an unknown key of an import is
-  coloured as a plain JSON key, not as an error.
+- An unknown member of a describe block, an unknown key of an import or an
+  unknown setting of a `set` line is coloured as a plain JSON key, not as an
+  error. Neither is a value a setting does not take.
 - Whether an include path or an alias exists.
 - A `# @basedir <path>` comment is highlighted for a path-completion plugin
   that is not part of this folder. The client does not read it.

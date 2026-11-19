@@ -752,15 +752,25 @@ fn cases(dir: &Path) -> Vec<Case> {
         case("url in a chain", r#"url has 127.0.0.1 && PUT /x {"a":1}"#, Some(&["url", "has", "127.0.0.1", "&&", "PUT", "/x", r#"{"a":1}"#]), &[])
             .fails("can't be part of a `&&`/`||` chain"),
         // A setting is a line of its own
-        case("set in a chain", "set include-nulls && GET /a", Some(&["set", "include-nulls", "&&", "GET", "/a"]), &[])
+        case("set in a chain", "set {\"include-nulls\":true} && GET /a", Some(&["set", "{\"include-nulls\":true}", "&&", "GET", "/a"]), &[])
             .fails("can't be part of a `&&`/`||` chain"),
-        case("set behind a chain", "GET /a && set include-nulls", Some(&["GET", "/a", "&&", "set", "include-nulls"]), &[])
+        case("set behind a chain", "GET /a && set {\"include-nulls\":true}", Some(&["GET", "/a", "&&", "set", "{\"include-nulls\":true}"]), &[])
             .fails("chain segment is not a request"),
-        case("set, then a request", "set include-nulls\nGET /a", None, &["GET /a"]),
-        case("SET in capitals, switched off again", "SET Include-Nulls ON\nset include-nulls off\nGET /a", None, &["GET /a"]),
-        case("a setting that is none", "set nulls\nGET /a", None, &[]).fails("unknown setting `nulls`"),
-        case("a setting with a value it does not take", "set fail-fast soon\nGET /a", None, &[])
-            .fails("set fail-fast takes `on` or `off`, not `soon`"),
+        case("set, then a request", "set {\"include-nulls\":true}\nGET /a", None, &["GET /a"]),
+        case("SET in capitals, switched off again", "SET {\"include-nulls\":true}\nset {\"include-nulls\":false}\nGET /a", None, &["GET /a"]),
+        case(
+            "set over several lines, with comments",
+            "set {\n  \"export\": \"a.b.c\", // as seed data\n  # and all of it\n  \"include-nulls\": true\n}  # both\nGET /a",
+            None,
+            &["GET /a"],
+        ),
+        case("a setting that is none", "set {\"nulls\":true}\nGET /a", None, &[]).fails("unknown setting `nulls`"),
+        case("a setting with a value it does not take", "set {\"fail-fast\":\"soon\"}\nGET /a", None, &[])
+            .fails("set: `fail-fast` takes true or false, not \"soon\""),
+        case("set in words, as 3.4.0 read it", "set include-nulls\nGET /a", None, &[])
+            .fails("a `set` line takes a JSON object: write `set { \"include-nulls\": true }`"),
+        case("set with a list", "set [\"raw\"]\nGET /a", None, &[]).fails("a `set` line takes a JSON object or an `@file`"),
+        case("set with nothing", "set {}\nGET /a", None, &[]).fails("set needs settings"),
         // Directives
         case("sleep", "sleep 100ms", Some(&["sleep", "100ms"]), &[]),
         case("sleep with a bad duration", "sleep abc", Some(&["sleep", "abc"]), &[]).fails("invalid sleep duration"),
@@ -1302,7 +1312,7 @@ fn a_timeout_is_for_silence_not_for_the_whole_transfer() {
     let streamed = run_in(&server, d, &["--stream", "--timeout", "1", "GET", "/slow", ">", "s.json"]);
     assert_eq!(streamed.code, Some(0), "{}", streamed.stderr);
     whole("s.json");
-    std::fs::write(d.join("t.api"), "set timeout 1\nGET /slow > f.json\nGET /after\n").unwrap();
+    std::fs::write(d.join("t.api"), "set {\"timeout\":1}\nGET /slow > f.json\nGET /after\n").unwrap();
     let by_line = run_in(&server, d, &["-sa", "t.api"]);
     assert_eq!((by_line.code, by_line.sent.len()), (Some(0), 2), "{}", by_line.stderr);
     whole("f.json");
@@ -1312,16 +1322,16 @@ fn a_timeout_is_for_silence_not_for_the_whole_transfer() {
     assert_eq!(late.code, Some(1), "{}", late.stderr);
     assert!(late.stderr.contains("Timed out after 1s"), "{}", late.stderr);
     // `0` waits for as long as it takes, and is not the default under
-    // another name: it holds against a `set timeout 1` of the file.
+    // another name: it holds against a `set {"timeout":1}` of the file.
     let never = run_in(&server, d, &["--timeout", "0", "GET", "/late"]);
     assert_eq!(never.code, Some(0), "{}", never.stderr);
-    std::fs::write(d.join("t.api"), "set timeout 1\nGET /late\n").unwrap();
+    std::fs::write(d.join("t.api"), "set {\"timeout\":1}\nGET /late\n").unwrap();
     let over_line = run_in(&server, d, &["--timeout", "0", "-sa", "t.api"]);
     assert_eq!(over_line.code, Some(0), "{}", over_line.stderr);
     assert!(over_line.stdout.contains("↳ ignored: --timeout 0 is set"), "{}", over_line.stdout);
-    // `set timeout 0` and `set timeout off` both end a `set timeout 1`.
-    for back in ["0", "off"] {
-        std::fs::write(d.join("t.api"), format!("set timeout 1\nset timeout {back}\nGET /late\nGET /after\n")).unwrap();
+    // `set {"timeout":0}` and `set {"timeout":null}` both end a `set {"timeout":1}`.
+    for back in ["0", "null", "false"] {
+        std::fs::write(d.join("t.api"), format!("set {{\"timeout\":1}}\nset {{\"timeout\":{back}}}\nGET /late\nGET /after\n")).unwrap();
         let got = run_in(&server, d, &["-sa", "t.api"]);
         assert_eq!((got.code, &got.sent[..]), (Some(0), &["GET /late", "GET /after"].map(String::from)[..]), "{back}: {}", got.stderr);
     }
@@ -1338,13 +1348,13 @@ fn what_would_send_nothing_or_drop_a_request_is_an_error() {
     let d = dir.path();
     std::fs::write(d.join("a.api"), "GET /a\n").unwrap();
 
-    for line in ["set include-nulls", "set include-nulls # note", "set timeout 5   # five", "set export a.b.c # as seed data"] {
+    for line in ["set {\"include-nulls\":true}", "set {\"include-nulls\":true} # note", "set {\"timeout\":5}   # five", "set {\"export\":\"a.b.c\"} # as seed data"] {
         let got = run_in(&server, d, &[line]);
         assert_eq!((got.code, got.sent.len(), got.stdout.as_str()), (Some(1), 0, ""), "{line}: {}", got.stderr);
         assert!(got.stderr.contains("`set` alone sends nothing"), "{line}: {}", got.stderr);
     }
     // With a request under it, the line is a line of a program.
-    let got = run_in(&server, d, &["set include-nulls # note\nGET /a"]);
+    let got = run_in(&server, d, &["set {\"include-nulls\":true} # note\nGET /a"]);
     assert_eq!((got.code, &got.sent[..]), (Some(0), &["GET /a".to_string()][..]), "{}", got.stderr);
 
     for option in ["--imports", "--describe", "--assert"] {
@@ -6154,7 +6164,7 @@ fn the_settings_menu_changes_what_the_session_has_set() {
     assert_eq!(sent, ["GET /missing"], "{shown}");
     assert_eq!(accepts, ["application/json;skipNulls=false"]);
     assert!(shown.contains("stopped at 404 (--fail-fast)"), "{shown}");
-    run_pasted(&mut prompt, &server, "set fail-fast off");
+    run_pasted(&mut prompt, &server, "set {\"fail-fast\":false}");
     prompt.pump(Duration::from_millis(3200));
     prompt.send(b"\x15");
     prompt.pump(Duration::from_millis(200));
@@ -6315,8 +6325,8 @@ fn a_menu_key_takes_ctrl_c_back_in_the_settings_menu() {
 }
 
 /// `--no-streaming` keeps streaming off for the session too. The menu's row
-/// and a typed `set stream` say that, not that streaming is on, and a file's
-/// `set stream` is passed over by the option's name: the session set nothing.
+/// and a typed `set {"stream":true}` say that, not that streaming is on, and a file's
+/// `set {"stream":true}` is passed over by the option's name: the session set nothing.
 #[cfg(unix)]
 #[test]
 fn a_session_started_with_no_streaming_says_that_streaming_stays_off() {
@@ -6326,7 +6336,7 @@ fn a_session_started_with_no_streaming_says_that_streaming_stays_off() {
     let server = RecordingServer::start();
     let dir = tempfile::tempdir().unwrap();
     prepare(dir.path());
-    std::fs::write(dir.path().join("stream.api"), "set stream\nGET /keyed > from-file.json\n").unwrap();
+    std::fs::write(dir.path().join("stream.api"), "set {\"stream\":true}\nGET /keyed > from-file.json\n").unwrap();
     let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("api"));
     cmd.args(["--no-keychain", "-b", &format!("http://127.0.0.1:{}", server.port), "-k", "streamer", "--no-streaming"])
         .current_dir(dir.path())
@@ -6355,7 +6365,7 @@ fn a_session_started_with_no_streaming_says_that_streaming_stays_off() {
     assert!(!rows.last().unwrap().trim_end().ends_with(" streaming"), "a marker for what is off:\n{}", rows.join("\n"));
 
     // Typed, it is the same line.
-    let (sent, shown) = run_pasted(&mut prompt, &server, "set stream");
+    let (sent, shown) = run_pasted(&mut prompt, &server, "set {\"stream\":true}");
     assert!(sent.is_empty() && shown.contains(REFUSED), "{shown}");
     // A request is not asked to stream.
     let (_, _, accepts) = run_pasted_accepts(&mut prompt, &server, "GET /keyed > typed.json");
@@ -6468,7 +6478,7 @@ fn a_set_line_at_the_prompt_holds_for_the_session() {
     let dir = tempfile::tempdir().unwrap();
     prepare(dir.path());
     std::fs::write(dir.path().join("plain.api"), "GET /keyed > from-file.json\n").unwrap();
-    std::fs::write(dir.path().join("own.api"), "set export other.name.id\nGET /keyed > from-own.json\n").unwrap();
+    std::fs::write(dir.path().join("own.api"), "set {\"export\":\"other.name.id\"}\nGET /keyed > from-own.json\n").unwrap();
     let mut prompt = Prompt::open(api(server.port, dir.path()));
     prompt.wait_ready(Duration::from_secs(15));
     let mut run = |paste: &str| run_pasted_accepts(&mut prompt, &server, paste);
@@ -6480,9 +6490,9 @@ fn a_set_line_at_the_prompt_holds_for_the_session() {
     assert!(shown.contains("\"key\": \"k1\"") && !shown.contains("key?"), "{shown}");
 
     // The line sends nothing, is logged, and says what it did.
-    let (sent, shown, _) = run("set export com.heads.seedID");
+    let (sent, shown, _) = run("set {\"export\":\"com.heads.seedID\"}");
     assert_eq!(sent, Vec::<String>::new());
-    assert!(shown.contains("set export com.heads.seedID") && shown.contains("export on: com.heads.seedID"), "{shown}");
+    assert!(shown.contains("set {\"export\":\"com.heads.seedID\"}") && shown.contains("export on: com.heads.seedID"), "{shown}");
     let (_, shown, _) = run("GET /keyed");
     assert!(shown.contains("\"key?\": \"k1\"") && shown.contains("\"com.heads.seedID\": \"k1\""), "{shown}");
 
@@ -6494,18 +6504,18 @@ fn a_set_line_at_the_prompt_holds_for_the_session() {
     let (sent, shown, _) = run("own.api");
     assert_eq!(sent, ["GET /keyed"]);
     assert_eq!(exported("from-own.json"), seed);
-    assert!(shown.contains("↳ ignored: the session has set export com.heads.seedID"), "{shown}");
+    assert!(shown.contains("↳ ignored: the session has set {\"export\":\"com.heads.seedID\"}"), "{shown}");
     run("GET /keyed > typed.json");
     assert_eq!(exported("typed.json"), seed);
 
     // A name that can't be one is refused, and the setting stays.
-    let (sent, shown, _) = run("set export nope");
+    let (sent, shown, _) = run("set {\"export\":\"nope\"}");
     assert_eq!(sent, Vec::<String>::new());
     assert!(shown.contains("invalid export identifier: nope"), "{shown}");
     run("GET /keyed > still.json");
     assert_eq!(exported("still.json"), seed);
 
-    let (sent, shown, _) = run("set export off");
+    let (sent, shown, _) = run("set {\"export\":null}");
     assert_eq!(sent, Vec::<String>::new());
     assert!(shown.contains("export off"), "{shown}");
     run("GET /keyed > off.json");
@@ -6519,50 +6529,65 @@ fn a_set_line_at_the_prompt_holds_for_the_session() {
     assert_eq!(exported("after-own.json"), None);
 
     // In a pasted block the line holds for the rest of the block, and after it.
-    let (sent, _, _) = run("GET /keyed > block-before.json\nset export com.heads.seedID\nGET /keyed > block-after.json");
+    let (sent, _, _) = run("GET /keyed > block-before.json\nset {\"export\":\"com.heads.seedID\"}\nGET /keyed > block-after.json");
     assert_eq!(sent.len(), 2);
     assert_eq!(exported("block-before.json"), None);
     assert_eq!(exported("block-after.json"), seed);
     run("GET /keyed > later.json");
     assert_eq!(exported("later.json"), seed);
-    run("set export off");
+    run("set {\"export\":null}");
 
     // The other settings, each by what it does to a request.
-    let (sent, shown, _) = run("set include-nulls");
+    let (sent, shown, _) = run("set {\"include-nulls\":true}");
     assert_eq!(sent, Vec::<String>::new());
     assert!(shown.contains("include-nulls on"), "{shown}");
     let (_, _, accepts) = run("GET /a");
     assert_eq!(accepts, ["application/json;skipNulls=false"]);
     let (_, _, accepts) = run("seed.api");
     assert_eq!(accepts, ["application/json;skipNulls=false", "application/json;skipNulls=false"], "a file run from here");
-    let (_, shown, _) = run("set ndjson on");
+    let (_, shown, _) = run("set {\"ndjson\":true}");
     assert!(shown.contains("ndjson on"), "{shown}");
     let (_, _, accepts) = run("GET /a");
     assert_eq!(accepts, ["application/x-ndjson;skipNulls=false"]);
-    let (_, shown, _) = run("set include-nulls off\nset ndjson off");
+    let (_, shown, _) = run("set {\"include-nulls\":false}\nset {\"ndjson\":false}");
     assert!(shown.contains("ndjson off"), "{shown}");
+    let (_, _, accepts) = run("GET /a");
+    assert_eq!(accepts, ["application/json"]);
+    // Several on one line: each is said, in the order they are written.
+    let (sent, shown, _) = run("set { \"include-nulls\": true, \"ndjson\": true }");
+    assert_eq!(sent, Vec::<String>::new());
+    assert!(shown.contains("set {\"include-nulls\":true,\"ndjson\":true}"), "{shown}");
+    assert!(shown.contains("include-nulls on, ndjson on"), "{shown}");
+    let (_, _, accepts) = run("GET /a");
+    assert_eq!(accepts, ["application/x-ndjson;skipNulls=false"]);
+    // The line in words is refused with what to write, and changes nothing.
+    let (_, shown, _) = run("set ndjson off");
+    assert!(shown.contains("a `set` line takes a JSON object: write `set { \"ndjson\": false }`"), "{shown}");
+    let (_, _, accepts) = run("GET /a");
+    assert_eq!(accepts, ["application/x-ndjson;skipNulls=false"]);
+    run("set {\"include-nulls\":null,\"ndjson\":null}");
     let (_, _, accepts) = run("GET /a");
     assert_eq!(accepts, ["application/json"]);
 
     // Fail fast: a block stops at the first failed request, until it is off.
-    run("set fail-fast");
+    run("set {\"fail-fast\":true}");
     let (sent, shown, _) = run("GET /missing\nGET /never");
     assert_eq!(sent, ["GET /missing"]);
     assert!(shown.contains("stopped at 404 (--fail-fast)"), "{shown}");
-    run("set fail-fast off");
+    run("set {\"fail-fast\":false}");
     let (sent, _, _) = run("GET /missing\nGET /after");
     assert_eq!(sent, ["GET /missing", "GET /after"]);
 
     // A timeout says what it is now, and `off` is the default again.
-    let (_, shown, _) = run("set timeout 30");
+    let (_, shown, _) = run("set {\"timeout\":30}");
     assert!(shown.contains("timeout 30s"), "{shown}");
-    let (_, shown, _) = run("set timeout 0");
+    let (_, shown, _) = run("set {\"timeout\":0}");
     assert!(shown.contains("no timeout"), "{shown}");
-    let (_, shown, _) = run("set timeout off");
+    let (_, shown, _) = run("set {\"timeout\":null}");
     assert!(shown.contains("timeout 600s"), "{shown}");
 
     // A setting that is none is said to be none, and nothing is sent.
-    let (sent, shown, _) = run("set nulls");
+    let (sent, shown, _) = run("set {\"nulls\":true}");
     assert_eq!(sent, Vec::<String>::new());
     assert!(shown.contains("unknown setting `nulls`"), "{shown}");
 }
@@ -6577,7 +6602,7 @@ fn a_set_line_changes_what_the_session_was_started_with() {
     let server = RecordingServer::start();
     let dir = tempfile::tempdir().unwrap();
     prepare(dir.path());
-    std::fs::write(dir.path().join("own.api"), "set export other.name.id\nset include-nulls off\nGET /keyed > from-own.json\n").unwrap();
+    std::fs::write(dir.path().join("own.api"), "set {\"export\":\"other.name.id\"}\nset {\"include-nulls\":false}\nGET /keyed > from-own.json\n").unwrap();
     let mut cmd = api(server.port, dir.path());
     cmd.args(["--export", "com.heads.seedID", "-i"]);
     let mut prompt = Prompt::open(cmd);
@@ -6593,15 +6618,15 @@ fn a_set_line_changes_what_the_session_was_started_with() {
     let (_, shown, accepts) = run("own.api");
     assert_eq!(exported("from-own.json"), Some("com.heads.seedID".to_string()));
     assert_eq!(accepts, ["application/json;skipNulls=false"]);
-    assert!(shown.contains("↳ ignored: the session has set export com.heads.seedID"), "{shown}");
-    assert!(shown.contains("↳ ignored: the session has set include-nulls"), "{shown}");
+    assert!(shown.contains("↳ ignored: the session has set {\"export\":\"com.heads.seedID\"}"), "{shown}");
+    assert!(shown.contains("↳ ignored: the session has set {\"include-nulls\":true}"), "{shown}");
 
     // A typed line is the session's own, and the last one wins.
-    let (_, shown, _) = run("set export other.name.id");
+    let (_, shown, _) = run("set {\"export\":\"other.name.id\"}");
     assert!(shown.contains("export on: other.name.id"), "{shown}");
     run("GET /keyed > typed.json");
     assert_eq!(exported("typed.json"), Some("other.name.id".to_string()));
-    let (_, shown, _) = run("set export off\nset include-nulls off");
+    let (_, shown, _) = run("set {\"export\":null}\nset {\"include-nulls\":false}");
     assert!(shown.contains("include-nulls off"), "{shown}");
     let (_, _, accepts) = run("GET /keyed > typed.json");
     assert_eq!(exported("typed.json"), None);
@@ -8061,7 +8086,7 @@ fn a_file_that_stops_at_the_prompt_leaves_the_sessions_settings_as_they_were() {
 
     let server = RecordingServer::start();
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("own.api"), "set export other.name.id\nassert GET /missing\nGET /never\n").unwrap();
+    std::fs::write(dir.path().join("own.api"), "set {\"export\":\"other.name.id\"}\nassert GET /missing\nGET /never\n").unwrap();
     std::fs::write(dir.path().join("plain.api"), "assert GET /missing\nGET /never\n").unwrap();
     let mut prompt = Prompt::open(api(server.port, dir.path()));
     prompt.wait_ready(Duration::from_secs(15));
@@ -8079,7 +8104,7 @@ fn a_file_that_stops_at_the_prompt_leaves_the_sessions_settings_as_they_were() {
     assert_eq!(exported("after-own.json"), None);
 
     // The session has it on, and a file run in it stops: still on.
-    run_pasted(&mut prompt, &server, "set export com.heads.seedID");
+    run_pasted(&mut prompt, &server, "set {\"export\":\"com.heads.seedID\"}");
     let (sent, shown) = run_pasted(&mut prompt, &server, "plain.api");
     assert_eq!(sent, ["GET /missing"], "{shown}");
     run_pasted(&mut prompt, &server, "GET /keyed > after-plain.json");
@@ -10834,7 +10859,7 @@ fn a_request_body_is_never_rewritten_by_export() {
     let request = format!("PUT /x {BODY}");
     let sent = [request.clone()];
     std::fs::write(d.join("flag.api"), format!("{request}\n")).unwrap();
-    std::fs::write(d.join("line.api"), format!("set export com.heads.seedID\n{request}\n")).unwrap();
+    std::fs::write(d.join("line.api"), format!("set {{\"export\":\"com.heads.seedID\"}}\n{request}\n")).unwrap();
     std::fs::write(d.join("body.json"), BODY).unwrap();
 
     for args in [
@@ -10843,13 +10868,13 @@ fn a_request_body_is_never_rewritten_by_export() {
         &["--export", "com.heads.seedID", "PUT", "/x", "@body.json"],
         &["--export", "com.heads.seedID", "-sa", "flag.api"],
         &["-sa", "line.api"],
-        &[&format!("set export com.heads.seedID\n{request}")],
+        &[&format!("set {{\"export\":\"com.heads.seedID\"}}\n{request}")],
     ] {
         let got = run_in(&server, d, args);
         assert_eq!((got.code, &got.sent[..]), (Some(0), &sent[..]), "{args:?}: {}", got.stderr);
     }
     // And from stdin, as the body and as the program.
-    for (args, stdin) in [(&["--export", "com.heads.seedID", "PUT", "/x"][..], BODY.to_string()), (&["-sa", "-"], format!("set export com.heads.seedID\n{request}\n"))]
+    for (args, stdin) in [(&["--export", "com.heads.seedID", "PUT", "/x"][..], BODY.to_string()), (&["-sa", "-"], format!("set {{\"export\":\"com.heads.seedID\"}}\n{request}\n"))]
     {
         server.take();
         let mut cmd = api(server.port, d);
@@ -10929,7 +10954,7 @@ fn a_request_under_a_set_export_line_is_not_streamed() {
     let d = dir.path();
     std::fs::write(
         d.join("e.api"),
-        "GET /a > before.json\nset export com.heads.seedID\nGET /keyed > keyed.json\nset export off\nGET /b > after.json\n",
+        "GET /a > before.json\nset {\"export\":\"com.heads.seedID\"}\nGET /keyed > keyed.json\nset {\"export\":null}\nGET /b > after.json\n",
     )
     .unwrap();
     let got = run_in(&server, d, &["--stream", "-sa", "e.api"]);
@@ -10942,7 +10967,7 @@ fn a_request_under_a_set_export_line_is_not_streamed() {
     assert!(keyed.get("secret").is_none(), "{keyed}");
 }
 
-/// `set include-nulls` is `-i` for the requests under it in its own file:
+/// `set {"include-nulls":true}` is `-i` for the requests under it in its own file:
 /// from the line down, to `off` or the end of the file, and not in a file
 /// that is included. `-i` holds for the whole run, whatever a line says.
 #[test]
@@ -10952,11 +10977,11 @@ fn a_set_line_holds_from_the_line_down_in_its_own_file() {
     let d = dir.path();
     std::fs::write(
         d.join("main.api"),
-        "GET /a\nset include-nulls\nGET /b\nplain.api\nown.api\nGET /c && GET /d\nassert GET /e\nset include-nulls off\nGET /f\n",
+        "GET /a\nset {\"include-nulls\":true}\nGET /b\nplain.api\nown.api\nGET /c && GET /d\nassert GET /e\nset {\"include-nulls\":false}\nGET /f\n",
     )
     .unwrap();
     std::fs::write(d.join("plain.api"), "GET /plain\n").unwrap();
-    std::fs::write(d.join("own.api"), "GET /own-before\nSET INCLUDE-NULLS ON\nGET /own\n").unwrap();
+    std::fs::write(d.join("own.api"), "GET /own-before\nSET {\"include-nulls\":true}\nGET /own\n").unwrap();
     let sent = ["GET /a", "GET /b", "GET /plain", "GET /own-before", "GET /own", "GET /c", "GET /d", "GET /e", "GET /f"];
     let nulls = |server: &RecordingServer| -> Vec<bool> {
         server.heads().iter().map(|head| accept_of(head).contains(";skipNulls=false")).collect()
@@ -10967,7 +10992,7 @@ fn a_set_line_holds_from_the_line_down_in_its_own_file() {
     assert_eq!(nulls(&server), [false, true, false, false, true, true, true, true, false], "{:?}", server.heads());
     // The log has each line where it is written, as it is shortest written.
     let lines: Vec<&str> = got.stdout.lines().filter(|line| line.starts_with("set ")).collect();
-    assert_eq!(lines, ["set include-nulls", "set include-nulls", "set include-nulls off"], "{}", got.stdout);
+    assert_eq!(lines, ["set {\"include-nulls\":true}", "set {\"include-nulls\":true}", "set {\"include-nulls\":false}"], "{}", got.stdout);
     assert!(!got.stdout.contains("ignored"), "{}", got.stdout);
 
     // `-i` is for every request, and the line that would turn it off says
@@ -10976,15 +11001,15 @@ fn a_set_line_holds_from_the_line_down_in_its_own_file() {
     assert_eq!((got.code, got.sent.len()), (Some(0), sent.len()), "{}", got.stderr);
     assert_eq!(nulls(&server), [true; 9], "{:?}", server.heads());
     assert_eq!(got.stdout.matches("↳ ignored: -i is set").count(), 1, "{}", got.stdout);
-    assert!(got.stdout.contains("set include-nulls off\n↳ ignored: -i is set"), "{}", got.stdout);
+    assert!(got.stdout.contains("set {\"include-nulls\":false}\n↳ ignored: -i is set"), "{}", got.stdout);
 
     // From stdin and as one argument a line is a line of the program.
-    for args in [&["-sa", "-"][..], &["set include-nulls\nGET /b\nset include-nulls off\nGET /f"]] {
+    for args in [&["-sa", "-"][..], &["set {\"include-nulls\":true}\nGET /b\nset {\"include-nulls\":false}\nGET /f"]] {
         server.take();
         let mut cmd = api(server.port, d);
         cmd.args(args).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
         let mut child = cmd.spawn().expect("spawn api");
-        child.stdin.take().unwrap().write_all(b"set include-nulls\nGET /b\nset include-nulls off\nGET /f\n").unwrap();
+        child.stdin.take().unwrap().write_all(b"set {\"include-nulls\":true}\nGET /b\nset {\"include-nulls\":false}\nGET /f\n").unwrap();
         let out = child.wait_with_output().expect("api runs");
         server.settle(Duration::from_millis(150), Duration::from_secs(3));
         assert_eq!(out.status.code(), Some(0), "{args:?}");
@@ -11003,7 +11028,7 @@ fn every_setting_does_what_its_option_does() {
     let accepts = |server: &RecordingServer| -> Vec<String> { server.heads().iter().map(|head| accept_of(head)).collect() };
 
     // ndjson and stream are in what the request asks for.
-    file("GET /a\nset ndjson\nGET /b\nset ndjson off\nset stream\nGET /c > c.json\nset stream off\nGET /d > d.json\n");
+    file("GET /a\nset {\"ndjson\":true}\nGET /b\nset {\"ndjson\":false}\nset {\"stream\":true}\nGET /c > c.json\nset {\"stream\":false}\nGET /d > d.json\n");
     let got = run_in(&server, d, &["-sa", "s.api"]);
     assert_eq!(got.code, Some(0), "{}", got.stderr);
     assert_eq!(
@@ -11016,21 +11041,21 @@ fn every_setting_does_what_its_option_does() {
     let got = run_in(&server, d, &["--no-streaming", "-sa", "s.api"]);
     assert_eq!(got.code, Some(0), "{}", got.stderr);
     assert!(accepts(&server).iter().all(|accept| !accept.contains("stream=true")), "{:?}", server.heads());
-    assert!(got.stdout.contains("set stream\n↳ ignored: --no-streaming is set"), "{}", got.stdout);
+    assert!(got.stdout.contains("set {\"stream\":true}\n↳ ignored: --no-streaming is set"), "{}", got.stdout);
     assert_eq!(got.stdout.matches("ignored").count(), 1, "{}", got.stdout);
     // The options that are on stay on, and each is named as it was given.
     let got = run_in(&server, d, &["--ndjson", "--stream", "-sa", "s.api"]);
     assert_eq!(got.code, Some(0), "{}", got.stderr);
-    assert!(got.stdout.contains("set ndjson off\n↳ ignored: --ndjson is set"), "{}", got.stdout);
-    assert!(got.stdout.contains("set stream off\n↳ ignored: --stream is set"), "{}", got.stdout);
+    assert!(got.stdout.contains("set {\"ndjson\":false}\n↳ ignored: --ndjson is set"), "{}", got.stdout);
+    assert!(got.stdout.contains("set {\"stream\":false}\n↳ ignored: --stream is set"), "{}", got.stdout);
     assert_eq!(got.stdout.matches("ignored").count(), 2, "{}", got.stdout);
     let mut cmd = api(server.port, d);
     cmd.env("API_STREAMING", "1").args(["-sa", "s.api"]);
     let got = ran(&server, cmd);
-    assert!(got.stdout.contains("set stream off\n↳ ignored: API_STREAMING is set"), "{}", got.stdout);
+    assert!(got.stdout.contains("set {\"stream\":false}\n↳ ignored: API_STREAMING is set"), "{}", got.stdout);
 
     // raw: a file holds the body as the server sent it, not laid out.
-    file("GET /keyed > laid-out.json\nset raw\nGET /keyed > raw.json\nset raw off\nGET /keyed > again.json\n");
+    file("GET /keyed > laid-out.json\nset {\"raw\":true}\nGET /keyed > raw.json\nset {\"raw\":false}\nGET /keyed > again.json\n");
     let got = run_in(&server, d, &["-sa", "s.api"]);
     assert_eq!(got.code, Some(0), "{}", got.stderr);
     let lines = |name: &str| std::fs::read_to_string(d.join(name)).unwrap().trim_end().lines().count();
@@ -11039,35 +11064,35 @@ fn every_setting_does_what_its_option_does() {
 
     // fail-fast: the first failed request under the line ends the run, with
     // its body last on stdout. Above the line a failure is passed.
-    file("GET /missing\nset fail-fast\nGET /gone\nGET /never\n");
+    file("GET /missing\nset {\"fail-fast\":true}\nGET /gone\nGET /never\n");
     let got = run_in(&server, d, &["-sa", "s.api"]);
     assert_eq!((got.code, &got.sent[..]), (Some(1), &["GET /missing".to_string(), "GET /gone".to_string()][..]), "{}", got.stderr);
     assert!(got.stdout.trim_end().ends_with(GONE.trim_end()), "{}", got.stdout);
     // It is the file's own: a failure in an included file is passed, as
     // without the line, and one after it is not.
     std::fs::write(d.join("inc.api"), "GET /missing\nGET /in-inc\n").unwrap();
-    file("set fail-fast\ninc.api\nGET /conflict\nGET /never\n");
+    file("set {\"fail-fast\":true}\ninc.api\nGET /conflict\nGET /never\n");
     let got = run_in(&server, d, &["-sa", "s.api"]);
     assert_eq!((got.code, &got.sent[..]), (Some(1), &["GET /missing", "GET /in-inc", "GET /conflict"].map(String::from)[..]), "{}", got.stderr);
     // And off again.
-    file("set fail-fast\nset fail-fast off\nGET /missing\nGET /after\n");
+    file("set {\"fail-fast\":true}\nset {\"fail-fast\":false}\nGET /missing\nGET /after\n");
     let got = run_in(&server, d, &["-sa", "s.api"]);
     assert_eq!((got.code, got.sent.len()), (Some(0), 2), "{}", got.stderr);
 
     // timeout: a request under the line is given up on after that long.
-    file("set timeout 1\nGET /stall\nGET /never\n");
+    file("set {\"timeout\":1}\nGET /stall\nGET /never\n");
     let got = run_in(&server, d, &["-sa", "s.api"]);
     assert_eq!((got.code, &got.sent[..]), (Some(1), &["GET /stall".to_string()][..]), "{}", got.stderr);
     assert!(got.stderr.contains("Timed out after 1s"), "{}", got.stderr);
     // `--timeout` is the run's, and the line says that it was passed over.
-    file("set timeout 600\nGET /stall\nGET /never\n");
+    file("set {\"timeout\":600}\nGET /stall\nGET /never\n");
     let got = run_in(&server, d, &["--timeout", "1", "-sa", "s.api"]);
     assert_eq!(got.code, Some(1), "{}", got.stderr);
     assert!(got.stderr.contains("Timed out after 1s"), "{}", got.stderr);
-    assert!(got.stdout.contains("set timeout 600\n↳ ignored: --timeout 1 is set"), "{}", got.stdout);
+    assert!(got.stdout.contains("set {\"timeout\":600}\n↳ ignored: --timeout 1 is set"), "{}", got.stdout);
 
     // The preview lists every line and counts none of them.
-    file("set include-nulls on\nset timeout off\nset export a.b.c\nGET /a\n");
+    file("set {\"include-nulls\":true}\nset {\"timeout\":null}\nset {\"export\":\"a.b.c\"}\nGET /a\n");
     let mut cmd = api(server.port, d);
     cmd.args(["-spa", "s.api"]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
     unsafe {
@@ -11083,7 +11108,7 @@ fn every_setting_does_what_its_option_does() {
     let out = child.wait_with_output().expect("api runs");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("Preview — 1 request | GET"), "{stderr}");
-    assert!(stderr.contains("  set include-nulls\n  set timeout off\n  set export a.b.c\n  GET /a\n"), "{stderr}");
+    assert!(stderr.contains("  set {\"include-nulls\":true}\n  set {\"timeout\":null}\n  set {\"export\":\"a.b.c\"}\n  GET /a\n"), "{stderr}");
     assert_eq!(server.take(), Vec::<String>::new());
 }
 
@@ -11677,9 +11702,11 @@ fn a_command_line_that_cannot_be_run_sends_nothing() {
         (&["PUT /x [{\"a\":1}"], "unclosed body"),
         (&["--describe", "one.api", "--assert", "one.api"], "--describe and --assert each print a document of their own: use one"),
         (&["--imports", "one.api", "--describe", "one.api", "--assert", "one.api"], "--describe, --assert and --imports each print a document of their own: use one"),
-        (&["set", "export", "com.heads.seedID"], "`set` alone sends nothing"),
-        (&["set", "include-nulls"], "`set` alone sends nothing"),
-        (&["set include-nulls off"], "`set` alone sends nothing"),
+        (&["set", "{\"export\":\"com.heads.seedID\"}"], "`set` alone sends nothing"),
+        (&["set", "{\"include-nulls\":true}"], "`set` alone sends nothing"),
+        (&["set {\n  \"raw\": true,\n  \"ndjson\": true\n}"], "`set` alone sends nothing"),
+        (&["set", "include-nulls"], "a `set` line takes a JSON object: write `set { \"include-nulls\": true }`"),
+        (&["set {\"include-nulls\":false}"], "`set` alone sends nothing"),
         (&["DELETE"], "DELETE needs a URI"),
         // A URI from a variable that is not set: the body is not the URI.
         (&["PUT", "", "{\"a\":1}"], "PUT needs a URI"),
@@ -11828,7 +11855,7 @@ fn the_closing_line_of_an_export_is_said_once_wherever_the_batch_ends() {
         ("GET /conflict\nGET /never", &["-sfa", "e.api"], None, 1, 3),
     ];
     for (ending, args, stdin, code, sent) in endings {
-        std::fs::write(d.join("e.api"), format!("set export a.b.c\nGET /keyed > k1.json\nGET /keyed > k2.json\n{ending}\n")).unwrap();
+        std::fs::write(d.join("e.api"), format!("set {{\"export\":\"a.b.c\"}}\nGET /keyed > k1.json\nGET /keyed > k2.json\n{ending}\n")).unwrap();
         let got = ask(&server, d, args, stdin);
         let what = format!("{ending:?} {args:?}:\n{}", got.stderr);
         assert_eq!((got.code, got.sent.len()), (Some(code), sent), "{what}");
@@ -11866,21 +11893,21 @@ fn a_set_line_reaches_no_other_file_whichever_way_that_file_is_brought_in() {
     let exported = |name: &str| exported_under(d, name);
     let all = |sent: &[&str]| sent.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
-    // An included file's `set fail-fast` does not stop the file that
+    // An included file's `set {"fail-fast":true}` does not stop the file that
     // included it, though it stops its own.
-    file("inc.api", "set fail-fast\nGET /in-inc\n");
+    file("inc.api", "set {\"fail-fast\":true}\nGET /in-inc\n");
     file("s.api", "inc.api\nGET /missing\nGET /after\n");
     let got = run_in(&server, d, &["-sa", "s.api"]);
     assert_eq!((got.code, got.sent), (Some(0), all(&["GET /in-inc", "GET /missing", "GET /after"])), "{}", got.stderr);
-    file("inc.api", "set fail-fast\nGET /missing\nGET /never\n");
+    file("inc.api", "set {\"fail-fast\":true}\nGET /missing\nGET /never\n");
     let got = run_in(&server, d, &["-sa", "s.api"]);
     assert_eq!((got.code, got.sent), (Some(1), all(&["GET /missing"])), "{}", got.stderr);
 
     // A glob: the first file's line is not the second's, the including
     // file's is neither's, and it is back when the glob is done.
-    file("parts/a.api", "set export a.b.c\nGET /keyed > a.json\n");
+    file("parts/a.api", "set {\"export\":\"a.b.c\"}\nGET /keyed > a.json\n");
     file("parts/b.api", "GET /keyed > b.json\n");
-    file("s.api", "set include-nulls\nparts/*.api\nGET /keyed > main.json\n");
+    file("s.api", "set {\"include-nulls\":true}\nparts/*.api\nGET /keyed > main.json\n");
     let got = run_in(&server, d, &["-sa", "s.api"]);
     assert_eq!((got.code, got.sent.len()), (Some(0), 3), "{}", got.stderr);
     assert_eq!(accepts_of(&server), ["application/json", "application/json", "application/json;skipNulls=false"]);
@@ -11888,27 +11915,113 @@ fn a_set_line_reaches_no_other_file_whichever_way_that_file_is_brought_in() {
 
     // A file of an import has lines of its own, which hold in it and end
     // with it.
-    file("lib/s.api", "set export x.y.z\nset fail-fast\nGET /keyed > imp.json\n");
+    file("lib/s.api", "set {\"export\":\"x.y.z\"}\nset {\"fail-fast\":true}\nGET /keyed > imp.json\n");
     file("s.api", "import dir cl { \"path\": \"lib\" }\ncl/s.api\nGET /keyed > after.json\nGET /missing\nGET /after\n");
     let got = run_in(&server, d, &["-sa", "s.api"]);
     assert_eq!((got.code, got.sent.len()), (Some(0), 4), "{}", got.stderr);
     assert_eq!((exported("imp.json"), exported("after.json")), (Some("x.y.z".to_string()), None));
-    file("lib/s.api", "set fail-fast\nGET /missing\nGET /never\n");
+    file("lib/s.api", "set {\"fail-fast\":true}\nGET /missing\nGET /never\n");
     let got = run_in(&server, d, &["-sa", "s.api"]);
     assert_eq!((got.code, got.sent), (Some(1), all(&["GET /missing"])), "{}", got.stderr);
 
     // The preview lists an included file's own line where it stands, and
     // nothing for the settings put aside around it.
-    file("inc.api", "set raw\nGET /in-inc\n");
-    file("s.api", "set include-nulls\ninc.api\nGET /after\n");
+    file("inc.api", "set {\"raw\":true}\nGET /in-inc\n");
+    file("s.api", "set {\"include-nulls\":true}\ninc.api\nGET /after\n");
     let got = ask(&server, d, &["-spa", "s.api"], Some("n\n"));
     assert_eq!((got.code, got.sent.len()), (Some(0), 0), "{}", got.stderr);
     let listed: Vec<&str> = got.stderr.lines().map(str::trim).filter(|line| line.starts_with("set ") || line.starts_with("GET ")).collect();
-    assert_eq!(listed, ["set include-nulls", "set raw", "GET /in-inc", "GET /after"], "{}", got.stderr);
+    assert_eq!(listed, ["set {\"include-nulls\":true}", "set {\"raw\":true}", "GET /in-inc", "GET /after"], "{}", got.stderr);
     assert!(got.stderr.contains("Preview — 2 requests"), "{}", got.stderr);
 }
 
-/// `set fail-fast` is `-f` for the lines under it in everything `-f` does:
+/// One `set` line may change several settings, and one it does not name is
+/// left as it is. The object may come from an `@file`, read as an import's
+/// is: from the working directory, and in an imported file from that
+/// import and nowhere else.
+#[test]
+fn a_set_line_takes_several_settings_and_reads_them_from_a_file() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let file = |name: &str, text: &str| {
+        std::fs::create_dir_all(d.join(name).parent().unwrap()).unwrap();
+        std::fs::write(d.join(name), text).unwrap();
+    };
+    let exported = |name: &str| exported_under(d, name);
+    const NULLS: &str = "application/json;skipNulls=false";
+
+    // Several on one line, over several lines, with comments. The line
+    // under it turns one of them off and leaves the other on.
+    file(
+        "s.api",
+        "GET /keyed > before.json\nset {\n  \"export\": \"a.b.c\",  // as seed data\n  \"include-nulls\": true\n}  # both\nGET /keyed > both.json\nset { \"export\": null }\nGET /keyed > nulls.json\n",
+    );
+    let got = run_in(&server, d, &["-sa", "s.api"]);
+    assert_eq!((got.code, got.sent.len()), (Some(0), 3), "{}", got.stderr);
+    assert_eq!(accepts_of(&server), ["application/json", NULLS, NULLS]);
+    assert_eq!((exported("before.json"), exported("both.json"), exported("nulls.json")), (None, Some("a.b.c".to_string()), None));
+    // The log has the line on one line, as it has a body.
+    assert!(got.stdout.contains("\nset {\"export\":\"a.b.c\",\"include-nulls\":true}\nGET /keyed > both.json"), "{}", got.stdout);
+    assert!(got.stdout.contains("\nset {\"export\":null}\n"), "{}", got.stdout);
+
+    // From a file, which may hold comments as a body in a `.api` file may.
+    file("settings.json", "{\n  // what a pull needs\n  \"export\": \"f.i.le\",\n  \"include-nulls\": true\n}\n");
+    file("s.api", "set @settings.json  # the team's\nGET /keyed > file.json\n");
+    let got = run_in(&server, d, &["-sa", "s.api"]);
+    assert_eq!((got.code, got.sent.len()), (Some(0), 1), "{}", got.stderr);
+    assert_eq!((accepts_of(&server), exported("file.json")), (vec![NULLS.to_string()], Some("f.i.le".to_string())));
+    // The file is named in the log and the preview, not what it holds.
+    assert!(got.stdout.contains("\nset @settings.json\nGET /keyed > file.json"), "{}", got.stdout);
+    let asked = ask(&server, d, &["-spa", "s.api"], Some("n\n"));
+    assert!(asked.stderr.contains("  set @settings.json\n  GET /keyed > file.json\n"), "{}", asked.stderr);
+
+    // Under an option each setting that is kept from what it says gets a
+    // note of its own, and the ones that are not get none.
+    file("s.api", "set {\"include-nulls\":false,\"fail-fast\":true,\"raw\":false}\nGET /missing\nGET /never\n");
+    let got = run_in(&server, d, &["-i", "-r", "-sa", "s.api"]);
+    assert_eq!((got.code, got.sent.len()), (Some(1), 1), "{}", got.stderr);
+    assert!(
+        got.stdout.contains("set {\"include-nulls\":false,\"fail-fast\":true,\"raw\":false}\n↳ ignored: -i is set\n↳ ignored: -r is set\nGET /missing"),
+        "{}",
+        got.stdout
+    );
+
+    // A file that can't be used stops the batch before anything is sent.
+    for (settings, says) in [
+        ("{\"nulls\":true}", "unknown setting `nulls`"),
+        ("[\"raw\"]", "set: expected a JSON object of settings"),
+        ("{\"raw\":true,}", "set: invalid JSON in settings.json: trailing comma"),
+    ] {
+        file("settings.json", settings);
+        file("s.api", "GET /first\nset @settings.json\nGET /never\n");
+        let got = run_in(&server, d, &["-sa", "s.api"]);
+        assert_eq!((got.code, got.sent.len()), (Some(1), 0), "{settings}: {}", got.stderr);
+        assert!(got.stderr.contains(says), "{settings}: {}", got.stderr);
+    }
+    file("s.api", "GET /first\nset @none.json\nGET /never\n");
+    let got = run_in(&server, d, &["-sa", "s.api"]);
+    assert_eq!((got.code, got.sent.len()), (Some(1), 0), "{}", got.stderr);
+    assert!(got.stderr.contains("none.json"), "{}", got.stderr);
+
+    // In an imported file the `@file` is one of that import, named from
+    // the file itself, and the settings are that file's own.
+    file("lib/own.json", "{ \"export\": \"x.y.z\" }");
+    file("lib/s.api", "set @own.json\nGET /keyed > imp.json\n");
+    file("s.api", "import dir cl { \"path\": \"lib\" }\ncl/s.api\nGET /keyed > after.json\n");
+    let got = run_in(&server, d, &["-sa", "s.api"]);
+    assert_eq!((got.code, got.sent.len()), (Some(0), 2), "{}", got.stderr);
+    assert_eq!((exported("imp.json"), exported("after.json")), (Some("x.y.z".to_string()), None));
+    assert!(got.stdout.contains("\nset @own.json\n"), "{}", got.stdout);
+    // One outside the import is refused, there or not.
+    file("settings.json", "{ \"export\": \"f.i.le\" }");
+    file("lib/s.api", "set @../settings.json\nGET /keyed > imp.json\n");
+    let got = run_in(&server, d, &["-sa", "s.api"]);
+    assert_eq!((got.code, got.sent.len()), (Some(1), 0), "{}", got.stderr);
+    assert!(got.stderr.contains("`@../settings.json` must be a relative path inside the import"), "{}", got.stderr);
+}
+
+/// `set {"fail-fast":true}` is `-f` for the lines under it in everything `-f` does:
 /// a check that could not be judged ends the run with its body, an error is
 /// kept out of an outfile, and a question may still be answered "no".
 #[test]
@@ -11925,7 +12038,7 @@ fn set_fail_fast_does_all_that_the_option_does() {
 
     // An `assert` and a poll that got no answer to judge: the body is last.
     for check in ["assert GET /barred", "sleep 1 while GET /barred"] {
-        let got = run(&format!("set fail-fast\n{check}\nGET /never\n"), &["-sa", "s.api"]);
+        let got = run(&format!("set {{\"fail-fast\":true}}\n{check}\nGET /never\n"), &["-sa", "s.api"]);
         assert_eq!((got.code, got.sent), (Some(1), all(&["GET /barred"])), "{check}: {}", got.stderr);
         assert!(got.stdout.trim_end().ends_with(BARRED), "{check}: {}", got.stdout);
         // Without the line there is no body.
@@ -11935,38 +12048,38 @@ fn set_fail_fast_does_all_that_the_option_does() {
     }
 
     // An error is not written to the outfile, and goes to stdout.
-    let got = run("set fail-fast\nGET /gone > g.json\nGET /never\n", &["-sa", "s.api"]);
+    let got = run("set {\"fail-fast\":true}\nGET /gone > g.json\nGET /never\n", &["-sa", "s.api"]);
     assert_eq!((got.code, got.sent), (Some(1), all(&["GET /gone"])), "{}", got.stderr);
     assert!(!d.join("g.json").exists());
     assert!(got.stdout.trim_end().ends_with(GONE.trim_end()), "{}", got.stdout);
     // Above the line it is written, as without `-f`.
-    let got = run("GET /gone > g.json\nset fail-fast\nGET /after\n", &["-sa", "s.api"]);
+    let got = run("GET /gone > g.json\nset {\"fail-fast\":true}\nGET /after\n", &["-sa", "s.api"]);
     assert_eq!((got.code, got.sent.len()), (Some(0), 2), "{}", got.stderr);
     assert_eq!(std::fs::read_to_string(d.join("g.json")).unwrap().trim_end(), GONE_INDENTED);
 
     // A "no" that was asked for passes; the last request of a chain is a
     // plain request and does not.
-    let got = run("set fail-fast\nGET /missing || GET /a\nassert not GET /missing\nGET /b\n", &["-sa", "s.api"]);
+    let got = run("set {\"fail-fast\":true}\nGET /missing || GET /a\nassert not GET /missing\nGET /b\n", &["-sa", "s.api"]);
     assert_eq!((got.code, got.sent.len()), (Some(0), 4), "{}", got.stderr);
-    let got = run("set fail-fast\nGET /missing || GET /conflict\nGET /never\n", &["-sa", "s.api"]);
+    let got = run("set {\"fail-fast\":true}\nGET /missing || GET /conflict\nGET /never\n", &["-sa", "s.api"]);
     assert_eq!((got.code, got.sent), (Some(1), all(&["GET /missing", "GET /conflict"])), "{}", got.stderr);
 
     // An outfile that can't be written ends the run under the line.
-    let got = run("set fail-fast\nGET /a > no/such/dir/a.json\nGET /never\n", &["-sa", "s.api"]);
+    let got = run("set {\"fail-fast\":true}\nGET /a > no/such/dir/a.json\nGET /never\n", &["-sa", "s.api"]);
     assert_eq!((got.code, got.sent), (Some(1), all(&["GET /a"])), "{}", got.stderr);
     assert!(got.stderr.contains("Error writing to no/such/dir/a.json"), "{}", got.stderr);
 
     // The options hold over a line that says `off`, and the log says so.
-    let got = run("set fail-fast off\nGET /missing\nGET /never\n", &["-sfa", "s.api"]);
+    let got = run("set {\"fail-fast\":false}\nGET /missing\nGET /never\n", &["-sfa", "s.api"]);
     assert_eq!((got.code, got.sent), (Some(1), all(&["GET /missing"])), "{}", got.stderr);
-    assert!(got.stdout.contains("set fail-fast off\n↳ ignored: -f is set"), "{}", got.stdout);
-    let got = run("set raw off\nGET /a > r.json\n", &["-r", "-sa", "s.api"]);
+    assert!(got.stdout.contains("set {\"fail-fast\":false}\n↳ ignored: -f is set"), "{}", got.stdout);
+    let got = run("set {\"raw\":false}\nGET /a > r.json\n", &["-r", "-sa", "s.api"]);
     assert_eq!(got.code, Some(0), "{}", got.stderr);
-    assert!(got.stdout.contains("set raw off\n↳ ignored: -r is set"), "{}", got.stdout);
+    assert!(got.stdout.contains("set {\"raw\":false}\n↳ ignored: -r is set"), "{}", got.stdout);
     assert_eq!(std::fs::read_to_string(d.join("r.json")).unwrap().trim_end(), r#"{"ok":"/api/v1/a"}"#);
 }
 
-/// What `set raw`, `set ndjson`, `set include-nulls` and `set stream` do to
+/// What `set {"raw":true}`, `set {"ndjson":true}`, `set {"include-nulls":true}` and `set {"stream":true}` do to
 /// a request and to what is printed, alone and together.
 #[test]
 fn set_lines_change_what_is_sent_asked_for_and_printed() {
@@ -11983,30 +12096,30 @@ fn set_lines_change_what_is_sent_asked_for_and_printed() {
 
     // raw: an export is laid out on stdout, and on one line under the line.
     // (A body that is not rewritten goes to a pipe as it came either way.)
-    let got = run("set export a.b.c\nGET /keyed\nset raw\nGET /keyed\nset raw off\nGET /keyed\n", &["-a", "s.api"]);
+    let got = run("set {\"export\":\"a.b.c\"}\nGET /keyed\nset {\"raw\":true}\nGET /keyed\nset {\"raw\":false}\nGET /keyed\n", &["-a", "s.api"]);
     assert_eq!(got.code, Some(0), "{}", got.stderr);
     const LAID_OUT: &str = "{\n  \"identifiers\": {\n    \"key?\": \"k1\",\n    \"a.b.c\": \"k1\"\n  },\n  \"name\": \"Ann\"\n}";
     assert_eq!(got.stdout.matches(LAID_OUT).count(), 2, "{}", got.stdout);
     assert_eq!(got.stdout.matches(r#"{"identifiers":{"key?":"k1","a.b.c":"k1"},"name":"Ann"}"#).count(), 1, "{}", got.stdout);
 
     // ndjson: sent as NDJSON and asked for, until `off`.
-    let got = run("set ndjson\nPUT /x {\"a\":1}\nset ndjson off\nPUT /y {\"a\":1}\n", &["-sa", "s.api"]);
+    let got = run("set {\"ndjson\":true}\nPUT /x {\"a\":1}\nset {\"ndjson\":false}\nPUT /y {\"a\":1}\n", &["-sa", "s.api"]);
     assert_eq!((got.code, got.sent.len()), (Some(0), 2), "{}", got.stderr);
     assert_eq!(content_types(&server), ["application/x-ndjson", "application/json"]);
     assert_eq!(accepts_of(&server), ["application/x-ndjson", "application/json"]);
 
     // What a file has set is put together in one `Accept`, with the format
     // of the outfile.
-    let got = run("set include-nulls\nset stream\nGET /a > x.csv\nGET /b > x.json\nset stream off\nGET /c > y.csv\n", &["-sa", "s.api"]);
+    let got = run("set {\"include-nulls\":true}\nset {\"stream\":true}\nGET /a > x.csv\nGET /b > x.json\nset {\"stream\":false}\nGET /c > y.csv\n", &["-sa", "s.api"]);
     assert_eq!((got.code, got.sent.len()), (Some(0), 3), "{}", got.stderr);
     assert_eq!(
         accepts_of(&server),
         ["text/csv;stream=true;skipNulls=false", "application/json;stream=true;skipNulls=false", "text/csv;skipNulls=false"]
     );
 
-    // `set export` under `set stream`: the whole body is needed, so the
+    // `set export` under `set {"stream":true}`: the whole body is needed, so the
     // request is not streamed, and is again once export is off.
-    let got = run("set stream\nGET /keyed > s1.json\nset export a.b.c\nGET /keyed > s2.json\nset export off\nGET /keyed > s3.json\n", &["-sa", "s.api"]);
+    let got = run("set {\"stream\":true}\nGET /keyed > s1.json\nset {\"export\":\"a.b.c\"}\nGET /keyed > s2.json\nset {\"export\":null}\nGET /keyed > s3.json\n", &["-sa", "s.api"]);
     assert_eq!((got.code, got.sent.len()), (Some(0), 3), "{}", got.stderr);
     assert_eq!(accepts_of(&server), ["application/json;stream=true", "application/json", "application/json;stream=true"]);
     assert_eq!((exported_under(d, "s1.json"), exported_under(d, "s2.json"), exported_under(d, "s3.json")), (None, Some("a.b.c".to_string()), None));
@@ -12015,7 +12128,7 @@ fn set_lines_change_what_is_sent_asked_for_and_printed() {
     assert!(std::fs::read_to_string(d.join("s2.json")).unwrap().contains("\n  "));
 
     // `--no-streaming` keeps the line off: the file is written buffered.
-    let got = run("set stream\nGET /keyed > n.json\n", &["--no-streaming", "-sa", "s.api"]);
+    let got = run("set {\"stream\":true}\nGET /keyed > n.json\n", &["--no-streaming", "-sa", "s.api"]);
     assert_eq!(accepts_of(&server), ["application/json"], "{}", got.stderr);
     assert!(std::fs::read_to_string(d.join("n.json")).unwrap().contains("\n  "));
     assert!(got.stdout.contains("↳ ignored: --no-streaming is set"), "{}", got.stdout);
@@ -12029,12 +12142,12 @@ fn assert_lists_a_file_with_set_lines_and_refuses_one_that_would_not_run() {
     let server = RecordingServer::start();
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
-    std::fs::write(d.join("a.api"), "set fail-fast\nPUT /assert {\"api/v1/x\":{\"is\":1}}\nset fail-fast off\nPUT v1/assert {\"api/v1/y\":{\"is not\":null}}\n").unwrap();
+    std::fs::write(d.join("a.api"), "set {\"fail-fast\":true}\nPUT /assert {\"api/v1/x\":{\"is\":1}}\nset {\"fail-fast\":false}\nPUT v1/assert {\"api/v1/y\":{\"is not\":null}}\n").unwrap();
     let got = run_in(&server, d, &["-r", "--assert", "a.api"]);
     assert_eq!((got.code, got.sent.len()), (Some(0), 0), "{}", got.stderr);
     assert_eq!(got.stdout.trim_end(), r#"[{"api/v1/x":{"is":1}},{"api/v1/y":{"is not":null}}]"#);
 
-    std::fs::write(d.join("a.api"), "set nulls\nPUT /assert {\"api/v1/x\":{\"is\":1}}\n").unwrap();
+    std::fs::write(d.join("a.api"), "set {\"nulls\":true}\nPUT /assert {\"api/v1/x\":{\"is\":1}}\n").unwrap();
     for option in ["--assert", "--imports"] {
         let got = run_in(&server, d, &[option, "a.api"]);
         assert_eq!((got.code, got.sent.len(), got.stdout.as_str()), (Some(1), 0, ""), "{option}: {}", got.stderr);
@@ -12291,7 +12404,7 @@ fn the_settings_menu_takes_a_resize_a_paste_and_an_unanswered_dialog() {
     assert!(!rows.iter().any(|row| row.contains("Timeout in seconds")), "{}", rows.join("\n"));
 }
 
-/// `set stream` typed at the prompt is the menu's first row: on a server
+/// `set {"stream":true}` typed at the prompt is the menu's first row: on a server
 /// that streams it turns streaming on and marks it, `off` turns it off, and
 /// while export is on a `> file` is not streamed, whatever the line said. On
 /// a server that does not stream it is refused.
@@ -12312,7 +12425,7 @@ fn set_stream_typed_at_the_prompt_is_the_menus_first_row() {
     prompt.pump(Duration::from_millis(600));
     assert!(!last_row(&prompt).ends_with("streaming"), "{}", last_row(&prompt));
 
-    let (sent, shown) = run_pasted(&mut prompt, &server, "set stream");
+    let (sent, shown) = run_pasted(&mut prompt, &server, "set {\"stream\":true}");
     assert!(sent.is_empty() && shown.contains("streamed bodies may encode errors"), "{shown}");
     assert!(last_row(&prompt).ends_with(" streaming"), "{}", last_row(&prompt));
     let (_, _, accepts) = run_pasted_accepts(&mut prompt, &server, "GET /keyed > streamed.json");
@@ -12321,15 +12434,15 @@ fn set_stream_typed_at_the_prompt_is_the_menus_first_row() {
 
     // Export needs the whole body: its marker takes the place of the other,
     // and the file holds seed data.
-    run_pasted(&mut prompt, &server, "set export a.b.c");
+    run_pasted(&mut prompt, &server, "set {\"export\":\"a.b.c\"}");
     assert!(last_row(&prompt).ends_with(" export"), "{}", last_row(&prompt));
     let (_, _, accepts) = run_pasted_accepts(&mut prompt, &server, "GET /keyed > exported.json");
     assert_eq!(accepts, ["application/json"]);
     assert_eq!(exported_under(d, "exported.json"), Some("a.b.c".to_string()));
-    run_pasted(&mut prompt, &server, "set export off");
+    run_pasted(&mut prompt, &server, "set {\"export\":null}");
     assert!(last_row(&prompt).ends_with(" streaming"), "{}", last_row(&prompt));
 
-    let (_, shown) = run_pasted(&mut prompt, &server, "set stream off");
+    let (_, shown) = run_pasted(&mut prompt, &server, "set {\"stream\":false}");
     assert!(shown.contains("streaming off"), "{shown}");
     prompt.pump(Duration::from_millis(300));
     assert!(!last_row(&prompt).ends_with("streaming"), "{}", last_row(&prompt));
@@ -12341,7 +12454,7 @@ fn set_stream_typed_at_the_prompt_is_the_menus_first_row() {
     let mut prompt = pty::Prompt::open_sized(api(server.port, d), COLS as u16);
     prompt.wait_ready(Duration::from_secs(15));
     prompt.pump(Duration::from_millis(600));
-    let (sent, shown) = run_pasted(&mut prompt, &server, "set stream");
+    let (sent, shown) = run_pasted(&mut prompt, &server, "set {\"stream\":true}");
     assert!(sent.is_empty() && shown.contains("streaming not available on this server"), "{shown}");
     let (_, _, accepts) = run_pasted_accepts(&mut prompt, &server, "GET /keyed > plain.json");
     assert_eq!(accepts, ["application/json"]);
@@ -12402,10 +12515,10 @@ fn a_file_at_the_prompt_neither_overrides_the_session_nor_leaves_its_settings_be
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
     let url = format!("http://127.0.0.1:{}", server.port);
-    std::fs::write(d.join("own.api"), "set timeout 5\nset fail-fast off\nset stream off\nset raw off\nset ndjson off\nGET /a > a.json\n").unwrap();
-    std::fs::write(d.join("declined.api"), "set include-nulls\nGET /first\nconfirm Go on?\nGET /never\n").unwrap();
-    std::fs::write(d.join("slept.api"), "set include-nulls\nGET /first\nsleep 30\nGET /never\n").unwrap();
-    std::fs::write(d.join("tripped.api"), "set include-nulls\nset fail-fast\nGET /missing\nGET /never\n").unwrap();
+    std::fs::write(d.join("own.api"), "set {\"timeout\":5}\nset {\"fail-fast\":false}\nset {\"stream\":false}\nset {\"raw\":false}\nset {\"ndjson\":false}\nGET /a > a.json\n").unwrap();
+    std::fs::write(d.join("declined.api"), "set {\"include-nulls\":true}\nGET /first\nconfirm Go on?\nGET /never\n").unwrap();
+    std::fs::write(d.join("slept.api"), "set {\"include-nulls\":true}\nGET /first\nsleep 30\nGET /never\n").unwrap();
+    std::fs::write(d.join("tripped.api"), "set {\"include-nulls\":true}\nset {\"fail-fast\":true}\nGET /missing\nGET /never\n").unwrap();
 
     // Every setting the session has on is named under the line it overrides.
     let mut cmd = api_bare(d);
@@ -12415,14 +12528,14 @@ fn a_file_at_the_prompt_neither_overrides_the_session_nor_leaves_its_settings_be
     prompt.pump(Duration::from_millis(600));
     let (sent, shown, accepts) = run_pasted_accepts(&mut prompt, &server, "own.api");
     assert_eq!(sent, ["GET /a"], "{shown}");
-    for held in ["set timeout 45", "set fail-fast", "set stream", "set raw", "set ndjson"] {
+    for held in ["set {\"timeout\":45}", "set {\"fail-fast\":true}", "set {\"stream\":true}", "set {\"raw\":true}", "set {\"ndjson\":true}"] {
         assert!(shown.contains(&format!("↳ ignored: the session has {held}")), "{held}: {shown}");
     }
     assert_eq!(shown.matches("↳ ignored").count(), 5, "{shown}");
     assert_eq!(accepts, ["application/x-ndjson;stream=true"]);
     drop(prompt);
 
-    // A file that stops: its `set include-nulls` is not the session's.
+    // A file that stops: its `set {"include-nulls":true}` is not the session's.
     let mut prompt = pty::Prompt::open(api(server.port, d));
     prompt.wait_ready(Duration::from_secs(15));
     prompt.pump(Duration::from_millis(600));

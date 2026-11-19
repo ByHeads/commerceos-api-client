@@ -779,7 +779,7 @@ struct Config {
     fail_fast: bool,
     /// `-m`: print the describe block of the file being run before it runs.
     describe_first: bool,
-    /// Export mode, from `--export <name>`, a `set export <name>` line or the
+    /// Export mode, from `--export <name>`, the `"export"` of a `set` line or the
     /// prompt: responses are rewritten as seed data, with `name` as the
     /// external identifier a lone database key is kept under, beside `key?`.
     /// `None` is off. See `export_value`.
@@ -5283,12 +5283,10 @@ fn main() {
     // exits 1 and a chain chains. Includes resolve against the working
     // directory.
     if let Some(line) = program_line {
-        // `api set include-nulls` would change a setting and send nothing.
-        // A line that is no setting is said to be none, further down.
-        let (first_word, rest) = split_first_word(line.trim());
-        let alone = line.lines().filter(|l| !l.trim().is_empty()).count() == 1
-            && first_word.eq_ignore_ascii_case("set")
-            && parse_set_line(without_trailing_comment(rest)).is_ok();
+        // `api 'set {"raw":true}'` would change a setting and send nothing.
+        // A line that is no setting is said to be none, further down, and
+        // so is one with a request under it, which is no object alone.
+        let alone = set_line_alone(&line);
         if alone {
             errln!("error: `set` alone sends nothing. Give the setting as an option with a request (`-i`, `--export <name>`), or put the line in a .api file.");
             exit_process(1);
@@ -6998,22 +6996,22 @@ fn is_os_junk(path: &std::path::Path) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// `set <name> [value]`: what a file, a line at the prompt and the command
-// line can each set
+// `set { … }` / `set @file.json`: what a file, a line at the prompt and the
+// command line can each set
 // ---------------------------------------------------------------------------
 
 /// One setting with the value a `set` line gives it. A setting is named as
-/// its long option is: `--include-nulls` is `set include-nulls`.
+/// its long option is: `--include-nulls` is `set { "include-nulls": true }`.
 #[derive(Debug, Clone, PartialEq)]
 enum Setting {
-    /// `set export <name>` / `set export off`.
+    /// `"export": "<name>"`; `null` is off.
     Export(Option<String>),
     IncludeNulls(bool),
     FailFast(bool),
     Ndjson(bool),
     Raw(bool),
     Stream(bool),
-    /// `set timeout <seconds>`; `off` is back to the default.
+    /// `"timeout": <seconds>`; `null` is back to the default.
     Timeout(Option<u64>),
 }
 
@@ -7033,27 +7031,24 @@ impl Setting {
         }
     }
 
-    /// The value as a `set` line has it: nothing for on, `off`, a name, or
-    /// seconds.
-    fn value(&self) -> Option<String> {
+    /// The value as a `set` line has it: `true` or `false`, a name, seconds,
+    /// or `null` for a name or a timeout that is off.
+    fn value(&self) -> Value {
         match self {
-            Setting::Export(name) => Some(name.clone().unwrap_or_else(|| "off".to_string())),
-            Setting::Timeout(seconds) => Some(seconds.map_or_else(|| "off".to_string(), |s| s.to_string())),
+            Setting::Export(name) => name.clone().map_or(Value::Null, Value::String),
+            Setting::Timeout(seconds) => seconds.map_or(Value::Null, Value::from),
             Setting::IncludeNulls(on)
             | Setting::FailFast(on)
             | Setting::Ndjson(on)
             | Setting::Raw(on)
-            | Setting::Stream(on) => (!on).then(|| "off".to_string()),
+            | Setting::Stream(on) => Value::Bool(*on),
         }
     }
 
-    /// The line as shown in previews and the logs: `set include-nulls`,
-    /// `set export com.heads.seedID`, `set timeout off`.
+    /// The setting as a `set` line of its own: `set {"include-nulls":true}`,
+    /// `set {"export":"com.heads.seedID"}`, `set {"timeout":null}`.
     fn line(&self) -> String {
-        match self.value() {
-            Some(value) => format!("set {} {}", self.name(), value),
-            None => format!("set {}", self.name()),
-        }
+        format!("set {{{}:{}}}", Value::from(self.name()), self.value())
     }
 
     /// Whether this is the setting left alone: off, or the default timeout.
@@ -7156,38 +7151,97 @@ impl Config {
     }
 }
 
-/// Parse what follows `set`: a setting's name and, where it takes one, its
-/// value.
-fn parse_set_line(rest: &str) -> Result<Setting, String> {
-    // A setting is a line of its own. Read as its value, a request behind a
-    // `&&` would never be sent.
+/// A `set` line: what it is shown as, and the settings it changes, in the
+/// order they are written. A setting it does not name is left as it is.
+#[derive(Debug, Clone, PartialEq)]
+struct SetLine {
+    /// `set {"include-nulls":true}`, the object on one line as a body is
+    /// shown, or `set @settings.json` as written.
+    shown: String,
+    settings: Vec<Setting>,
+}
+
+const SET_USAGE: &str = "`set { \"include-nulls\": true }` or `set @file.json`";
+
+/// Parse what follows `set`: a JSON object of settings, on the line or in an
+/// `@file`, read as an import's is. `file_dir` and `within` are the file the
+/// line stands in, when that file is itself imported.
+fn parse_set_line(
+    rest: &str,
+    file_dir: Option<&std::path::Path>,
+    within: Option<&ImportedRepo>,
+) -> Result<SetLine, String> {
+    let rest = without_trailing_comment(rest.trim()).trim();
+    // A setting is a line of its own. Read as part of its value, a request
+    // behind a `&&` would never be sent.
     if chain_parts(rest).len() > 1 {
-        return Err(format!("a `set` line can't be part of a `&&`/`||` chain: `set {}`", rest.trim()));
+        return Err(format!("a `set` line can't be part of a `&&`/`||` chain: `set {}`", rest));
     }
-    let mut words = rest.split_whitespace();
-    let Some(name) = words.next() else {
-        return Err(format!("set needs a setting: `set include-nulls` (one of {})", SETTING_NAMES.join(", ")));
+    if rest.is_empty() {
+        return Err(format!("set needs settings: {} (one of {})", SET_USAGE, SETTING_NAMES.join(", ")));
+    }
+    if !rest.starts_with(['{', '@']) {
+        return Err(match word_form_as_json(rest) {
+            Some(object) => format!("a `set` line takes a JSON object: write `set {}`", object),
+            None => format!("a `set` line takes a JSON object or an `@file`: {}", SET_USAGE),
+        });
+    }
+    let json = directive_json(rest, "a `set` line", "settings file", file_dir, within)?;
+    // A file is named in what is said of its JSON: the line does not show it.
+    let value: Value = serde_json::from_str(json.trim()).map_err(|e| match rest.strip_prefix('@') {
+        Some(file) => format!("set: invalid JSON in {}: {}", file.trim(), e),
+        None => format!("set: invalid JSON: {}", e),
+    })?;
+    let Some(object) = value.as_object() else {
+        return Err(format!("set: expected a JSON object of settings: {}", SET_USAGE));
     };
-    let value = words.next();
-    if words.next().is_some() {
-        return Err(format!("set takes a setting and one value: `set {}`", rest.trim()));
+    if object.is_empty() {
+        return Err(format!("set needs settings: {} (one of {})", SET_USAGE, SETTING_NAMES.join(", ")));
     }
-    let off = value.is_some_and(|v| v.eq_ignore_ascii_case("off"));
-    let name = name.to_ascii_lowercase();
+    let settings = object.iter().map(|(name, value)| setting_of(name, value)).collect::<Result<Vec<_>, _>>()?;
+    let shown = if rest.starts_with('@') { format!("set {}", rest) } else { format!("set {}", value) };
+    Ok(SetLine { shown, settings })
+}
+
+/// Whether `text` is one `set` line and nothing else, bar blank lines and
+/// comments: a program that changes settings and sends nothing.
+fn set_line_alone(text: &str) -> bool {
+    let mut lines = text.lines().skip_while(|line| line.trim().is_empty() || line.trim().starts_with('#'));
+    let mut line = String::new();
+    // The object may span lines: the line ends where its brackets close.
+    for part in lines.by_ref() {
+        line.push_str(part);
+        line.push('\n');
+        if strip_body_comments_and_count(&line).1 <= 0 {
+            break;
+        }
+    }
+    let (first_word, rest) = split_first_word(line.trim());
+    first_word.eq_ignore_ascii_case("set")
+        && lines.all(|line| line.trim().is_empty() || line.trim().starts_with('#'))
+        && parse_set_line(&strip_body_comments_and_count(rest).0, None, None).is_ok()
+}
+
+/// One member of a `set` object as a setting. `null` and `false` turn any
+/// setting off; for the timeout that is the default.
+fn setting_of(name: &str, value: &Value) -> Result<Setting, String> {
+    let off = matches!(value, Value::Null | Value::Bool(false));
     let switch = || match value {
-        None => Ok(true),
-        Some(v) if v.eq_ignore_ascii_case("on") => Ok(true),
-        Some(_) if off => Ok(false),
-        Some(v) => Err(format!("set {} takes `on` or `off`, not `{}`", name, v)),
+        Value::Bool(on) => Ok(*on),
+        Value::Null => Ok(false),
+        other => Err(format!("set: `{}` takes true or false, not {}", name, other)),
     };
-    Ok(match name.as_str() {
+    Ok(match name {
         "export" => match value {
-            None => {
-                return Err("set export needs a name: `set export com.heads.seedID`, or `set export off`".to_string());
+            _ if off => Setting::Export(None),
+            Value::String(id) if is_namespaced_key(id) => Setting::Export(Some(id.clone())),
+            Value::String(id) => return Err(format!("invalid export identifier: {} ({})", id, NAMESPACED_KEY_HELP)),
+            other => {
+                return Err(format!(
+                    "set: `export` takes a name, like \"com.heads.seedID\", or null for off, not {}",
+                    other
+                ));
             }
-            Some(_) if off => Setting::Export(None),
-            Some(v) if is_namespaced_key(v) => Setting::Export(Some(v.to_string())),
-            Some(v) => return Err(format!("invalid export identifier: {} ({})", v, NAMESPACED_KEY_HELP)),
         },
         "include-nulls" => Setting::IncludeNulls(switch()?),
         "fail-fast" => Setting::FailFast(switch()?),
@@ -7195,14 +7249,39 @@ fn parse_set_line(rest: &str) -> Result<Setting, String> {
         "raw" => Setting::Raw(switch()?),
         "stream" => Setting::Stream(switch()?),
         "timeout" => match value {
-            Some(_) if off => Setting::Timeout(None),
-            Some(v) if v.parse::<u64>().is_ok() => Setting::Timeout(v.parse().ok()),
-            _ => {
-                return Err("set timeout needs whole seconds: `set timeout 30` (0 is no timeout), or `set timeout off`".to_string());
+            _ if off => Setting::Timeout(None),
+            Value::Number(seconds) if seconds.as_u64().is_some() => Setting::Timeout(seconds.as_u64()),
+            other => {
+                return Err(format!(
+                    "set: `timeout` takes whole seconds (0 is no timeout), or null for the default, not {}",
+                    other
+                ));
             }
         },
         _ => return Err(format!("unknown setting `{}` (one of {})", name, SETTING_NAMES.join(", "))),
     })
+}
+
+/// What a `set` line in words (`set include-nulls`, `set export off`, as
+/// 3.4.0 read it) is as an object, for the message that refuses it.
+fn word_form_as_json(rest: &str) -> Option<String> {
+    let mut words = rest.split_whitespace();
+    let name = words.next()?.to_ascii_lowercase();
+    let value = words.next();
+    if words.next().is_some() || !SETTING_NAMES.contains(&name.as_str()) {
+        return None;
+    }
+    let value = match (name.as_str(), value) {
+        (_, Some(v)) if v.eq_ignore_ascii_case("off") && matches!(name.as_str(), "export" | "timeout") => Value::Null,
+        (_, Some(v)) if v.eq_ignore_ascii_case("off") => Value::Bool(false),
+        ("export", Some(v)) => Value::from(v),
+        ("timeout", Some(v)) => Value::from(v.parse::<u64>().ok()?),
+        ("export" | "timeout", None) => return None,
+        (_, None) => Value::Bool(true),
+        (_, Some(v)) if v.eq_ignore_ascii_case("on") => Value::Bool(true),
+        _ => return None,
+    };
+    Some(format!("{{ {}: {} }}", Value::from(name), value))
 }
 
 /// One executable step in a parsed `.api` bulk program, in file order.
@@ -7230,13 +7309,13 @@ enum BulkStep {
     /// continuing. If a message is provided, it's used as the prompt; otherwise
     /// the default "Continue?" is used.
     Confirm(Option<String>),
-    /// `set <name> [value]`: a setting for the requests that follow.
+    /// `set { … }` / `set @file.json`: settings for the requests that follow.
     Set {
         /// The line, shown in the preview and the log. None for the parser's
         /// own steps, put around an included file so that what a file sets
         /// stays that file's: nothing set on the way in, what the including
         /// file had set on the way out.
-        written: Option<Setting>,
+        written: Option<SetLine>,
         /// Everything the file has set, from this step on.
         file: Settings,
         /// A line typed at the prompt, where the session stands in the
@@ -7943,10 +8022,15 @@ fn parse_condition(condition: &str, what: &str, usage: &str) -> Result<(bool, St
 }
 
 /// Apply a `set` step of a file: what the file has set is `file` from here
-/// on. Returns the option that keeps a written line from doing what it
-/// says, when one does.
-fn apply_set_step(config: &mut Config, written: &Option<Setting>, file: &Settings) -> Option<String> {
-    let overridden = written.as_ref().and_then(|setting| config.overriding_option(setting));
+/// on. Returns the options that keep a written line from doing what it
+/// says, one for each of its settings that is kept from it, with what the
+/// run holds for that setting.
+fn apply_set_step(config: &mut Config, written: &Option<SetLine>, file: &Settings) -> Vec<(Setting, String)> {
+    let overridden = written
+        .iter()
+        .flat_map(|line| &line.settings)
+        .filter_map(|setting| Some((config.given.get(setting), config.overriding_option(setting)?)))
+        .collect();
     config.file = file.clone();
     config.apply_settings();
     overridden
@@ -8243,6 +8327,38 @@ fn split_first_word(s: &str) -> (&str, &str) {
     }
 }
 
+/// The JSON of a directive that takes it on its line or from one file
+/// (`import … { … }`, `set @settings.json`): `body` as it is, or the text of
+/// its `@file`, read like a request's and with its comments stripped.
+/// `whose` and `file_noun` name the directive in what is refused. In an
+/// imported file the `@file` is one of its own repository.
+fn directive_json(
+    body: &str,
+    whose: &str,
+    file_noun: &str,
+    file_dir: Option<&std::path::Path>,
+    within: Option<&ImportedRepo>,
+) -> Result<String, String> {
+    if !body.starts_with('@') {
+        return Ok(body.to_string());
+    }
+    let (file_body, functions) = parse_body_functions(body);
+    if !functions.is_empty() {
+        return Err(format!("{}'s `@file` takes no `~map(…)` suffix", whose));
+    }
+    let raw = file_body.trim_start_matches('@').trim();
+    if raw.is_empty() || raw.contains(['*', '?', '[']) {
+        return Err(format!("{} reads one JSON file, not `@{}`", whose, raw));
+    }
+    let path = match within {
+        Some(repo) => rebase_import_body(raw, file_dir, repo)?,
+        None => raw.to_string(),
+    };
+    let contents = resolve_at_file_body(&path)?.contents;
+    let text = String::from_utf8(contents).map_err(|_| format!("{} is not UTF-8 text: {}", file_noun, raw))?;
+    normalize_request_text(&text).map_err(|e| format!("{} {}: {}", file_noun, raw, e))
+}
+
 const IMPORT_USAGE: &str = "expected `import <git|dir|archive> <alias> { … }` or `import <git|dir|archive> <alias> @file.json`";
 
 /// Parse an assembled `import …` directive (comments stripped, brackets
@@ -8275,28 +8391,10 @@ fn parse_import_directive(
         ));
     }
 
-    let json = if body.starts_with('@') {
-        let (file_body, functions) = parse_body_functions(body);
-        if !functions.is_empty() {
-            return Err("an import's `@file` takes no `~map(…)` suffix".to_string());
-        }
-        let raw = file_body.trim_start_matches('@').trim();
-        if raw.is_empty() || raw.contains(['*', '?', '[']) {
-            return Err(format!("an import reads one JSON file, not `@{}`", raw));
-        }
-        let path = match within {
-            Some(repo) => rebase_import_body(raw, file_dir, repo)?,
-            None => raw.to_string(),
-        };
-        let contents = resolve_at_file_body(&path)?.contents;
-        let text = String::from_utf8(contents)
-            .map_err(|_| format!("import file is not UTF-8 text: {}", raw))?;
-        normalize_request_text(&text).map_err(|e| format!("import file {}: {}", raw, e))?
-    } else if body.starts_with('{') {
-        body.to_string()
-    } else {
+    if !body.starts_with(['@', '{']) {
         return Err(format!("invalid import: {}", IMPORT_USAGE));
-    };
+    }
+    let json = directive_json(body, "an import", "import file", file_dir, within)?;
 
     let value: Value = serde_json::from_str(json.trim())
         .map_err(|e| format!("import {}: invalid JSON: {}", alias, e))?;
@@ -9762,12 +9860,16 @@ fn check_describe_block(block: DescribeBlock) -> (DescribeBlock, Vec<String>) {
 
 /// Whether a line that starts something new in a `.api` file is whole as it
 /// stands: a directive or an include. Its brackets are not counted, where a
-/// request, an `import` and a describe block go on until theirs are closed.
+/// request, an `import`, a `set` and a describe block go on until theirs are
+/// closed.
 /// The batch parser and `scan_describe_block` both ask here, so that they
 /// read the lines above a describe block the same way.
 fn is_one_line_step(trimmed: &str) -> bool {
     let first_word = trimmed.split_whitespace().next().unwrap_or("");
-    !trimmed.starts_with('{') && !first_word.eq_ignore_ascii_case("import") && !starts_a_request(first_word)
+    !trimmed.starts_with('{')
+        && !first_word.eq_ignore_ascii_case("import")
+        && !first_word.eq_ignore_ascii_case("set")
+        && !starts_a_request(first_word)
 }
 
 /// The describe block of a `.api` text, checked, without running anything it
@@ -10413,6 +10515,8 @@ fn split_bulk_requests_inner(
     // Whether `current` is an `import` directive rather than a request. Its
     // JSON may span lines, so it is assembled the way a request body is.
     let mut importing = false;
+    // Whether `current` is a `set` line, whose object may span lines too.
+    let mut setting = false;
     let mut declared = std::collections::HashSet::new();
     // What the `set` lines of this text have set so far.
     let mut set = Settings::default();
@@ -10429,6 +10533,7 @@ fn split_bulk_requests_inner(
             describing = place.begin(trimmed)?;
             let first_word = trimmed.split_whitespace().next().unwrap_or("");
             importing = first_word.eq_ignore_ascii_case("import");
+            setting = first_word.eq_ignore_ascii_case("set");
             if is_one_line_step(trimmed) {
                 // A `confirm` keeps its whole line: all of it is the question.
                 let trimmed = if first_word.eq_ignore_ascii_case("confirm") {
@@ -10460,16 +10565,6 @@ fn split_bulk_requests_inner(
                 if first_word.eq_ignore_ascii_case("confirm") {
                     let rest = trimmed["confirm".len()..].trim();
                     program.steps.push(parse_confirm_step(rest)?);
-                    continue;
-                }
-                // `set <name> [value]` — a setting for the rest of this
-                // file, and for this file only.
-                if first_word.eq_ignore_ascii_case("set") {
-                    let setting = parse_set_line(trimmed["set".len()..].trim())?;
-                    if !session {
-                        set.put(&setting);
-                    }
-                    program.steps.push(BulkStep::Set { written: Some(setting), file: set.clone(), session });
                     continue;
                 }
                 // `url has`/`url is` — environment gate, collected globally.
@@ -10567,6 +10662,18 @@ fn split_bulk_requests_inner(
                 importing = false;
                 current.clear();
                 declare_import(&assembled, base_dir, within, aliases, &mut declared, program)?;
+                continue;
+            }
+            // `set { … }` — settings for the rest of this file, and for
+            // this file only.
+            if setting {
+                setting = false;
+                current.clear();
+                let line = parse_set_line(split_first_word(assembled.trim()).1, base_dir, within)?;
+                if !session {
+                    line.settings.iter().for_each(|setting| set.put(setting));
+                }
+                program.steps.push(BulkStep::Set { written: Some(line), file: set.clone(), session });
                 continue;
             }
             if chain_is_incomplete(&assembled) {
@@ -11074,7 +11181,7 @@ fn run_bulk_program(config: &mut Config, contents: &str, base_dir: Option<&std::
                 }
                 BulkStep::Assert { negate, request } => vec![format_assert(*negate, request)],
                 BulkStep::Confirm(message) => vec![format_confirm(message)],
-                BulkStep::Set { written, .. } => written.iter().map(Setting::line).collect(),
+                BulkStep::Set { written, .. } => written.iter().map(|line| line.shown.clone()).collect(),
             }))
             .collect();
         if !confirm_preview(&preview_lines, &config.base_uri) {
@@ -11126,9 +11233,9 @@ fn run_bulk_program(config: &mut Config, contents: &str, base_dir: Option<&std::
             }
             BulkStep::Set { written, file, .. } => {
                 let overridden = apply_set_step(config, written, file);
-                if let Some(setting) = written.as_ref().filter(|_| config.bulk_silent) {
-                    outln!("{}", setting.line().dimmed());
-                    if let Some(option) = overridden {
+                if let Some(line) = written.as_ref().filter(|_| config.bulk_silent) {
+                    outln!("{}", line.shown.dimmed());
+                    for (_, option) in overridden {
                         outln!("{}", format!("↳ ignored: {} is set", option).dimmed());
                     }
                 }
@@ -14735,20 +14842,19 @@ fn run_program_steps(
                 yes
             }
             // Typed here: the session's own setting, until it is changed.
-            BulkStep::Set { written: Some(setting), session: true, .. } => {
-                log_directive_line(state, stdout, setting.line().dimmed().to_string())?;
-                let said = set_for_session(state, setting);
-                show_program_status(state, stdout, said)?;
+            BulkStep::Set { written: Some(line), session: true, .. } => {
+                log_directive_line(state, stdout, line.shown.dimmed().to_string())?;
+                let said: Vec<String> = line.settings.iter().map(|setting| set_for_session(state, setting)).collect();
+                show_program_status(state, stdout, said.join(", "))?;
                 true
             }
             // A line of a file run from here: that file's, and the session's
             // own setting holds where it is on.
             BulkStep::Set { written, file, .. } => {
-                let held = written.as_ref().map(|setting| state.config.given.get(setting));
                 let overridden = apply_set_step(&mut state.config, written, file);
-                if let Some(setting) = written {
-                    log_directive_line(state, stdout, setting.line().dimmed().to_string())?;
-                    if let (Some(held), Some(option)) = (held, overridden) {
+                if let Some(line) = written {
+                    log_directive_line(state, stdout, line.shown.dimmed().to_string())?;
+                    for (held, option) in overridden {
                         // What the session has set is what holds, but for
                         // `--no-streaming`, which it was started with and
                         // which no `set` line of its own is behind.
@@ -19143,8 +19249,8 @@ struct FilePathContext {
     is_append: bool,
     /// The line itself is a path to a `.api` file to run.
     is_include: bool,
-    /// No path at all: the name of a setting on a `set` line, which is
-    /// completed and shown ahead the same way.
+    /// No path at all: the first setting of a `set` line (`{"include-nulls": `),
+    /// which is completed and shown ahead the same way.
     is_setting: bool,
 }
 
@@ -19183,13 +19289,20 @@ fn include_path_context(input: &str, seg_start: usize, seg_end: usize) -> Option
     })
 }
 
-/// The name being typed on a `set` line, from the blank behind `set` up to
-/// the end of the line. Not once a value follows it: the name is whole then.
+/// What opens a `set` line's object with the setting `name`, up to where
+/// its value goes: what Tab writes behind `set `.
+fn setting_opening(name: &str) -> String {
+    format!("{{\"{}\": ", name)
+}
+
+/// The first setting being typed on a `set` line, from the blank behind
+/// `set` up to the end of the line: `{"in` of `set {"in`, or nothing yet.
+/// Not once a value follows it: the name is whole then.
 fn setting_name_context(input: &str) -> Option<FilePathContext> {
     let behind_set = input.len() - input.trim_start().len() + "set".len();
     let rest = &input[behind_set..];
     let name = rest.trim_start();
-    if name.len() == rest.len() || name.contains(char::is_whitespace) {
+    if name.len() == rest.len() || !SETTING_NAMES.iter().any(|setting| setting_opening(setting).starts_with(name)) {
         return None;
     }
     let path_start = input.len() - name.len();
@@ -19421,9 +19534,9 @@ fn get_include_completions(partial: &str) -> Vec<String> {
 
 fn file_completions_for(ctx: &FilePathContext) -> Vec<String> {
     if ctx.is_setting {
-        // As they are listed, in lower case: what the ghost shows ahead is
-        // what is left of the name as it was typed.
-        SETTING_NAMES.iter().filter(|name| name.starts_with(&ctx.partial)).map(|name| name.to_string()).collect()
+        // As they are listed: what the ghost shows ahead is what is left
+        // of the opening as it was typed.
+        SETTING_NAMES.iter().map(|name| setting_opening(name)).filter(|opening| opening.starts_with(&ctx.partial)).collect()
     } else if ctx.is_include {
         get_include_completions(&ctx.partial)
     } else if ctx.is_outfile && !ctx.is_append {
@@ -21522,12 +21635,20 @@ mod tests {
         assert_eq!(host_of("http://localhost:5000"), "localhost:5000");
     }
 
+    /// The `set` line that changes `setting` and nothing else.
+    fn set_of(setting: &Setting) -> SetLine {
+        SetLine { shown: setting.line(), settings: vec![setting.clone()] }
+    }
+
     #[test]
     fn a_set_line_names_a_setting_as_its_long_option_does() {
-        let set = |rest: &str| parse_set_line(rest).unwrap();
-        assert_eq!(set("export com.heads.seedID"), Setting::Export(Some("com.heads.seedID".to_string())));
-        assert_eq!(set("  export   my_co.my-org.seed-id$  "), Setting::Export(Some("my_co.my-org.seed-id$".to_string())));
-        assert_eq!(set("EXPORT Off"), Setting::Export(None));
+        let set = |rest: &str| parse_set_line(rest, None, None).unwrap().settings;
+        let export = |name: &str| Setting::Export(Some(name.to_string()));
+        assert_eq!(set(r#"{"export":"com.heads.seedID"}"#), [export("com.heads.seedID")]);
+        assert_eq!(set(r#"  { "export" : "my_co.my-org.seed-id$" }  "#), [export("my_co.my-org.seed-id$")]);
+        // `null` is off, and so is `false`, for any setting.
+        assert_eq!(set(r#"{"export":null}"#), [Setting::Export(None)]);
+        assert_eq!(set(r#"{"export":false}"#), [Setting::Export(None)]);
         for (name, on, off) in [
             ("include-nulls", Setting::IncludeNulls(true), Setting::IncludeNulls(false)),
             ("fail-fast", Setting::FailFast(true), Setting::FailFast(false)),
@@ -21535,53 +21656,115 @@ mod tests {
             ("raw", Setting::Raw(true), Setting::Raw(false)),
             ("stream", Setting::Stream(true), Setting::Stream(false)),
         ] {
-            assert_eq!(set(name), on, "{name}");
-            assert_eq!(set(&format!("{name} on")), on, "{name}");
-            assert_eq!(set(&format!("{} ON", name.to_uppercase())), on, "{name}");
-            assert_eq!(set(&format!("{name} off")), off, "{name}");
+            assert_eq!(set(&format!(r#"{{"{name}":true}}"#)), [on.clone()], "{name}");
+            assert_eq!(set(&format!(r#"{{"{name}":false}}"#)), [off.clone()], "{name}");
+            assert_eq!(set(&format!(r#"{{"{name}":null}}"#)), [off.clone()], "{name}");
             assert_eq!(on.name(), name);
-            // A line is shown as the shortest way to write it.
-            assert_eq!(on.line(), format!("set {name}"));
-            assert_eq!(off.line(), format!("set {name} off"));
+            // A setting alone is shown as the line that sets it.
+            assert_eq!(on.line(), format!(r#"set {{"{name}":true}}"#));
+            assert_eq!(off.line(), format!(r#"set {{"{name}":false}}"#));
+            assert_eq!(parse_set_line(&on.line()["set".len()..], None, None).unwrap(), set_of(&on));
             assert!(off.is_off() && !on.is_off(), "{name}");
-            let said = parse_set_line(&format!("{name} yes")).unwrap_err();
-            assert_eq!(said, format!("set {name} takes `on` or `off`, not `yes`"));
+            for bad in ["\"on\"", "1", "[]", "{}"] {
+                let said = parse_set_line(&format!(r#"{{"{name}":{bad}}}"#), None, None).unwrap_err();
+                assert_eq!(said, format!("set: `{name}` takes true or false, not {bad}"));
+            }
         }
-        assert_eq!(set("timeout 30"), Setting::Timeout(Some(30)));
-        assert_eq!(set("timeout 0"), Setting::Timeout(Some(0)));
-        assert_eq!(set("timeout off"), Setting::Timeout(None));
-        assert_eq!(Setting::Timeout(Some(30)).line(), "set timeout 30");
-        assert_eq!(Setting::Timeout(None).line(), "set timeout off");
-        assert_eq!(Setting::Export(Some("a.b.c".to_string())).line(), "set export a.b.c");
-        assert_eq!(Setting::Export(None).line(), "set export off");
+        assert_eq!(set(r#"{"timeout":30}"#), [Setting::Timeout(Some(30))]);
+        assert_eq!(set(r#"{"timeout":0}"#), [Setting::Timeout(Some(0))]);
+        assert_eq!(set(r#"{"timeout":null}"#), [Setting::Timeout(None)]);
+        assert_eq!(set(r#"{"timeout":false}"#), [Setting::Timeout(None)]);
+        assert_eq!(Setting::Timeout(Some(30)).line(), r#"set {"timeout":30}"#);
+        assert_eq!(Setting::Timeout(None).line(), r#"set {"timeout":null}"#);
+        assert_eq!(export("a.b.c").line(), r#"set {"export":"a.b.c"}"#);
+        assert_eq!(Setting::Export(None).line(), r#"set {"export":null}"#);
         // Every name `set` takes is one of the list its messages give.
         for name in SETTING_NAMES {
-            let line = format!("{name} off");
-            assert_eq!(parse_set_line(&line).unwrap().name(), name);
+            assert_eq!(set(&format!(r#"{{"{name}":null}}"#))[0].name(), name);
         }
 
-        let refused = |rest: &str| parse_set_line(rest).unwrap_err();
-        assert!(refused("").starts_with("set needs a setting"), "{}", refused(""));
-        assert!(refused("export").starts_with("set export needs a name"));
-        for bad in ["export seedID", "export com.heads", "export on"] {
-            assert!(refused(bad).starts_with("invalid export identifier"), "{bad}");
+        // Several settings on one line, in the order they are written, and
+        // the line shown on one line as a body is. A comment behind the
+        // object is no part of it.
+        let line = parse_set_line("{\n  \"include-nulls\": true,\n  \"export\": \"a.b.c\"\n}  # seed data", None, None).unwrap();
+        assert_eq!(line.settings, [Setting::IncludeNulls(true), export("a.b.c")]);
+        assert_eq!(line.shown, r#"set {"include-nulls":true,"export":"a.b.c"}"#);
+
+        let refused = |rest: &str| parse_set_line(rest, None, None).unwrap_err();
+        for empty in ["", "  ", "{}", "{ }"] {
+            assert!(refused(empty).starts_with("set needs settings: `set { \"include-nulls\": true }` or `set @file.json` (one of export,"), "{empty}");
         }
-        for bad in ["timeout", "timeout soon", "timeout -1", "timeout 1.5"] {
-            assert!(refused(bad).starts_with("set timeout needs whole seconds"), "{bad}");
+        for bad in ["seedID", "com.heads", "on"] {
+            assert!(refused(&format!(r#"{{"export":"{bad}"}}"#)).starts_with("invalid export identifier"), "{bad}");
         }
-        assert_eq!(refused("include-nulls on now"), "set takes a setting and one value: `set include-nulls on now`");
-        assert!(refused("nulls").starts_with("unknown setting `nulls` (one of export, include-nulls,"));
+        for bad in ["true", "1", "[]"] {
+            assert!(refused(&format!(r#"{{"export":{bad}}}"#)).starts_with("set: `export` takes a name"), "{bad}");
+        }
+        for bad in ["true", "\"soon\"", "-1", "1.5", "\"30\""] {
+            assert!(refused(&format!(r#"{{"timeout":{bad}}}"#)).starts_with("set: `timeout` takes whole seconds"), "{bad}");
+        }
+        assert!(refused(r#"{"nulls":true}"#).starts_with("unknown setting `nulls` (one of export, include-nulls,"));
+        // A name is as its option has it: no other case.
+        assert!(refused(r#"{"Include-Nulls":true}"#).starts_with("unknown setting `Include-Nulls`"));
+        // One wrong member refuses the whole line.
+        assert!(refused(r#"{"raw":true,"nulls":true}"#).starts_with("unknown setting `nulls`"));
+        assert!(refused(r#"{"raw":true,}"#).starts_with("set: invalid JSON: "));
+        assert!(refused(r#"{"raw":true} {"ndjson":true}"#).starts_with("set: invalid JSON: "));
+        for other in ["[]", "[{\"raw\":true}]", "true", "\"raw\""] {
+            assert!(refused(other).starts_with("a `set` line takes a JSON object or an `@file`"), "{other}");
+        }
         // What picks where a request goes is not a setting.
         for never in ["base-uri", "key", "token", "connection", "no-keychain", "me", "silent", "preview"] {
-            assert!(refused(never).starts_with("unknown setting"), "{never}");
+            assert!(refused(&format!(r#"{{"{never}":true}}"#)).starts_with("unknown setting"), "{never}");
         }
+
+        // The line in words, as 3.4.0 read it, is refused with the object
+        // to write in its place.
+        for (words, object) in [
+            ("include-nulls", r#"{ "include-nulls": true }"#),
+            ("fail-fast on", r#"{ "fail-fast": true }"#),
+            ("RAW Off", r#"{ "raw": false }"#),
+            ("export com.heads.seedID", r#"{ "export": "com.heads.seedID" }"#),
+            ("export off", r#"{ "export": null }"#),
+            ("timeout 30", r#"{ "timeout": 30 }"#),
+            ("timeout off", r#"{ "timeout": null }"#),
+        ] {
+            assert_eq!(refused(words), format!("a `set` line takes a JSON object: write `set {object}`"), "{words}");
+        }
+        for words in ["nulls", "export", "timeout soon", "include-nulls on now", "raw yes"] {
+            let said = refused(words);
+            assert_eq!(said, "a `set` line takes a JSON object or an `@file`: `set { \"include-nulls\": true }` or `set @file.json`", "{words}");
+        }
+    }
+
+    #[test]
+    fn a_set_line_reads_its_settings_from_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let at = |name: &str| dir.path().join(name).display().to_string();
+        fs::write(at("settings.json"), "{\n  // seed data\n  \"export\": \"a.b.c\",\n  \"timeout\": 45\n}\n").unwrap();
+        fs::write(at("list.json"), "[1]").unwrap();
+        fs::write(at("odd.json"), "{\"nulls\":true}").unwrap();
+        let line = parse_set_line(&format!("@{}  # the team's", at("settings.json")), None, None).unwrap();
+        assert_eq!(line.settings, [Setting::Export(Some("a.b.c".to_string())), Setting::Timeout(Some(45))]);
+        // Shown as written: the file is named, not what it holds.
+        assert_eq!(line.shown, format!("set @{}", at("settings.json")));
+
+        let refused = |rest: &str| parse_set_line(rest, None, None).unwrap_err();
+        assert!(refused(&format!("@{}", at("list.json"))).starts_with("set: expected a JSON object of settings"));
+        assert!(refused(&format!("@{}", at("odd.json"))).starts_with("unknown setting `nulls`"));
+        assert!(refused(&format!("@{}", at("none.json"))).contains("none.json"));
+        fs::write(at("comma.json"), "{\"raw\":true,}").unwrap();
+        assert!(refused(&format!("@{}", at("comma.json"))).starts_with(&format!("set: invalid JSON in {}: trailing comma", at("comma.json"))));
+        assert_eq!(refused("@*.json"), "a `set` line reads one JSON file, not `@*.json`");
+        assert_eq!(refused("@"), "a `set` line reads one JSON file, not `@`");
+        assert_eq!(refused("@a.json~map(x)"), "a `set` line's `@file` takes no `~map(…)` suffix");
     }
 
     #[test]
     fn a_set_line_is_scoped_to_its_file_by_steps_around_each_include() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("plain.api"), "GET /plain\n").unwrap();
-        fs::write(dir.path().join("own.api"), "set export in.ner.id\nGET /own\n").unwrap();
+        fs::write(dir.path().join("own.api"), "set {\n  \"export\": \"in.ner.id\"\n}\nGET /own\n").unwrap();
         let steps = |text: &str, session: bool| {
             split_bulk_requests_with(text, Some(dir.path()), &mut ImportAliases::new(), session).unwrap().steps
         };
@@ -21591,7 +21774,7 @@ mod tests {
             all
         };
         let export = |name: &str| Setting::Export(Some(name.to_string()));
-        let written = |setting: Setting, file: &[Setting]| BulkStep::Set { written: Some(setting), file: has(file), session: false };
+        let written = |setting: Setting, file: &[Setting]| BulkStep::Set { written: Some(set_of(&setting)), file: has(file), session: false };
         let scope = |file: &[Setting]| BulkStep::Set { written: None, file: has(file), session: false };
         let get = |uri: &str| BulkStep::Request(format!("GET {}", uri));
         let nulls = Setting::IncludeNulls(true);
@@ -21600,12 +21783,12 @@ mod tests {
         assert_eq!(steps("GET /a\nplain.api\n", false), [get("/a"), get("/plain")]);
         // Under a line: nothing set on the way in, back on the way out.
         assert_eq!(
-            steps("set export a.b.c\nplain.api\nGET /a\n", false),
+            steps("set {\"export\":\"a.b.c\"}\nplain.api\nGET /a\n", false),
             [written(export("a.b.c"), &[export("a.b.c")]), scope(&[]), get("/plain"), scope(&[export("a.b.c")]), get("/a")]
         );
         // Each step holds everything the file has set by then.
         assert_eq!(
-            steps("set include-nulls\nset export a.b.c\nplain.api\n", false),
+            steps("set {\"include-nulls\":true}\nset {\"export\":\"a.b.c\"}\nplain.api\n", false),
             [
                 written(nulls.clone(), &[nulls.clone()]),
                 written(export("a.b.c"), &[nulls.clone(), export("a.b.c")]),
@@ -21614,13 +21797,29 @@ mod tests {
                 scope(&[nulls.clone(), export("a.b.c")]),
             ]
         );
+        // One line may set several, and one it does not name is left as it
+        // is: `export` stays on under the line that turns nulls off.
+        let both = SetLine {
+            shown: r#"set {"include-nulls":true,"export":"a.b.c"}"#.to_string(),
+            settings: vec![nulls.clone(), export("a.b.c")],
+        };
+        assert_eq!(
+            steps("set {\n  \"include-nulls\": true, // all of it\n  \"export\": \"a.b.c\"\n}\nset {\"include-nulls\":false}\nplain.api\n", false),
+            [
+                BulkStep::Set { written: Some(both), file: has(&[nulls.clone(), export("a.b.c")]), session: false },
+                written(Setting::IncludeNulls(false), &[export("a.b.c")]),
+                scope(&[]),
+                get("/plain"),
+                scope(&[export("a.b.c")]),
+            ]
+        );
         // What an included file sets ends with it, whatever the includer has.
         assert_eq!(
             steps("own.api\nGET /a\n", false),
             [written(export("in.ner.id"), &[export("in.ner.id")]), get("/own"), scope(&[]), get("/a")]
         );
         assert_eq!(
-            steps("set include-nulls\nown.api\n", false),
+            steps("set {\"include-nulls\":true}\nown.api\n", false),
             [
                 written(nulls.clone(), &[nulls.clone()]),
                 scope(&[]),
@@ -21631,17 +21830,17 @@ mod tests {
         );
         // After `off` an include needs nothing around it again.
         assert_eq!(
-            steps("set export a.b.c\nset export off\nplain.api\n", false),
+            steps("set {\"export\":\"a.b.c\"}\nset {\"export\":null}\nplain.api\n", false),
             [written(export("a.b.c"), &[export("a.b.c")]), written(Setting::Export(None), &[]), get("/plain")]
         );
 
         // A line typed at the prompt is the session's: no file has set it,
         // and a file named under it is not kept out of anything.
-        let typed = BulkStep::Set { written: Some(nulls.clone()), file: has(&[]), session: true };
-        assert_eq!(steps("set include-nulls\nplain.api", true), [typed.clone(), get("/plain")]);
+        let typed = BulkStep::Set { written: Some(set_of(&nulls)), file: has(&[]), session: true };
+        assert_eq!(steps("set {\"include-nulls\":true}\nplain.api", true), [typed.clone(), get("/plain")]);
         // A file's own line is still that file's, and ends with it.
         assert_eq!(
-            steps("set include-nulls\nown.api", true),
+            steps("set {\"include-nulls\":true}\nown.api", true),
             [typed, written(export("in.ner.id"), &[export("in.ner.id")]), get("/own"), scope(&[])]
         );
         // A file runs as a file, however little it holds: its one request
@@ -21651,14 +21850,20 @@ mod tests {
         assert!(matches!(classify_prompt_line("GET /plain"), PromptLine::Request(_)));
         assert!(matches!(classify_prompt_line("# said first\nGET /plain"), PromptLine::Request(_)));
         assert!(matches!(classify_prompt_line("{\"title\":{}}\nGET /plain"), PromptLine::Request(_)));
-        assert!(matches!(classify_prompt_line("set export a.b.c"), PromptLine::Program));
+        assert!(matches!(classify_prompt_line("set {\"export\":\"a.b.c\"}"), PromptLine::Program));
 
         // A `set` line is a line of its own.
-        let chained = split_bulk_requests("GET /a && set include-nulls", None).unwrap_err();
-        assert_eq!(chained, "chain segment is not a request: `set include-nulls`");
-        assert!(split_bulk_requests("set nulls\nGET /a", None).unwrap_err().starts_with("unknown setting `nulls`"));
-        let chained = split_bulk_requests("set include-nulls && GET /a", None).unwrap_err();
-        assert_eq!(chained, "a `set` line can't be part of a `&&`/`||` chain: `set include-nulls && GET /a`");
+        let chained = split_bulk_requests("GET /a && set {\"raw\":true}", None).unwrap_err();
+        assert_eq!(chained, "chain segment is not a request: `set {\"raw\":true}`");
+        assert!(split_bulk_requests("set {\"nulls\":true}\nGET /a", None).unwrap_err().starts_with("unknown setting `nulls`"));
+        let chained = split_bulk_requests("set {\"raw\":true} && GET /a", None).unwrap_err();
+        assert_eq!(chained, "a `set` line can't be part of a `&&`/`||` chain: `set {\"raw\":true} && GET /a`");
+        // An object that is never closed takes the rest of the file.
+        let open = split_bulk_requests("set {\n  \"raw\": true\nGET /a\n", None).unwrap_err();
+        assert!(open.starts_with("unclosed body at end of bulk file"), "{open}");
+        // The line in words is refused where it is read.
+        let words = split_bulk_requests("set include-nulls\nGET /a", None).unwrap_err();
+        assert_eq!(words, "a `set` line takes a JSON object: write `set { \"include-nulls\": true }`");
     }
 
     #[test]
@@ -21680,7 +21885,7 @@ mod tests {
             Setting::Timeout(Some(30)),
         ];
         for setting in &all {
-            assert_eq!(apply_set_step(&mut config, &Some(setting.clone()), &file(&[setting.clone()])), None);
+            assert_eq!(apply_set_step(&mut config, &Some(set_of(setting)), &file(&[setting.clone()])), []);
         }
         apply_set_step(&mut config, &None, &file(&all));
         assert_eq!(config.export_id.as_deref(), Some("a.b.c"));
@@ -21705,26 +21910,36 @@ mod tests {
             (Setting::Timeout(None), "--timeout 30"),
             (Setting::Timeout(Some(5)), "--timeout 30"),
         ] {
-            let said = apply_set_step(&mut config, &Some(line.clone()), &file(&[line.clone()]));
-            assert_eq!(said.as_deref(), Some(option), "{line:?}");
+            let said = apply_set_step(&mut config, &Some(set_of(&line)), &file(&[line.clone()]));
+            // With what the run holds for the setting, which a session says.
+            assert_eq!(said, [(config.given.get(&line), option.to_string())], "{line:?}");
         }
+        // A line of several: one note for each that is kept from what it
+        // says, in the order they are written, and none for the rest.
+        let several = SetLine {
+            shown: String::new(),
+            settings: vec![Setting::Raw(false), Setting::IncludeNulls(true), Setting::Timeout(Some(5))],
+        };
+        let said: Vec<String> = apply_set_step(&mut config, &Some(several), &file(&all)).into_iter().map(|(_, option)| option).collect();
+        assert_eq!(said, ["-r", "--timeout 30"]);
         assert_eq!(config.export_id.as_deref(), Some("a.b.c"));
         assert!(config.include_nulls && config.fail_fast && config.ndjson && config.raw && config.stream_requested);
         assert_eq!(config.timeout_secs, 30);
         // A line that asks for what holds anyway is kept from nothing.
         for setting in &all {
-            assert_eq!(apply_set_step(&mut config, &Some(setting.clone()), &file(&[setting.clone()])), None);
+            assert_eq!(apply_set_step(&mut config, &Some(set_of(setting)), &file(&[setting.clone()])), []);
         }
 
         // `--no-streaming` and `API_STREAMING`.
         let mut config = Config { no_streaming: true, ..Config::default() };
         let stream = Setting::Stream(true);
-        assert_eq!(apply_set_step(&mut config, &Some(stream.clone()), &file(&[stream.clone()])).as_deref(), Some("--no-streaming"));
+        let options = |said: Vec<(Setting, String)>| said.into_iter().map(|(_, option)| option).collect::<Vec<_>>();
+        assert_eq!(options(apply_set_step(&mut config, &Some(set_of(&stream)), &file(&[stream.clone()]))), ["--no-streaming"]);
         assert!(!config.stream_requested);
         let mut config = Config { stream_by_env: true, ..Config::default() };
         config.given.stream = true;
         let off = Setting::Stream(false);
-        assert_eq!(apply_set_step(&mut config, &Some(off.clone()), &file(&[])).as_deref(), Some("API_STREAMING"));
+        assert_eq!(options(apply_set_step(&mut config, &Some(set_of(&off)), &file(&[]))), ["API_STREAMING"]);
         assert!(config.stream_requested);
     }
 
@@ -28043,7 +28258,7 @@ mod tests {
             // take the block below into it.
             ("confirm Send [x?\n{ \"title\": {} }\n", late.to_string()),
             ("confirm Send {x?\n\n{ \"title\": {} }\n", late.to_string()),
-            ("set export com.heads.seedID\n{ \"title\": {} }\n", late.to_string()),
+            ("set {\"export\":\"com.heads.seedID\"}\n{ \"title\": {} }\n", late.to_string()),
             ("import dir d { \"path\": \".\" }\n{ \"title\": {} }\n", late.to_string()),
             // Under a request with no body it is most likely the body.
             ("PUT /a\n{ \"x\": 1 }\n", format!("{late} (a body starts on the request line)")),
@@ -29927,8 +30142,8 @@ mod tests {
         // Directives.
         assert_eq!(steps("sleep 2 # wait"), [BulkStep::Sleep(Duration::from_secs(2))]);
         assert_eq!(
-            steps("set raw off # done"),
-            [BulkStep::Set { written: Some(Setting::Raw(false)), file: Settings::default(), session: false }]
+            steps("set {\"raw\":false} # done"),
+            [BulkStep::Set { written: Some(set_of(&Setting::Raw(false))), file: Settings::default(), session: false }]
         );
         assert_eq!(
             steps("assert not GET /a~count # none left"),
@@ -32599,7 +32814,7 @@ mod tests {
         }
         assert!(!could_become_a_keyword("sets"));
         // The line of a directive is not an include to complete.
-        for line in ["set export com.heads.seedID", "set include-nulls off", "set ", "set in"] {
+        for line in ["set {\"export\":\"com.heads.seedID\"}", "set {\"include-nulls\":false}", "set ", "set {\"in", "set in"] {
             assert!(include_path_context(line, 0, line.len()).is_none_or(|ctx| !ctx.is_include), "{line}");
         }
         // `export` is a path like any other now.
@@ -32607,10 +32822,15 @@ mod tests {
     }
 
     #[test]
-    fn tab_completes_the_name_on_a_set_line() {
-        assert_eq!(ghost_then_tab("set in^", false), ("clude-nulls".to_string(), "set include-nulls^".to_string()));
-        assert_eq!(ghost_then_tab("set f^", false), ("ail-fast".to_string(), "set fail-fast^".to_string()));
-        assert_eq!(ghost_then_tab("SET t^", false), ("imeout".to_string(), "SET timeout^".to_string()));
+    fn tab_completes_the_first_setting_on_a_set_line() {
+        let after = |marked: &str| ghost_then_tab(marked, false);
+        assert_eq!(after(r#"set {"in^"#), (r#"clude-nulls": "#.to_string(), r#"set {"include-nulls": ^"#.to_string()));
+        assert_eq!(after(r#"set {"f^"#), (r#"ail-fast": "#.to_string(), r#"set {"fail-fast": ^"#.to_string()));
+        assert_eq!(after(r#"SET {"t^"#), (r#"imeout": "#.to_string(), r#"SET {"timeout": ^"#.to_string()));
+        assert_eq!(after("set {^"), (r#""export": "#.to_string(), r#"set {"export": ^"#.to_string()));
+        // With the experimental body completion on, a `set` line is still
+        // completed as one: its object is no body of a request.
+        assert_eq!(ghost_then_tab(r#"set {"in^"#, true).1, r#"set {"include-nulls": ^"#);
         // Nothing typed: the first of the list, and Tab goes through them.
         let mut state = completing("set ^");
         let mut seen = Vec::new();
@@ -32618,13 +32838,22 @@ mod tests {
             assert!(tab_pressed(&mut state));
             seen.push(shown(&state));
         }
-        let all: Vec<String> = SETTING_NAMES.iter().chain(SETTING_NAMES.first()).map(|name| format!("set {name}^")).collect();
+        let line = |name: &&str| format!(r#"set {{"{name}": ^"#);
+        let all: Vec<String> = SETTING_NAMES.iter().chain(SETTING_NAMES.first()).map(line).collect();
         assert_eq!(seen, all);
         assert!(backtab_pressed(&mut state));
-        assert_eq!(shown(&state), format!("set {}^", SETTING_NAMES.last().unwrap()));
-        // Nothing to add to a name that is no setting, behind a value, or
-        // behind `set` with no blank yet.
-        for line in ["set nulls^", "set IN^", "set timeout 3^", "set export off^", "set include-nulls ^"] {
+        assert_eq!(shown(&state), line(SETTING_NAMES.last().unwrap()));
+        // Nothing to add to a name that is no setting, to the line in words,
+        // behind a value, or behind `set` with no blank yet.
+        for line in [
+            r#"set {"nulls^"#,
+            r#"set {"IN^"#,
+            "set in^",
+            r#"set {"timeout": 3^"#,
+            r#"set {"export": null^"#,
+            r#"set {"raw": true, "in^"#,
+            "set @se^",
+        ] {
             let (ghost, after) = ghost_then_tab(line, false);
             assert_eq!((ghost.as_str(), after.as_str()), ("", line), "{line}");
         }

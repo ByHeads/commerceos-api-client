@@ -86,11 +86,8 @@ syn match  apiNot /\cnot\ze\%(\s\|$\)/ contained nextgroup=apiUri,apiSegRead,api
 syn match  apiDirective /^\s*\zs\cconfirm\ze\%(\s\|$\)/ nextgroup=apiMessage skipwhite
 syn match  apiMessage /.*$/ contained
 
-" set <name> [value]
-syn match  apiDirective /^\s*\zs\cset\ze\%(\s\|$\)/ nextgroup=apiSetting skipwhite
-syn match  apiSetting /\c\%(export\|include-nulls\|fail-fast\|ndjson\|raw\|stream\|timeout\)\ze\%(\s\|$\)/ contained nextgroup=apiValue,apiSetNumber,apiOnOff,apiTrailComment skipwhite
-syn match  apiSetNumber /\d\+\ze\%(\s\|$\)/ contained nextgroup=apiTrailComment skipwhite
-syn match  apiOnOff /\c\%(on\|off\)\ze\%(\s\|$\)/ contained nextgroup=apiTrailComment skipwhite
+" set { … }  or  set @file.json
+syn match  apiDirective /^\s*\zs\cset\ze\%(\s\|$\)/ nextgroup=apiBodyObject,apiInfile skipwhite
 
 " import git|dir|archive <alias> { … }  or  … @file.json
 syn match  apiImport /^\s*\zs\cimport\ze\%(\s\|$\)/ nextgroup=apiImportKind skipwhite
@@ -134,9 +131,6 @@ hi def link apiValue        String
 hi def link apiMessage      String
 hi def link apiBodyString   String
 hi def link apiDuration     Number
-hi def link apiSetNumber    Number
-hi def link apiSetting      Identifier
-hi def link apiOnOff        Boolean
 hi def link apiImportKind   Type
 hi def link apiAlias        Identifier
 hi def link apiJsonKey      Label

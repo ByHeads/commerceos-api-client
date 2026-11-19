@@ -124,59 +124,39 @@
     },
 
     "set": {
+      "comment": "set { … }   or   set @file.json",
+      "begin": "^\\s*((?i:set))(?=\\s|$)",
+      "beginCaptures": { "1": { "name": "keyword.control.command.api" } },
+      "end": "$",
       "patterns": [
         {
-          "begin": "^\\s*((?i:set))\\s+((?i:include-nulls|fail-fast|ndjson|raw|stream))(?=\\s|$)",
-          "beginCaptures": {
-            "1": { "name": "keyword.control.command.api" },
-            "2": { "name": "variable.parameter.setting.api" }
-          },
-          "end": "$",
+          "begin": "\\{",
+          "beginCaptures": { "0": { "name": "punctuation.section.mapping.begin.json" } },
+          "end": "\\}",
+          "endCaptures": { "0": { "name": "punctuation.section.mapping.end.json" } },
+          "name": "meta.set.api meta.embedded.block.json meta.mapping.json",
           "patterns": [
-            { "include": "#trailing-comment" },
-            { "match": "\\G\\s+((?i:on|off))(?=\\s|$)", "captures": { "1": { "name": "constant.language.api" } } },
-            { "match": "\\S+", "name": "invalid.illegal.trailing.api" }
+            {
+              "match": "(\")(export|include-nulls|fail-fast|ndjson|raw|stream|timeout)(\")(?=\\s*:)",
+              "name": "meta.mapping.key.json string.quoted.double.json",
+              "captures": { "2": { "name": "support.type.property-name.setting.api keyword.other.member.api" } }
+            },
+            { "include": "#json-members" }
           ]
         },
         {
-          "begin": "^\\s*((?i:set))\\s+((?i:export))(?=\\s|$)",
-          "beginCaptures": {
-            "1": { "name": "keyword.control.command.api" },
-            "2": { "name": "variable.parameter.setting.api" }
-          },
-          "end": "$",
-          "patterns": [
-            { "include": "#trailing-comment" },
-            { "match": "\\G\\s+((?i:off))(?=\\s|$)", "captures": { "1": { "name": "constant.language.api" } } },
-            { "match": "\\G\\s+(\\S+)", "captures": { "1": { "name": "string.unquoted.value.api" } } },
-            { "match": "\\S+", "name": "invalid.illegal.trailing.api" }
-          ]
+          "comment": "one JSON file: no glob, no ~map(…)",
+          "begin": "(?<=\\s)(@)\\s*",
+          "beginCaptures": { "1": { "name": "keyword.operator.infile.api" } },
+          "end": "(?=\\s*$|\\s+#)",
+          "contentName": "meta.path.infile.api",
+          "patterns": [{ "match": "~\\w+\\([^)]*\\)|[*?\\[]", "name": "invalid.illegal.setting.api" }]
         },
+        { "include": "#trailing-comment" },
         {
-          "begin": "^\\s*((?i:set))\\s+((?i:timeout))(?=\\s|$)",
-          "beginCaptures": {
-            "1": { "name": "keyword.control.command.api" },
-            "2": { "name": "variable.parameter.setting.api" }
-          },
-          "end": "$",
-          "patterns": [
-            { "include": "#trailing-comment" },
-            { "match": "\\G\\s+(\\d+)(?=\\s|$)", "captures": { "1": { "name": "constant.numeric.api" } } },
-            { "match": "\\G\\s+((?i:off))(?=\\s|$)", "captures": { "1": { "name": "constant.language.api" } } },
-            { "match": "\\S+", "name": "invalid.illegal.trailing.api" }
-          ]
-        },
-        {
-          "begin": "^\\s*((?i:set))(?=\\s|$)(?:\\s+(?!#)(\\S+))?",
-          "beginCaptures": {
-            "1": { "name": "keyword.control.command.api" },
-            "2": { "name": "invalid.illegal.setting.api" }
-          },
-          "end": "$",
-          "patterns": [
-            { "include": "#trailing-comment" },
-            { "match": "\\S+", "name": "invalid.illegal.trailing.api" }
-          ]
+          "comment": "the line in words (`set include-nulls`) is no longer read",
+          "match": "\\S+",
+          "name": "invalid.illegal.setting.api"
         }
       ]
     },
