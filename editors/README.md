@@ -16,7 +16,7 @@ Run it again after the client is updated: it replaces what it wrote before.
 
 | Folder | Format | Read by |
 |---|---|---|
-| `sublime/` | `API.sublime-syntax` | Sublime Text |
+| `sublime/` | `API.sublime-syntax`, and `api_completions.py`, a plugin for completions | Sublime Text |
 | `vscode/` | a VS Code extension around `syntaxes/api.tmLanguage.json`, a TextMate grammar | VS Code, Cursor, and JetBrains IDEs as a TextMate bundle |
 | `vim/` | `syntax/`, `ftdetect/` and `ftplugin/` of a Vim package | Vim, Neovim |
 
@@ -24,14 +24,15 @@ Run it again after the client is updated: it replaces what it wrote before.
 
 | Editor | What is written | What is left to do |
 |---|---|---|
-| Sublime Text | `API.sublime-syntax` in `Packages/User` of Sublime's data folder | nothing |
+| Sublime Text | `API.sublime-syntax` and `api_completions.py` in `Packages/User` of Sublime's data folder | nothing |
 | VS Code, Cursor | `~/.local/share/api/editors/commerceos-api.vsix`, then installed with `code --install-extension` (`cursor --install-extension`) | nothing when the editor's command is on the `PATH`. Otherwise: *Extensions: Install from VSIX…* in the command palette, and choose that file |
 | Rider | the extension's folder, `~/.local/share/api/editors/commerceos-api` | once: *Settings → Editor → TextMate Bundles*, `+`, and choose that folder. The IDE reads it where it is, so a later install needs no second visit |
 | Vim | `~/.vim/pack/commerceos/start/api/` (`~/vimfiles/…` on Windows) | nothing; it needs `syntax on` |
 | Neovim | `~/.local/share/nvim/site/pack/commerceos/start/api/` (under `$XDG_DATA_HOME` when set; `nvim-data` on Windows) | nothing |
 
 A file of the same name that is already there is replaced: an
-`API.sublime-syntax` of your own in `Packages/User` is this one afterwards.
+`API.sublime-syntax` or an `api_completions.py` of your own in `Packages/User`
+is this one afterwards.
 
 ## What is highlighted
 
@@ -61,7 +62,9 @@ cargo test --test editors
 
 holds the Sublime syntax to `sample.api` (through `syntect`, which reads the
 same format), checks that it finds no error in any `.api` file of this
-repository, and holds `--install-syntax`. The TextMate grammar has no parser
+repository, and holds `--install-syntax`. Where there is a `python3` on the
+`PATH` it also asks the Sublime plugin what it completes at a cursor: see
+`sublime/README.md`. The TextMate grammar has no parser
 in Rust. Its tokens for `sample.api` are kept in `sample.api.snap`, and Node
 compares them:
 

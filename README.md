@@ -245,7 +245,8 @@ api --install-syntax sublime    # or vscode, cursor, rider, vim, nvim
 
 It writes the grammar that belongs to this version of the client where the editor reads
 it, prints each path it wrote, and sends nothing. Sublime Text, Vim and Neovim need
-nothing more. VS Code and Cursor are handed a `.vsix` through their own command (`code`,
+nothing more. Sublime Text gets completions too: settings, import keys, methods,
+directives, URI operators and paths, by where the cursor is. VS Code and Cursor are handed a `.vsix` through their own command (`code`,
 `cursor`), which has to be on the `PATH`. Rider gets a TextMate bundle and asks for one
 step, once: *Settings → Editor → TextMate Bundles*, `+`, and the folder the command
 printed. Run it again after an update of the client. `editors/README.md` has the details.

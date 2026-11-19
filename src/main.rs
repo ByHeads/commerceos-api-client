@@ -9954,6 +9954,9 @@ fn print_json_document(value: &serde_json::Value, raw: bool) {
 // ---------------------------------------------------------------------------
 
 const SUBLIME_SYNTAX: &str = include_str!("../editors/sublime/API.sublime-syntax");
+/// The plugin that completes what a `.api` file can hold, by where the
+/// cursor is. Sublime Text loads a `.py` of `Packages/User` as it is written.
+const SUBLIME_COMPLETIONS: &str = include_str!("../editors/sublime/api_completions.py");
 
 /// The VS Code extension, less its `package.json`. A JetBrains IDE reads the
 /// same folder as a TextMate bundle.
@@ -10031,7 +10034,8 @@ fn editor_files_dir() -> Result<PathBuf, String> {
     Ok(home_for_syntax()?.join(".local").join("share").join("api").join("editors"))
 }
 
-/// Sublime Text reads a syntax from `Packages/User` of its data directory.
+/// Sublime Text reads a syntax and a plugin from `Packages/User` of its data
+/// directory.
 /// The directory is the editor's to make: one that is not there means there
 /// is no Sublime Text to install into.
 fn install_sublime_syntax() -> Result<String, String> {
@@ -10049,7 +10053,9 @@ fn install_sublime_syntax() -> Result<String, String> {
         ));
     };
     write_syntax_file(&packages.join("User").join("API.sublime-syntax"), SUBLIME_SYNTAX.as_bytes())?;
-    Ok("Installed in Sublime Text. A .api file that is open picks it up at once.".to_string())
+    write_syntax_file(&packages.join("User").join("api_completions.py"), SUBLIME_COMPLETIONS.as_bytes())?;
+    Ok("Installed in Sublime Text, highlighting and completions. A .api file that is open picks both up at once."
+        .to_string())
 }
 
 fn vim_package_dir() -> Result<PathBuf, String> {

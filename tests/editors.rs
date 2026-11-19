@@ -528,6 +528,368 @@ fn the_vim_syntax_gives_each_construct_of_the_sample_its_group() {
     }
 }
 
+// ------------------------------------------------- Sublime Text completions
+
+/// What `editors/sublime/api_completions.py` offers at the `|` of each text:
+/// `(typed, names, snippets)`, `Some(None)` in a URI and `None` where it
+/// leaves the editor to itself. The second list is what Sublime Text is
+/// handed when its own prefix is the second string of the case.
+///
+/// The half of the plugin that decides this is plain Python, run here by
+/// the `python3` of the machine. `None` for the whole where there is none:
+/// the tests that need it say so and hold nothing.
+#[allow(clippy::type_complexity)]
+fn sublime_completions(dir: &Path, cases: &[(&str, &str)]) -> Option<Vec<serde_json::Value>> {
+    let driver = r#"
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import api_completions as plugin
+root = sys.argv[2]
+out = []
+for marked, prefix in json.load(sys.stdin):
+    offset = marked.rindex('|')  # the last one: a chain has a `||` of its own
+    text = marked[:offset] + marked[offset + 1:]
+    aliases = plugin.dir_aliases(text, root)
+    result = plugin.complete(text, offset, root, plugin.base_dir(text, root), aliases)
+    if result is not None and 'items' in result:
+        result['sublime'] = plugin.to_sublime(result, prefix)
+    out.append(result)
+json.dump(out, sys.stdout)
+"#;
+    let mut python = std::process::Command::new("python3");
+    python
+        .args(["-I", "-B", "-c", driver])
+        .arg(repo().join("editors/sublime"))
+        .arg(dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = python.spawn().ok()?;
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(serde_json::to_string(cases).unwrap().as_bytes()).unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "the plugin failed:\n{}", String::from_utf8_lossy(&output.stderr));
+    Some(serde_json::from_slice(&output.stdout).expect("the driver prints JSON"))
+}
+
+fn names_of(result: &serde_json::Value) -> Vec<String> {
+    result["items"].as_array().unwrap().iter().map(|item| item[0].as_str().unwrap().to_string()).collect()
+}
+
+fn snippet_of(result: &serde_json::Value, name: &str) -> String {
+    let items = result["items"].as_array().unwrap();
+    let item = items.iter().find(|item| item[0] == name).unwrap_or_else(|| panic!("no `{}` in {}", name, result));
+    item[1].as_str().unwrap().to_string()
+}
+
+/// What Sublime Text is handed: `(trigger, contents)`, the trigger without
+/// the note behind its tab.
+fn handed(result: &serde_json::Value) -> Vec<(String, String)> {
+    result["sublime"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|pair| {
+            let trigger = pair[0].as_str().unwrap().split('\t').next().unwrap().to_string();
+            (trigger, pair[1].as_str().unwrap().to_string())
+        })
+        .collect()
+}
+
+/// A directory with what the path cases complete to.
+fn completion_fixture() -> tempfile::TempDir {
+    let dir = tempdir().unwrap();
+    for file in [
+        "seed.api",
+        "settings.json",
+        "notes.txt",
+        ".hidden.api",
+        "shared/users.api",
+        "shared/data.json",
+        "shared/deep/more.api",
+        "cloddy/sv.api",
+        "cloddy/seeds/one.api",
+        "work/body.json",
+    ] {
+        let path = dir.path().join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "").unwrap();
+    }
+    dir
+}
+
+#[test]
+fn the_sublime_plugin_completes_the_members_of_a_set_an_import_and_a_describe_block() {
+    let dir = completion_fixture();
+    let cases = [
+        // the line of the screenshot: a name being typed in its quotes
+        ("set {\n  \"in|\"\n}\n", "in"),
+        ("set { \"include-nulls\": true, \"|\" }", ""),
+        ("set {\n  |\n}", ""),
+        ("set { \"include-n|\" }", "n"),
+        ("set { \"raw\": | }", ""),
+        ("set { \"timeout\": | }", ""),
+        ("set { \"raw\": true | }", ""),
+        ("set { \"export\": \"com.|\" }", ""),
+        ("import git cl {\n  \"|\"\n}", ""),
+        ("import dir cl { \"|\" }", ""),
+        ("import archive ar { \"url\": \"x\", | }", ""),
+        ("{\n  \"|\"\n}\nGET /a", ""),
+        ("{\n  \"title\": { \"sv-SE\": \"Katalog\", \"|\" }\n}", ""),
+        ("{ \"owner\": { \"|\" } }", ""),
+        // a request's body, a comment, a `confirm`: not this plugin's
+        ("PUT /people/x { \"na|\" }", "na"),
+        ("PUT /things {\n  // a |\n}", ""),
+        ("# set { \"|\" }", ""),
+        ("confirm Seed { \"|", ""),
+        ("GET /a   # then set { \"|", ""),
+        // a body that closed is behind the cursor
+        ("PUT /a { \"x\": 1 }\nset { \"|\" }", ""),
+        ("PUT /a {\n  \"x\": \"a } b\"\n}\nimport git cl { \"|\" }", ""),
+    ];
+    let Some(got) = sublime_completions(dir.path(), &cases) else {
+        eprintln!("skipped: no python3 on the PATH");
+        return;
+    };
+    let settings = ["export", "include-nulls", "fail-fast", "ndjson", "raw", "stream", "timeout"];
+
+    assert_eq!(got[0]["typed"], "in");
+    assert_eq!(names_of(&got[0]), settings);
+    assert_eq!(snippet_of(&got[0], "include-nulls"), "include-nulls");
+    // a setting the object has is not offered again
+    assert_eq!(names_of(&got[1]), ["export", "fail-fast", "ndjson", "raw", "stream", "timeout"]);
+    // nothing quoted yet: the member whole, with a value to type over
+    assert_eq!(names_of(&got[2]), settings);
+    assert_eq!(snippet_of(&got[2], "include-nulls"), "\"include-nulls\": ${1:true}");
+    assert_eq!(snippet_of(&got[2], "timeout"), "\"timeout\": ${1:30}");
+    assert_eq!(snippet_of(&got[2], "export"), "\"export\": \"${1:com.heads.seedID}\"");
+    // Sublime Text cuts a word at `-`: what it replaces is `n`, of `include-n`
+    assert_eq!(handed(&got[3]), [("nulls".to_string(), "nulls".to_string())]);
+    assert_eq!(names_of(&got[4]), ["true", "false", "null"]);
+    assert_eq!(names_of(&got[5]), ["0", "null"]);
+    assert!(names_of(&got[6]).is_empty(), "{}", got[6]);
+    assert!(names_of(&got[7]).is_empty(), "{}", got[7]);
+    assert_eq!(names_of(&got[8]), ["url", "ref", "path"]);
+    assert_eq!(names_of(&got[9]), ["path"]);
+    assert_eq!(names_of(&got[10]), ["sha256", "token_env", "path"]);
+    assert_eq!(snippet_of(&got[10], "sha256"), "\"sha256\": \"$1\"");
+    assert_eq!(names_of(&got[11]), ["title", "description", "docsLink"]);
+    assert_eq!(names_of(&got[12])[..2], ["en-US", "nb-NO"]);
+    assert!(names_of(&got[13]).is_empty(), "{}", got[13]);
+    for case in 14..19 {
+        assert!(got[case].is_null(), "{}: {}", cases[case].0, got[case]);
+    }
+    assert_eq!(names_of(&got[19]), settings);
+    assert_eq!(names_of(&got[20]), ["url", "ref", "path"]);
+
+    // the seven settings are the seven the syntax scopes as settings
+    let syntax = read("editors/sublime/API.sublime-syntax");
+    assert!(syntax.contains(&format!("(\")({})(\")", settings.join("|"))), "the settings of the syntax have changed");
+}
+
+#[test]
+fn the_sublime_plugin_completes_the_words_of_a_line() {
+    let dir = completion_fixture();
+    let cases = [
+        ("|", ""),
+        ("GET /a\nde|", "de"),
+        ("import |", ""),
+        ("import git |", ""),
+        ("url |", ""),
+        ("sleep |", ""),
+        ("sleep 20 wh|", "wh"),
+        ("sleep 20 while |", ""),
+        ("assert |", ""),
+        ("assert not |", ""),
+        ("GET /a && |", ""),
+        ("GET /people~|", ""),
+        ("GET /people~wh|", "wh"),
+        ("GET /people~where(name=x)~c|", "c"),
+        ("GET /people~where(a~|", ""),
+        ("GET /people/|", ""),
+        ("/peo|", "peo"),
+        ("GET /a || PUT /people~|", ""),
+        ("PUT /x @data.csv~|", ""),
+        ("GET /people > c|", "c"),
+        ("GET /people >> c|", "c"),
+        ("assert GET /x > c|", "c"),
+        ("GET /x~where(name=\"a > c|", "c"),
+    ];
+    let Some(got) = sublime_completions(dir.path(), &cases) else {
+        eprintln!("skipped: no python3 on the PATH");
+        return;
+    };
+    let methods = ["GET", "PUT", "POST", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+    let with_not: Vec<&str> = ["not"].into_iter().chain(methods).collect();
+
+    // an empty line: the methods, the directives, and what can be included
+    let first = names_of(&got[0]);
+    assert_eq!(first[..7], methods);
+    assert_eq!(first[7..13], ["sleep", "assert", "confirm", "set", "url", "import"]);
+    assert_eq!(first[13..], ["cloddy/", "seed.api", "shared/", "work/"]);
+    assert_eq!(snippet_of(&got[0], "GET"), "GET ");
+    assert_eq!(handed(&got[1]), [("DELETE".to_string(), "DELETE ".to_string())]);
+    assert_eq!(names_of(&got[2]), ["git", "dir", "archive"]);
+    assert!(got[3].is_null(), "an alias is a name of one's own: {}", got[3]);
+    assert_eq!(names_of(&got[4]), ["has", "is"]);
+    assert_eq!(names_of(&got[5]), ["while"]);
+    assert_eq!(names_of(&got[6]), ["while"]);
+    assert_eq!(names_of(&got[7]), with_not);
+    assert_eq!(names_of(&got[8]), with_not);
+    assert_eq!(names_of(&got[9]), methods);
+    assert_eq!(names_of(&got[10]), methods);
+
+    // the operators are the ones the client completes at its prompt
+    let source = read("src/main.rs");
+    let block = source.split("const API_OPERATORS: &[&str] = &[").nth(1).unwrap().split("];").next().unwrap();
+    let operators: Vec<&str> = block.split('"').skip(1).step_by(2).collect();
+    assert!(operators.len() > 10, "{:?}", operators);
+    assert_eq!(names_of(&got[11]), operators);
+    assert_eq!(got[12]["typed"], "wh");
+    assert_eq!(snippet_of(&got[12], "where("), "where($1)");
+    assert_eq!(snippet_of(&got[13], "count"), "count");
+    // inside the parentheses of an operator a `~` is not the next operator
+    assert_eq!(got[14]["uri"], true, "{}", got[14]);
+    // a URI is left to the editor
+    assert_eq!(got[15]["uri"], true);
+    assert_eq!(got[16]["uri"], true);
+    assert_eq!(names_of(&got[17]), operators);
+    assert_eq!(names_of(&got[18]), ["map("]);
+    assert_eq!(names_of(&got[19]), ["clipboard", "cloddy/"]);
+    // nothing is appended to the clipboard, and a condition has no outfile
+    assert_eq!(names_of(&got[20]), ["cloddy/"]);
+    assert!(got[21].is_null(), "{}", got[21]);
+    assert!(got[22].is_null(), "{}", got[22]);
+}
+
+#[test]
+fn the_sublime_plugin_completes_paths_from_where_each_is_relative_to() {
+    let dir = completion_fixture();
+    let cases = [
+        // an include: relative to the file, directories and `.api` files
+        ("se|", "se"),
+        ("shared/|", ""),
+        ("shared/us|", "us"),
+        (".|", ""),
+        // an alias of an `import dir`, read from its line
+        ("import dir cl { \"path\": \"cloddy\" }\ncl/|", ""),
+        ("import dir cl { \"path\": \"cloddy\" }\nc|", "c"),
+        ("import dir cl {\n  \"path\": \"cloddy\"\n}\ncl/seeds/|", ""),
+        // the `path` of an `import dir`: directories
+        ("import dir cl { \"path\": \"|\" }", ""),
+        ("import dir cl { \"path\": \"shared/|\" }", ""),
+        ("import git cl { \"path\": \"|\" }", ""),
+        // an `@file`: relative to the working directory, any file
+        ("PUT /x @|", ""),
+        ("PUT /x @shared/|", ""),
+        ("# @basedir work\nPUT /x @|", ""),
+        // the one JSON file of a `set` and an `import`
+        ("set @|", ""),
+        ("import git cl @sh|", "sh"),
+        ("import git cl @shared/|", ""),
+        // an outfile
+        ("GET /people > shared/d|", "d"),
+    ];
+    let Some(got) = sublime_completions(dir.path(), &cases) else {
+        eprintln!("skipped: no python3 on the PATH");
+        return;
+    };
+    assert_eq!(names_of(&got[0]), ["set", "seed.api"]);
+    assert_eq!(names_of(&got[1]), ["shared/deep/", "shared/users.api"]);
+    assert_eq!(names_of(&got[2]), ["shared/users.api"]);
+    // Sublime Text replaces `us`: `shared/` stays where it is
+    assert_eq!(handed(&got[2]), [("users.api".to_string(), "users.api".to_string())]);
+    assert_eq!(names_of(&got[3]), [".hidden.api"]);
+    assert_eq!(names_of(&got[4]), ["cl/seeds/", "cl/sv.api"]);
+    assert_eq!(handed(&got[4]), [("seeds/".to_string(), "seeds/".to_string()), ("sv.api".to_string(), "sv.api".to_string())]);
+    assert_eq!(names_of(&got[5]), ["confirm", "cl/", "cloddy/"]);
+    assert_eq!(names_of(&got[6]), ["cl/seeds/one.api"]);
+    assert_eq!(names_of(&got[7]), ["cloddy/", "shared/", "work/"]);
+    assert_eq!(names_of(&got[8]), ["shared/deep/"]);
+    assert!(names_of(&got[9]).is_empty(), "a path in a repository is not one of this machine: {}", got[9]);
+    assert_eq!(names_of(&got[10]), ["cloddy/", "notes.txt", "seed.api", "settings.json", "shared/", "work/"]);
+    assert_eq!(names_of(&got[11]), ["shared/data.json", "shared/deep/", "shared/users.api"]);
+    assert_eq!(names_of(&got[12]), ["body.json"]);
+    assert_eq!(names_of(&got[13]), ["cloddy/", "settings.json", "shared/", "work/"]);
+    assert_eq!(names_of(&got[14]), ["shared/"]);
+    assert_eq!(names_of(&got[15]), ["shared/data.json", "shared/deep/"]);
+    assert_eq!(names_of(&got[16]), ["shared/data.json", "shared/deep/"]);
+}
+
+/// The client is asked where a git or archive alias is with the file's
+/// import lines alone: the file itself can't be read while a line of it is
+/// half typed, which is when a completion is asked for.
+#[test]
+fn the_sublime_plugin_asks_the_client_about_the_import_lines_alone() {
+    let text = "# seed\nimport git cl {\n  \"url\": \"https://example.com/r\", // here\n  \"ref\": \"1.0.0\"\n}\n\
+                import dir local { \"path\": \"../x\" }\nimport archive ar @ar.json   # from a file\n\
+                PUT /x { \"import git\": 1 }\ncl/\nimport archive half { \"url\": \"x";
+    let script = "import sys\nsys.path.insert(0, sys.argv[1])\nimport api_completions\n\
+                  sys.stdout.write(api_completions.remote_imports(sys.stdin.read()))";
+    let mut python = std::process::Command::new("python3");
+    python
+        .args(["-I", "-B", "-c", script])
+        .arg(repo().join("editors/sublime"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    let Ok(mut child) = python.spawn() else {
+        eprintln!("skipped: no python3 on the PATH");
+        return;
+    };
+    {
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(text.as_bytes()).unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "import git cl {\n  \"url\": \"https://example.com/r\", // here\n  \"ref\": \"1.0.0\"\n}\n\
+         import archive ar @ar.json   # from a file"
+    );
+}
+
+/// Sublime Text runs a plugin of `Packages/User` in Python 3.3. What that
+/// version can't read is no error to the `python3` the tests above run, so
+/// the syntax tree of the plugin is searched for what came later.
+#[test]
+fn the_sublime_plugin_is_written_for_python_3_3() {
+    let check = r#"
+import ast, sys
+tree = ast.parse(open(sys.argv[1], encoding='utf-8').read())
+later = []
+for node in ast.walk(tree):
+    kind = type(node).__name__
+    if kind in ('JoinedStr', 'TemplateStr', 'NamedExpr', 'AsyncFunctionDef', 'AsyncFor', 'AsyncWith', 'Await',
+                'AnnAssign', 'Match', 'MatMult', 'TryStar'):
+        later.append('line %d: %s' % (getattr(node, 'lineno', 0), kind))
+    if kind == 'Attribute' and node.attr in ('run', 'scandir', 'fspath', 'removeprefix', 'removesuffix'):
+        later.append('line %d: .%s' % (node.lineno, node.attr))
+    if kind in ('Import', 'ImportFrom'):
+        names = [alias.name for alias in node.names] + [getattr(node, 'module', None)]
+        if any(name in ('pathlib', 'typing', 'dataclasses', 'enum', 'asyncio') for name in names):
+            later.append('line %d: import %s' % (node.lineno, names))
+    if kind in ('Dict', 'List', 'Tuple', 'Set', 'Call') and any(
+            type(item).__name__ == 'Starred' or item is None
+            for item in getattr(node, 'elts', None) or getattr(node, 'keys', None) or []) and kind != 'Call':
+        later.append('line %d: unpacking in a display' % node.lineno)
+print('\n'.join(later))
+"#;
+    let output = std::process::Command::new("python3")
+        .args(["-I", "-c", check])
+        .arg(repo().join("editors/sublime/api_completions.py"))
+        .output();
+    let Ok(output) = output else {
+        eprintln!("skipped: no python3 on the PATH");
+        return;
+    };
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "", "not Python 3.3");
+}
+
 // ------------------------------------------------------------ --install-syntax
 
 /// The client with `home` as the home directory and nothing of this machine
@@ -586,11 +948,13 @@ fn install_syntax_for_sublime_writes_the_syntax_into_its_user_package() {
 
     fs::create_dir_all(sublime_packages(home.path())).unwrap();
     let target = sublime_packages(home.path()).join("User/API.sublime-syntax");
+    let plugin = sublime_packages(home.path()).join("User/api_completions.py");
     for _ in 0..2 {
         let output = api(home.path(), bin.path()).args(["--install-syntax", "Sublime"]).output().unwrap();
         assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-        assert_eq!(stdout_lines(&output), [target.display().to_string()]);
+        assert_eq!(stdout_lines(&output), [target.display().to_string(), plugin.display().to_string()]);
         assert_eq!(fs::read_to_string(&target).unwrap(), read("editors/sublime/API.sublime-syntax"));
+        assert_eq!(fs::read_to_string(&plugin).unwrap(), read("editors/sublime/api_completions.py"));
     }
 }
 

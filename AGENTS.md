@@ -780,9 +780,16 @@ Nothing is sent and no connection is needed.
 
 - **Each path written is a line on stdout.** What is left to do, if anything,
   is said on stderr.
-- `sublime` writes `API.sublime-syntax` to `Packages/User` of Sublime Text's
-  data folder. Where Sublime Text has no folder it is an error, and none is
-  made.
+- `sublime` writes `API.sublime-syntax` and `api_completions.py` to
+  `Packages/User` of Sublime Text's data folder. Where Sublime Text has no
+  folder it is an error, and none is made. The second file is a plugin that
+  completes what can stand where the cursor is: the settings of a `set`
+  line, the keys of an `import`, the members of a describe block, methods,
+  directives and URI operators, and paths. An include completes from the
+  directory of the file and from the directory of an import alias. An
+  `@file` and an outfile complete from the working directory, which an
+  editor does not know: a `# @basedir <path>` comment in the file says it
+  (the client does not read it), else it is the project folder.
 - `vim` and `nvim` write a package (`syntax/`, `ftdetect/`, `ftplugin/`) to
   `~/.vim/pack/commerceos/start/api` and
   `~/.local/share/nvim/site/pack/commerceos/start/api`.
