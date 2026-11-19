@@ -49,60 +49,36 @@ import kind, an alias that is a method or directive, a body function other than
   one is a plain JSON key, not an error. Neither is a value a setting does
   not take.
 - Whether an include path or an alias exists.
-- A URI's endpoints and members: they are the server's to say, and the
-  plugin asks no server. A word of a URI completes from the words of the
-  file, as in any file.
+- A URI's endpoints and members: they are the server's to say, and no server
+  is asked. A word of a URI completes from the words of the file, as in any
+  file.
 
 ## Completions
 
 `api_completions.py` is a plugin: Sublime Text loads it from `Packages/User`
-as it is written. It answers in `.api` files only, by where the cursor is:
+as it is written. It answers in `.api` files only. What can stand where the
+cursor is, is the client's to say: the plugin asks it (`api --complete`, see
+`AGENTS.md` for what is offered where) and hands the answer to Sublime Text.
 
-| Where | What is offered |
-|---|---|
-| The start of a line | the methods, the directives, and what can be included: directories, `.api` files and import aliases |
-| In `set { … }` | the settings the object does not have yet; behind a `:`, the values the setting takes |
-| Behind `import` | `git`, `dir`, `archive` |
-| In the object of an `import` | the keys of its kind |
-| In a describe block | `title`, `description`, `docsLink`; in the first two, locales |
-| Behind `url`, `sleep`, `assert`, `while`, `&&`, `\|\|` | `has` / `is`, `while`, `not`, the methods |
-| Behind a `~` of a URI | the operators the client completes at its prompt |
-| Behind `>` | `clipboard` (not behind `>>`) and paths |
-| Behind `@` | paths; behind a `~` there, `map(` |
+- The client is the `api` on the `PATH`, or where one is usually installed
+  when Sublime Text was not started from a shell. The setting `api_binary`
+  names another.
+- It is asked in the project folder the file is in, and without a project in
+  the directory of the file. That is what an `@file` and an outfile are
+  completed from; a `# @basedir <path>` comment in the file names another
+  directory, relative to the file.
+- In quotes that are typed already (`"in"`) a name is completed alone. Where
+  nothing is quoted yet the member is written whole, with a value to type
+  over: `"include-nulls": true`.
+- Sublime Text cuts a word at `-` and `/`, so behind `"include-n` the list
+  holds `nulls`, with the whole name beside it.
+- In a request's body and in a comment the plugin offers nothing of its own,
+  and Sublime Text completes as it does in any file. So it does with a
+  client from before `--complete`.
 
-In quotes that are typed already (`"in"`) a name is completed alone. Where
-nothing is quoted yet the member is written whole, with a value to type over:
-`"include-nulls": true`.
-
-**Paths.** What a path is relative to is what the client takes it to be
-relative to:
-
-- An include, and the `"path"` of an `import dir`: the directory of the file.
-- Behind an alias (`cl/…`): the directory the alias stands for. For an
-  `import dir` that is read from its line. For an `import git` or an `import
-  archive` the plugin asks the client (`api --imports`, of the file's
-  import lines as they stand, saved or not) in the background, and offers
-  nothing until it has the answer. An import that is not in the client's
-  cache is fetched by that, as a run would fetch it. The client is the `api` on the `PATH`, or the one the setting
-  `api_binary` names.
-- An `@file` body, the `@file` of a `set` or an `import`, and an outfile: the
-  working directory of the run, which an editor does not know. A comment in
-  the file says it, relative to the file:
-
-  ```
-  # @basedir ..
-  ```
-
-  Without one it is the project folder the file is in, and without a project
-  the directory of the file. The client does not read the comment.
-
-In a request's body and in a comment the plugin offers nothing of its own,
-and Sublime Text completes as it does in any file.
-
-The half of the plugin that decides what to offer is plain Python that knows
-nothing of the editor. `cargo test --test editors` runs it with the `python3`
-of the machine, a cursor at a time, and checks that the file holds nothing
-the Python 3.3 of Sublime Text can't read.
+`cargo test --test editors` has the `python3` of the machine ask a client
+through the plugin, and checks that the file holds nothing the Python 3.3 of
+Sublime Text can't read.
 
 ## Checking a change
 

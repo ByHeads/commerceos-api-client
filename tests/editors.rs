@@ -528,76 +528,7 @@ fn the_vim_syntax_gives_each_construct_of_the_sample_its_group() {
     }
 }
 
-// ------------------------------------------------- Sublime Text completions
-
-/// What `editors/sublime/api_completions.py` offers at the `|` of each text:
-/// `(typed, names, snippets)`, `Some(None)` in a URI and `None` where it
-/// leaves the editor to itself. The second list is what Sublime Text is
-/// handed when its own prefix is the second string of the case.
-///
-/// The half of the plugin that decides this is plain Python, run here by
-/// the `python3` of the machine. `None` for the whole where there is none:
-/// the tests that need it say so and hold nothing.
-#[allow(clippy::type_complexity)]
-fn sublime_completions(dir: &Path, cases: &[(&str, &str)]) -> Option<Vec<serde_json::Value>> {
-    let driver = r#"
-import json, sys
-sys.path.insert(0, sys.argv[1])
-import api_completions as plugin
-root = sys.argv[2]
-out = []
-for marked, prefix in json.load(sys.stdin):
-    offset = marked.rindex('|')  # the last one: a chain has a `||` of its own
-    text = marked[:offset] + marked[offset + 1:]
-    aliases = plugin.dir_aliases(text, root)
-    result = plugin.complete(text, offset, root, plugin.base_dir(text, root), aliases)
-    if result is not None and 'items' in result:
-        result['sublime'] = plugin.to_sublime(result, prefix)
-    out.append(result)
-json.dump(out, sys.stdout)
-"#;
-    let mut python = std::process::Command::new("python3");
-    python
-        .args(["-I", "-B", "-c", driver])
-        .arg(repo().join("editors/sublime"))
-        .arg(dir)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let mut child = python.spawn().ok()?;
-    {
-        use std::io::Write;
-        let mut stdin = child.stdin.take().unwrap();
-        stdin.write_all(serde_json::to_string(cases).unwrap().as_bytes()).unwrap();
-    }
-    let output = child.wait_with_output().unwrap();
-    assert!(output.status.success(), "the plugin failed:\n{}", String::from_utf8_lossy(&output.stderr));
-    Some(serde_json::from_slice(&output.stdout).expect("the driver prints JSON"))
-}
-
-fn names_of(result: &serde_json::Value) -> Vec<String> {
-    result["items"].as_array().unwrap().iter().map(|item| item[0].as_str().unwrap().to_string()).collect()
-}
-
-fn snippet_of(result: &serde_json::Value, name: &str) -> String {
-    let items = result["items"].as_array().unwrap();
-    let item = items.iter().find(|item| item[0] == name).unwrap_or_else(|| panic!("no `{}` in {}", name, result));
-    item[1].as_str().unwrap().to_string()
-}
-
-/// What Sublime Text is handed: `(trigger, contents)`, the trigger without
-/// the note behind its tab.
-fn handed(result: &serde_json::Value) -> Vec<(String, String)> {
-    result["sublime"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|pair| {
-            let trigger = pair[0].as_str().unwrap().split('\t').next().unwrap().to_string();
-            (trigger, pair[1].as_str().unwrap().to_string())
-        })
-        .collect()
-}
+// --------------------------------------------------------------- --complete
 
 /// A directory with what the path cases complete to.
 fn completion_fixture() -> tempfile::TempDir {
@@ -621,239 +552,390 @@ fn completion_fixture() -> tempfile::TempDir {
     dir
 }
 
-#[test]
-fn the_sublime_plugin_completes_the_members_of_a_set_an_import_and_a_describe_block() {
-    let dir = completion_fixture();
-    let cases = [
-        // the line of the screenshot: a name being typed in its quotes
-        ("set {\n  \"in|\"\n}\n", "in"),
-        ("set { \"include-nulls\": true, \"|\" }", ""),
-        ("set {\n  |\n}", ""),
-        ("set { \"include-n|\" }", "n"),
-        ("set { \"raw\": | }", ""),
-        ("set { \"timeout\": | }", ""),
-        ("set { \"raw\": true | }", ""),
-        ("set { \"export\": \"com.|\" }", ""),
-        ("import git cl {\n  \"|\"\n}", ""),
-        ("import dir cl { \"|\" }", ""),
-        ("import archive ar { \"url\": \"x\", | }", ""),
-        ("{\n  \"|\"\n}\nGET /a", ""),
-        ("{\n  \"title\": { \"sv-SE\": \"Katalog\", \"|\" }\n}", ""),
-        ("{ \"owner\": { \"|\" } }", ""),
-        // a request's body, a comment, a `confirm`: not this plugin's
-        ("PUT /people/x { \"na|\" }", "na"),
-        ("PUT /things {\n  // a |\n}", ""),
-        ("# set { \"|\" }", ""),
-        ("confirm Seed { \"|", ""),
-        ("GET /a   # then set { \"|", ""),
-        // a body that closed is behind the cursor
-        ("PUT /a { \"x\": 1 }\nset { \"|\" }", ""),
-        ("PUT /a {\n  \"x\": \"a } b\"\n}\nimport git cl { \"|\" }", ""),
-    ];
-    let Some(got) = sublime_completions(dir.path(), &cases) else {
-        eprintln!("skipped: no python3 on the PATH");
-        return;
-    };
-    let settings = ["export", "include-nulls", "fail-fast", "ndjson", "raw", "stream", "timeout"];
+/// What `api --complete` says can stand at the last `|` of `marked`, the
+/// text of `main.api` in `dir`, asked in that directory: `null` where it
+/// leaves the editor to itself, `{"uri": true}` in a URI.
+fn completion(dir: &Path, marked: &str) -> serde_json::Value {
+    // the last one: a chain has a `||` of its own
+    let offset = marked.rfind('|').unwrap();
+    let text = format!("{}{}", &marked[..offset], &marked[offset + 1..]);
+    let output = Command::cargo_bin("api")
+        .unwrap()
+        .current_dir(dir)
+        .env("API_IMPORT_CACHE", dir.join(".imports"))
+        .args(["-r", "--complete"])
+        .arg(dir.join("main.api"))
+        .args(["--at", &offset.to_string()])
+        .write_stdin(text)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}: {}", marked, stderr(&output));
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|e| panic!("{}: {}", marked, e))
+}
 
-    assert_eq!(got[0]["typed"], "in");
-    assert_eq!(names_of(&got[0]), settings);
-    assert_eq!(snippet_of(&got[0], "include-nulls"), "include-nulls");
+fn names_of(result: &serde_json::Value) -> Vec<String> {
+    let items = result["items"].as_array().unwrap_or_else(|| panic!("no items: {}", result));
+    items.iter().map(|item| item["name"].as_str().unwrap().to_string()).collect()
+}
+
+fn item_of<'a>(result: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    let items = result["items"].as_array().unwrap();
+    items.iter().find(|item| item["name"] == name).unwrap_or_else(|| panic!("no `{}` in {}", name, result))
+}
+
+const SETTINGS: [&str; 7] = ["export", "include-nulls", "fail-fast", "ndjson", "raw", "stream", "timeout"];
+const METHODS: [&str; 7] = ["GET", "PUT", "POST", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+
+#[test]
+fn complete_offers_the_members_of_a_set_an_import_and_a_describe_block() {
+    let dir = completion_fixture();
+    let at = |marked: &str| completion(dir.path(), marked);
+
+    // a name being typed in its quotes
+    let quoted = at("set {\n  \"in|\"\n}\n");
+    assert_eq!(quoted["typed"], "in");
+    assert_eq!(names_of(&quoted), SETTINGS);
+    assert_eq!(item_of(&quoted, "include-nulls")["snippet"], "include-nulls");
     // a setting the object has is not offered again
-    assert_eq!(names_of(&got[1]), ["export", "fail-fast", "ndjson", "raw", "stream", "timeout"]);
+    assert_eq!(
+        names_of(&at("set { \"include-nulls\": true, \"|\" }")),
+        ["export", "fail-fast", "ndjson", "raw", "stream", "timeout"]
+    );
     // nothing quoted yet: the member whole, with a value to type over
-    assert_eq!(names_of(&got[2]), settings);
-    assert_eq!(snippet_of(&got[2], "include-nulls"), "\"include-nulls\": ${1:true}");
-    assert_eq!(snippet_of(&got[2], "timeout"), "\"timeout\": ${1:30}");
-    assert_eq!(snippet_of(&got[2], "export"), "\"export\": \"${1:com.heads.seedID}\"");
-    // Sublime Text cuts a word at `-`: what it replaces is `n`, of `include-n`
-    assert_eq!(handed(&got[3]), [("nulls".to_string(), "nulls".to_string())]);
-    assert_eq!(names_of(&got[4]), ["true", "false", "null"]);
-    assert_eq!(names_of(&got[5]), ["0", "null"]);
-    assert!(names_of(&got[6]).is_empty(), "{}", got[6]);
-    assert!(names_of(&got[7]).is_empty(), "{}", got[7]);
-    assert_eq!(names_of(&got[8]), ["url", "ref", "path"]);
-    assert_eq!(names_of(&got[9]), ["path"]);
-    assert_eq!(names_of(&got[10]), ["sha256", "token_env", "path"]);
-    assert_eq!(snippet_of(&got[10], "sha256"), "\"sha256\": \"$1\"");
-    assert_eq!(names_of(&got[11]), ["title", "description", "docsLink"]);
-    assert_eq!(names_of(&got[12])[..2], ["en-US", "nb-NO"]);
-    assert!(names_of(&got[13]).is_empty(), "{}", got[13]);
-    for case in 14..19 {
-        assert!(got[case].is_null(), "{}: {}", cases[case].0, got[case]);
+    let bare = at("set {\n  |\n}");
+    assert_eq!(names_of(&bare), SETTINGS);
+    assert_eq!(item_of(&bare, "include-nulls")["snippet"], "\"include-nulls\": ${1:true}");
+    assert_eq!(item_of(&bare, "include-nulls")["text"], "\"include-nulls\": true");
+    assert_eq!(item_of(&bare, "timeout")["snippet"], "\"timeout\": ${1:30}");
+    assert_eq!(item_of(&bare, "export")["snippet"], "\"export\": \"${1:com.heads.seedID}\"");
+    assert_eq!(item_of(&bare, "export")["text"], "\"export\": \"com.heads.seedID\"");
+    assert_eq!(item_of(&bare, "export")["note"], "setting");
+    assert_eq!(at("set { \"include-n|\" }")["typed"], "include-n");
+
+    // the values a setting takes
+    assert_eq!(names_of(&at("set { \"raw\": | }")), ["true", "false", "null"]);
+    assert_eq!(names_of(&at("set { \"timeout\": | }")), ["0", "null"]);
+    assert!(names_of(&at("set { \"raw\": true | }")).is_empty());
+    assert!(names_of(&at("set { \"export\": \"com.|\" }")).is_empty());
+
+    // the keys of an import are the keys of its kind
+    assert_eq!(names_of(&at("import git cl {\n  \"|\"\n}")), ["url", "ref", "path"]);
+    assert_eq!(names_of(&at("import dir cl { \"|\" }")), ["path"]);
+    let archive = at("import archive ar { \"url\": \"x\", | }");
+    assert_eq!(names_of(&archive), ["sha256", "token_env", "path"]);
+    assert_eq!(item_of(&archive, "sha256")["snippet"], "\"sha256\": \"$1\"");
+    assert_eq!(item_of(&archive, "sha256")["text"], "\"sha256\": \"\"");
+
+    // a describe block, and the locales of its texts
+    let describe = at("{\n  \"|\"\n}\nGET /a");
+    assert_eq!(names_of(&describe), ["title", "description", "docsLink"]);
+    let whole = at("{\n  |\n}");
+    assert_eq!(item_of(&whole, "title")["snippet"], "\"title\": { \"${1:sv-SE}\": \"$2\" }");
+    assert_eq!(item_of(&whole, "title")["text"], "\"title\": { \"sv-SE\": \"\" }");
+    assert_eq!(names_of(&at("{\n  \"title\": { \"sv-SE\": \"Katalog\", \"|\" }\n}"))[..2], ["en-US", "nb-NO"]);
+    assert!(names_of(&at("{ \"owner\": { \"|\" } }")).is_empty());
+
+    // a request's body, a comment, a `confirm`: the editor's own
+    for marked in [
+        "PUT /people/x { \"na|\" }",
+        "PUT /things {\n  // a |\n}",
+        "PUT /things {\n  /* a | */\n}",
+        "# set { \"|\" }",
+        "confirm Seed { \"|",
+        "GET /a   # then set { \"|",
+    ] {
+        assert!(at(marked).is_null(), "{}: {}", marked, at(marked));
     }
-    assert_eq!(names_of(&got[19]), settings);
-    assert_eq!(names_of(&got[20]), ["url", "ref", "path"]);
+
+    // a body that closed is behind the cursor
+    assert_eq!(names_of(&at("PUT /a { \"x\": 1 }\nset { \"|\" }")), SETTINGS);
+    assert_eq!(names_of(&at("PUT /a {\n  \"x\": \"a } b\"\n}\nimport git cl { \"|\" }")), ["url", "ref", "path"]);
+    // the place is counted in bytes
+    assert_eq!(names_of(&at("# é\nset { \"å\": 1, \"|\" }")), SETTINGS);
 
     // the seven settings are the seven the syntax scopes as settings
     let syntax = read("editors/sublime/API.sublime-syntax");
-    assert!(syntax.contains(&format!("(\")({})(\")", settings.join("|"))), "the settings of the syntax have changed");
+    assert!(syntax.contains(&format!("(\")({})(\")", SETTINGS.join("|"))), "the settings of the syntax have changed");
 }
 
 #[test]
-fn the_sublime_plugin_completes_the_words_of_a_line() {
+fn complete_offers_the_words_of_a_line() {
     let dir = completion_fixture();
-    let cases = [
-        ("|", ""),
-        ("GET /a\nde|", "de"),
-        ("import |", ""),
-        ("import git |", ""),
-        ("url |", ""),
-        ("sleep |", ""),
-        ("sleep 20 wh|", "wh"),
-        ("sleep 20 while |", ""),
-        ("assert |", ""),
-        ("assert not |", ""),
-        ("GET /a && |", ""),
-        ("GET /people~|", ""),
-        ("GET /people~wh|", "wh"),
-        ("GET /people~where(name=x)~c|", "c"),
-        ("GET /people~where(a~|", ""),
-        ("GET /people/|", ""),
-        ("/peo|", "peo"),
-        ("GET /a || PUT /people~|", ""),
-        ("PUT /x @data.csv~|", ""),
-        ("GET /people > c|", "c"),
-        ("GET /people >> c|", "c"),
-        ("assert GET /x > c|", "c"),
-        ("GET /x~where(name=\"a > c|", "c"),
-    ];
-    let Some(got) = sublime_completions(dir.path(), &cases) else {
-        eprintln!("skipped: no python3 on the PATH");
-        return;
-    };
-    let methods = ["GET", "PUT", "POST", "PATCH", "DELETE", "HEAD", "OPTIONS"];
-    let with_not: Vec<&str> = ["not"].into_iter().chain(methods).collect();
+    let at = |marked: &str| completion(dir.path(), marked);
+    let with_not: Vec<&str> = ["not"].into_iter().chain(METHODS).collect();
+    let operators =
+        ["with(", "just(", "without(", "where(", "orderBy(", "take(", "skip(", "first", "last", "count", "flat", "entries", "array", "map("];
 
     // an empty line: the methods, the directives, and what can be included
-    let first = names_of(&got[0]);
-    assert_eq!(first[..7], methods);
-    assert_eq!(first[7..13], ["sleep", "assert", "confirm", "set", "url", "import"]);
-    assert_eq!(first[13..], ["cloddy/", "seed.api", "shared/", "work/"]);
-    assert_eq!(snippet_of(&got[0], "GET"), "GET ");
-    assert_eq!(handed(&got[1]), [("DELETE".to_string(), "DELETE ".to_string())]);
-    assert_eq!(names_of(&got[2]), ["git", "dir", "archive"]);
-    assert!(got[3].is_null(), "an alias is a name of one's own: {}", got[3]);
-    assert_eq!(names_of(&got[4]), ["has", "is"]);
-    assert_eq!(names_of(&got[5]), ["while"]);
-    assert_eq!(names_of(&got[6]), ["while"]);
-    assert_eq!(names_of(&got[7]), with_not);
-    assert_eq!(names_of(&got[8]), with_not);
-    assert_eq!(names_of(&got[9]), methods);
-    assert_eq!(names_of(&got[10]), methods);
+    let empty = at("|");
+    let names = names_of(&empty);
+    assert_eq!(names[..7], METHODS);
+    assert_eq!(names[7..13], ["sleep", "assert", "confirm", "set", "url", "import"]);
+    assert_eq!(names[13..], ["cloddy/", "shared/", "work/", "seed.api"]);
+    assert_eq!(item_of(&empty, "GET")["snippet"], "GET ");
+    assert_eq!(item_of(&empty, "GET")["note"], "method");
+    assert_eq!(item_of(&empty, "sleep")["note"], "directive");
+    assert_eq!(names_of(&at("GET /a\nde|")), ["DELETE"]);
 
-    // the operators are the ones the client completes at its prompt
-    let source = read("src/main.rs");
-    let block = source.split("const API_OPERATORS: &[&str] = &[").nth(1).unwrap().split("];").next().unwrap();
-    let operators: Vec<&str> = block.split('"').skip(1).step_by(2).collect();
-    assert!(operators.len() > 10, "{:?}", operators);
-    assert_eq!(names_of(&got[11]), operators);
-    assert_eq!(got[12]["typed"], "wh");
-    assert_eq!(snippet_of(&got[12], "where("), "where($1)");
-    assert_eq!(snippet_of(&got[13], "count"), "count");
+    assert_eq!(names_of(&at("import |")), ["git", "dir", "archive"]);
+    assert!(at("import git |").is_null(), "an alias is a name of one's own");
+    assert_eq!(names_of(&at("url |")), ["has", "is"]);
+    assert!(at("url has |").is_null());
+    assert_eq!(names_of(&at("sleep |")), ["while"]);
+    assert_eq!(names_of(&at("sleep 20 wh|")), ["while"]);
+    assert!(at("sleep 2|").is_null());
+    assert_eq!(names_of(&at("sleep 20 while |")), with_not);
+    assert_eq!(names_of(&at("sleep while |")), with_not);
+    assert_eq!(names_of(&at("assert |")), with_not);
+    assert_eq!(names_of(&at("assert not |")), METHODS);
+    assert_eq!(names_of(&at("GET /a && |")), METHODS);
+
+    // the operators are the ones the prompt completes
+    let all = at("GET /people~|");
+    assert_eq!(names_of(&all), operators);
+    assert_eq!(item_of(&all, "where(")["snippet"], "where($1)");
+    assert_eq!(item_of(&all, "where(")["text"], "where(");
+    assert_eq!(item_of(&all, "count")["snippet"], "count");
+    assert_eq!(at("GET /people~wh|")["typed"], "wh");
+    assert_eq!(names_of(&at("GET /people~where(name=x)~c|")), operators);
+    assert_eq!(names_of(&at("GET /a || PUT /people~|")), operators);
+    assert_eq!(names_of(&at("/people~|")), operators);
+    assert_eq!(names_of(&at("assert /people~|")), operators);
     // inside the parentheses of an operator a `~` is not the next operator
-    assert_eq!(got[14]["uri"], true, "{}", got[14]);
-    // a URI is left to the editor
-    assert_eq!(got[15]["uri"], true);
-    assert_eq!(got[16]["uri"], true);
-    assert_eq!(names_of(&got[17]), operators);
-    assert_eq!(names_of(&got[18]), ["map("]);
-    assert_eq!(names_of(&got[19]), ["clipboard", "cloddy/"]);
+    assert_eq!(at("GET /people~where(a~|")["uri"], true);
+    // a URI is the server's
+    assert_eq!(at("GET /people/|")["uri"], true);
+    assert_eq!(at("/peo|")["uri"], true);
+    assert_eq!(at("GET |")["uri"], true);
+
+    assert_eq!(names_of(&at("PUT /x @data.csv~|")), ["map("]);
+    assert_eq!(names_of(&at("GET /people > c|")), ["clipboard", "cloddy/"]);
+    assert_eq!(names_of(&at("GET /people >c|")), ["clipboard", "cloddy/"]);
     // nothing is appended to the clipboard, and a condition has no outfile
-    assert_eq!(names_of(&got[20]), ["cloddy/"]);
-    assert!(got[21].is_null(), "{}", got[21]);
-    assert!(got[22].is_null(), "{}", got[22]);
+    assert_eq!(names_of(&at("GET /people >> c|")), ["cloddy/"]);
+    assert!(at("assert GET /x > c|").is_null());
+    // a string of a line is not this client's to complete
+    assert!(at("GET /x~where(name=\"a > c|").is_null());
+    assert!(at("PUT /x \"a > c|").is_null());
 }
 
 #[test]
-fn the_sublime_plugin_completes_paths_from_where_each_is_relative_to() {
+fn complete_offers_paths_from_where_each_is_relative_to() {
     let dir = completion_fixture();
-    let cases = [
-        // an include: relative to the file, directories and `.api` files
-        ("se|", "se"),
-        ("shared/|", ""),
-        ("shared/us|", "us"),
-        (".|", ""),
-        // an alias of an `import dir`, read from its line
-        ("import dir cl { \"path\": \"cloddy\" }\ncl/|", ""),
-        ("import dir cl { \"path\": \"cloddy\" }\nc|", "c"),
-        ("import dir cl {\n  \"path\": \"cloddy\"\n}\ncl/seeds/|", ""),
-        // the `path` of an `import dir`: directories
-        ("import dir cl { \"path\": \"|\" }", ""),
-        ("import dir cl { \"path\": \"shared/|\" }", ""),
-        ("import git cl { \"path\": \"|\" }", ""),
-        // an `@file`: relative to the working directory, any file
-        ("PUT /x @|", ""),
-        ("PUT /x @shared/|", ""),
-        ("# @basedir work\nPUT /x @|", ""),
-        // the one JSON file of a `set` and an `import`
-        ("set @|", ""),
-        ("import git cl @sh|", "sh"),
-        ("import git cl @shared/|", ""),
-        // an outfile
-        ("GET /people > shared/d|", "d"),
-    ];
-    let Some(got) = sublime_completions(dir.path(), &cases) else {
-        eprintln!("skipped: no python3 on the PATH");
-        return;
-    };
-    assert_eq!(names_of(&got[0]), ["set", "seed.api"]);
-    assert_eq!(names_of(&got[1]), ["shared/deep/", "shared/users.api"]);
-    assert_eq!(names_of(&got[2]), ["shared/users.api"]);
-    // Sublime Text replaces `us`: `shared/` stays where it is
-    assert_eq!(handed(&got[2]), [("users.api".to_string(), "users.api".to_string())]);
-    assert_eq!(names_of(&got[3]), [".hidden.api"]);
-    assert_eq!(names_of(&got[4]), ["cl/seeds/", "cl/sv.api"]);
-    assert_eq!(handed(&got[4]), [("seeds/".to_string(), "seeds/".to_string()), ("sv.api".to_string(), "sv.api".to_string())]);
-    assert_eq!(names_of(&got[5]), ["confirm", "cl/", "cloddy/"]);
-    assert_eq!(names_of(&got[6]), ["cl/seeds/one.api"]);
-    assert_eq!(names_of(&got[7]), ["cloddy/", "shared/", "work/"]);
-    assert_eq!(names_of(&got[8]), ["shared/deep/"]);
-    assert!(names_of(&got[9]).is_empty(), "a path in a repository is not one of this machine: {}", got[9]);
-    assert_eq!(names_of(&got[10]), ["cloddy/", "notes.txt", "seed.api", "settings.json", "shared/", "work/"]);
-    assert_eq!(names_of(&got[11]), ["shared/data.json", "shared/deep/", "shared/users.api"]);
-    assert_eq!(names_of(&got[12]), ["body.json"]);
-    assert_eq!(names_of(&got[13]), ["cloddy/", "settings.json", "shared/", "work/"]);
-    assert_eq!(names_of(&got[14]), ["shared/"]);
-    assert_eq!(names_of(&got[15]), ["shared/data.json", "shared/deep/"]);
-    assert_eq!(names_of(&got[16]), ["shared/data.json", "shared/deep/"]);
+    let at = |marked: &str| names_of(&completion(dir.path(), marked));
+
+    // an include: relative to the file, directories and `.api` files
+    assert_eq!(at("se|"), ["set", "seed.api"]);
+    assert_eq!(at("shared/|"), ["shared/deep/", "shared/users.api"]);
+    assert_eq!(at("shared/us|"), ["shared/users.api"]);
+    assert_eq!(at(".|"), [".hidden.api"]);
+    assert_eq!(at("./sh|"), ["./shared/"]);
+    // an alias of an `import dir`, read from its line
+    let import = "import dir cl { \"path\": \"cloddy\" }";
+    assert_eq!(at(&format!("{}\ncl/|", import)), ["cl/seeds/", "cl/sv.api"]);
+    assert_eq!(at(&format!("{}\nc|", import)), ["confirm", "cl/", "cloddy/"]);
+    assert_eq!(at("import dir cl {\n  // where it is\n  \"path\": \"cloddy\"\n}\ncl/seeds/|"), ["cl/seeds/one.api"]);
+    // an import that can't be read has no alias, and stops nothing
+    assert_eq!(at(&format!("{}\ncl/|\nimport dir half {{ \"path\": \"clo", import)), ["cl/seeds/", "cl/sv.api"]);
+    // the `path` of an `import dir`: directories
+    assert_eq!(at("import dir cl { \"path\": \"|\" }"), ["cloddy/", "shared/", "work/"]);
+    assert_eq!(at("import dir cl { \"path\": \"shared/|\" }"), ["shared/deep/"]);
+    assert!(at("import git cl { \"path\": \"|\" }").is_empty(), "a path in a repository is not one of this machine");
+    // an `@file`: relative to the working directory, any file
+    assert_eq!(at("PUT /x @|"), ["cloddy/", "shared/", "work/", "notes.txt", "seed.api", "settings.json"]);
+    assert_eq!(at("PUT /x @shared/|"), ["shared/deep/", "shared/data.json", "shared/users.api"]);
+    assert_eq!(at("PUT /x @ sh|"), ["shared/"]);
+    // … which a comment of the file can name, relative to the file
+    assert_eq!(at("# @basedir work\nPUT /x @|"), ["body.json"]);
+    assert_eq!(at("# @basedir work\nGET /x > |"), ["clipboard", "body.json"]);
+    assert_eq!(at("# @basedir work\nsh|"), ["shared/"], "an include is relative to the file");
+    // the one JSON file of a `set` and an `import`
+    assert_eq!(at("set @|"), ["cloddy/", "shared/", "work/", "settings.json"]);
+    assert_eq!(at("import git cl @sh|"), ["shared/"]);
+    assert_eq!(at("import git cl @shared/|"), ["shared/deep/", "shared/data.json"]);
+    // an outfile, also behind a body of several lines
+    assert_eq!(at("GET /people > shared/d|"), ["shared/deep/", "shared/data.json"]);
+    assert_eq!(at("PUT /a {\n  \"x\": 1\n} > sh|"), ["shared/"]);
+
+    // the file need not be where the client is asked
+    let elsewhere = tempdir().unwrap();
+    let output = Command::cargo_bin("api")
+        .unwrap()
+        .current_dir(elsewhere.path())
+        .args(["-r", "--complete"])
+        .arg(dir.path().join("shared/users.api"))
+        .write_stdin("de")
+        .output()
+        .unwrap();
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(names_of(&result), ["DELETE", "deep/"]);
+    // a text that is kept nowhere yet has no directory to include from
+    let output = Command::cargo_bin("api").unwrap().current_dir(dir.path()).args(["-r", "--complete", "-"]).write_stdin("se").output().unwrap();
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(names_of(&result), ["set"]);
 }
 
-/// The client is asked where a git or archive alias is with the file's
-/// import lines alone: the file itself can't be read while a line of it is
-/// half typed, which is when a completion is asked for.
+/// A git alias completes from the cache, where a run or `--imports` left
+/// its checkout. Nothing is fetched to complete: an editor asks on a
+/// keystroke.
 #[test]
-fn the_sublime_plugin_asks_the_client_about_the_import_lines_alone() {
-    let text = "# seed\nimport git cl {\n  \"url\": \"https://example.com/r\", // here\n  \"ref\": \"1.0.0\"\n}\n\
-                import dir local { \"path\": \"../x\" }\nimport archive ar @ar.json   # from a file\n\
-                PUT /x { \"import git\": 1 }\ncl/\nimport archive half { \"url\": \"x";
-    let script = "import sys\nsys.path.insert(0, sys.argv[1])\nimport api_completions\n\
-                  sys.stdout.write(api_completions.remote_imports(sys.stdin.read()))";
-    let mut python = std::process::Command::new("python3");
-    python
-        .args(["-I", "-B", "-c", script])
+fn complete_reads_a_git_alias_from_the_cache_and_fetches_nothing() {
+    let dir = completion_fixture();
+    let repo = tempdir().unwrap();
+    fs::create_dir_all(repo.path().join("seeds")).unwrap();
+    fs::write(repo.path().join("sv.api"), "GET /about\n").unwrap();
+    fs::write(repo.path().join("seeds/one.api"), "GET /about\n").unwrap();
+    let git = |args: &[&str]| {
+        let done = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["-c", "user.name=test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(done.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&done.stderr));
+    };
+    git(&["init", "-q"]);
+    git(&["add", "."]);
+    git(&["commit", "-qm", "seeds"]);
+    git(&["tag", "1.0.0"]);
+    let import = format!("import git gl {{ \"url\": \"file://{}\", \"ref\": \"1.0.0\" }}\n", repo.path().display());
+    let whole = format!("{}import git sub {{ \"url\": \"file://{}\", \"ref\": \"1.0.0\", \"path\": \"seeds\" }}\n", import, repo.path().display());
+
+    // never fetched: the alias stands for nothing yet
+    assert!(names_of(&completion(dir.path(), &format!("{}gl/|", whole))).is_empty());
+    assert!(!dir.path().join(".imports").exists(), "a completion fetched an import");
+
+    let listed = Command::cargo_bin("api")
+        .unwrap()
+        .current_dir(dir.path())
+        .env("API_IMPORT_CACHE", dir.path().join(".imports"))
+        .args(["--imports", "-"])
+        .write_stdin(whole.clone())
+        .output()
+        .unwrap();
+    assert_eq!(listed.status.code(), Some(0), "{}", stderr(&listed));
+
+    assert_eq!(names_of(&completion(dir.path(), &format!("{}gl/|", whole))), ["gl/seeds/", "gl/sv.api"]);
+    assert_eq!(names_of(&completion(dir.path(), &format!("{}sub/|", whole))), ["sub/one.api"]);
+    assert_eq!(names_of(&completion(dir.path(), &format!("{}g|", whole))), ["GET", "gl/"]);
+    // the remote is gone: the checkout it left is still what the alias is
+    fs::remove_dir_all(repo.path()).unwrap();
+    assert_eq!(names_of(&completion(dir.path(), &format!("{}gl/|", whole))), ["gl/seeds/", "gl/sv.api"]);
+}
+
+#[test]
+fn complete_prints_a_document_and_stands_alone() {
+    let dir = completion_fixture();
+    let api = || {
+        let mut cmd = Command::cargo_bin("api").unwrap();
+        cmd.current_dir(dir.path());
+        cmd
+    };
+    // indented as the other documents are, on one line with `-r`
+    let output = api().args(["--complete", "-"]).write_stdin("url ").output().unwrap();
+    assert!(String::from_utf8_lossy(&output.stdout).starts_with("{\n  \"typed\": \"\",\n  \"items\": [\n"), "{:?}", output);
+    let output = api().args(["-r", "--complete", "-"]).write_stdin("# a comment").output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "null\n");
+    // without `--at` the place is the end of the text; past the end is the end
+    let output = api().args(["-r", "--complete", "-", "--at", "999"]).write_stdin("import ").output().unwrap();
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(names_of(&result), ["git", "dir", "archive"]);
+
+    let output = api().args(["--complete", "-", "GET", "/people"]).write_stdin("").output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stderr(&output), "error: --complete - prints a document and GET /people is a request: give one of the two\n");
+    let output = api().args(["--complete", "-", "--describe", "seed.api"]).write_stdin("").output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stderr(&output), "error: --describe and --complete each print a document of their own: use one\n");
+    let output = api().args(["--at", "3", "GET", "/people"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+}
+
+// ------------------------------------------------------ the editors' callers
+
+/// Run `script` with the `python3` of the machine, the Sublime plugin on its
+/// path, and return what it printed. `None` where there is no `python3`:
+/// the tests that need it say so and hold nothing.
+fn with_the_sublime_plugin(script: &str, args: &[&std::ffi::OsStr]) -> Option<String> {
+    let output = std::process::Command::new("python3")
+        .args(["-I", "-B", "-c", &format!("import sys\nsys.path.insert(0, sys.argv[1])\nimport api_completions as plugin\n{}", script)])
         .arg(repo().join("editors/sublime"))
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped());
-    let Ok(mut child) = python.spawn() else {
+        .args(args)
+        .output()
+        .ok()?;
+    assert!(output.status.success(), "the plugin failed:\n{}", String::from_utf8_lossy(&output.stderr));
+    Some(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// The Sublime plugin asks the client and hands Sublime Text what is left
+/// of each name behind the part of it that stays: Sublime replaces the word
+/// in front of the cursor as its word separators cut it.
+#[test]
+fn the_sublime_plugin_asks_the_client_and_hands_over_what_is_left_of_a_name() {
+    let dir = completion_fixture();
+    let script = r#"
+import json
+binary, root = sys.argv[2], sys.argv[3]
+out = []
+# (the text with a `|` at the cursor, the word Sublime Text replaces)
+for marked, prefix in json.loads(sys.argv[4]):
+    offset = marked.index('|')
+    text = marked[:offset] + marked[offset + 1:]
+    result = plugin.ask(binary, text, offset, root + '/main.api', plugin.working_dir(root + '/main.api', [root]))
+    out.append(None if result is None or 'items' not in result else plugin.to_sublime(result, prefix))
+out.append(plugin.ask(root + '/no-such-client', 'se', 2))
+out.append(plugin.ask(binary, 'GET /people/', 12, None, root))
+out.append(plugin.working_dir('/a/b/c/x.api', ['/a/other', '/a/b']))
+out.append(plugin.working_dir('/a/b/c/x.api', []))
+out.append(plugin.working_dir(None, ['/a/other']))
+print(json.dumps(out))
+"#;
+    let cases = [
+        ("set {\n  \"in|\"\n}\n", "in"),
+        // Sublime Text cuts a word at `-`: what it replaces is `n`, of `include-n`
+        ("set { \"include-n|\" }", "n"),
+        ("# é å ö\nset { \"include-n|\" }", "n"),
+        ("GET /a\nde|", "de"),
+        ("shared/us|", "us"),
+        ("import dir cl { \"path\": \"cloddy\" }\ncl/|", ""),
+        ("GET /people~wh|", "wh"),
+        ("PUT /x { \"na|\" }", "na"),
+    ];
+    let binary = assert_cmd::cargo::cargo_bin("api");
+    let args = [binary.as_os_str(), dir.path().as_os_str(), std::ffi::OsStr::new(&serde_json::to_string(&cases).unwrap()).to_owned().as_os_str()]
+        .map(|arg| arg.to_owned());
+    let args: Vec<&std::ffi::OsStr> = args.iter().map(|arg| arg.as_os_str()).collect();
+    let Some(printed) = with_the_sublime_plugin(script, &args) else {
         eprintln!("skipped: no python3 on the PATH");
         return;
     };
-    {
-        use std::io::Write;
-        child.stdin.take().unwrap().write_all(text.as_bytes()).unwrap();
-    }
-    let output = child.wait_with_output().unwrap();
-    assert!(output.status.success());
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        "import git cl {\n  \"url\": \"https://example.com/r\", // here\n  \"ref\": \"1.0.0\"\n}\n\
-         import archive ar @ar.json   # from a file"
-    );
+    let got: serde_json::Value = serde_json::from_str(&printed).unwrap();
+    let handed = |n: usize| -> Vec<(String, String)> {
+        let pairs = got[n].as_array().unwrap_or_else(|| panic!("{}: {}", cases[n].0, got[n]));
+        pairs.iter().map(|pair| (pair[0].as_str().unwrap().to_string(), pair[1].as_str().unwrap().to_string())).collect()
+    };
+    let pair = |trigger: &str, contents: &str| (trigger.to_string(), contents.to_string());
+    assert_eq!(handed(0)[1], pair("include-nulls\tsetting", "include-nulls"));
+    assert_eq!(handed(0).len(), 7);
+    assert_eq!(handed(1), [pair("nulls\tinclude-nulls", "nulls")]);
+    assert_eq!(handed(2), [pair("nulls\tinclude-nulls", "nulls")], "the place is given in bytes");
+    assert_eq!(handed(3), [pair("DELETE\tmethod", "DELETE ")]);
+    assert_eq!(handed(4), [pair("users.api\tfile", "users.api")]);
+    assert_eq!(handed(5), [pair("seeds/\tdirectory", "seeds/"), pair("sv.api\tfile", "sv.api")]);
+    assert_eq!(handed(6)[3], pair("where(\toperator", "where($1)"));
+    assert!(got[7].is_null(), "{}", got[7]);
+    // a client that is not there, and a URI
+    assert!(got[8].is_null(), "{}", got[8]);
+    assert_eq!(got[9]["uri"], true);
+    assert_eq!(got[10], "/a/b");
+    assert_eq!(got[11], "/a/b/c");
+    assert_eq!(got[12], "/a/other");
 }
 
 /// Sublime Text runs a plugin of `Packages/User` in Python 3.3. What that
-/// version can't read is no error to the `python3` the tests above run, so
+/// version can't read is no error to the `python3` the test above runs, so
 /// the syntax tree of the plugin is searched for what came later.
 #[test]
 fn the_sublime_plugin_is_written_for_python_3_3() {
@@ -872,14 +954,14 @@ for node in ast.walk(tree):
         names = [alias.name for alias in node.names] + [getattr(node, 'module', None)]
         if any(name in ('pathlib', 'typing', 'dataclasses', 'enum', 'asyncio') for name in names):
             later.append('line %d: import %s' % (node.lineno, names))
-    if kind in ('Dict', 'List', 'Tuple', 'Set', 'Call') and any(
+    if kind in ('Dict', 'List', 'Tuple', 'Set') and any(
             type(item).__name__ == 'Starred' or item is None
-            for item in getattr(node, 'elts', None) or getattr(node, 'keys', None) or []) and kind != 'Call':
+            for item in getattr(node, 'elts', None) or getattr(node, 'keys', None) or []):
         later.append('line %d: unpacking in a display' % node.lineno)
 print('\n'.join(later))
 "#;
     let output = std::process::Command::new("python3")
-        .args(["-I", "-c", check])
+        .args(["-I", "-B", "-c", check])
         .arg(repo().join("editors/sublime/api_completions.py"))
         .output();
     let Ok(output) = output else {
@@ -888,6 +970,212 @@ print('\n'.join(later))
     };
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "", "not Python 3.3");
+}
+
+/// The VS Code extension asks the client and hands the editor an item for
+/// each answer, to stand where the text typed so far is. It is run by the
+/// `node` of the machine against a `vscode` module of the test's own, which
+/// holds what the extension uses of the editor. Holds nothing without `node`.
+#[test]
+fn the_vscode_extension_asks_the_client_and_hands_over_items_for_the_typed_text() {
+    let dir = completion_fixture();
+    let modules = tempdir().unwrap();
+    fs::create_dir_all(modules.path().join("node_modules/vscode")).unwrap();
+    fs::write(
+        modules.path().join("node_modules/vscode/index.js"),
+        r#"
+class Position { constructor(line, character) { this.line = line; this.character = character; }
+  translate(lines, characters) { return new Position(this.line + lines, this.character + characters); } }
+class Range { constructor(start, end) { this.start = start; this.end = end; } }
+class SnippetString { constructor(value) { this.value = value; } }
+class CompletionItem { constructor(label, kind) { this.label = label; this.kind = kind; } }
+const CompletionItemKind = new Proxy({}, { get: (_, name) => name });
+const state = { binary: '', folders: [], providers: [] };
+module.exports = {
+  Position, Range, SnippetString, CompletionItem, CompletionItemKind, state,
+  workspace: {
+    getConfiguration: () => ({ get: () => state.binary }),
+    getWorkspaceFolder: () => undefined,
+    get workspaceFolders() { return state.folders; },
+  },
+  languages: {
+    registerCompletionItemProvider: (language, provider, ...triggers) => {
+      state.providers.push({ language, provider, triggers });
+      return { dispose() {} };
+    },
+  },
+};
+"#,
+    )
+    .unwrap();
+    let driver = r#"
+const [extensionPath, binary, root, cases] = process.argv.slice(1);
+const vscode = require('vscode');
+const extension = require(extensionPath);
+const subscriptions = [];
+extension.activate({ subscriptions });
+const { language, provider, triggers } = vscode.state.providers[0];
+vscode.state.folders = [{ uri: { scheme: 'file', fsPath: root } }];
+// a document, as the extension reads one
+const documentOf = (marked) => {
+  const offset = marked.lastIndexOf('|');
+  const text = marked.slice(0, offset) + marked.slice(offset + 1);
+  const lines = text.slice(0, offset).split('\n');
+  const position = new vscode.Position(lines.length - 1, lines[lines.length - 1].length);
+  const offsetAt = (p) => text.split('\n').slice(0, p.line).reduce((n, line) => n + line.length + 1, 0) + p.character;
+  const document = {
+    uri: { scheme: 'file', fsPath: root + '/main.api' },
+    getText: (range) => (range ? text.slice(offsetAt(range.start), offsetAt(range.end)) : text),
+  };
+  return { document, position };
+};
+(async () => {
+  const out = { language, triggers, subscribed: subscriptions.length, answers: [] };
+  for (const client of [binary, root + '/no-such-client']) {
+    vscode.state.binary = client;
+    for (const marked of JSON.parse(cases)) {
+      const { document, position } = documentOf(marked);
+      const items = await provider.provideCompletionItems(document, position, undefined);
+      out.answers.push(items === undefined ? null : items.map((item) => ({
+        label: item.label, kind: item.kind, insert: item.insertText.value, detail: item.detail, sort: item.sortText,
+        from: item.range.start.character, to: item.range.end.character, line: item.range.start.line,
+        again: Boolean(item.command),
+      })));
+    }
+  }
+  console.log(JSON.stringify(out));
+})();
+"#;
+    let cases = ["set {\n  \"in|\"\n}\n", "# é å ö\nset {\n  |", "shared/us|", "GET /people~wh|", "PUT /x { \"na|\" }", "GET /people/|", "sh|"];
+    let output = std::process::Command::new("node")
+        .args(["-e", driver, "--"])
+        .arg(repo().join("editors/vscode/extension.js"))
+        .arg(assert_cmd::cargo::cargo_bin("api"))
+        .arg(dir.path())
+        .arg(serde_json::to_string(&cases).unwrap())
+        .env("NODE_PATH", modules.path().join("node_modules"))
+        .output();
+    let Ok(output) = output else {
+        eprintln!("skipped: no node on the PATH");
+        return;
+    };
+    assert!(output.status.success(), "the extension failed:\n{}", String::from_utf8_lossy(&output.stderr));
+    let got: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    // it answers for the language the extension's package.json names
+    let package: serde_json::Value = serde_json::from_str(&read("editors/vscode/package.json")).unwrap();
+    assert_eq!(got["language"], package["contributes"]["languages"][0]["id"]);
+    assert_eq!(package["main"], "./extension.js");
+    assert_eq!(package["activationEvents"][0], format!("onLanguage:{}", got["language"].as_str().unwrap()));
+    assert!(package["contributes"]["configuration"]["properties"].get("commerceosApi.binary").is_some());
+    assert_eq!(got["triggers"], serde_json::json!(["\"", "/", "~", "@"]));
+    assert_eq!(got["subscribed"], 1);
+
+    let answers = got["answers"].as_array().unwrap();
+    let labels = |n: usize| -> Vec<&str> { answers[n].as_array().unwrap().iter().map(|item| item["label"].as_str().unwrap()).collect() };
+    assert_eq!(labels(0), SETTINGS);
+    let nulls = &answers[0][1];
+    // `in` is what the item takes the place of: columns 3 to 5 of line 1
+    assert_eq!(
+        *nulls,
+        serde_json::json!({
+            "label": "include-nulls", "kind": "Property", "insert": "include-nulls", "detail": "setting",
+            "sort": "0001", "from": 3, "to": 5, "line": 1, "again": false
+        })
+    );
+    // the place is given to the client in bytes
+    assert_eq!(labels(1), SETTINGS);
+    assert_eq!(answers[1][1]["insert"], "\"include-nulls\": ${1:true}");
+    assert_eq!(answers[1][1]["from"], 2);
+    assert_eq!(labels(2), ["shared/users.api"]);
+    assert_eq!((answers[2][0]["from"].as_u64(), answers[2][0]["kind"].as_str()), (Some(0), Some("File")));
+    assert_eq!(answers[3][3]["insert"], "where($1)");
+    assert_eq!(answers[3][3]["from"], 12);
+    // the editor's own: a request's body, and a URI
+    assert!(answers[4].is_null() && answers[5].is_null(), "{} {}", answers[4], answers[5]);
+    // a directory is gone on into
+    assert_eq!(labels(6), ["shared/"]);
+    assert_eq!(answers[6][0]["again"], true);
+    // a client that is not there: nothing, and no error
+    assert!(answers[cases.len()..].iter().all(|answer| answer.is_null()), "{:?}", &answers[cases.len()..]);
+}
+
+/// Omni completion in Vim itself (ctrl+x ctrl+o), with the package on the
+/// runtime path as an install leaves it: the first thing the client offers
+/// is written where the text typed so far stands. Holds nothing on a
+/// machine without `vim`.
+#[cfg(unix)]
+#[test]
+fn the_vim_package_completes_with_what_the_client_offers() {
+    let dir = completion_fixture();
+    let home = tempdir().unwrap();
+    let script = home.path().join("complete.vim");
+    let written = home.path().join("lines.txt");
+    // (the text, as lines; the cursor is behind its last character)
+    let cases: [&[&str]; 7] = [
+        &["set {", "  \"in"],
+        &["# é å ö", "set { \"include-nulls\": true, \"f"],
+        &["sleep 20 wh"],
+        &["shared/us"],
+        &["GET /people~wh"],
+        &["import dir cl { \"path\": \"cloddy\" }", "cl/sv"],
+        &["PUT /x { \"na"],
+    ];
+    let mut commands = String::from("set nocompatible encoding=utf-8 completeopt=menu\nlet s:out = []\n");
+    for lines in cases {
+        commands.push_str("%delete _\n");
+        commands.push_str(&format!("call setline(1, {})\n", serde_json::to_string(lines).unwrap()));
+        commands.push_str("call cursor(line('$'), 1)\nexecute \"normal! A\\<C-x>\\<C-o>\"\ncall add(s:out, getline('$'))\n");
+    }
+    commands.push_str("call add(s:out, &omnifunc)\ncall writefile(s:out, g:api_written)\nqa!\n");
+    fs::write(&script, commands).unwrap();
+    let mut vim = std::process::Command::new("vim");
+    vim.args(["-e", "-s", "-u", "NONE", "-i", "NONE", "-N"])
+        .arg("--cmd")
+        .arg(format!("set runtimepath^={}", repo().join("editors/vim").display()))
+        .arg("--cmd")
+        .arg("filetype plugin on")
+        .arg("--cmd")
+        .arg(format!("let g:api_binary='{}'", assert_cmd::cargo::cargo_bin("api").display()))
+        .arg("--cmd")
+        .arg(format!("let g:api_written='{}'", written.display()))
+        .arg(dir.path().join("main.api"))
+        .arg("-S")
+        .arg(&script)
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let Ok(mut child) = vim.spawn() else {
+        eprintln!("skipped: no vim on the PATH");
+        return;
+    };
+    let started = std::time::Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if started.elapsed() > std::time::Duration::from_secs(60) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("vim did not end");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let lines = fs::read_to_string(&written).expect("vim wrote nothing: the package did not load");
+    let lines: Vec<&str> = lines.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "  \"include-nulls",
+            "set { \"include-nulls\": true, \"fail-fast",
+            "sleep 20 while ",
+            "shared/users.api",
+            "GET /people~where(",
+            "cl/sv.api",
+            // a request's body is not the client's to complete
+            "PUT /x { \"na",
+            "ApiComplete",
+        ]
+    );
 }
 
 // ------------------------------------------------------------ --install-syntax
@@ -995,7 +1283,7 @@ fn install_syntax_for_rider_writes_a_bundle_and_says_the_step_that_is_left() {
     let bundle = home.path().join(".local/share/api/editors/commerceos-api");
     assert_eq!(
         stdout_lines(&output),
-        ["package.json", "language-configuration.json", "syntaxes/api.tmLanguage.json"]
+        ["package.json", "extension.js", "language-configuration.json", "syntaxes/api.tmLanguage.json"]
             .map(|file| bundle.join(file).display().to_string())
     );
     assert!(stderr(&output).contains("TextMate Bundles"), "{}", stderr(&output));
@@ -1045,6 +1333,7 @@ fn install_syntax_for_vscode_and_cursor_hands_a_vsix_to_the_editors_command() {
             [
                 "[Content_Types].xml",
                 "extension.vsixmanifest",
+                "extension/extension.js",
                 "extension/language-configuration.json",
                 "extension/package.json",
                 "extension/syntaxes/api.tmLanguage.json",
@@ -1061,6 +1350,8 @@ fn install_syntax_for_vscode_and_cursor_hands_a_vsix_to_the_editors_command() {
         );
         assert!(manifest.contains(r#"Path="extension/package.json""#), "{}", manifest);
         assert_eq!(files["extension/syntaxes/api.tmLanguage.json"], read("editors/vscode/syntaxes/api.tmLanguage.json"));
+        assert_eq!(files["extension/extension.js"], read("editors/vscode/extension.js"));
+        assert!(files["[Content_Types].xml"].contains(r#"Extension=".js""#), "{}", files["[Content_Types].xml"]);
 
         // The command is there: it is asked to install that file.
         fake_command(bin.path(), command, 0);

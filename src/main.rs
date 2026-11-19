@@ -708,6 +708,17 @@ struct Args {
     #[arg(long = "imports", value_name = "FILE")]
     imports: Option<String>,
 
+    /// Print what can stand at a place of a .api file, for an editor: the
+    /// file's text is read from stdin, FILE says where it is kept (- for
+    /// nowhere yet), and nothing is sent
+    #[arg(long = "complete", value_name = "FILE")]
+    complete: Option<String>,
+
+    /// With --complete: the place, as the number of bytes in front of it
+    /// (the end of the text when not given)
+    #[arg(long = "at", value_name = "BYTES", requires = "complete")]
+    at: Option<usize>,
+
     /// Install syntax highlighting for .api files in an editor (sublime,
     /// vscode, cursor, rider, vim or nvim) and send nothing
     #[arg(long = "install-syntax", value_name = "EDITOR")]
@@ -4665,23 +4676,33 @@ fn main() {
         exit_process(0);
     }
 
-    // `--describe`, `--assert` and `--imports` read a file and print what it
-    // says. Nothing is sent, so none of them needs a connection.
-    let documents: Vec<&str> = [("--describe", &args.describe), ("--assert", &args.assert), ("--imports", &args.imports)]
-        .into_iter()
-        .filter_map(|(flag, file)| file.as_ref().map(|_| flag))
-        .collect();
+    // `--describe`, `--assert`, `--imports` and `--complete` read a file and
+    // print what it says. Nothing is sent, so none of them needs a connection.
+    let documents: Vec<&str> = [
+        ("--describe", &args.describe),
+        ("--assert", &args.assert),
+        ("--imports", &args.imports),
+        ("--complete", &args.complete),
+    ]
+    .into_iter()
+    .filter_map(|(flag, file)| file.as_ref().map(|_| flag))
+    .collect();
     if documents.len() > 1 {
         let (last, rest) = documents.split_last().unwrap_or((&"", &[]));
         errln!("error: {} and {} each print a document of their own: use one", rest.join(", "), last);
         exit_process(1);
     }
-    // Each of the three prints a document about a file and sends nothing. A
+    // Each of them prints a document about a file and sends nothing. A
     // file to run or a request beside one is not dropped without a word, as
     // a request beside `-a` is not, below.
-    let document = [("--imports", &args.imports), ("--describe", &args.describe), ("--assert", &args.assert)]
-        .into_iter()
-        .find_map(|(option, file)| file.as_ref().map(|file| format!("{} {}", option, file)));
+    let document = [
+        ("--imports", &args.imports),
+        ("--describe", &args.describe),
+        ("--assert", &args.assert),
+        ("--complete", &args.complete),
+    ]
+    .into_iter()
+    .find_map(|(option, file)| file.as_ref().map(|file| format!("{} {}", option, file)));
     // `--install-syntax` writes files for an editor and sends nothing. What
     // stands beside it is not dropped without a word either.
     if let Some(editor) = &args.install_syntax {
@@ -4714,6 +4735,9 @@ fn main() {
     }
     if let Some(file) = &args.imports {
         exit_process(print_imports(file, args.raw));
+    }
+    if let Some(file) = &args.complete {
+        exit_process(print_completions(file, args.at, args.raw));
     }
     if let Some(file) = &args.describe {
         exit_process(print_describe_block(file, args.raw));
@@ -9947,6 +9971,867 @@ fn print_json_document(value: &serde_json::Value, raw: bool) {
 }
 
 // ---------------------------------------------------------------------------
+// `--complete <file>`: what can stand at a place of a `.api` file, for an
+// editor. The file's text is read from stdin, as the editor has it, and the
+// answer is a JSON document on stdout. Nothing is sent and nothing is
+// fetched: an editor asks on a keystroke.
+// ---------------------------------------------------------------------------
+
+/// One thing that can stand at the cursor.
+struct EditorItem {
+    /// What it is called, and what the text typed so far is matched with.
+    name: String,
+    /// What is written in its place, as a snippet: `$1` and `${1:true}` are
+    /// where the cursor stops, the second with a value to type over.
+    snippet: String,
+    /// What is written by an editor that has no snippets, where that is not
+    /// the snippet with its stops taken out.
+    text: Option<String>,
+    note: &'static str,
+}
+
+impl EditorItem {
+    fn plain(name: &str, note: &'static str) -> EditorItem {
+        EditorItem { name: name.to_string(), snippet: snippet_escaped(name), text: None, note }
+    }
+}
+
+/// What `--complete` answers.
+enum EditorCompletion {
+    /// A place the client has nothing to say about (a request's body, a
+    /// comment): the editor completes as it does in any file.
+    Nothing,
+    /// In a URI, which is the server's to complete.
+    Uri,
+    /// `items` can stand where `typed`, the text in front of the cursor, is.
+    Items { typed: String, items: Vec<EditorItem> },
+}
+
+const HTTP_METHODS: [&str; 7] = ["GET", "PUT", "POST", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+const IMPORT_KINDS: [&str; 3] = ["git", "dir", "archive"];
+const DESCRIBE_LOCALES: [&str; 6] = ["sv-SE", "en-US", "nb-NO", "da-DK", "fi-FI", "de-DE"];
+
+/// `text` as the literal text of a snippet.
+fn snippet_escaped(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('$', "\\$")
+}
+
+/// A snippet as plain text: its stops taken out, the value of one kept.
+fn snippet_plain(snippet: &str) -> String {
+    let mut out = String::new();
+    let mut chars = snippet.chars().peekable();
+    // the `}` that closes a `${1:…}` is not text
+    let mut open = 0;
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => out.extend(chars.next()),
+            '$' if chars.peek() == Some(&'{') => {
+                chars.next();
+                while chars.next_if(|c| c.is_ascii_digit()).is_some() {}
+                chars.next_if_eq(&':');
+                open += 1;
+            }
+            '$' => while chars.next_if(|c| c.is_ascii_digit()).is_some() {},
+            '}' if open > 0 => open -= 1,
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum JsonExpect {
+    Key,
+    Colon,
+    Value,
+}
+
+/// An object or an array that is open at the cursor.
+struct EditorJsonFrame {
+    object: bool,
+    /// The keys the object has in front of the cursor.
+    keys: Vec<String>,
+    /// The key whose value is being written.
+    current: Option<String>,
+    expect: JsonExpect,
+}
+
+#[derive(PartialEq)]
+enum JsonRole {
+    Key,
+    Value,
+    Other,
+}
+
+/// Where in a body the cursor is.
+struct JsonPlace {
+    /// The objects and arrays that are open, outermost first.
+    stack: Vec<EditorJsonFrame>,
+    /// The text of the string the cursor is in, up to the cursor.
+    string: Option<String>,
+    /// Outside a string: the word in front of the cursor.
+    bare: String,
+    role: JsonRole,
+}
+
+enum JsonScan {
+    /// The body closes before the cursor, at this position.
+    Closed(usize),
+    InComment,
+    At(JsonPlace),
+}
+
+fn line_end_from(text: &str, from: usize) -> usize {
+    text[from..].find('\n').map_or(text.len(), |n| from + n)
+}
+
+/// Read the body that opens at `start`, as far as `offset`. A body is JSON
+/// with `//`, `#` and `/* */` comments, and a string in it may span lines.
+fn scan_editor_json(text: &str, start: usize, offset: usize) -> JsonScan {
+    let bytes = text.as_bytes();
+    let mut stack: Vec<EditorJsonFrame> = Vec::new();
+    // the end of the last token, and the token itself
+    let mut pos = start;
+    let mut last = b' ';
+    let mut i = start;
+    while i < offset {
+        match bytes[i] {
+            b'"' => {
+                let mut j = i + 1;
+                let mut closed = false;
+                while j < bytes.len() {
+                    match bytes[j] {
+                        b'\\' => j += 2,
+                        b'"' => {
+                            closed = true;
+                            j += 1;
+                            break;
+                        }
+                        _ => j += 1,
+                    }
+                }
+                let end = j.min(bytes.len());
+                let is_key = stack.last().is_some_and(|top| top.object && top.expect == JsonExpect::Key);
+                if offset <= if closed { end - 1 } else { end } {
+                    let role = match (is_key, last) {
+                        (true, _) => JsonRole::Key,
+                        (false, b':') => JsonRole::Value,
+                        _ => JsonRole::Other,
+                    };
+                    return JsonScan::At(JsonPlace {
+                        stack,
+                        string: Some(text[i + 1..offset].to_string()),
+                        bare: String::new(),
+                        role,
+                    });
+                }
+                if let (true, Some(top)) = (is_key, stack.last_mut()) {
+                    let key = text[i + 1..end - 1].to_string();
+                    top.keys.push(key.clone());
+                    top.current = Some(key);
+                    top.expect = JsonExpect::Colon;
+                }
+                last = b'"';
+                i = end;
+                pos = end;
+            }
+            b'#' => {
+                let end = line_end_from(text, i);
+                if offset <= end {
+                    return JsonScan::InComment;
+                }
+                i = end;
+                pos = end;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                let end = line_end_from(text, i);
+                if offset <= end {
+                    return JsonScan::InComment;
+                }
+                i = end;
+                pos = end;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => match text[i + 2..].find("*/") {
+                Some(n) if offset >= i + 2 + n + 2 => {
+                    i += 2 + n + 2;
+                    pos = i;
+                }
+                _ => return JsonScan::InComment,
+            },
+            c @ (b'{' | b'[') => {
+                let expect = if c == b'{' { JsonExpect::Key } else { JsonExpect::Value };
+                stack.push(EditorJsonFrame { object: c == b'{', keys: Vec::new(), current: None, expect });
+                last = c;
+                i += 1;
+                pos = i;
+            }
+            c @ (b'}' | b']') => {
+                stack.pop();
+                if stack.is_empty() {
+                    return JsonScan::Closed(i + 1);
+                }
+                last = c;
+                i += 1;
+                pos = i;
+            }
+            c @ (b':' | b',') => {
+                if let Some(top) = stack.last_mut().filter(|top| top.object) {
+                    top.expect = if c == b':' { JsonExpect::Value } else { JsonExpect::Key };
+                    if c == b',' {
+                        top.current = None;
+                    }
+                }
+                last = c;
+                i += 1;
+                pos = i;
+            }
+            _ => i += 1,
+        }
+    }
+    let Some(top) = stack.last() else { return JsonScan::InComment };
+    let between = &text[pos..offset];
+    let word_start = between
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| c.is_alphanumeric() || matches!(c, '_' | '.' | '-'))
+        .last()
+        .map_or(between.len(), |(n, _)| n);
+    let bare = &between[word_start..];
+    let role = match (top.object, top.expect, last) {
+        _ if between.trim() != bare => JsonRole::Other,
+        (true, JsonExpect::Key, b'{' | b',') => JsonRole::Key,
+        (true, JsonExpect::Value, b':') => JsonRole::Value,
+        _ => JsonRole::Other,
+    };
+    let bare = bare.to_string();
+    JsonScan::At(JsonPlace { stack, string: None, bare, role })
+}
+
+/// Where in a `.api` file the cursor is.
+enum EditorPlace<'a> {
+    /// In a comment, in a `confirm` line or in a string of a line.
+    Nowhere,
+    /// In a body: `owner` is the line in front of the bracket that opens it.
+    Block { owner: &'a str, place: JsonPlace },
+    /// On a line: `line` up to the cursor, and `segment`, the request of a
+    /// chain the cursor is in. `paren` is how many parentheses of a URI
+    /// operator are open, in which nothing ends the URI.
+    Line { line: &'a str, segment: &'a str, first: bool, paren: usize },
+}
+
+fn editor_place(text: &str, offset: usize) -> EditorPlace<'_> {
+    let bytes = text.as_bytes();
+    let (mut i, mut line_start, mut segment_start, mut paren) = (0, 0, 0, 0usize);
+    while i < offset {
+        if i == line_start {
+            // all of a `confirm` line is the question
+            let end = line_end_from(text, i);
+            if split_first_word(&text[i..end]).0.eq_ignore_ascii_case("confirm") {
+                if offset <= end {
+                    return EditorPlace::Nowhere;
+                }
+                i = end;
+                continue;
+            }
+        }
+        let after_blank = i == line_start || bytes[i - 1].is_ascii_whitespace();
+        match bytes[i] {
+            b'\n' => {
+                i += 1;
+                line_start = i;
+                segment_start = i;
+                paren = 0;
+            }
+            // a `#` in `~where(…)` is sent
+            b'#' if after_blank && paren == 0 => {
+                let end = line_end_from(text, i);
+                if offset <= end {
+                    return EditorPlace::Nowhere;
+                }
+                i = end;
+            }
+            b'{' | b'[' if after_blank && paren == 0 => match scan_editor_json(text, i, offset) {
+                JsonScan::InComment => return EditorPlace::Nowhere,
+                JsonScan::At(place) => return EditorPlace::Block { owner: &text[line_start..i], place },
+                JsonScan::Closed(end) => i = end,
+            },
+            b'(' => {
+                paren += 1;
+                i += 1;
+            }
+            b')' => {
+                paren = paren.saturating_sub(1);
+                i += 1;
+            }
+            b'"' => {
+                let mut j = i + 1;
+                let mut closed = false;
+                while j < bytes.len() && bytes[j] != b'\n' {
+                    match bytes[j] {
+                        b'\\' => j += 2,
+                        b'"' => {
+                            closed = true;
+                            j += 1;
+                            break;
+                        }
+                        _ => j += 1,
+                    }
+                }
+                let end = j.min(bytes.len());
+                if offset <= if closed { end - 1 } else { end } {
+                    return EditorPlace::Nowhere;
+                }
+                i = end;
+            }
+            c @ (b'&' | b'|') if bytes.get(i + 1) == Some(&c) && i + 2 <= offset => {
+                i += 2;
+                if paren == 0 {
+                    segment_start = i;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    EditorPlace::Line {
+        line: &text[line_start..offset],
+        segment: &text[segment_start..offset],
+        first: segment_start == line_start,
+        paren,
+    }
+}
+
+/// Which files a path may name.
+#[derive(Clone, Copy, PartialEq)]
+enum EditorFiles {
+    Any,
+    Api,
+    Json,
+    /// Directories only.
+    None,
+}
+
+/// The directories, and the files `want` takes, that the path `typed` may
+/// become. A relative path is read from `root`, or from the directory of an
+/// import alias when it starts with one.
+fn editor_paths(
+    typed: &str,
+    root: Option<&std::path::Path>,
+    want: EditorFiles,
+    aliases: &[(String, PathBuf)],
+) -> Vec<EditorItem> {
+    let in_directory = typed.contains('/');
+    let mut items: Vec<EditorItem> = Vec::new();
+    if !in_directory {
+        items.extend(
+            aliases
+                .iter()
+                .filter(|(alias, _)| alias.to_lowercase().starts_with(&typed.to_lowercase()))
+                .map(|(alias, _)| EditorItem::plain(&format!("{}/", alias), "import")),
+        );
+    }
+    // What is listed, and what a result is shown with in the place of the
+    // directory it was listed from.
+    let alias = typed.split_once('/').and_then(|(first, rest)| {
+        aliases.iter().find(|(alias, _)| alias == first).map(|(alias, dir)| (dir.as_path(), rest, format!("{}/", alias)))
+    });
+    let listed: Vec<String> = if typed.starts_with('~') || std::path::Path::new(typed).is_absolute() {
+        get_file_completions(typed)
+    } else {
+        let (directory, rest, shown) = match (alias, root) {
+            (Some(alias), _) => alias,
+            (None, Some(root)) => (root, typed, String::new()),
+            (None, None) => return items,
+        };
+        let base = format!("{}/", directory.display());
+        get_file_completions(&format!("{}{}", base, rest))
+            .into_iter()
+            .filter_map(|found| found.strip_prefix(&base).map(|inside| format!("{}{}", shown, inside)))
+            .collect()
+    };
+    for path in listed {
+        let is_directory = path.ends_with('/');
+        let name = path.trim_end_matches('/').rsplit('/').next().unwrap_or_default();
+        let wanted = match want {
+            EditorFiles::Any => true,
+            EditorFiles::Api => names_api_file(name),
+            EditorFiles::Json => name.to_ascii_lowercase().ends_with(".json"),
+            EditorFiles::None => false,
+        };
+        if is_os_junk(std::path::Path::new(name)) || !(is_directory || wanted) {
+            continue;
+        }
+        items.push(EditorItem::plain(&path, if is_directory { "directory" } else { "file" }));
+    }
+    items
+}
+
+/// The members an object does not have yet: the name alone in a string that
+/// is being typed, the member whole where nothing is quoted yet.
+fn editor_members(place: &JsonPlace, members: &[(&str, &str)], note: &'static str) -> EditorCompletion {
+    let present = place.stack.last().map(|top| top.keys.as_slice()).unwrap_or_default();
+    let left = members.iter().filter(|(name, _)| !present.iter().any(|key| key == name));
+    match &place.string {
+        Some(typed) => EditorCompletion::Items {
+            typed: typed.clone(),
+            items: left.map(|(name, _)| EditorItem::plain(name, note)).collect(),
+        },
+        None => EditorCompletion::Items {
+            typed: place.bare.clone(),
+            items: left
+                .map(|(name, value)| EditorItem {
+                    name: name.to_string(),
+                    snippet: format!("\"{}\": {}", snippet_escaped(name), value),
+                    text: None,
+                    note,
+                })
+                .collect(),
+        },
+    }
+}
+
+fn editor_words(typed: &str, names: &[&str], note: &'static str, behind: &str) -> EditorCompletion {
+    let items = names
+        .iter()
+        .map(|name| EditorItem { name: name.to_string(), snippet: format!("{}{}", snippet_escaped(name), behind), text: None, note })
+        .collect();
+    EditorCompletion::Items { typed: typed.to_string(), items }
+}
+
+/// In the object of a `set` line, of an `import` or of a describe block.
+fn complete_in_block(owner: &str, place: &JsonPlace, file_dir: Option<&std::path::Path>) -> EditorCompletion {
+    enum Block {
+        Set,
+        Describe,
+        Import(&'static [&'static str]),
+    }
+    let words: Vec<&str> = owner.split_whitespace().collect();
+    let block = match words.as_slice() {
+        [] => Block::Describe,
+        [set] if set.eq_ignore_ascii_case("set") => Block::Set,
+        [import, kind, _alias] if import.eq_ignore_ascii_case("import") => match kind.to_ascii_lowercase().as_str() {
+            "git" => Block::Import(&["url", "ref", "path"]),
+            "dir" => Block::Import(&["path"]),
+            "archive" => Block::Import(&["url", "sha256", "token_env", "path"]),
+            _ => return EditorCompletion::Nothing,
+        },
+        // a request's body: the editor's own completions
+        _ => return EditorCompletion::Nothing,
+    };
+    let (Some(outer), Some(top)) = (place.stack.first(), place.stack.last()) else { return EditorCompletion::Nothing };
+    if !outer.object {
+        return EditorCompletion::Nothing;
+    }
+    let depth = place.stack.len();
+    let nothing_here = EditorCompletion::Items { typed: String::new(), items: Vec::new() };
+    match block {
+        Block::Set if depth == 1 && place.role == JsonRole::Key => {
+            let members: Vec<(&str, &str)> = SETTING_NAMES
+                .iter()
+                .map(|name| match *name {
+                    "export" => (*name, "\"${1:com.heads.seedID}\""),
+                    "timeout" => (*name, "${1:30}"),
+                    _ => (*name, "${1:true}"),
+                })
+                .collect();
+            editor_members(place, &members, "setting")
+        }
+        Block::Set if depth == 1 && place.role == JsonRole::Value && place.string.is_none() => {
+            let values: &[&str] = match top.current.as_deref() {
+                Some("export") => &["null"],
+                Some("timeout") => &["0", "null"],
+                _ => &["true", "false", "null"],
+            };
+            editor_words(&place.bare, values, "value", "")
+        }
+        Block::Describe if depth == 1 && place.role == JsonRole::Key => {
+            let texts = "{ \"${1:sv-SE}\": \"$2\" }";
+            editor_members(place, &[("title", texts), ("description", texts), ("docsLink", "\"${1:https://}\"")], "describe")
+        }
+        Block::Describe
+            if depth == 2
+                && place.role == JsonRole::Key
+                && matches!(outer.current.as_deref(), Some("title" | "description")) =>
+        {
+            let locales: Vec<(&str, &str)> = DESCRIBE_LOCALES.iter().map(|locale| (*locale, "\"$1\"")).collect();
+            editor_members(place, &locales, "locale")
+        }
+        Block::Import(keys) if depth == 1 && place.role == JsonRole::Key => {
+            let members: Vec<(&str, &str)> = keys.iter().map(|key| (*key, "\"$1\"")).collect();
+            editor_members(place, &members, "import")
+        }
+        // the directory of an `import dir`, relative to the file
+        Block::Import(&["path"]) if depth == 1 && place.role == JsonRole::Value && top.current.as_deref() == Some("path") => {
+            match &place.string {
+                Some(typed) => EditorCompletion::Items {
+                    typed: typed.clone(),
+                    items: editor_paths(typed, file_dir, EditorFiles::None, &[]),
+                },
+                None => nothing_here,
+            }
+        }
+        _ => nothing_here,
+    }
+}
+
+/// `line` cut at its last blank: what stands in front, and the word the
+/// cursor is behind.
+fn split_last_word(line: &str) -> (&str, &str) {
+    match line.rfind(char::is_whitespace) {
+        Some(blank) => {
+            let word = blank + line[blank..].chars().next().map_or(1, char::len_utf8);
+            (&line[..word], &line[word..])
+        }
+        None => ("", line),
+    }
+}
+
+/// `text` without the keyword it starts with, when a blank follows it.
+fn behind_keyword<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
+    let (word, rest) = split_first_word(text);
+    let followed = text.trim_start().len() > word.len();
+    (word.eq_ignore_ascii_case(keyword) && followed).then_some(rest)
+}
+
+/// The request of an `assert` or a `sleep while`, as far as it is typed,
+/// and whether a `not` stands in front of it.
+fn condition_request(line: &str) -> Option<(&str, bool)> {
+    let request = behind_keyword(line, "assert").or_else(|| {
+        let rest = behind_keyword(line, "sleep")?;
+        let (interval, behind) = split_first_word(rest);
+        let rest = if parse_sleep_directive(interval).is_ok() && rest.len() > interval.len() { behind } else { rest };
+        behind_keyword(rest, "while")
+    })?;
+    Some(match behind_keyword(request, "not") {
+        Some(request) => (request, true),
+        None => (request, false),
+    })
+}
+
+/// In a URI: the operators behind a `~`. The rest is the server's.
+fn complete_uri(uri: &str, paren: usize) -> EditorCompletion {
+    let operator = uri.rfind('~').map(|tilde| &uri[tilde + 1..]).filter(|typed| typed.chars().all(|c| c.is_alphanumeric() || c == '_'));
+    match operator {
+        Some(typed) if paren == 0 => EditorCompletion::Items {
+            typed: typed.to_string(),
+            items: API_OPERATORS
+                .iter()
+                .map(|operator| match operator.strip_suffix('(') {
+                    Some(name) => EditorItem {
+                        name: operator.to_string(),
+                        snippet: format!("{}($1)", name),
+                        text: Some(operator.to_string()),
+                        note: "operator",
+                    },
+                    None => EditorItem::plain(operator, "operator"),
+                })
+                .collect(),
+        },
+        _ => EditorCompletion::Uri,
+    }
+}
+
+/// In one request: `request` is its text up to the cursor. `outfile` is
+/// whether it may have one, and `or_not` whether a `not` may stand in front.
+fn complete_request(
+    request: &str,
+    paren: usize,
+    base_dir: Option<&std::path::Path>,
+    outfile: bool,
+    or_not: bool,
+) -> EditorCompletion {
+    let request = request.trim_start();
+    if !request.contains(char::is_whitespace) {
+        if request.starts_with('/') {
+            return complete_uri(request, paren);
+        }
+        let mut names: Vec<&str> = if or_not { vec!["not"] } else { Vec::new() };
+        names.extend(HTTP_METHODS);
+        return editor_words(request, &names, "method", " ");
+    }
+    let (first, behind) = split_first_word(request);
+    let rest = if HTTP_METHODS.iter().any(|method| first.eq_ignore_ascii_case(method)) {
+        behind
+    } else if request.starts_with('/') {
+        request
+    } else {
+        return EditorCompletion::Nothing;
+    };
+    // in `~where(…)`: nothing there ends the URI
+    if paren > 0 {
+        return EditorCompletion::Uri;
+    }
+    if !rest.contains(char::is_whitespace) {
+        return complete_uri(rest, paren);
+    }
+    let (in_front, word) = split_last_word(rest);
+    let before = in_front.split_whitespace().next_back().unwrap_or_default();
+    if outfile {
+        let target = if let Some(path) = word.strip_prefix(">>") {
+            Some((">>", path))
+        } else if let Some(path) = word.strip_prefix('>') {
+            Some((">", path))
+        } else if before == ">" || before == ">>" {
+            Some((before, word))
+        } else {
+            None
+        };
+        if let Some((redirect, path)) = target {
+            let mut items = editor_paths(path, base_dir, EditorFiles::Any, &[]);
+            // nothing is appended to the clipboard
+            if redirect == ">" && "clipboard".starts_with(&path.to_lowercase()) {
+                items.insert(0, EditorItem { name: "clipboard".into(), snippet: "clipboard".into(), text: None, note: "system clipboard" });
+            }
+            return EditorCompletion::Items { typed: path.to_string(), items };
+        }
+    }
+    let infile = word.strip_prefix('@').or_else(|| (before == "@").then_some(word));
+    if let Some(path) = infile {
+        // `~map(type)` is the only function an `@file` body takes
+        let function = path.rfind('~').map(|tilde| &path[tilde + 1..]).filter(|typed| typed.chars().all(char::is_alphanumeric));
+        return match function {
+            Some(typed) => EditorCompletion::Items {
+                typed: typed.to_string(),
+                items: vec![EditorItem { name: "map(".into(), snippet: "map($1)".into(), text: Some("map(".into()), note: "X-Request-Map" }],
+            },
+            None => EditorCompletion::Items { typed: path.to_string(), items: editor_paths(path, base_dir, EditorFiles::Any, &[]) },
+        };
+    }
+    EditorCompletion::Nothing
+}
+
+/// On a line that is no body.
+fn complete_on_line(
+    line: &str,
+    file_dir: Option<&std::path::Path>,
+    base_dir: Option<&std::path::Path>,
+    aliases: &[(String, PathBuf)],
+    paren: usize,
+) -> EditorCompletion {
+    let (in_front, word) = split_last_word(line);
+    let before: Vec<&str> = in_front.split_whitespace().collect();
+    let is = |n: usize, keyword: &str| before.get(n).is_some_and(|word| word.eq_ignore_ascii_case(keyword));
+    if is(0, "import") || is(0, "set") {
+        if is(0, "import") && before.len() == 1 {
+            return editor_words(word, &IMPORT_KINDS, "import", " ");
+        }
+        // one JSON file, where the object would stand
+        let object_place = if is(0, "set") { 1 } else { 3 };
+        let file = match before.len() {
+            n if n == object_place => word.strip_prefix('@'),
+            n if n == object_place + 1 && before[object_place] == "@" => Some(word),
+            _ => None,
+        };
+        return match file {
+            Some(path) => EditorCompletion::Items {
+                typed: path.to_string(),
+                items: editor_paths(path, base_dir, EditorFiles::Json, &[]),
+            },
+            None => EditorCompletion::Nothing,
+        };
+    }
+    if is(0, "url") {
+        return match before.len() {
+            1 => editor_words(word, &["has", "is"], "url", " "),
+            _ => EditorCompletion::Nothing,
+        };
+    }
+    let interval_only = before.len() == 1 || (before.len() == 2 && parse_sleep_directive(before[1]).is_ok());
+    if is(0, "sleep") && interval_only && word.chars().all(|c| c.is_ascii_alphabetic()) {
+        return editor_words(word, &["while"], "sleep", " ");
+    }
+    if let Some((request, negated)) = condition_request(line) {
+        // the request of an `assert` or a `sleep while` has no outfile
+        return complete_request(request, paren, base_dir, false, !negated);
+    }
+    if !before.is_empty() {
+        return complete_request(line, paren, base_dir, true, false);
+    }
+    // `/tmp/seed.api` is an include, but what starts with `/` is a URI
+    // until it ends in `.api`
+    if word.starts_with('/') {
+        return complete_uri(word, paren);
+    }
+    let includes = editor_paths(word, file_dir, EditorFiles::Api, aliases);
+    if word.contains('/') || word.starts_with(['~', '.']) {
+        return EditorCompletion::Items { typed: word.to_string(), items: includes };
+    }
+    let starts = |name: &&str| name.to_lowercase().starts_with(&word.to_lowercase());
+    let keyword = |note: &'static str| move |name: &str| EditorItem { name: name.to_string(), snippet: format!("{} ", name), text: None, note };
+    let mut items: Vec<EditorItem> = HTTP_METHODS.into_iter().filter(starts).map(keyword("method")).collect();
+    // in the order a file has them, as the syntax lists them
+    let directives = ["sleep", "assert", "confirm", "set", "url", "import"];
+    debug_assert!(directives.iter().all(|directive| DIRECTIVES.contains(directive)));
+    items.extend(directives.into_iter().filter(starts).map(keyword("directive")));
+    items.extend(includes);
+    EditorCompletion::Items { typed: word.to_string(), items }
+}
+
+/// What can stand at `offset` of the `.api` file `text`.
+///
+/// `file_dir` is the directory of the file, which an include is relative
+/// to; `base_dir` the working directory, which an `@file` and an outfile are
+/// relative to; `aliases` the directory each import alias stands for.
+fn editor_completion(
+    text: &str,
+    offset: usize,
+    file_dir: Option<&std::path::Path>,
+    base_dir: Option<&std::path::Path>,
+    aliases: &[(String, PathBuf)],
+) -> EditorCompletion {
+    match editor_place(text, offset) {
+        EditorPlace::Nowhere => EditorCompletion::Nothing,
+        EditorPlace::Block { owner, place } => complete_in_block(owner, &place, file_dir),
+        // behind a `&&` or `||`
+        EditorPlace::Line { segment, first: false, paren, .. } => complete_request(segment, paren, base_dir, true, false),
+        EditorPlace::Line { line, paren, .. } => complete_on_line(line, file_dir, base_dir, aliases, paren),
+    }
+}
+
+/// Where an import that was fetched before is in the cache. Nothing is
+/// asked of a remote: a ref is the commit it last resolved to.
+fn cached_import_dir(spec: &ImportSpec) -> Option<PathBuf> {
+    let cache = import_cache_dir().ok()?;
+    let remembered = |file: PathBuf| fs::read_to_string(file).ok().map(|sha| sha.trim().to_string());
+    let (checkout, top) = match &spec.source {
+        ImportSource::Git { url, git_ref } => {
+            let repo = cache.join(import_cache_key(url));
+            let sha = match is_full_sha(git_ref) {
+                true => git_ref.to_ascii_lowercase(),
+                false => remembered(repo.join("refs").join(import_cache_key(git_ref))).filter(|sha| is_full_sha(sha))?,
+            };
+            (repo.join(&sha), repo.join(&sha))
+        }
+        ImportSource::Archive { url, sha256, .. } => {
+            let archives = cache.join("archives");
+            let sha = match sha256 {
+                Some(sha) => sha.clone(),
+                None => remembered(archives.join("refs").join(import_cache_key(url))).filter(|sha| sha.len() == 64)?,
+            };
+            let unpacked = archives.join(&sha);
+            if !unpacked.is_dir() {
+                return None;
+            }
+            (unpacked.clone(), archive_top_dir(&unpacked))
+        }
+        ImportSource::Dir { .. } => return None,
+    };
+    let root = match &spec.path {
+        Some(path) => top.join(path),
+        None => top,
+    };
+    if !root.is_dir() {
+        return None;
+    }
+    // An editor that reads a checkout uses it: it is not cleared out.
+    mark_import_used(&checkout);
+    Some(root)
+}
+
+/// The directory each import alias of `text` stands for: an `import dir`
+/// where its line says, a git or archive import where the cache has it. An
+/// import that can't be read, or was never fetched, has none.
+fn editor_aliases(text: &str, file_dir: Option<&std::path::Path>) -> Vec<(String, PathBuf)> {
+    let bytes = text.as_bytes();
+    let mut aliases = Vec::new();
+    let mut line_start = 0;
+    while line_start < text.len() {
+        let mut end = line_end_from(text, line_start);
+        let line = &text[line_start..end];
+        // a body that opens on the line belongs to it, however far it goes
+        let opens = line
+            .char_indices()
+            .find(|(n, c)| matches!(c, '{' | '[') && (*n == 0 || bytes[line_start + n - 1].is_ascii_whitespace()))
+            .map(|(n, _)| line_start + n);
+        let mut whole = opens.is_none();
+        if let Some(open) = opens {
+            if let JsonScan::Closed(closed) = scan_editor_json(text, open, text.len()) {
+                end = closed;
+                whole = true;
+            }
+        }
+        if whole && split_first_word(line).0.eq_ignore_ascii_case("import") {
+            let directive = &text[line_start..end];
+            let directive = match opens {
+                Some(_) => directive,
+                None => directive.split(" #").next().unwrap_or(directive),
+            };
+            let spec = normalize_request_text(directive).ok().and_then(|text| parse_import_directive(&text, file_dir, None).ok());
+            let directory = spec.as_ref().and_then(|spec| match &spec.source {
+                ImportSource::Dir { path } => resolve_import_dir(&spec.alias, path, file_dir, None).ok(),
+                _ => cached_import_dir(spec),
+            });
+            if let (Some(spec), Some(directory)) = (spec, directory) {
+                aliases.push((spec.alias, directory));
+            }
+        }
+        line_start = line_end_from(text, end) + 1;
+    }
+    aliases
+}
+
+/// The directory an `@file` and an outfile are relative to in an editor. It
+/// is the working directory of a run, which an editor does not know: a
+/// `# @basedir <path>` comment of the file says it, relative to the file,
+/// and without one it is the directory the editor ran the client in.
+fn editor_base_dir(text: &str, file_dir: Option<&std::path::Path>) -> Option<PathBuf> {
+    let named = text.lines().find_map(|line| {
+        let comment = line.trim().strip_prefix('#')?;
+        behind_keyword(comment, "@basedir").map(str::trim).filter(|path| !path.is_empty())
+    });
+    match named {
+        Some(path) => {
+            let path = PathBuf::from(expand_home(path));
+            Some(match (path.is_absolute(), file_dir) {
+                (false, Some(dir)) => dir.join(path),
+                _ => path,
+            })
+        }
+        None => std::env::current_dir().ok(),
+    }
+}
+
+/// `--complete <file>`: what can stand at byte `at` of the file's text,
+/// which is read from stdin, as one JSON document on stdout. `file` says
+/// where the text is kept (`-`: nowhere yet). Returns the exit code.
+fn print_completions(file: &str, at: Option<usize>, raw: bool) -> i32 {
+    let mut text = String::new();
+    if io::stdin().read_to_string(&mut text).is_err() {
+        errln!("error: could not read the text from stdin: it is not UTF-8");
+        return 1;
+    }
+    let mut offset = at.unwrap_or(text.len()).min(text.len());
+    while !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    let file_dir = (file != "-").then(|| {
+        let path = PathBuf::from(expand_home(file));
+        let path = match (path.is_absolute(), std::env::current_dir()) {
+            (false, Ok(cwd)) => cwd.join(path),
+            _ => path,
+        };
+        path.parent().map(|dir| dir.to_path_buf()).unwrap_or(path)
+    });
+    let base_dir = editor_base_dir(&text, file_dir.as_deref());
+    let aliases = editor_aliases(&text, file_dir.as_deref());
+    let document = match editor_completion(&text, offset, file_dir.as_deref(), base_dir.as_deref(), &aliases) {
+        EditorCompletion::Nothing => Value::Null,
+        EditorCompletion::Uri => serde_json::json!({ "uri": true }),
+        EditorCompletion::Items { typed, items } => {
+            let items: Vec<Value> = items
+                .into_iter()
+                .map(|item| {
+                    let text = item.text.unwrap_or_else(|| snippet_plain(&item.snippet));
+                    serde_json::json!({ "name": item.name, "snippet": item.snippet, "text": text, "note": item.note })
+                })
+                .collect();
+            serde_json::json!({ "typed": typed, "items": items })
+        }
+    };
+    print_json_document(&document, raw);
+    0
+}
+
+// ---------------------------------------------------------------------------
 // `--install-syntax <editor>`: syntax highlighting for `.api` files.
 //
 // The grammars are the files of `editors/`, compiled in, so the highlighting
@@ -9961,7 +10846,8 @@ const SUBLIME_COMPLETIONS: &str = include_str!("../editors/sublime/api_completio
 /// The VS Code extension, less its `package.json`. A JetBrains IDE reads the
 /// same folder as a TextMate bundle.
 const VSCODE_PACKAGE_JSON: &str = include_str!("../editors/vscode/package.json");
-const VSCODE_FILES: [(&str, &str); 2] = [
+const VSCODE_FILES: [(&str, &str); 3] = [
+    ("extension.js", include_str!("../editors/vscode/extension.js")),
     ("language-configuration.json", include_str!("../editors/vscode/language-configuration.json")),
     ("syntaxes/api.tmLanguage.json", include_str!("../editors/vscode/syntaxes/api.tmLanguage.json")),
 ];
@@ -10142,7 +11028,7 @@ fn vsix() -> Result<Vec<u8>, String> {
         engine = engine,
     );
     let content_types = r#"<?xml version="1.0" encoding="utf-8"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension=".json" ContentType="application/json" /><Default Extension=".vsixmanifest" ContentType="text/xml" /></Types>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension=".json" ContentType="application/json" /><Default Extension=".js" ContentType="application/javascript" /><Default Extension=".vsixmanifest" ContentType="text/xml" /></Types>
 "#;
     let mut entries = vec![
         ("extension.vsixmanifest".to_string(), vsix_manifest),

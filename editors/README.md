@@ -1,7 +1,8 @@
-# Syntax highlighting for `.api` files
+# Syntax highlighting and completions for `.api` files
 
 The grammars for the `.api` batch files that `AGENTS.md` describes, one folder
-per editor format. They are compiled into the client, which installs them:
+per editor format, and beside each what makes its editor complete. They are
+compiled into the client, which installs them:
 
 ```sh
 api --install-syntax sublime    # Sublime Text
@@ -17,8 +18,8 @@ Run it again after the client is updated: it replaces what it wrote before.
 | Folder | Format | Read by |
 |---|---|---|
 | `sublime/` | `API.sublime-syntax`, and `api_completions.py`, a plugin for completions | Sublime Text |
-| `vscode/` | a VS Code extension around `syntaxes/api.tmLanguage.json`, a TextMate grammar | VS Code, Cursor, and JetBrains IDEs as a TextMate bundle |
-| `vim/` | `syntax/`, `ftdetect/` and `ftplugin/` of a Vim package | Vim, Neovim |
+| `vscode/` | a VS Code extension around `syntaxes/api.tmLanguage.json`, a TextMate grammar, with `extension.js` for completions | VS Code, Cursor, and JetBrains IDEs as a TextMate bundle (the grammar only) |
+| `vim/` | `syntax/`, `ftdetect/` and `ftplugin/` of a Vim package; the last holds the omni completion | Vim, Neovim |
 
 ## What each editor gets, and where
 
@@ -51,6 +52,38 @@ anything is sent. It differs in three places:
 The Vim syntax colours what a line is (method, URI, directive, body, comment,
 outfile) and marks no errors.
 
+## Completions
+
+No editor decides what to offer. Each asks the client, with the text of the
+file and the place of the cursor, and shows the answer:
+
+```sh
+api -r --complete seed.api --at 42 < seed.api
+```
+
+`AGENTS.md` has what is offered where, and the document it is answered with.
+A change to what a `.api` file can hold is therefore a change in the client
+alone, and an editor offers what the client that is installed reads.
+
+| Editor | What asks | How it is asked for | Another client than the `api` on the `PATH` |
+|---|---|---|---|
+| Sublime Text | `sublime/api_completions.py` | as you type, and `ctrl+space` | the setting `api_binary` |
+| VS Code, Cursor | `vscode/extension.js` | as you type, and `ctrl+space` | the setting `commerceosApi.binary` |
+| Vim, Neovim | `ApiComplete` in `vim/ftplugin/api.vim`, the `omnifunc` | `ctrl+x ctrl+o` | `g:api_binary` |
+| Rider | nothing: a TextMate bundle is highlighting only | | |
+
+- An editor that was not started from a shell may have no `PATH` to speak
+  of. The Sublime plugin and the extension then look where a client is
+  usually installed (`/opt/homebrew/bin`, `/usr/local/bin`, `~/.cargo/bin`,
+  `~/.local/bin`).
+- The client is asked in the project (workspace) folder the file is in, and
+  without one in the directory of the file: that is what an `@file` and an
+  outfile are completed from. Vim asks in its own working directory.
+- A client from before `--complete`, or none at all, is no error: the editor
+  completes as it does in any file.
+- Vim has no snippets, so a member is written with its value as it stands
+  (`"include-nulls": true`) and an operator up to its parenthesis.
+
 ## Changing a grammar
 
 `sample.api` holds one line of every construct, the errors included. The three
@@ -62,9 +95,10 @@ cargo test --test editors
 
 holds the Sublime syntax to `sample.api` (through `syntect`, which reads the
 same format), checks that it finds no error in any `.api` file of this
-repository, and holds `--install-syntax`. Where there is a `python3` on the
-`PATH` it also asks the Sublime plugin what it completes at a cursor: see
-`sublime/README.md`. The TextMate grammar has no parser
+repository, and holds `--install-syntax` and `--complete`. Each caller of
+`--complete` is run where its interpreter is on the `PATH`: the Sublime
+plugin by `python3`, the extension by `node` against a `vscode` module of
+the test's own, and the omni completion in `vim` itself. The TextMate grammar has no parser
 in Rust. Its tokens for `sample.api` are kept in `sample.api.snap`, and Node
 compares them:
 

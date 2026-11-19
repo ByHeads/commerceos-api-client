@@ -767,7 +767,83 @@ omnium/omnium.api
   ref that does not exist) is `error: …` on stderr with exit 1 and nothing on
   stdout.
 
-## Syntax highlighting: `--install-syntax <editor>`
+## Completing a file for an editor: `--complete <file>`
+
+```sh
+api --complete seed.api --at 42 < seed.api
+```
+
+Prints what can stand at a place of a `.api` file, as one JSON document on
+stdout. It is what an editor asks on a keystroke: the plugins that
+[`--install-syntax`](#syntax-highlighting-and-completions---install-syntax-editor) installs
+are callers of it. Nothing is sent and no connection is needed.
+
+- **The text is read from stdin**, as the editor has it, saved or not. `<file>`
+  says where it is kept, which is what an include is relative to; `-` is a
+  text that is kept nowhere yet.
+- **`--at <bytes>` is the place**: the number of bytes of UTF-8 in front of
+  the cursor. Without it the place is the end of the text.
+
+```json
+{
+  "typed": "in",
+  "items": [
+    { "name": "include-nulls", "snippet": "include-nulls", "text": "include-nulls", "note": "setting" }
+  ]
+}
+```
+
+| Member | Holds |
+|---|---|
+| `typed` | the text in front of the cursor that an item takes the place of |
+| `name` | what the item is called, and what `typed` is matched with |
+| `snippet` | what is written, with stops for the cursor: `$1`, and `${1:true}` with a value to type over |
+| `text` | the same for an editor without snippets |
+| `note` | what kind of thing it is: `setting`, `method`, `directive`, `operator`, `file`, `directory`, … |
+
+The items are not narrowed to `typed`, except paths, methods and directives:
+an editor matches as it matches everywhere (`nulls` finds `include-nulls`).
+
+| Where | What is offered |
+|---|---|
+| The start of a line | the methods, the directives, and what can be included: directories, `.api` files and import aliases |
+| In `set { … }` | the settings the object does not have yet; behind a `:`, the values the setting takes |
+| Behind `import` | `git`, `dir`, `archive` |
+| In the object of an `import` | the keys of its kind; for an `import dir`, the directories its `"path"` may name |
+| In a describe block | `title`, `description`, `docsLink`; in the first two, locales |
+| Behind `url`, `sleep`, `assert`, `while`, `&&`, `\|\|` | `has` / `is`, `while`, `not`, the methods |
+| Behind a `~` of a URI | the operators the prompt completes |
+| Behind `>` | `clipboard` (not behind `>>`) and paths |
+| Behind `@` | paths; behind a `~` there, `map(` |
+
+- In quotes that are typed already (`"in"`) a name is offered alone. Where
+  nothing is quoted yet it is the member whole: `"include-nulls": true`.
+- **`null` is the answer where the client has nothing to say**: in a
+  request's body, in a comment, in a `confirm` line. An editor completes
+  there as it does in any file. **`{ "uri": true }`** is the answer in a URI,
+  whose endpoints and members are the server's to say and are not completed.
+- **A path is completed from where a run reads it.** An include and the
+  `"path"` of an `import dir` from the directory of the file. An `@file`
+  body, the `@file` of a `set` or an `import`, and an outfile from the
+  working directory, so an editor asks in the directory a run would start
+  in (its project folder). A file can name it for editors with a comment,
+  relative to itself, which a run does not read:
+
+  ```
+  # @basedir ..
+  ```
+- **Behind an alias (`cl/…`) it is the directory the alias stands for.** An
+  `import dir` is read from its line. An `import git` or an `import archive`
+  is read from the cache, where a run or `api --imports` left it, at the
+  commit a ref last resolved to. **Nothing is fetched to complete**: an
+  alias that was never fetched has nothing to offer until the file is run,
+  or listed with `--imports`, once.
+- An import line that can't be read, as one that is half typed, has no alias
+  and stops nothing else from being completed.
+- `-r` prints the document on one line. A file to run, a request or another
+  document beside it is an error, as for `--imports`.
+
+## Syntax highlighting and completions: `--install-syntax <editor>`
 
 ```sh
 api --install-syntax sublime
@@ -778,30 +854,31 @@ Installs highlighting for `.api` files in an editor: `sublime`, `vscode`,
 client, so what is installed is the one for the syntax this client reads.
 Nothing is sent and no connection is needed.
 
+Sublime Text, VS Code, Cursor, Vim and Neovim get completions too: what is
+installed asks the client what can stand where the cursor is
+([`api --complete`](#completing-a-file-for-an-editor---complete-file)), so
+it needs the `api` on the `PATH`, or the one a setting of the editor names.
+
 - **Each path written is a line on stdout.** What is left to do, if anything,
   is said on stderr.
-- `sublime` writes `API.sublime-syntax` and `api_completions.py` to
-  `Packages/User` of Sublime Text's data folder. Where Sublime Text has no
-  folder it is an error, and none is made. The second file is a plugin that
-  completes what can stand where the cursor is: the settings of a `set`
-  line, the keys of an `import`, the members of a describe block, methods,
-  directives and URI operators, and paths. An include completes from the
-  directory of the file and from the directory of an import alias. An
-  `@file` and an outfile complete from the working directory, which an
-  editor does not know: a `# @basedir <path>` comment in the file says it
-  (the client does not read it), else it is the project folder.
+- `sublime` writes `API.sublime-syntax` and `api_completions.py`, a plugin,
+  to `Packages/User` of Sublime Text's data folder. Where Sublime Text has no
+  folder it is an error, and none is made. The setting `api_binary` names
+  another client.
 - `vim` and `nvim` write a package (`syntax/`, `ftdetect/`, `ftplugin/`) to
   `~/.vim/pack/commerceos/start/api` and
-  `~/.local/share/nvim/site/pack/commerceos/start/api`.
+  `~/.local/share/nvim/site/pack/commerceos/start/api`. Completion is omni
+  completion, `ctrl+x ctrl+o`; `g:api_binary` names another client.
 - `vscode` and `cursor` write `~/.local/share/api/editors/commerceos-api.vsix`
   and install it with the editor's own command (`code --install-extension`,
   `cursor --install-extension`). Without that command on the `PATH` the file
   is still written, the exit code is 1 and stderr says how to install it by
-  hand.
+  hand. The setting `commerceosApi.binary` names another client.
 - `rider` writes a TextMate bundle to
   `~/.local/share/api/editors/commerceos-api`, for any JetBrains IDE. Adding
   it under *Settings → Editor → TextMate Bundles* is a step in the IDE, said
-  on stderr, and needed once.
+  on stderr, and needed once. A TextMate bundle is highlighting only: a
+  JetBrains IDE gets no completions from it.
 - **A file that is there is replaced.** Running it again after an update of
   the client is how the highlighting is updated.
 - An editor that is not one of the six is `error: unknown editor …` with exit
@@ -1115,8 +1192,8 @@ file, or through something that strips them before the pipe.
 (`api -sa seed.api GET /people`) is an error, before anything is sent:
 `-a seed.api runs a file and GET /people is a request: give one of the two`.
 
-`--describe`, `--assert` and `--imports` each print a document about a file
-and send nothing. A file to run or a request beside one of them is an error
+`--describe`, `--assert`, `--imports` and `--complete` each print a document
+about a file and send nothing. A file to run or a request beside one of them is an error
 too: `--imports a.api prints a document and GET /people is a request: give
 one of the two`.
 
@@ -1703,6 +1780,6 @@ Run it: `api -sa workshop.api`.
 - Add `-f` (`-sfa`) so a failed request stops the batch: check the exit code, and on failure read the error body from the end of stdout (everything after the last `└─HTTP/1.1 …` line; it is usually several lines of JSON). Without it a batch exits 0 however many plain requests failed.
 - Open a file with a [describe block](#describe-block) (`title`, `description`, `docsLink`) so a tool or a person can tell what it does; read one with `api --describe file.api`, which sends nothing.
 - To see what a file checks without running it, `api --assert file.api` prints every `PUT /assert` body it sends as one JSON array.
-- When someone asks for `.api` highlighting in their editor, it is `api --install-syntax <editor>`. Don't copy a grammar out of `editors/` by hand: the client holds the one that matches it.
+- When someone asks for `.api` highlighting or completions in their editor, it is `api --install-syntax <editor>`. Don't copy a grammar out of `editors/` by hand: the client holds the one that matches it.
 - To read a file of an import yourself, ask `api --imports file.api` for the directory its alias stands for. Don't rebuild a path into the import cache: its layout is the client's own.
 - Run with `--no-keychain` and an absolute `API_CREDENTIALS_FILE` so nothing depends on an unlocked keychain or on the working directory.

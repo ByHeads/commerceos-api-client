@@ -1,7 +1,7 @@
 {
   "name": "commerceos-api",
   "displayName": "CommerceOS .api files",
-  "description": "Syntax highlighting for the .api batch files of the CommerceOS API client",
+  "description": "Syntax highlighting and completions for the .api batch files of the CommerceOS API client",
   "version": "0.0.0",
   "publisher": "heads",
   "license": "MIT",
@@ -12,6 +12,10 @@
   "engines": {
     "vscode": "^1.60.0"
   },
+  "main": "./extension.js",
+  "activationEvents": [
+    "onLanguage:commerceos-api"
+  ],
   "categories": [
     "Programming Languages"
   ],
@@ -35,6 +39,16 @@
         "scopeName": "source.api",
         "path": "./syntaxes/api.tmLanguage.json"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "CommerceOS .api files",
+      "properties": {
+        "commerceosApi.binary": {
+          "type": "string",
+          "default": "",
+          "description": "The CommerceOS API client that is asked what can stand at the cursor. Empty: the `api` on the PATH."
+        }
+      }
+    }
   }
 }
