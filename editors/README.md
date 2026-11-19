@@ -38,12 +38,14 @@ A file of the same name that is already there is replaced: an
 The Sublime syntax is the reference; `sublime/README.md` lists its scopes. The
 TextMate grammar is a port of it with the same scope names, and marks the same
 things as errors (`invalid.illegal.*`): what would stop a batch before
-anything is sent. It differs in two places:
+anything is sent. It differs in three places:
 
 - A JSON key has `support.type.property-name.json` as well, the scope VS Code
-  themes colour a key by, and a known member of a describe block or an import
-  has `keyword.other.member.api`, so that it stands out from an unknown one.
+  themes colour a key by. A known member of a describe block, an import or a
+  `set` line has it too, and so the colour of any other key, as in Sublime.
 - A second describe block that comes before the first request is not marked.
+- A bare JSON scalar is coloured as a body wherever it stands as a word of
+  its own behind a request, not only right behind the URI.
 
 The Vim syntax colours what a line is (method, URI, directive, body, comment,
 outfile) and marks no errors.

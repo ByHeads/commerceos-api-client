@@ -138,8 +138,8 @@
           "patterns": [
             {
               "match": "(\")(export|include-nulls|fail-fast|ndjson|raw|stream|timeout)(\")(?=\\s*:)",
-              "name": "meta.mapping.key.json string.quoted.double.json",
-              "captures": { "2": { "name": "support.type.property-name.setting.api keyword.other.member.api" } }
+              "name": "meta.mapping.key.json string.quoted.double.json support.type.property-name.json",
+              "captures": { "2": { "name": "meta.property-name.setting.api" } }
             },
             { "include": "#json-members" }
           ]
@@ -183,8 +183,8 @@
           "patterns": [
             {
               "match": "(\")(url|ref|path|sha256|token_env)(\")(?=\\s*:)",
-              "name": "meta.mapping.key.json string.quoted.double.json",
-              "captures": { "2": { "name": "support.type.property-name.import.api keyword.other.member.api" } }
+              "name": "meta.mapping.key.json string.quoted.double.json support.type.property-name.json",
+              "captures": { "2": { "name": "meta.property-name.import.api" } }
             },
             { "include": "#json-members" }
           ]
@@ -223,8 +223,8 @@
       "patterns": [
         {
           "match": "(\")(title|description|docsLink)(\")(?=\\s*:)",
-          "name": "meta.mapping.key.json string.quoted.double.json",
-          "captures": { "2": { "name": "support.type.property-name.describe.api keyword.other.member.api" } }
+          "name": "meta.mapping.key.json string.quoted.double.json support.type.property-name.json",
+          "captures": { "2": { "name": "meta.property-name.describe.api" } }
         },
         { "include": "#json-members" }
       ]
@@ -387,7 +387,7 @@
     },
 
     "body": {
-      "comment": "A body starts behind a blank: a JSON object or array, or a string.",
+      "comment": "A body starts behind a blank: a JSON object or array, a string, or a bare JSON scalar.",
       "patterns": [
         {
           "begin": "(?<=\\s)\\{",
@@ -412,6 +412,15 @@
           "endCaptures": { "0": { "name": "punctuation.definition.string.end.api" } },
           "name": "string.quoted.double.api",
           "patterns": [{ "match": "\\\\.", "name": "constant.character.escape.api" }]
+        },
+        {
+          "comment": "a body that is one bare JSON scalar: `PUT /x true`, `PUT /x 42`",
+          "match": "(?<=\\s)(?:true|false|null)(?=\\s*$|\\s+#|\\s+>|\\s*&&|\\s*\\|\\|)",
+          "name": "constant.language.json"
+        },
+        {
+          "match": "(?<=\\s)-?(?:0|[1-9]\\d*)(?:\\.\\d+)?(?:[eE][+-]?\\d+)?(?=\\s*$|\\s+#|\\s+>|\\s*&&|\\s*\\|\\|)",
+          "name": "constant.numeric.json"
         }
       ]
     },

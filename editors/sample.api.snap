@@ -18,9 +18,9 @@
 #^ source.api meta.describe.api meta.mapping.json punctuation.section.mapping.begin.json
 >  "title": { "en-US": "Sample" },
 #^^ source.api meta.describe.api meta.mapping.json
-#  ^ source.api meta.describe.api meta.mapping.json meta.mapping.key.json string.quoted.double.json
-#   ^^^^^ source.api meta.describe.api meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.describe.api keyword.other.member.api
-#        ^ source.api meta.describe.api meta.mapping.json meta.mapping.key.json string.quoted.double.json
+#  ^ source.api meta.describe.api meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
+#   ^^^^^ source.api meta.describe.api meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json meta.property-name.describe.api
+#        ^ source.api meta.describe.api meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
 #         ^ source.api meta.describe.api meta.mapping.json meta.mapping.value.json punctuation.separator.key-value.json
 #          ^ source.api meta.describe.api meta.mapping.json meta.mapping.value.json
 #           ^ source.api meta.describe.api meta.mapping.json meta.mapping.value.json meta.mapping.json punctuation.section.mapping.begin.json
@@ -38,9 +38,9 @@
 #                                ^ source.api meta.describe.api meta.mapping.json punctuation.separator.sequence.json
 >  "description": { "sv-SE": "Ett exempel" },
 #^^ source.api meta.describe.api meta.mapping.json
-#  ^ source.api meta.describe.api meta.mapping.json meta.mapping.key.json string.quoted.double.json
-#   ^^^^^^^^^^^ source.api meta.describe.api meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.describe.api keyword.other.member.api
-#              ^ source.api meta.describe.api meta.mapping.json meta.mapping.key.json string.quoted.double.json
+#  ^ source.api meta.describe.api meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
+#   ^^^^^^^^^^^ source.api meta.describe.api meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json meta.property-name.describe.api
+#              ^ source.api meta.describe.api meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
 #               ^ source.api meta.describe.api meta.mapping.json meta.mapping.value.json punctuation.separator.key-value.json
 #                ^ source.api meta.describe.api meta.mapping.json meta.mapping.value.json
 #                 ^ source.api meta.describe.api meta.mapping.json meta.mapping.value.json meta.mapping.json punctuation.section.mapping.begin.json
@@ -58,9 +58,9 @@
 #                                           ^ source.api meta.describe.api meta.mapping.json punctuation.separator.sequence.json
 >  "docsLink": "https://link-to-docs.com",
 #^^ source.api meta.describe.api meta.mapping.json
-#  ^ source.api meta.describe.api meta.mapping.json meta.mapping.key.json string.quoted.double.json
-#   ^^^^^^^^ source.api meta.describe.api meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.describe.api keyword.other.member.api
-#           ^ source.api meta.describe.api meta.mapping.json meta.mapping.key.json string.quoted.double.json
+#  ^ source.api meta.describe.api meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
+#   ^^^^^^^^ source.api meta.describe.api meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json meta.property-name.describe.api
+#           ^ source.api meta.describe.api meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
 #            ^ source.api meta.describe.api meta.mapping.json meta.mapping.value.json punctuation.separator.key-value.json
 #             ^ source.api meta.describe.api meta.mapping.json meta.mapping.value.json
 #              ^ source.api meta.describe.api meta.mapping.json meta.mapping.value.json string.quoted.double.json punctuation.definition.string.begin.json
@@ -90,9 +90,9 @@
 #              ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json punctuation.section.mapping.begin.json
 >  "url": "https://github.com/Polyjuice/cloddy",
 #^^ source.api meta.import.api meta.embedded.block.json meta.mapping.json
-#  ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
-#   ^^^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.import.api keyword.other.member.api
-#      ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
+#  ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
+#   ^^^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json meta.property-name.import.api
+#      ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
 #       ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json punctuation.separator.key-value.json
 #        ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json
 #         ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json string.quoted.double.json punctuation.definition.string.begin.json
@@ -101,9 +101,9 @@
 #                                              ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json punctuation.separator.sequence.json
 >  "ref": "2.1.0"
 #^^ source.api meta.import.api meta.embedded.block.json meta.mapping.json
-#  ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
-#   ^^^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.import.api keyword.other.member.api
-#      ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
+#  ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
+#   ^^^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json meta.property-name.import.api
+#      ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
 #       ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json punctuation.separator.key-value.json
 #        ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json
 #         ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json string.quoted.double.json punctuation.definition.string.begin.json
@@ -132,9 +132,9 @@
 #                  ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json punctuation.section.mapping.begin.json
 >  "url": "https://example.com/releases/a.tar.gz",
 #^^ source.api meta.import.api meta.embedded.block.json meta.mapping.json
-#  ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
-#   ^^^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.import.api keyword.other.member.api
-#      ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
+#  ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
+#   ^^^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json meta.property-name.import.api
+#      ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
 #       ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json punctuation.separator.key-value.json
 #        ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json
 #         ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json string.quoted.double.json punctuation.definition.string.begin.json
@@ -143,9 +143,9 @@
 #                                                ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json punctuation.separator.sequence.json
 >  "sha256": "9f2c",
 #^^ source.api meta.import.api meta.embedded.block.json meta.mapping.json
-#  ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
-#   ^^^^^^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.import.api keyword.other.member.api
-#         ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
+#  ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
+#   ^^^^^^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json meta.property-name.import.api
+#         ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
 #          ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json punctuation.separator.key-value.json
 #           ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json
 #            ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json string.quoted.double.json punctuation.definition.string.begin.json
@@ -154,9 +154,9 @@
 #                  ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json punctuation.separator.sequence.json
 >  "token_env": "AR_TOKEN",
 #^^ source.api meta.import.api meta.embedded.block.json meta.mapping.json
-#  ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
-#   ^^^^^^^^^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.import.api keyword.other.member.api
-#            ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
+#  ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
+#   ^^^^^^^^^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json meta.property-name.import.api
+#            ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
 #             ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json punctuation.separator.key-value.json
 #              ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json
 #               ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json string.quoted.double.json punctuation.definition.string.begin.json
@@ -165,9 +165,9 @@
 #                         ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json punctuation.separator.sequence.json
 >  "path": "seeds"
 #^^ source.api meta.import.api meta.embedded.block.json meta.mapping.json
-#  ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
-#   ^^^^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.import.api keyword.other.member.api
-#       ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
+#  ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
+#   ^^^^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json meta.property-name.import.api
+#       ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
 #        ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json punctuation.separator.key-value.json
 #         ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json
 #          ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json string.quoted.double.json punctuation.definition.string.begin.json
@@ -184,9 +184,9 @@
 #                  ^ source.api
 #                   ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json punctuation.section.mapping.begin.json
 #                    ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json
-#                     ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
-#                      ^^^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.import.api keyword.other.member.api
-#                         ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
+#                     ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
+#                      ^^^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json meta.property-name.import.api
+#                         ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
 #                          ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json punctuation.separator.key-value.json
 #                           ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json
 #                            ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json string.quoted.double.json punctuation.definition.string.begin.json
@@ -203,9 +203,9 @@
 #              ^ source.api
 #               ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json punctuation.section.mapping.begin.json
 #                ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json
-#                 ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
-#                  ^^^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.import.api keyword.other.member.api
-#                     ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
+#                 ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
+#                  ^^^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json meta.property-name.import.api
+#                     ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
 #                      ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json punctuation.separator.key-value.json
 #                       ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json
 #                        ^ source.api meta.import.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json string.quoted.double.json punctuation.definition.string.begin.json
@@ -232,9 +232,9 @@
 #   ^ source.api
 #    ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json punctuation.section.mapping.begin.json
 #     ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json
-#      ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
-#       ^^^^^^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.setting.api keyword.other.member.api
-#             ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
+#      ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
+#       ^^^^^^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json meta.property-name.setting.api
+#             ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
 #              ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json punctuation.separator.key-value.json
 #               ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json
 #                ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json string.quoted.double.json punctuation.definition.string.begin.json
@@ -248,9 +248,9 @@
 #    ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json punctuation.section.mapping.begin.json
 >  "include-nulls": true,   // nulls too
 #^^ source.api meta.set.api meta.embedded.block.json meta.mapping.json
-#  ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
-#   ^^^^^^^^^^^^^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.setting.api keyword.other.member.api
-#                ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
+#  ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
+#   ^^^^^^^^^^^^^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json meta.property-name.setting.api
+#                ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
 #                 ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json punctuation.separator.key-value.json
 #                  ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json
 #                   ^^^^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json constant.language.json
@@ -259,18 +259,18 @@
 #                           ^^^^^^^^^^^^ source.api meta.set.api meta.embedded.block.json meta.mapping.json comment.line.double-slash.json
 >  "fail-fast": false,
 #^^ source.api meta.set.api meta.embedded.block.json meta.mapping.json
-#  ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
-#   ^^^^^^^^^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.setting.api keyword.other.member.api
-#            ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
+#  ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
+#   ^^^^^^^^^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json meta.property-name.setting.api
+#            ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
 #             ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json punctuation.separator.key-value.json
 #              ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json
 #               ^^^^^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json constant.language.json
 #                    ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json punctuation.separator.sequence.json
 >  "timeout": 30
 #^^ source.api meta.set.api meta.embedded.block.json meta.mapping.json
-#  ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
-#   ^^^^^^^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.setting.api keyword.other.member.api
-#          ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
+#  ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
+#   ^^^^^^^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json meta.property-name.setting.api
+#          ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
 #           ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json punctuation.separator.key-value.json
 #            ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json
 #             ^^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json constant.numeric.json
@@ -283,17 +283,17 @@
 #   ^ source.api
 #    ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json punctuation.section.mapping.begin.json
 #     ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json
-#      ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
-#       ^^^^^^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.setting.api keyword.other.member.api
-#             ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
+#      ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
+#       ^^^^^^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json meta.property-name.setting.api
+#             ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
 #              ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json punctuation.separator.key-value.json
 #               ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json
 #                ^^^^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json constant.language.json
 #                    ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json punctuation.separator.sequence.json
 #                     ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json
-#                      ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
-#                       ^^^^^^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.setting.api keyword.other.member.api
-#                             ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
+#                      ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
+#                       ^^^^^^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json meta.property-name.setting.api
+#                             ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
 #                              ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json punctuation.separator.key-value.json
 #                               ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json
 #                                ^^^^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json constant.language.json
@@ -315,9 +315,9 @@
 #   ^ source.api
 #    ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json punctuation.section.mapping.begin.json
 #     ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json
-#      ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
-#       ^^^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.setting.api keyword.other.member.api
-#          ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json
+#      ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
+#       ^^^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json meta.property-name.setting.api
+#          ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.key.json string.quoted.double.json support.type.property-name.json
 #           ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json punctuation.separator.key-value.json
 #            ^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json
 #             ^^^^ source.api meta.set.api meta.embedded.block.json meta.mapping.json meta.mapping.value.json constant.language.json
@@ -551,6 +551,62 @@
 #                                                      ^^^^^^^^^^^^^^ source.api meta.request.api meta.path.outfile.api
 #                                                                    ^^ source.api meta.request.api
 #                                                                      ^^^^^^ source.api meta.request.api comment.line.number-sign.api
+>PUT /flags/open true
+#^^^ source.api meta.request.api keyword.control.http.write.api
+#   ^ source.api meta.request.api
+#    ^ source.api meta.request.api punctuation.separator.path.api
+#     ^^^^^ source.api meta.request.api
+#          ^ source.api meta.request.api punctuation.separator.path.api
+#           ^^^^^ source.api meta.request.api
+#                ^^^^ source.api meta.request.api constant.language.json
+>PUT /flags/limit 42 > /tmp/limit.json   # a scalar body
+#^^^ source.api meta.request.api keyword.control.http.write.api
+#   ^ source.api meta.request.api
+#    ^ source.api meta.request.api punctuation.separator.path.api
+#     ^^^^^ source.api meta.request.api
+#          ^ source.api meta.request.api punctuation.separator.path.api
+#           ^^^^^^ source.api meta.request.api
+#                 ^^ source.api meta.request.api constant.numeric.json
+#                   ^ source.api meta.request.api
+#                    ^ source.api meta.request.api keyword.operator.outfile.api
+#                     ^ source.api meta.request.api
+#                      ^^^^^^^^^^^^^^^ source.api meta.request.api meta.path.outfile.api
+#                                     ^^^ source.api meta.request.api
+#                                        ^^^^^^^^^^^^^^^ source.api meta.request.api comment.line.number-sign.api
+>GET /a && PUT /flags/open null || PUT /flags/limit -1.5e3
+#^^^ source.api meta.request.api keyword.control.http.read.api
+#   ^ source.api meta.request.api
+#    ^ source.api meta.request.api punctuation.separator.path.api
+#     ^^ source.api meta.request.api
+#       ^^ source.api meta.request.api keyword.operator.logical.api
+#         ^ source.api meta.request.api
+#          ^^^ source.api meta.request.api keyword.control.http.write.api
+#             ^ source.api meta.request.api
+#              ^ source.api meta.request.api punctuation.separator.path.api
+#               ^^^^^ source.api meta.request.api
+#                    ^ source.api meta.request.api punctuation.separator.path.api
+#                     ^^^^^ source.api meta.request.api
+#                          ^^^^ source.api meta.request.api constant.language.json
+#                              ^ source.api meta.request.api
+#                               ^^ source.api meta.request.api keyword.operator.logical.api
+#                                 ^ source.api meta.request.api
+#                                  ^^^ source.api meta.request.api keyword.control.http.write.api
+#                                     ^ source.api meta.request.api
+#                                      ^ source.api meta.request.api punctuation.separator.path.api
+#                                       ^^^^^ source.api meta.request.api
+#                                            ^ source.api meta.request.api punctuation.separator.path.api
+#                                             ^^^^^^ source.api meta.request.api
+#                                                   ^^^^^^ source.api meta.request.api constant.numeric.json
+>assert PUT /flags/check false
+#^^^^^^ source.api keyword.control.command.api
+#      ^ source.api
+#       ^^^ source.api keyword.control.http.write.api
+#          ^ source.api
+#           ^ source.api punctuation.separator.path.api
+#            ^^^^^ source.api
+#                 ^ source.api punctuation.separator.path.api
+#                  ^^^^^^ source.api
+#                        ^^^^^ source.api constant.language.json
 >PUT /things {
 #^^^ source.api meta.request.api keyword.control.http.write.api
 #   ^ source.api meta.request.api

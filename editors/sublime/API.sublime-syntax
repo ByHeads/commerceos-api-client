@@ -11,6 +11,9 @@ variables:
   word_end: '(?=\s|$)'
   # end of what a line says: the line's end, or a ` # comment`
   line_end: '(?=\s*$|\s+#)'
+  json_number: '-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?'
+  # a body that is one bare JSON scalar: `PUT /x true`, `PUT /x 42`
+  scalar_body: '(?:true|false|null|{{json_number}})(?=\s*$|\s+#|\s+>|\s*&&|\s*\|\|)'
 
 contexts:
   # The top of a file. Only comments, blank lines and `url` lines may stand
@@ -168,6 +171,8 @@ contexts:
       set: json_body
     - match: '\s+(?=")'
       set: string_body
+    - match: '\s+(?={{scalar_body}})'
+      set: scalar_body
     - include: uri_parts
 
   # everything behind `confirm` is the question: no comment, no chain
@@ -194,7 +199,7 @@ contexts:
         - match: '(")(export|include-nulls|fail-fast|ndjson|raw|stream|timeout)(")(?=\s*:)'
           scope: meta.mapping.key.json string.quoted.double.json
           captures:
-            2: support.type.property-name.setting.api
+            2: meta.property-name.setting.api
         - include: json_members
     - include: trailing_comment
     # the line in words (`set include-nulls`) is no longer read
@@ -245,7 +250,7 @@ contexts:
         - match: '(")(url|ref|path|sha256|token_env)(")(?=\s*:)'
           scope: meta.mapping.key.json string.quoted.double.json
           captures:
-            2: support.type.property-name.import.api
+            2: meta.property-name.import.api
         - include: json_members
     - include: trailing_comment
     - match: '\S+'
@@ -280,7 +285,7 @@ contexts:
         - match: '(")(title|description|docsLink)(")(?=\s*:)'
           scope: meta.mapping.key.json string.quoted.double.json
           captures:
-            2: support.type.property-name.describe.api
+            2: meta.property-name.describe.api
         - include: json_members
 
   # A `{` or `[` that starts a line below the top of the file: a second
@@ -352,6 +357,8 @@ contexts:
       set: json_body
     - match: '\s+(?=")'
       set: string_body
+    - match: '\s+(?={{scalar_body}})'
+      set: scalar_body
     - include: redirect
     - match: '\s+(@)\s*'
       captures:
@@ -446,6 +453,14 @@ contexts:
       set: after_body
     - match: '\\.'
       scope: constant.character.escape.api
+
+  scalar_body:
+    - match: 'true|false|null'
+      scope: constant.language.json
+      set: after_body
+    - match: '{{json_number}}'
+      scope: constant.numeric.json
+      set: after_body
 
   after_body:
     - include: body_tail

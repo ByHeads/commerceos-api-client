@@ -34,13 +34,16 @@ syn match  apiTrailComment /\s\@1<=#.*$/ contained
 " nested object can't start on the brace that opened its parent.
 
 " a URI: up to the next blank, with the parentheses of an operator kept whole
-syn match  apiUri /\%([^[:space:](]\|([^)]*)\)\+/ contained contains=apiUriString,apiUriPunct nextgroup=apiBodyObject,apiBodyArray,apiBodyString,apiInfile,@apiTail skipwhite
+syn match  apiUri /\%([^[:space:](]\|([^)]*)\)\+/ contained contains=apiUriString,apiUriPunct nextgroup=apiBodyObject,apiBodyArray,apiBodyString,apiBodyConst,apiBodyNumber,apiInfile,@apiTail skipwhite
 syn match  apiUriPunct  /[\/~(){}:?#=&@.;,<>+*!|-]/ contained
 syn region apiUriString start=/"/ end=/"\|$/ contained oneline
 
 syn region apiBodyObject matchgroup=apiBrace start=/{/ end=/}/ contained contains=@apiJson nextgroup=@apiTail skipwhite
 syn region apiBodyArray  matchgroup=apiBrace start=/\[/ end=/\]/ contained contains=@apiJson nextgroup=@apiTail skipwhite
 syn region apiBodyString start=/"/ skip=/\\./ end=/"/ contained oneline nextgroup=@apiTail skipwhite
+" a body that is one bare JSON scalar: `PUT /x true`, `PUT /x 42`
+syn match  apiBodyConst  /\%(true\|false\|null\)\ze\%(\s*$\|\s\+[#>]\|\s*&&\|\s*||\)/ contained nextgroup=@apiTail skipwhite
+syn match  apiBodyNumber /-\=\%(0\|[1-9]\d*\)\%(\.\d\+\)\=\%([eE][+-]\=\d\+\)\=\ze\%(\s*$\|\s\+[#>]\|\s*&&\|\s*||\)/ contained nextgroup=@apiTail skipwhite
 
 syn match  apiInfile /@\s*\S*/ contained contains=apiInfileOp,apiMap,apiWildcard nextgroup=@apiTail skipwhite
 syn match  apiInfileOp /@/ contained
@@ -63,7 +66,7 @@ syn match  apiSegDelete /\cDELETE\ze\%(\s\|$\)/ contained nextgroup=apiUri skipw
 syn match  apiInclude /^\s*\zs[^[:space:]#{\[].\{-}\ze\s*\%(\s#.*\)\=$/ contains=apiWildcard nextgroup=apiTrailComment skipwhite
 
 " `/people` is `GET /people`; `/tmp/seed.api` is an include
-syn match  apiImpliedUri /^\s*\zs\/\%([^[:space:](]\|([^)]*)\)*/ contains=apiUriString,apiUriPunct nextgroup=apiBodyObject,apiBodyArray,apiBodyString,apiInfile,@apiTail skipwhite
+syn match  apiImpliedUri /^\s*\zs\/\%([^[:space:](]\|([^)]*)\)*/ contains=apiUriString,apiUriPunct nextgroup=apiBodyObject,apiBodyArray,apiBodyString,apiBodyConst,apiBodyNumber,apiInfile,@apiTail skipwhite
 syn match  apiInclude /^\s*\zs\/\S*\c\.api\ze\s*\%(\s#.*\)\=$/ contains=apiWildcard nextgroup=apiTrailComment skipwhite
 
 syn match  apiMethodRead   /^\s*\zs\c\%(GET\|HEAD\|OPTIONS\)\ze\%(\s\|$\)/ nextgroup=apiUri skipwhite
@@ -131,6 +134,8 @@ hi def link apiValue        String
 hi def link apiMessage      String
 hi def link apiBodyString   String
 hi def link apiDuration     Number
+hi def link apiBodyNumber   Number
+hi def link apiBodyConst    Boolean
 hi def link apiImportKind   Type
 hi def link apiAlias        Identifier
 hi def link apiJsonKey      Label

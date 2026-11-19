@@ -58,6 +58,10 @@ PUT /people @people/*.json
 PUT /sync-webhooks @data.csv~map(com.heads.csv-product) > /tmp/r.json
 PUT /x @backup~old(1)
 PUT /people/com.mi6.id=007 { "name": "James Bond" } > /tmp/bond.json  # tail
+PUT /flags/open true
+PUT /flags/limit 42 > /tmp/limit.json   # a scalar body
+GET /a && PUT /flags/open null || PUT /flags/limit -1.5e3
+assert PUT /flags/check false
 PUT /things {
   // JS-style line comment
   # shell-style line comment

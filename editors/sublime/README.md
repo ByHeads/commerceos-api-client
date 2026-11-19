@@ -22,15 +22,16 @@ pick it up. By hand: copy `API.sublime-syntax` to that folder
 | `while`, `not` | `keyword.control.loop.api` |
 | `url has` / `url is` and the value | `keyword.operator.api`, `string.unquoted.value.api` |
 | `confirm` message | `string.unquoted.message.api` |
-| `set { … }`, the names of its settings; `set @file.json` | `meta.set.api`, `support.type.property-name.setting.api`; `keyword.operator.infile.api`, `meta.path.infile.api` |
-| `import`, its kind, its alias, its keys | `keyword.control.import.api`, `storage.type.import.api`, `entity.name.namespace.import.api`, `support.type.property-name.import.api` |
-| Describe block and its `title`, `description`, `docsLink` | `meta.describe.api`, `support.type.property-name.describe.api` |
+| `set { … }`, the names of its settings; `set @file.json` | `meta.set.api`, `meta.property-name.setting.api`; `keyword.operator.infile.api`, `meta.path.infile.api` |
+| `import`, its kind, its alias, its keys | `keyword.control.import.api`, `storage.type.import.api`, `entity.name.namespace.import.api`, `meta.property-name.import.api` |
+| Describe block and its `title`, `description`, `docsLink` | `meta.describe.api`, `meta.property-name.describe.api` |
 | Include line | `meta.include.api` |
 | `&&`, `\|\|` | `keyword.operator.logical.api` |
 | `>`, `>>`, the path, `clipboard` | `keyword.operator.outfile.api`, `meta.path.outfile.api`, `support.constant.clipboard.api` |
 | `@file`, `~map(type)` | `keyword.operator.infile.api`, `meta.path.infile.api`, `support.function.map.api` |
 | `# …` on a line of its own or behind one | `comment.line.number-sign.api` |
 | JSON bodies, with `//`, `#` and `/* */` comments | `*.json` scopes |
+| A body that is one bare JSON scalar (`PUT /x true`, `PUT /x 42`) | `constant.language.json`, `constant.numeric.json` |
 
 Marked `invalid.illegal.*`, since each stops a batch: a `&&`/`||` with nothing
 on one side, a directive or include in a chain, a `>` with no path, a chain or
@@ -41,9 +42,11 @@ import kind, an alias that is a method or directive, a body function other than
 
 ## Not covered
 
-- An unknown member of a describe block, an unknown key of an import or an
-  unknown setting of a `set` line is coloured as a plain JSON key, not as an
-  error. Neither is a value a setting does not take.
+- A known member of a describe block, key of an import or setting of a `set`
+  line has a scope of its own (`meta.property-name.*.api`) and the colour of
+  any JSON key: a `meta` scope is not one a colour scheme colours by. An unknown
+  one is a plain JSON key, not an error. Neither is a value a setting does
+  not take.
 - Whether an include path or an alias exists.
 - A `# @basedir <path>` comment is highlighted for a path-completion plugin
   that is not part of this folder. The client does not read it.
