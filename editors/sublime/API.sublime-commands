@@ -1,0 +1,4 @@
+[
+  { "caption": "API: Format", "command": "api_format" },
+  { "caption": "API: Format, a line for each member", "command": "api_format", "args": { "expanded": true } }
+]

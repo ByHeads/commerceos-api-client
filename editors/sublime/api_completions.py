@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
-"""Completions for `.api` batch files in Sublime Text.
+"""Completions and formatting for `.api` batch files in Sublime Text.
 
 Installed beside `API.sublime-syntax` by `api --install-syntax sublime`.
 What can stand where the cursor is, is the client's to say: this plugin asks
 it (`api --complete`) and hands the answer to the editor. So what is offered
-is what the client that is installed reads.
+is what the client that is installed reads. The command `api_format` lays
+the file out the same way: by asking the client (`api --format`).
 
 It is written for the Python 3.3 that Sublime Text runs a plugin of
 `Packages/User` in, so it does without what came later.
@@ -68,6 +69,32 @@ def ask(binary, text, offset, path=None, cwd=None):
         if process.returncode != 0:
             return None
         return json.loads(out.decode('utf-8'))
+    except (OSError, ValueError):
+        return None
+
+
+def formatted(binary, text, expanded=False):
+    """`text` as the client lays a `.api` file out. None when it can't be
+    asked (a client from before `--format`)."""
+    args = [binary, '--format', '-']
+    if expanded:
+        args.append('--expand')
+    try:
+        startup = None
+        if os.name == 'nt':
+            startup = subprocess.STARTUPINFO()
+            startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        process = subprocess.Popen(
+            args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, startupinfo=startup)
+        try:
+            out, _ = process.communicate(text.encode('utf-8'), timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            return None
+        if process.returncode != 0:
+            return None
+        return out.decode('utf-8')
     except (OSError, ValueError):
         return None
 
@@ -168,3 +195,21 @@ if sublime_plugin is not None:
                 # from the words of the file, as before
                 return None if prefix else ([], quiet)
             return (to_sublime(result, prefix), quiet)
+
+    class ApiFormatCommand(sublime_plugin.TextCommand):
+        """`api_format`: lay the file out as the client does. With
+        `expanded`, a line for each member of every object and array."""
+
+        def is_enabled(self):
+            return _is_api_view(self.view)
+
+        def run(self, edit, expanded=False):
+            view = self.view
+            binary = client(view.settings().get('api_binary'))
+            whole = sublime.Region(0, view.size())
+            text = view.substr(whole)
+            laid_out = formatted(binary, text, expanded) if binary else None
+            if laid_out is None:
+                sublime.status_message('API: the client could not format this file (it needs an api with --format)')
+            elif laid_out != text:
+                view.replace(edit, whole, laid_out)

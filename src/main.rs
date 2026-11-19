@@ -719,6 +719,15 @@ struct Args {
     #[arg(long = "at", value_name = "BYTES", requires = "complete")]
     at: Option<usize>,
 
+    /// Print a .api file laid out one way: bodies indented, words a blank
+    /// apart (- reads the text from stdin), and send nothing
+    #[arg(long = "format", value_name = "FILE")]
+    format: Option<String>,
+
+    /// With --format: a line for each member of every object and array
+    #[arg(long = "expand", requires = "format")]
+    expand: bool,
+
     /// Install syntax highlighting for .api files in an editor (sublime,
     /// vscode, cursor, rider, vim or nvim) and send nothing
     #[arg(long = "install-syntax", value_name = "EDITOR")]
@@ -4676,13 +4685,14 @@ fn main() {
         exit_process(0);
     }
 
-    // `--describe`, `--assert`, `--imports` and `--complete` read a file and
-    // print what it says. Nothing is sent, so none of them needs a connection.
+    // `--describe`, `--assert`, `--imports`, `--complete` and `--format` read
+    // a file and print what it says. Nothing is sent, so none of them needs a connection.
     let documents: Vec<&str> = [
         ("--describe", &args.describe),
         ("--assert", &args.assert),
         ("--imports", &args.imports),
         ("--complete", &args.complete),
+        ("--format", &args.format),
     ]
     .into_iter()
     .filter_map(|(flag, file)| file.as_ref().map(|_| flag))
@@ -4700,6 +4710,7 @@ fn main() {
         ("--describe", &args.describe),
         ("--assert", &args.assert),
         ("--complete", &args.complete),
+        ("--format", &args.format),
     ]
     .into_iter()
     .find_map(|(option, file)| file.as_ref().map(|file| format!("{} {}", option, file)));
@@ -4738,6 +4749,9 @@ fn main() {
     }
     if let Some(file) = &args.complete {
         exit_process(print_completions(file, args.at, args.raw));
+    }
+    if let Some(file) = &args.format {
+        exit_process(print_formatted(file, args.expand));
     }
     if let Some(file) = &args.describe {
         exit_process(print_describe_block(file, args.raw));
@@ -10832,6 +10846,548 @@ fn print_completions(file: &str, at: Option<usize>, raw: bool) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// `--format <file>`: a `.api` file laid out one way.
+//
+// The file is cut into its steps as the batch parser cuts it (a line that is
+// whole as it stands, or the lines up to where a body closes), so what is a
+// body here is what a run reads as one. Only blanks outside strings change:
+// a body that can't be read as JSON, and everything the formatter does not
+// know, is written as it stands.
+// ---------------------------------------------------------------------------
+
+const FORMAT_INDENT: &str = "  ";
+
+#[derive(Clone, Copy, PartialEq)]
+enum BodyTokenKind {
+    Open,
+    Close,
+    Colon,
+    Comma,
+    /// A string or a scalar.
+    Text,
+    Comment,
+}
+
+struct BodyToken<'a> {
+    kind: BodyTokenKind,
+    text: &'a str,
+    /// The line breaks in front of it: none, one, or a blank line.
+    breaks: usize,
+}
+
+/// The tokens of a body: JSON, with the `//`, `#` and `/* */` comments a
+/// `.api` file may have in one, and strings that may span lines.
+struct BodyLexer<'a> {
+    text: &'a str,
+    pos: usize,
+}
+
+impl<'a> BodyLexer<'a> {
+    /// The next token. `Err` at the end of the text, and for a string or a
+    /// comment that is never closed.
+    fn next(&mut self) -> Result<BodyToken<'a>, ()> {
+        let bytes = self.text.as_bytes();
+        let mut breaks = 0;
+        while let Some(&c) = bytes.get(self.pos) {
+            match c {
+                b'\n' => breaks += 1,
+                c if c.is_ascii_whitespace() => {}
+                _ => break,
+            }
+            self.pos += 1;
+        }
+        let start = self.pos;
+        let Some(&c) = bytes.get(start) else { return Err(()) };
+        let next = bytes.get(start + 1).copied();
+        let (kind, end) = match c {
+            b'"' => {
+                let mut j = start + 1;
+                loop {
+                    match bytes.get(j) {
+                        None => return Err(()),
+                        Some(b'\\') => j += 2,
+                        Some(b'"') => break,
+                        Some(_) => j += 1,
+                    }
+                }
+                (BodyTokenKind::Text, j + 1)
+            }
+            b'#' => (BodyTokenKind::Comment, line_end_from(self.text, start)),
+            b'/' if next == Some(b'/') => (BodyTokenKind::Comment, line_end_from(self.text, start)),
+            b'/' if next == Some(b'*') => match self.text[start + 2..].find("*/") {
+                Some(n) => (BodyTokenKind::Comment, start + 2 + n + 2),
+                None => return Err(()),
+            },
+            b'{' | b'[' => (BodyTokenKind::Open, start + 1),
+            b'}' | b']' => (BodyTokenKind::Close, start + 1),
+            b':' => (BodyTokenKind::Colon, start + 1),
+            b',' => (BodyTokenKind::Comma, start + 1),
+            _ => {
+                let mut j = start;
+                while let Some(&b) = bytes.get(j) {
+                    let comment = b == b'/' && matches!(bytes.get(j + 1), Some(b'/' | b'*'));
+                    if b.is_ascii_whitespace() || comment || matches!(b, b'{' | b'}' | b'[' | b']' | b':' | b',' | b'"' | b'#') {
+                        break;
+                    }
+                    j += 1;
+                }
+                (BodyTokenKind::Text, j)
+            }
+        };
+        self.pos = end;
+        Ok(BodyToken { kind, text: self.text[start..end].trim_end(), breaks })
+    }
+}
+
+enum BodyNode<'a> {
+    Scalar(&'a str),
+    Container(BodyContainer<'a>),
+}
+
+struct BodyContainer<'a> {
+    object: bool,
+    entries: Vec<BodyEntry<'a>>,
+    /// It is written over several lines, and stays so.
+    multiline: bool,
+    /// On one line it has a blank inside its brackets: `{ "a": 1 }`.
+    padded: bool,
+}
+
+enum BodyEntry<'a> {
+    Value { key: Option<&'a str>, node: BodyNode<'a>, blank_before: bool },
+    /// `same_line`: it stands behind what is in front of it, on its line.
+    Comment { text: &'a str, same_line: bool, blank_before: bool },
+}
+
+/// Read the object or array whose bracket `open` was just read. Strict
+/// where a layout would otherwise have to guess: a trailing comma, a comma
+/// that is missing, or a comment between a key and its value is `Err`, and
+/// the body is then left as it is written.
+fn parse_body_container<'a>(lexer: &mut BodyLexer<'a>, open: &str, depth: usize) -> Result<BodyContainer<'a>, ()> {
+    if depth > 200 {
+        return Err(());
+    }
+    let object = open == "{";
+    let padded = matches!(lexer.text.as_bytes().get(lexer.pos), Some(b' ' | b'\t'));
+    let mut entries = Vec::new();
+    let mut multiline = false;
+    // A value stands last, and a comma or the end may follow it.
+    let mut have_value = false;
+    let mut after_comma = false;
+    loop {
+        let token = lexer.next()?;
+        multiline |= token.breaks > 0;
+        let blank_before = token.breaks > 1;
+        match token.kind {
+            BodyTokenKind::Comment => {
+                entries.push(BodyEntry::Comment { text: token.text, same_line: token.breaks == 0, blank_before });
+            }
+            BodyTokenKind::Close => {
+                let matches_open = (token.text == "}") == object;
+                if !matches_open || after_comma {
+                    return Err(());
+                }
+                return Ok(BodyContainer { object, entries, multiline, padded });
+            }
+            BodyTokenKind::Comma if have_value => {
+                have_value = false;
+                after_comma = true;
+            }
+            BodyTokenKind::Open | BodyTokenKind::Text if !have_value => {
+                let (key, value) = if object {
+                    if token.kind != BodyTokenKind::Text || lexer.next()?.kind != BodyTokenKind::Colon {
+                        return Err(());
+                    }
+                    (Some(token.text), lexer.next()?)
+                } else {
+                    (None, token)
+                };
+                let node = match value.kind {
+                    BodyTokenKind::Text => BodyNode::Scalar(value.text),
+                    BodyTokenKind::Open => BodyNode::Container(parse_body_container(lexer, value.text, depth + 1)?),
+                    _ => return Err(()),
+                };
+                entries.push(BodyEntry::Value { key, node, blank_before });
+                have_value = true;
+                after_comma = false;
+            }
+            _ => return Err(()),
+        }
+    }
+}
+
+/// Write `node` with its lines indented by `indent`. A container that is
+/// written on one line stays on one line, unless `expanded` or it holds a
+/// comment; one that spans lines gets a line for each member.
+fn write_body_node(node: &BodyNode, indent: &str, expanded: bool, out: &mut String) {
+    let container = match node {
+        BodyNode::Scalar(text) => return out.push_str(text),
+        BodyNode::Container(container) => container,
+    };
+    let (open, close) = if container.object { ('{', '}') } else { ('[', ']') };
+    let last_value = container.entries.iter().rposition(|entry| matches!(entry, BodyEntry::Value { .. }));
+    let commented = container.entries.iter().any(|entry| matches!(entry, BodyEntry::Comment { .. }));
+    out.push(open);
+    if container.entries.is_empty() {
+        return out.push(close);
+    }
+    if !(container.multiline || expanded || commented) {
+        if container.padded {
+            out.push(' ');
+        }
+        for (n, entry) in container.entries.iter().enumerate() {
+            let BodyEntry::Value { key, node, .. } = entry else { continue };
+            if n > 0 {
+                out.push_str(", ");
+            }
+            if let Some(key) = key {
+                out.push_str(key);
+                out.push_str(": ");
+            }
+            write_body_node(node, indent, expanded, out);
+        }
+        if container.padded {
+            out.push(' ');
+        }
+        return out.push(close);
+    }
+    let inner = format!("{}{}", indent, FORMAT_INDENT);
+    for (n, entry) in container.entries.iter().enumerate() {
+        let blank_before = match entry {
+            BodyEntry::Comment { text, same_line: true, .. } => {
+                // behind the bracket or the member it was written behind
+                out.push(' ');
+                out.push_str(text);
+                continue;
+            }
+            BodyEntry::Comment { blank_before, .. } | BodyEntry::Value { blank_before, .. } => *blank_before,
+        };
+        out.push('\n');
+        if blank_before && n > 0 {
+            out.push('\n');
+        }
+        out.push_str(&inner);
+        match entry {
+            BodyEntry::Comment { text, .. } => out.push_str(text),
+            BodyEntry::Value { key, node, .. } => {
+                if let Some(key) = key {
+                    out.push_str(key);
+                    out.push_str(": ");
+                }
+                write_body_node(node, &inner, expanded, out);
+                if Some(n) != last_value {
+                    out.push(',');
+                }
+            }
+        }
+    }
+    out.push('\n');
+    out.push_str(indent);
+    out.push(close);
+}
+
+/// The body that opens at `start` of `text`, laid out, and where it ends.
+/// None for one that is not JSON as the formatter reads it.
+fn format_body_at(text: &str, start: usize, expanded: bool) -> Option<(String, usize)> {
+    let mut lexer = BodyLexer { text, pos: start };
+    let open = lexer.next().ok()?;
+    let container = parse_body_container(&mut lexer, open.text, 0).ok()?;
+    let mut out = String::new();
+    write_body_node(&BodyNode::Container(container), "", expanded, &mut out);
+    Some((out, lexer.pos))
+}
+
+/// One step of a file that may span lines, laid out: a request or a chain
+/// with its bodies, an `import`, a `set` line, a describe block. Its words
+/// stand a blank apart and each body is laid out. A body that is no JSON
+/// (`PUT /x a  b`), and what the formatter does not know, is as written.
+fn format_unit(text: &str, expanded: bool) -> String {
+    #[derive(PartialEq)]
+    enum At {
+        /// Where a request starts.
+        Head,
+        /// Behind a URI, where its body would stand.
+        Body,
+        /// Behind a body, an outfile or an `@file`.
+        Tail,
+    }
+    let text = text.trim();
+    let bytes = text.as_bytes();
+    let blanks = |from: usize| from + bytes[from..].iter().take_while(|b| matches!(b, b' ' | b'\t')).count();
+    let word_at = |from: usize| &text[from..from + text[from..].find(char::is_whitespace).unwrap_or(text.len() - from)];
+    let mut out = String::new();
+    let mut at = At::Head;
+    let mut pos = 0;
+    loop {
+        let gap_start = pos;
+        pos = blanks(pos);
+        if pos >= text.len() {
+            break;
+        }
+        let (gap, rest) = (&text[gap_start..pos], &text[pos..]);
+        let first = bytes[pos];
+        // a comment runs to the end of the line, with the blanks in front
+        // of it as they are: comments are often lined up
+        if first == b'#' && !gap.is_empty() {
+            out.push_str(gap);
+            out.push_str(rest);
+            break;
+        }
+        let word = |out: &mut String, word: &str| {
+            if !out.is_empty() && !out.ends_with(' ') {
+                out.push(' ');
+            }
+            out.push_str(word);
+        };
+        let opens_body = matches!(first, b'{' | b'[') && (!gap.is_empty() || gap_start == 0);
+        match at {
+            At::Head if opens_body => at = At::Body,
+            At::Head => {
+                let name = word_at(pos);
+                if HTTP_METHODS.iter().any(|method| name.eq_ignore_ascii_case(method)) {
+                    word(&mut out, name);
+                    pos = blanks(pos + name.len());
+                    let uri = &text[pos..pos + uri_end(&text[pos..])];
+                    if !uri.is_empty() {
+                        word(&mut out, uri);
+                    }
+                    pos += uri.len();
+                } else if name.starts_with('/') {
+                    let uri = &rest[..uri_end(rest)];
+                    word(&mut out, uri);
+                    pos += uri.len();
+                } else if out.is_empty() && name.eq_ignore_ascii_case("set") {
+                    word(&mut out, name);
+                    pos += name.len();
+                } else if out.is_empty() && name.eq_ignore_ascii_case("import") {
+                    // import <kind> <alias>
+                    word(&mut out, name);
+                    pos += name.len();
+                    for _ in 0..2 {
+                        let next = blanks(pos);
+                        if next >= text.len() || matches!(bytes[next], b'{' | b'[' | b'@') {
+                            break;
+                        }
+                        word(&mut out, word_at(next));
+                        pos = next + word_at(next).len();
+                    }
+                } else {
+                    word(&mut out, rest);
+                    break;
+                }
+                at = At::Body;
+            }
+            At::Body | At::Tail => {
+                if opens_body {
+                    match format_body_at(text, pos, expanded) {
+                        Some((body, end)) => {
+                            word(&mut out, &body);
+                            pos = end;
+                            at = At::Tail;
+                        }
+                        None => {
+                            out.push_str(gap);
+                            out.push_str(rest);
+                            break;
+                        }
+                    }
+                } else if !gap.is_empty() && (rest.starts_with("&&") || rest.starts_with("||")) {
+                    word(&mut out, &rest[..2]);
+                    pos += 2;
+                    at = At::Head;
+                } else if !gap.is_empty() && first == b'>' {
+                    let marker = if rest.starts_with(">>") { 2 } else { 1 };
+                    word(&mut out, &rest[..marker]);
+                    pos = blanks(pos + marker);
+                    if pos < text.len() {
+                        word(&mut out, word_at(pos));
+                        pos += word_at(pos).len();
+                    }
+                    at = At::Tail;
+                } else if first == b'"' {
+                    // a string body, to the quote that closes it
+                    let mut end = None;
+                    let mut j = pos + 1;
+                    while let Some(&b) = bytes.get(j) {
+                        match b {
+                            b'\\' => j += 1,
+                            b'"' => {
+                                end = Some(j + 1);
+                                break;
+                            }
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    let Some(end) = end else {
+                        word(&mut out, rest);
+                        break;
+                    };
+                    word(&mut out, &text[pos..end]);
+                    pos = end;
+                    at = At::Tail;
+                } else if at == At::Body && first != b'@' {
+                    // a body that is no JSON: its blanks are its own
+                    word(&mut out, rest);
+                    break;
+                } else {
+                    word(&mut out, word_at(pos));
+                    pos += word_at(pos).len();
+                    at = At::Tail;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A line that is whole as it stands, laid out: a `sleep`, an `assert`, a
+/// `url` line, a `confirm` or an include. Its keywords stand a blank apart,
+/// and the comment behind it is where it was.
+fn format_step_line(trimmed: &str, expanded: bool) -> String {
+    let (first, _) = split_first_word(trimmed);
+    // all of a `confirm` line is the question
+    if first.eq_ignore_ascii_case("confirm") {
+        let question = trimmed[first.len()..].trim();
+        return if question.is_empty() { first.to_string() } else { format!("{} {}", first, question) };
+    }
+    let said = without_trailing_comment(trimmed);
+    let comment = &trimmed[said.len()..];
+    let (first, mut rest) = split_first_word(said);
+    let mut out = first.to_string();
+    // [not] <request>
+    let condition = |out: &mut String, rest: &str| {
+        let (word, behind) = split_first_word(rest);
+        let request = if word.eq_ignore_ascii_case("not") {
+            out.push(' ');
+            out.push_str(word);
+            behind
+        } else {
+            rest
+        };
+        if !request.is_empty() {
+            out.push(' ');
+            out.push_str(&format_unit(request, expanded));
+        }
+    };
+    if first.eq_ignore_ascii_case("sleep") {
+        let (word, behind) = split_first_word(rest);
+        if !word.is_empty() && !word.eq_ignore_ascii_case("while") {
+            out.push(' ');
+            out.push_str(word);
+            rest = behind;
+        }
+        let (word, behind) = split_first_word(rest);
+        if word.eq_ignore_ascii_case("while") {
+            out.push(' ');
+            out.push_str(word);
+            condition(&mut out, behind);
+        } else if !rest.is_empty() {
+            out.push(' ');
+            out.push_str(rest);
+        }
+    } else if first.eq_ignore_ascii_case("assert") {
+        condition(&mut out, rest);
+    } else if first.eq_ignore_ascii_case("url") {
+        let (operator, value) = split_first_word(rest);
+        for part in [operator, value] {
+            if !part.is_empty() {
+                out.push(' ');
+                out.push_str(part);
+            }
+        }
+    } else {
+        // an include: a path
+        out = said.to_string();
+    }
+    out.push_str(comment);
+    out
+}
+
+/// The text of a `.api` file laid out one way. `expanded`: every object and
+/// array that holds something gets a line for each member.
+///
+/// A line loses the blanks in front of it and behind it, its words stand a
+/// blank apart, and a body is indented by two blanks a level. Comments and
+/// blank lines stay where they are. Nothing outside a blank changes, so the
+/// file runs as it ran.
+fn format_api_text(text: &str, expanded: bool) -> String {
+    let crlf = text.contains("\r\n");
+    let unix = text.replace("\r\n", "\n");
+    let (bom, body) = match unix.strip_prefix('\u{feff}') {
+        Some(body) => ("\u{feff}", body),
+        None => ("", unix.as_str()),
+    };
+    let lines: Vec<&str> = body.lines().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut n = 0;
+    while n < lines.len() {
+        let line = lines[n];
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            out.push(line.trim_end().to_string());
+            n += 1;
+            continue;
+        }
+        if is_one_line_step(trimmed) {
+            out.push(format_step_line(trimmed, expanded));
+            n += 1;
+            continue;
+        }
+        // A request, an `import`, a `set` line or a describe block: the
+        // lines up to where its brackets close, as the batch parser reads it.
+        let mut unit = line.to_string();
+        let mut last = n;
+        let closed = loop {
+            if strip_body_comments_and_count(&unit).1 <= 0 {
+                break true;
+            }
+            last += 1;
+            let Some(next) = lines.get(last) else { break false };
+            unit.push('\n');
+            unit.push_str(next);
+        };
+        if !closed {
+            // never closed: as it is written
+            out.extend(lines[n..].iter().map(|line| line.to_string()));
+            break;
+        }
+        out.push(format_unit(&unit, expanded));
+        n = last + 1;
+    }
+    let mut formatted = out.join("\n");
+    if body.ends_with('\n') {
+        formatted.push('\n');
+    }
+    if crlf {
+        formatted = formatted.replace('\n', "\r\n");
+    }
+    format!("{}{}", bom, formatted)
+}
+
+/// `--format <file>`: the file laid out, on stdout. `-` reads the text from
+/// stdin, as an editor has it. Returns the exit code.
+fn print_formatted(file: &str, expanded: bool) -> i32 {
+    let text = if file == "-" {
+        let mut text = String::new();
+        io::stdin().read_to_string(&mut text).map(|_| text).map_err(|_| "could not read stdin: it is not UTF-8".to_string())
+    } else {
+        let path = expand_home(file);
+        fs::read_to_string(&path).map_err(|e| format!("could not read {}: {}", path, e))
+    };
+    match text {
+        Ok(text) => {
+            out!("{}", format_api_text(&text, expanded));
+            0
+        }
+        Err(e) => {
+            errln!("error: {}", e);
+            1
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // `--install-syntax <editor>`: syntax highlighting for `.api` files.
 //
 // The grammars are the files of `editors/`, compiled in, so the highlighting
@@ -10842,6 +11398,8 @@ const SUBLIME_SYNTAX: &str = include_str!("../editors/sublime/API.sublime-syntax
 /// The plugin that completes what a `.api` file can hold, by where the
 /// cursor is. Sublime Text loads a `.py` of `Packages/User` as it is written.
 const SUBLIME_COMPLETIONS: &str = include_str!("../editors/sublime/api_completions.py");
+/// The plugin's format command in Sublime Text's command palette.
+const SUBLIME_COMMANDS: &str = include_str!("../editors/sublime/API.sublime-commands");
 
 /// The VS Code extension, less its `package.json`. A JetBrains IDE reads the
 /// same folder as a TextMate bundle.
@@ -10940,7 +11498,8 @@ fn install_sublime_syntax() -> Result<String, String> {
     };
     write_syntax_file(&packages.join("User").join("API.sublime-syntax"), SUBLIME_SYNTAX.as_bytes())?;
     write_syntax_file(&packages.join("User").join("api_completions.py"), SUBLIME_COMPLETIONS.as_bytes())?;
-    Ok("Installed in Sublime Text, highlighting and completions. A .api file that is open picks both up at once."
+    write_syntax_file(&packages.join("User").join("API.sublime-commands"), SUBLIME_COMMANDS.as_bytes())?;
+    Ok("Installed in Sublime Text: highlighting, completions and the command \"API: Format\". A .api file that is open picks them up at once."
         .to_string())
 }
 
@@ -34273,5 +34832,250 @@ mod tests {
         assert_eq!(load_refusal("HTTP/1.1 401 Unauthorized"), "unauthorized");
         assert_eq!(load_refusal("HTTP/1.1 403 Forbidden"), "forbidden");
         assert_eq!(load_refusal("op: item not found"), "auth failed");
+    }
+
+    // ------------------------------------------------------------ --format
+
+    /// What a run reads of `text`, cut into its words: comments out, the
+    /// blanks outside strings out, a string whole. Two texts that differ
+    /// only in their layout are the same words.
+    fn words_read(text: &str) -> Vec<String> {
+        let (cleaned, _) = strip_body_comments_and_count(text);
+        let mut words = Vec::new();
+        let mut word = String::new();
+        let (mut in_string, mut escape) = (false, false);
+        for ch in cleaned.chars() {
+            if in_string {
+                word.push(ch);
+                if escape {
+                    escape = false;
+                } else if ch == '\\' {
+                    escape = true;
+                } else if ch == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            let alone = matches!(ch, '{' | '}' | '[' | ']' | ':' | ',');
+            if ch.is_whitespace() || alone {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+                if alone {
+                    words.push(ch.to_string());
+                }
+                continue;
+            }
+            in_string = ch == '"';
+            word.push(ch);
+        }
+        if !word.is_empty() {
+            words.push(word);
+        }
+        words
+    }
+
+    /// The steps the batch parser reads from `text`, each as its words.
+    fn steps_read(text: &str) -> Vec<String> {
+        let program = split_bulk_requests(text, None).unwrap_or_else(|e| panic!("{}:\n{}", e, text));
+        let mut steps: Vec<String> = program
+            .steps
+            .iter()
+            .map(|step| match step {
+                BulkStep::Request(request) => format!("request {:?}", words_read(request)),
+                BulkStep::Chain(segments) => {
+                    let segments: Vec<_> = segments.iter().map(|(op, request)| (op, words_read(request))).collect();
+                    format!("chain {:?}", segments)
+                }
+                BulkStep::SleepWhile { interval, negate, request } => {
+                    format!("sleep {:?} while {} {:?}", interval, negate, words_read(request))
+                }
+                BulkStep::Assert { negate, request } => format!("assert {} {:?}", negate, words_read(request)),
+                other => format!("{:?}", other),
+            })
+            .collect();
+        steps.push(format!("{:?} {:?}", program.url_conditions, program.describe));
+        steps
+    }
+
+    const UNFORMATTED: &str = r#"url   has    localhost:5000   # gate
+{
+"title": { "sv-SE": "Shade, test", "en-US": "Shade, test" },
+      "description": {"en-US": "x"},
+
+
+  // why
+"docsLink":"https://x"   // tail
+}
+set   {"include-nulls":true,"timeout":30}   # back
+set {
+"raw": true, // one
+        "fail-fast": false
+}
+  sleep   20   while   not   GET    /imports~where(state="a  b")~count   # poll
+sleep   500ms
+assert   not   /people~count
+assert PUT   /flags/check   {"a":[1,2]}
+confirm   Seed a  &&  b?  # all
+   PUT    /people/com.mi6.id=007     {"name":"James Bond","tags":[1,2,  3],"deep":{"a":{}}}    >   /tmp/bond.json     # tail
+PUT /things   [{ // first
+"a": 1,   "b": [
+1,
+2],
+/* block
+   comment */
+"line2": "
+    raw   newline
+  ",
+"n": 12345678901234567890123, "ok": true
+}]   ||   POST /things [ 1, 2 ]   &&   GET /x   >>   out.json
+PUT /x   hello    world  {"a":1}
+PUT /y  "a   b"   > out.txt
+PUT /z @data.csv~map(com.heads.csv)    >  /tmp/r.json
+GET /x~where(a=1||b=2)    >   out.json
+PUT /bad {"a": 1,}
+PUT /worse {"a" 1}   # no colon
+GET /people/com.x.id=[A#1]   # c
+DELETE   /people/com.x.id=A#1
+PUT /flags/open   true   > /tmp/f.json
+"#;
+
+    const FORMATTED: &str = r#"url has localhost:5000   # gate
+{
+  "title": { "sv-SE": "Shade, test", "en-US": "Shade, test" },
+  "description": {"en-US": "x"},
+
+  // why
+  "docsLink": "https://x" // tail
+}
+set {"include-nulls": true, "timeout": 30}   # back
+set {
+  "raw": true, // one
+  "fail-fast": false
+}
+sleep 20 while not GET /imports~where(state="a  b")~count   # poll
+sleep 500ms
+assert not /people~count
+assert PUT /flags/check {"a": [1, 2]}
+confirm Seed a  &&  b?  # all
+PUT /people/com.mi6.id=007 {"name": "James Bond", "tags": [1, 2, 3], "deep": {"a": {}}} > /tmp/bond.json     # tail
+PUT /things [{ // first
+  "a": 1,
+  "b": [
+    1,
+    2
+  ],
+  /* block
+   comment */
+  "line2": "
+    raw   newline
+  ",
+  "n": 12345678901234567890123,
+  "ok": true
+}] || POST /things [ 1, 2 ] && GET /x >> out.json
+PUT /x hello    world  {"a":1}
+PUT /y "a   b" > out.txt
+PUT /z @data.csv~map(com.heads.csv) > /tmp/r.json
+GET /x~where(a=1||b=2) > out.json
+PUT /bad {"a": 1,}
+PUT /worse {"a" 1}   # no colon
+GET /people/com.x.id=[A#1]   # c
+DELETE /people/com.x.id=A#1
+PUT /flags/open true   > /tmp/f.json
+"#;
+
+    #[test]
+    fn format_lays_a_file_out_and_leaves_alone_what_it_can_not_read() {
+        assert_eq!(format_api_text(UNFORMATTED, false), FORMATTED);
+        // a second time changes nothing
+        assert_eq!(format_api_text(FORMATTED, false), FORMATTED);
+        // and the file runs as it ran
+        assert_eq!(steps_read(FORMATTED), steps_read(UNFORMATTED));
+        assert_eq!(words_read(FORMATTED), words_read(UNFORMATTED));
+        // a chain written without its blanks gets them, and is the chain it was
+        let chain = "get /a   &&PUT /b {\"x\":1}   ||   /c\n";
+        assert_eq!(format_api_text(chain, false), "get /a && PUT /b {\"x\": 1} || /c\n");
+        assert_eq!(steps_read(&format_api_text(chain, false)), steps_read(chain));
+    }
+
+    /// The members of a describe block are indented, where a formatter that
+    /// knew only request bodies put them in the first column.
+    #[test]
+    fn format_indents_a_describe_block_an_import_and_a_set_line() {
+        let text = "{\n\"title\": { \"sv-SE\": \"Shade\" },\n\"description\": { \"en-US\": \"The ERP panel\" }\n}\nurl has //localhost\n\
+                    import git cl {\n\"url\": \"https://example.com/r\",\n\"ref\": \"1.0.0\"\n}\nset {\n\"raw\": true\n}\n";
+        assert_eq!(
+            format_api_text(text, false),
+            "{\n  \"title\": { \"sv-SE\": \"Shade\" },\n  \"description\": { \"en-US\": \"The ERP panel\" }\n}\nurl has //localhost\n\
+             import git cl {\n  \"url\": \"https://example.com/r\",\n  \"ref\": \"1.0.0\"\n}\nset {\n  \"raw\": true\n}\n"
+        );
+    }
+
+    #[test]
+    fn format_expanded_gives_every_member_a_line() {
+        let text = "PUT /a { \"x\": [1, {\"y\": 2}], \"e\": {}, \"l\": [] } > out.json\nset {\"raw\": true}\n";
+        let expanded = "PUT /a {\n  \"x\": [\n    1,\n    {\n      \"y\": 2\n    }\n  ],\n  \"e\": {},\n  \"l\": []\n} > out.json\nset {\n  \"raw\": true\n}\n";
+        assert_eq!(format_api_text(text, true), expanded);
+        assert_eq!(format_api_text(expanded, true), expanded);
+        // what is expanded stays so without the option: it spans lines
+        assert_eq!(format_api_text(expanded, false), expanded);
+        assert_eq!(steps_read(expanded), steps_read(text));
+    }
+
+    #[test]
+    fn format_keeps_comments_blank_lines_line_endings_and_what_is_not_closed() {
+        // a comment and a blank line between requests are where they were
+        let text = "  # indented comment\n\n\nGET /a\n\n   \nGET /b";
+        assert_eq!(format_api_text(text, false), "  # indented comment\n\n\nGET /a\n\n\nGET /b");
+        // one blank line in a body is kept, and none at its ends
+        let body = "PUT /a {\n\n\"a\": 1,\n\n\n\"b\": 2\n\n}\n";
+        assert_eq!(format_api_text(body, false), "PUT /a {\n  \"a\": 1,\n\n  \"b\": 2\n}\n");
+        // a comma that stood behind a comment is in front of it
+        let comma = "PUT /a [\n1 // one\n, 2 /* two */\n]\n";
+        assert_eq!(format_api_text(comma, false), "PUT /a [\n  1, // one\n  2 /* two */\n]\n");
+        assert_eq!(words_read(&format_api_text(comma, false)), words_read(comma));
+        // a line comment makes one line several
+        assert_eq!(format_api_text("PUT /a {\"a\": 1 // why\n}\n", false), "PUT /a {\n  \"a\": 1 // why\n}\n");
+        // a byte order mark and the line endings of the file stay
+        assert_eq!(format_api_text("\u{feff}GET   /a\r\nPUT /b {\r\n\"a\":1\r\n}\r\n", false), "\u{feff}GET /a\r\nPUT /b {\r\n  \"a\": 1\r\n}\r\n");
+        // a body that is never closed is as written, with all under it
+        let open = "GET   /a\nPUT /b {\n\"s\": \"x  \n   GET   /c\n";
+        assert_eq!(format_api_text(open, false), "GET /a\nPUT /b {\n\"s\": \"x  \n   GET   /c\n");
+        // a body the formatter can't read is as written, and the rest goes on
+        let odd = "PUT /a {\n\"a\" /* why */ : 1\n}   > f.json\nGET   /b\n";
+        assert_eq!(format_api_text(odd, false), "PUT /a {\n\"a\" /* why */ : 1\n}   > f.json\nGET /b\n");
+        assert_eq!(format_api_text("", false), "");
+        assert_eq!(format_api_text("\n", false), "\n");
+    }
+
+    /// Every `.api` file of the repository: formatting changes no word of
+    /// what a run reads, and a second time changes nothing.
+    #[test]
+    fn format_changes_no_word_of_the_files_of_the_repository() {
+        fn api_files(dir: &std::path::Path, found: &mut Vec<PathBuf>) {
+            for entry in fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                if path.is_dir() {
+                    if !["target", "dist", ".git"].contains(&name.as_str()) {
+                        api_files(&path, found);
+                    }
+                } else if name.ends_with(".api") {
+                    found.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        api_files(std::path::Path::new(env!("CARGO_MANIFEST_DIR")), &mut files);
+        assert!(files.len() > 10, "{:?}", files);
+        for file in files {
+            let Ok(text) = fs::read_to_string(&file) else { continue };
+            for expanded in [false, true] {
+                let formatted = format_api_text(&text, expanded);
+                assert_eq!(words_read(&formatted), words_read(&text), "{} (expanded: {})", file.display(), expanded);
+                assert_eq!(format_api_text(&formatted, expanded), formatted, "{} (expanded: {})", file.display(), expanded);
+                assert_eq!(formatted.ends_with('\n'), text.ends_with('\n'), "{}", file.display());
+            }
+        }
     }
 }

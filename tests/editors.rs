@@ -853,6 +853,47 @@ fn complete_prints_a_document_and_stands_alone() {
     assert!(output.stdout.is_empty());
 }
 
+// ----------------------------------------------------------------- --format
+
+const UNFORMATTED: &str = "{\n\"title\": { \"sv-SE\": \"Shade\" }\n}\n  PUT   /people   {\"name\":\"Ann\",\n\"tags\":[1,2]}   > out.json   # tail\n";
+const FORMATTED: &str = "{\n  \"title\": { \"sv-SE\": \"Shade\" }\n}\nPUT /people {\n  \"name\": \"Ann\",\n  \"tags\": [1, 2]\n} > out.json   # tail\n";
+const EXPANDED: &str = "{\n  \"title\": {\n    \"sv-SE\": \"Shade\"\n  }\n}\nPUT /people {\n  \"name\": \"Ann\",\n  \"tags\": [\n    1,\n    2\n  ]\n} > out.json   # tail\n";
+
+#[test]
+fn format_prints_a_file_laid_out_and_stands_alone() {
+    let dir = tempdir().unwrap();
+    let api = || {
+        let mut cmd = Command::cargo_bin("api").unwrap();
+        cmd.current_dir(dir.path());
+        cmd
+    };
+    // from stdin, as an editor has the text
+    let output = api().args(["--format", "-"]).write_stdin(UNFORMATTED).output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), FORMATTED);
+    let output = api().args(["--format", "-", "--expand"]).write_stdin(UNFORMATTED).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&output.stdout), EXPANDED);
+    // from a file, which is left as it is
+    fs::write(dir.path().join("seed.api"), UNFORMATTED).unwrap();
+    let output = api().args(["--format", "seed.api"]).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&output.stdout), FORMATTED);
+    assert_eq!(fs::read_to_string(dir.path().join("seed.api")).unwrap(), UNFORMATTED);
+    // what is laid out is not laid out again
+    let output = api().args(["--format", "-"]).write_stdin(FORMATTED).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&output.stdout), FORMATTED);
+
+    let output = api().args(["--format", "missing.api"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).starts_with("error: could not read missing.api: "), "{}", stderr(&output));
+    assert!(output.stdout.is_empty());
+    let output = api().args(["--format", "-", "GET", "/people"]).write_stdin("").output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stderr(&output), "error: --format - prints a document and GET /people is a request: give one of the two\n");
+    let output = api().args(["--expand", "GET", "/people"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+}
+
 // ------------------------------------------------------ the editors' callers
 
 /// Run `script` with the `python3` of the machine, the Sublime plugin on its
@@ -890,6 +931,10 @@ out.append(plugin.ask(binary, 'GET /people/', 12, None, root))
 out.append(plugin.working_dir('/a/b/c/x.api', ['/a/other', '/a/b']))
 out.append(plugin.working_dir('/a/b/c/x.api', []))
 out.append(plugin.working_dir(None, ['/a/other']))
+unformatted = sys.argv[5]
+out.append(plugin.formatted(binary, unformatted))
+out.append(plugin.formatted(binary, unformatted, True))
+out.append(plugin.formatted(root + '/no-such-client', unformatted))
 print(json.dumps(out))
 "#;
     let cases = [
@@ -904,7 +949,8 @@ print(json.dumps(out))
         ("PUT /x { \"na|\" }", "na"),
     ];
     let binary = assert_cmd::cargo::cargo_bin("api");
-    let args = [binary.as_os_str(), dir.path().as_os_str(), std::ffi::OsStr::new(&serde_json::to_string(&cases).unwrap()).to_owned().as_os_str()]
+    let cases_json = serde_json::to_string(&cases).unwrap();
+    let args = [binary.as_os_str(), dir.path().as_os_str(), std::ffi::OsStr::new(&cases_json), std::ffi::OsStr::new(UNFORMATTED)]
         .map(|arg| arg.to_owned());
     let args: Vec<&std::ffi::OsStr> = args.iter().map(|arg| arg.as_os_str()).collect();
     let Some(printed) = with_the_sublime_plugin(script, &args) else {
@@ -932,6 +978,10 @@ print(json.dumps(out))
     assert_eq!(got[10], "/a/b");
     assert_eq!(got[11], "/a/b/c");
     assert_eq!(got[12], "/a/other");
+    // the format command: the text as the client lays it out
+    assert_eq!(got[13], FORMATTED);
+    assert_eq!(got[14], EXPANDED);
+    assert!(got[15].is_null(), "{}", got[15]);
 }
 
 /// Sublime Text runs a plugin of `Packages/User` in Python 3.3. What that
@@ -989,10 +1039,14 @@ class Position { constructor(line, character) { this.line = line; this.character
 class Range { constructor(start, end) { this.start = start; this.end = end; } }
 class SnippetString { constructor(value) { this.value = value; } }
 class CompletionItem { constructor(label, kind) { this.label = label; this.kind = kind; } }
+class TextEdit { constructor(range, newText) { this.range = range; this.newText = newText; }
+  static replace(range, newText) { return new TextEdit(range, newText); } }
 const CompletionItemKind = new Proxy({}, { get: (_, name) => name });
-const state = { binary: '', folders: [], providers: [] };
+const state = { binary: '', folders: [], providers: [], formatters: [], commands: {}, editor: undefined };
 module.exports = {
-  Position, Range, SnippetString, CompletionItem, CompletionItemKind, state,
+  Position, Range, SnippetString, CompletionItem, CompletionItemKind, TextEdit, state,
+  window: { get activeTextEditor() { return state.editor; } },
+  commands: { registerCommand: (name, run) => { state.commands[name] = run; return { dispose() {} }; } },
   workspace: {
     getConfiguration: () => ({ get: () => state.binary }),
     getWorkspaceFolder: () => undefined,
@@ -1003,13 +1057,17 @@ module.exports = {
       state.providers.push({ language, provider, triggers });
       return { dispose() {} };
     },
+    registerDocumentFormattingEditProvider: (language, provider) => {
+      state.formatters.push({ language, provider });
+      return { dispose() {} };
+    },
   },
 };
 "#,
     )
     .unwrap();
     let driver = r#"
-const [extensionPath, binary, root, cases] = process.argv.slice(1);
+const [extensionPath, binary, root, cases, unformatted] = process.argv.slice(1);
 const vscode = require('vscode');
 const extension = require(extensionPath);
 const subscriptions = [];
@@ -1026,6 +1084,7 @@ const documentOf = (marked) => {
   const document = {
     uri: { scheme: 'file', fsPath: root + '/main.api' },
     getText: (range) => (range ? text.slice(offsetAt(range.start), offsetAt(range.end)) : text),
+    languageId: language,
   };
   return { document, position };
 };
@@ -1043,6 +1102,22 @@ const documentOf = (marked) => {
       })));
     }
   }
+  // Format Document, and the command for one member a line
+  const plain = (edits) => edits.map((edit) => ({ text: edit.newText, start: edit.range.start, end: edit.range.end }));
+  const formatter = vscode.state.formatters[0];
+  out.formats = formatter.language;
+  out.format = [];
+  for (const client of [binary, root + '/no-such-client']) {
+    vscode.state.binary = client;
+    const { document } = documentOf(unformatted + '|');
+    out.format.push(plain(await formatter.provider.provideDocumentFormattingEdits(document, {}, undefined)));
+  }
+  vscode.state.binary = binary;
+  const { document } = documentOf(unformatted + '|');
+  const replaced = [];
+  vscode.state.editor = { document, edit: async (change) => change({ replace: (range, text) => replaced.push(text) }) };
+  await vscode.state.commands['commerceosApi.formatExpanded']();
+  out.expanded = replaced;
   console.log(JSON.stringify(out));
 })();
 "#;
@@ -1053,6 +1128,7 @@ const documentOf = (marked) => {
         .arg(assert_cmd::cargo::cargo_bin("api"))
         .arg(dir.path())
         .arg(serde_json::to_string(&cases).unwrap())
+        .arg(UNFORMATTED)
         .env("NODE_PATH", modules.path().join("node_modules"))
         .output();
     let Ok(output) = output else {
@@ -1069,7 +1145,18 @@ const documentOf = (marked) => {
     assert_eq!(package["activationEvents"][0], format!("onLanguage:{}", got["language"].as_str().unwrap()));
     assert!(package["contributes"]["configuration"]["properties"].get("commerceosApi.binary").is_some());
     assert_eq!(got["triggers"], serde_json::json!(["\"", "/", "~", "@"]));
-    assert_eq!(got["subscribed"], 1);
+    assert_eq!(got["subscribed"], 3);
+    assert_eq!(package["contributes"]["commands"][0]["command"], "commerceosApi.formatExpanded");
+
+    // Format Document: one edit, the whole text for the text laid out
+    assert_eq!(got["formats"], got["language"]);
+    assert_eq!(
+        got["format"][0],
+        serde_json::json!([{ "text": FORMATTED, "start": { "line": 0, "character": 0 }, "end": { "line": 5, "character": 0 } }])
+    );
+    // a client that is not there: no edit, and no error
+    assert_eq!(got["format"][1], serde_json::json!([]));
+    assert_eq!(got["expanded"], serde_json::json!([EXPANDED]));
 
     let answers = got["answers"].as_array().unwrap();
     let labels = |n: usize| -> Vec<&str> { answers[n].as_array().unwrap().iter().map(|item| item["label"].as_str().unwrap()).collect() };
@@ -1127,7 +1214,15 @@ fn the_vim_package_completes_with_what_the_client_offers() {
         commands.push_str(&format!("call setline(1, {})\n", serde_json::to_string(lines).unwrap()));
         commands.push_str("call cursor(line('$'), 1)\nexecute \"normal! A\\<C-x>\\<C-o>\"\ncall add(s:out, getline('$'))\n");
     }
-    commands.push_str("call add(s:out, &omnifunc)\ncall writefile(s:out, g:api_written)\nqa!\n");
+    commands.push_str("call add(s:out, &omnifunc)\n");
+    // :ApiFormat lays the buffer out, :ApiFormat! with a line for each member,
+    // and `gq` does what :ApiFormat does to the lines it is given
+    let unformatted = serde_json::to_string(&UNFORMATTED.trim_end().split('\n').collect::<Vec<_>>()).unwrap();
+    for lay_out in ["ApiFormat", "ApiFormat!", "normal! gggqG"] {
+        commands.push_str(&format!("%delete _\ncall setline(1, {})\n{}\n", unformatted, lay_out));
+        commands.push_str("call add(s:out, '--')\ncall extend(s:out, getline(1, '$'))\n");
+    }
+    commands.push_str("call writefile(s:out, g:api_written)\nqa!\n");
     fs::write(&script, commands).unwrap();
     let mut vim = std::process::Command::new("vim");
     vim.args(["-e", "-s", "-u", "NONE", "-i", "NONE", "-N"])
@@ -1163,7 +1258,7 @@ fn the_vim_package_completes_with_what_the_client_offers() {
     let lines = fs::read_to_string(&written).expect("vim wrote nothing: the package did not load");
     let lines: Vec<&str> = lines.lines().collect();
     assert_eq!(
-        lines,
+        lines[..8],
         [
             "  \"include-nulls",
             "set { \"include-nulls\": true, \"fail-fast",
@@ -1176,6 +1271,8 @@ fn the_vim_package_completes_with_what_the_client_offers() {
             "ApiComplete",
         ]
     );
+    let laid_out: Vec<String> = lines[8..].join("\n").split("--\n").skip(1).map(|text| format!("{}\n", text.trim_end())).collect();
+    assert_eq!(laid_out, [FORMATTED, EXPANDED, FORMATTED]);
 }
 
 // ------------------------------------------------------------ --install-syntax
@@ -1237,13 +1334,20 @@ fn install_syntax_for_sublime_writes_the_syntax_into_its_user_package() {
     fs::create_dir_all(sublime_packages(home.path())).unwrap();
     let target = sublime_packages(home.path()).join("User/API.sublime-syntax");
     let plugin = sublime_packages(home.path()).join("User/api_completions.py");
+    let commands = sublime_packages(home.path()).join("User/API.sublime-commands");
     for _ in 0..2 {
         let output = api(home.path(), bin.path()).args(["--install-syntax", "Sublime"]).output().unwrap();
         assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-        assert_eq!(stdout_lines(&output), [target.display().to_string(), plugin.display().to_string()]);
+        assert_eq!(stdout_lines(&output), [&target, &plugin, &commands].map(|path| path.display().to_string()));
         assert_eq!(fs::read_to_string(&target).unwrap(), read("editors/sublime/API.sublime-syntax"));
         assert_eq!(fs::read_to_string(&plugin).unwrap(), read("editors/sublime/api_completions.py"));
+        assert_eq!(fs::read_to_string(&commands).unwrap(), read("editors/sublime/API.sublime-commands"));
     }
+    // the palette names the command the plugin has
+    let palette: serde_json::Value = serde_json::from_str(&read("editors/sublime/API.sublime-commands")).unwrap();
+    assert_eq!(palette[0]["command"], "api_format");
+    assert_eq!(palette[1]["args"]["expanded"], true);
+    assert!(read("editors/sublime/api_completions.py").contains("class ApiFormatCommand(sublime_plugin.TextCommand)"));
 }
 
 #[test]

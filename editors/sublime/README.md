@@ -1,7 +1,8 @@
-# Sublime Text highlighting and completions for `.api` files
+# Sublime Text highlighting, completions and formatting for `.api` files
 
 `API.sublime-syntax` highlights `.api` batch files as `AGENTS.md` describes
-them, and `api_completions.py` completes what can stand where the cursor is.
+them, and `api_completions.py` completes what can stand where the cursor is
+and lays a file out.
 
 ## Install
 
@@ -9,8 +10,9 @@ them, and `api_completions.py` completes what can stand where the cursor is.
 api --install-syntax sublime
 ```
 
-writes both files to Sublime's `Packages/User` folder. Files ending in `.api`
-pick them up. By hand: copy the two files to that folder
+writes them to Sublime's `Packages/User` folder, with `API.sublime-commands`
+for the command palette. Files ending in `.api` pick them up. By hand: copy
+the three files to that folder
 (*Preferences → Browse Packages…*).
 
 ## What it covers
@@ -79,6 +81,22 @@ cursor is, is the client's to say: the plugin asks it (`api --complete`, see
 `cargo test --test editors` has the `python3` of the machine ask a client
 through the plugin, and checks that the file holds nothing the Python 3.3 of
 Sublime Text can't read.
+
+## Formatting
+
+*API: Format* in the command palette lays the file out as the client does
+(`api --format`, see `AGENTS.md`): bodies indented, the members of a describe
+block, a `set` line and an `import` too, and the words of a line a blank
+apart. *API: Format, a line for each member* is `--expand`. The command is
+`api_format`, with `"args": { "expanded": true }` for the second, in files
+of the scope `source.api`:
+
+```json
+{ "keys": ["super+enter"], "command": "api_format", "context": [{ "key": "selector", "operand": "source.api" }] }
+```
+
+With a client from before `--format` nothing changes, and the status bar
+says so.
 
 ## Checking a change
 

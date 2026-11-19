@@ -247,8 +247,8 @@ It writes the grammar that belongs to this version of the client where the edito
 it, prints each path it wrote, and sends nothing. Sublime Text, Vim and Neovim need
 nothing more. Sublime Text, VS Code, Cursor, Vim and Neovim get completions too
 (settings, import keys, methods, directives, URI operators and paths, by where the
-cursor is): what is installed asks the client, `api --complete`, which `AGENTS.md`
-describes. VS Code and Cursor are handed a `.vsix` through their own command (`code`,
+cursor is) and a format command: what is installed asks the client, `api --complete`
+and `api --format`, which `AGENTS.md` describes. VS Code and Cursor are handed a `.vsix` through their own command (`code`,
 `cursor`), which has to be on the `PATH`. Rider gets a TextMate bundle and asks for one
 step, once: *Settings → Editor → TextMate Bundles*, `+`, and the folder the command
 printed. Run it again after an update of the client. `editors/README.md` has the details.
@@ -364,6 +364,8 @@ Usage: api [OPTIONS] [METHOD] [URI] [BODY]
       --imports <FILE>            Print every import FILE reads and where it resolved to, as one JSON array; sends nothing
       --complete <FILE>           Print what can stand at a place of FILE, whose text is read from stdin, for an editor; sends nothing
       --at <BYTES>                With --complete: the place, as the bytes in front of it (the end when not given)
+      --format <FILE>             Print FILE laid out one way: bodies indented, words a blank apart (- reads stdin); sends nothing
+      --expand                    With --format: a line for each member of every object and array
       --install-syntax <EDITOR>   Install .api syntax highlighting in sublime, vscode, cursor, rider, vim or nvim; sends nothing
       --export <EXTERNAL_ID>      Rewrite responses as seed data: keys dropped, a lone one kept as `key?` and EXTERNAL_ID
   -r, --raw                       No pretty-printing

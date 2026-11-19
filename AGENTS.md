@@ -843,6 +843,47 @@ an editor matches as it matches everywhere (`nulls` finds `include-nulls`).
 - `-r` prints the document on one line. A file to run, a request or another
   document beside it is an error, as for `--imports`.
 
+## Laying a file out: `--format <file>`
+
+```sh
+api --format seed.api            # the file laid out, on stdout
+api --format - < seed.api        # the text from stdin, as an editor has it
+api --format seed.api --expand   # a line for each member of every object and array
+```
+
+Prints a `.api` file laid out one way. Nothing is sent, no connection is
+needed, and the file itself is not written to.
+
+```
+  PUT   /people   {"name":"Ann",          PUT /people {
+"tags":[1,2]}   > out.json   # tail        "name": "Ann",
+                                            "tags": [1, 2]
+                                          } > out.json   # tail
+```
+
+- **A body is indented by two blanks a level**: of a request, and the object
+  of a describe block, a `set` line and an `import`. A `"key": value` has one
+  blank behind its colon, and a comma one behind it.
+- **An object or an array that is written on one line stays on one line**,
+  with the blank inside its brackets that it has or has not (`{ "a": 1 }`,
+  `{"a": 1}`). One that spans lines gets a line for each member. `--expand`
+  gives every one that holds something a line for each member.
+- **A line starts in the first column**, and its words stand one blank
+  apart: the method, the URI, the body, `>` and its file, `&&` and `||`, and
+  the keywords of a directive (`sleep 20 while not GET /x`).
+- **Comments and blank lines stay.** A comment between requests is as it is
+  written, and the blanks in front of a ` # comment` behind a line are kept:
+  such comments are often lined up. In a body a comment keeps its line, or
+  its place behind a member, and one blank line between members is kept.
+- **Only blanks outside strings change**, so the file runs as it ran: a
+  string, a number, a URI and the text of a comment are as they are written.
+  A body that is no JSON (`PUT /x a  b`) is left alone, and so is one that
+  can't be read as JSON (a trailing comma, a comment between a key and its
+  value) and one that is never closed, with everything under it.
+- The line endings of the file (`\r\n`) and a byte order mark stay.
+- A file to run, a request or another document beside it is an error, as for
+  `--imports`. `--expand` without `--format` is an error too.
+
 ## Syntax highlighting and completions: `--install-syntax <editor>`
 
 ```sh
@@ -854,26 +895,31 @@ Installs highlighting for `.api` files in an editor: `sublime`, `vscode`,
 client, so what is installed is the one for the syntax this client reads.
 Nothing is sent and no connection is needed.
 
-Sublime Text, VS Code, Cursor, Vim and Neovim get completions too: what is
-installed asks the client what can stand where the cursor is
-([`api --complete`](#completing-a-file-for-an-editor---complete-file)), so
-it needs the `api` on the `PATH`, or the one a setting of the editor names.
+Sublime Text, VS Code, Cursor, Vim and Neovim get completions and a format
+command too: what is installed asks the client what can stand where the
+cursor is ([`api --complete`](#completing-a-file-for-an-editor---complete-file))
+and how the file is laid out ([`api --format`](#laying-a-file-out---format-file)),
+so it needs the `api` on the `PATH`, or the one a setting of the editor names.
 
 - **Each path written is a line on stdout.** What is left to do, if anything,
   is said on stderr.
-- `sublime` writes `API.sublime-syntax` and `api_completions.py`, a plugin,
-  to `Packages/User` of Sublime Text's data folder. Where Sublime Text has no
-  folder it is an error, and none is made. The setting `api_binary` names
-  another client.
+- `sublime` writes `API.sublime-syntax`, `api_completions.py` (a plugin) and
+  `API.sublime-commands` to `Packages/User` of Sublime Text's data folder.
+  Where Sublime Text has no folder it is an error, and none is made. The
+  format command is `API: Format` in the command palette (`api_format` for a
+  key binding). The setting `api_binary` names another client.
 - `vim` and `nvim` write a package (`syntax/`, `ftdetect/`, `ftplugin/`) to
   `~/.vim/pack/commerceos/start/api` and
   `~/.local/share/nvim/site/pack/commerceos/start/api`. Completion is omni
-  completion, `ctrl+x ctrl+o`; `g:api_binary` names another client.
+  completion, `ctrl+x ctrl+o`. `:ApiFormat` lays the file out (`:ApiFormat!`
+  with a line for each member), and `gq` does the same to the lines it is
+  given. `g:api_binary` names another client.
 - `vscode` and `cursor` write `~/.local/share/api/editors/commerceos-api.vsix`
   and install it with the editor's own command (`code --install-extension`,
   `cursor --install-extension`). Without that command on the `PATH` the file
   is still written, the exit code is 1 and stderr says how to install it by
-  hand. The setting `commerceosApi.binary` names another client.
+  hand. *Format Document* lays the file out. The setting
+  `commerceosApi.binary` names another client.
 - `rider` writes a TextMate bundle to
   `~/.local/share/api/editors/commerceos-api`, for any JetBrains IDE. Adding
   it under *Settings → Editor → TextMate Bundles* is a step in the IDE, said
@@ -1192,8 +1238,8 @@ file, or through something that strips them before the pipe.
 (`api -sa seed.api GET /people`) is an error, before anything is sent:
 `-a seed.api runs a file and GET /people is a request: give one of the two`.
 
-`--describe`, `--assert`, `--imports` and `--complete` each print a document
-about a file and send nothing. A file to run or a request beside one of them is an error
+`--describe`, `--assert`, `--imports`, `--complete` and `--format` each print
+a document about a file and send nothing. A file to run or a request beside one of them is an error
 too: `--imports a.api prints a document and GET /people is a request: give
 one of the two`.
 
@@ -1780,6 +1826,7 @@ Run it: `api -sa workshop.api`.
 - Add `-f` (`-sfa`) so a failed request stops the batch: check the exit code, and on failure read the error body from the end of stdout (everything after the last `└─HTTP/1.1 …` line; it is usually several lines of JSON). Without it a batch exits 0 however many plain requests failed.
 - Open a file with a [describe block](#describe-block) (`title`, `description`, `docsLink`) so a tool or a person can tell what it does; read one with `api --describe file.api`, which sends nothing.
 - To see what a file checks without running it, `api --assert file.api` prints every `PUT /assert` body it sends as one JSON array.
+- Lay a file you wrote or changed out with `api --format file.api` before handing it over: it changes blanks only, and what it prints is what an editor's format command would make of the file.
 - When someone asks for `.api` highlighting or completions in their editor, it is `api --install-syntax <editor>`. Don't copy a grammar out of `editors/` by hand: the client holds the one that matches it.
 - To read a file of an import yourself, ask `api --imports file.api` for the directory its alias stands for. Don't rebuild a path into the import cache: its layout is the client's own.
 - Run with `--no-keychain` and an absolute `API_CREDENTIALS_FILE` so nothing depends on an unlocked keychain or on the working directory.

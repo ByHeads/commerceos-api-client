@@ -1,7 +1,7 @@
-# Syntax highlighting and completions for `.api` files
+# Syntax highlighting, completions and formatting for `.api` files
 
 The grammars for the `.api` batch files that `AGENTS.md` describes, one folder
-per editor format, and beside each what makes its editor complete. They are
+per editor format, and beside each what makes its editor complete and format. They are
 compiled into the client, which installs them:
 
 ```sh
@@ -17,23 +17,23 @@ Run it again after the client is updated: it replaces what it wrote before.
 
 | Folder | Format | Read by |
 |---|---|---|
-| `sublime/` | `API.sublime-syntax`, and `api_completions.py`, a plugin for completions | Sublime Text |
-| `vscode/` | a VS Code extension around `syntaxes/api.tmLanguage.json`, a TextMate grammar, with `extension.js` for completions | VS Code, Cursor, and JetBrains IDEs as a TextMate bundle (the grammar only) |
-| `vim/` | `syntax/`, `ftdetect/` and `ftplugin/` of a Vim package; the last holds the omni completion | Vim, Neovim |
+| `sublime/` | `API.sublime-syntax`; `api_completions.py`, a plugin for completions and formatting; `API.sublime-commands`, its entries in the command palette | Sublime Text |
+| `vscode/` | a VS Code extension around `syntaxes/api.tmLanguage.json`, a TextMate grammar, with `extension.js` for completions and formatting | VS Code, Cursor, and JetBrains IDEs as a TextMate bundle (the grammar only) |
+| `vim/` | `syntax/`, `ftdetect/` and `ftplugin/` of a Vim package; the last holds the omni completion and the format command | Vim, Neovim |
 
 ## What each editor gets, and where
 
 | Editor | What is written | What is left to do |
 |---|---|---|
-| Sublime Text | `API.sublime-syntax` and `api_completions.py` in `Packages/User` of Sublime's data folder | nothing |
+| Sublime Text | `API.sublime-syntax`, `api_completions.py` and `API.sublime-commands` in `Packages/User` of Sublime's data folder | nothing |
 | VS Code, Cursor | `~/.local/share/api/editors/commerceos-api.vsix`, then installed with `code --install-extension` (`cursor --install-extension`) | nothing when the editor's command is on the `PATH`. Otherwise: *Extensions: Install from VSIX…* in the command palette, and choose that file |
 | Rider | the extension's folder, `~/.local/share/api/editors/commerceos-api` | once: *Settings → Editor → TextMate Bundles*, `+`, and choose that folder. The IDE reads it where it is, so a later install needs no second visit |
 | Vim | `~/.vim/pack/commerceos/start/api/` (`~/vimfiles/…` on Windows) | nothing; it needs `syntax on` |
 | Neovim | `~/.local/share/nvim/site/pack/commerceos/start/api/` (under `$XDG_DATA_HOME` when set; `nvim-data` on Windows) | nothing |
 
 A file of the same name that is already there is replaced: an
-`API.sublime-syntax` or an `api_completions.py` of your own in `Packages/User`
-is this one afterwards.
+`API.sublime-syntax`, an `api_completions.py` or an `API.sublime-commands` of
+your own in `Packages/User` is this one afterwards.
 
 ## What is highlighted
 
@@ -84,6 +84,34 @@ alone, and an editor offers what the client that is installed reads.
 - Vim has no snippets, so a member is written with its value as it stands
   (`"include-nulls": true`) and an operator up to its parenthesis.
 
+## Formatting
+
+No editor has rules for this either: each hands the text to the client and
+takes what comes back.
+
+```sh
+api --format - < seed.api
+```
+
+`AGENTS.md` has what is laid out how. Only blanks outside strings change, so
+a file runs as it ran.
+
+| Editor | How it is asked for | A line for each member (`--expand`) |
+|---|---|---|
+| Sublime Text | *API: Format* in the command palette; the command is `api_format`, for a key binding | *API: Format, a line for each member* (`"args": { "expanded": true }`) |
+| VS Code, Cursor | *Format Document*, and format on save when that is on | *CommerceOS API: Format, a line for each member* in the command palette |
+| Vim, Neovim | `:ApiFormat`; `gq` for the lines it is given (`gggqG` for the file) | `:ApiFormat!` |
+| Rider | nothing: a TextMate bundle is highlighting only | |
+
+A key binding in Sublime Text:
+
+```json
+{ "keys": ["super+enter"], "command": "api_format", "context": [{ "key": "selector", "operand": "source.api" }] }
+```
+
+A client from before `--format` changes nothing: Sublime Text says so in its
+status bar, Vim under the window, and VS Code makes no edit.
+
 ## Changing a grammar
 
 `sample.api` holds one line of every construct, the errors included. The three
@@ -95,8 +123,8 @@ cargo test --test editors
 
 holds the Sublime syntax to `sample.api` (through `syntect`, which reads the
 same format), checks that it finds no error in any `.api` file of this
-repository, and holds `--install-syntax` and `--complete`. Each caller of
-`--complete` is run where its interpreter is on the `PATH`: the Sublime
+repository, and holds `--install-syntax`, `--complete` and `--format`. Each
+caller of the two is run where its interpreter is on the `PATH`: the Sublime
 plugin by `python3`, the extension by `node` against a `vscode` module of
 the test's own, and the omni completion in `vim` itself. The TextMate grammar has no parser
 in Rust. Its tokens for `sample.api` are kept in `sample.api.snap`, and Node

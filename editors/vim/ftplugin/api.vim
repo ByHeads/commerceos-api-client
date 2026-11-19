@@ -7,8 +7,14 @@ let b:did_ftplugin = 1
 setlocal commentstring=#\ %s
 setlocal comments=:#
 setlocal omnifunc=ApiComplete
+" `gq` lays out what it is given as the client does (`api --format`): `gggqG`
+" for the whole file. A motion that cuts a body in two is left as it is.
+let &l:formatprg = shellescape(get(g:, 'api_binary', 'api')) . ' --format -'
+" :ApiFormat lays the whole file out and leaves the cursor where it is;
+" :ApiFormat! gives every member of an object or an array a line.
+command! -buffer -bang ApiFormat call ApiFormat(<bang>0)
 
-let b:undo_ftplugin = 'setlocal commentstring< comments< omnifunc<'
+let b:undo_ftplugin = 'setlocal commentstring< comments< omnifunc< formatprg< | delcommand ApiFormat'
 
 if exists('*ApiComplete')
   finish
@@ -48,4 +54,30 @@ function! ApiComplete(findstart, base) abort
     endif
   endfor
   return l:matches
+endfunction
+
+" The whole buffer as the client lays a `.api` file out. A client that
+" can't be asked (one from before `--format`) changes nothing.
+function! ApiFormat(expanded) abort
+  let l:command = shellescape(get(g:, 'api_binary', 'api')) . ' --format -' . (a:expanded ? ' --expand' : '')
+  let l:text = join(getline(1, '$'), "\n") . "\n"
+  silent let l:answer = system(l:command, l:text)
+  if v:shell_error
+    echohl WarningMsg | echo 'api --format failed: it needs a client that has it' | echohl None
+    return
+  endif
+  if l:answer ==# l:text
+    return
+  endif
+  let l:view = winsaveview()
+  let l:lines = split(l:answer, "\n", 1)
+  if !empty(l:lines) && l:lines[-1] ==# ''
+    call remove(l:lines, -1)
+  endif
+  silent! undojoin
+  if len(l:lines) < line('$')
+    silent execute (len(l:lines) + 1) . ',$delete _'
+  endif
+  call setline(1, l:lines)
+  call winrestview(l:view)
 endfunction

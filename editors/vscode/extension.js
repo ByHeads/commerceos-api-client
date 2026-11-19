@@ -1,9 +1,10 @@
-// Completions for `.api` batch files in VS Code and Cursor.
+// Completions and formatting for `.api` batch files in VS Code and Cursor.
 //
 // What can stand where the cursor is, is the client's to say: this extension
 // asks it (`api --complete`) and hands the answer to the editor. So what is
-// offered is what the client that is installed reads. It needs nothing but
-// what the editor has: no module is installed for it.
+// offered is what the client that is installed reads. Format Document lays
+// the file out the same way: by asking the client (`api --format`). It needs
+// nothing but what the editor has: no module is installed for it.
 
 const childProcess = require('child_process');
 const fs = require('fs');
@@ -122,9 +123,61 @@ async function provideCompletionItems(document, position, token) {
   });
 }
 
+// The text of `document` as the client lays a `.api` file out. Undefined
+// when it can't be asked (a client from before `--format`).
+function formatted(document, expanded, token) {
+  const args = ['--format', '-'].concat(expanded ? ['--expand'] : []);
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = childProcess.execFile(client(), args, { timeout: 10000, maxBuffer: 256 * 1024 * 1024 }, (error, stdout) => {
+        resolve(error ? undefined : stdout);
+      });
+    } catch (e) {
+      return resolve(undefined);
+    }
+    child.on('error', () => resolve(undefined));
+    child.stdin.on('error', () => {});
+    child.stdin.end(document.getText());
+    if (token) {
+      token.onCancellationRequested(() => child.kill());
+    }
+  });
+}
+
+// One edit that puts the laid out text in the place of the whole document.
+async function formattingEdits(document, expanded, token) {
+  const text = document.getText();
+  const laidOut = await formatted(document, expanded, token);
+  if (laidOut === undefined || laidOut === text) {
+    return [];
+  }
+  const lines = text.split('\n');
+  const end = new vscode.Position(lines.length - 1, lines[lines.length - 1].length);
+  return [vscode.TextEdit.replace(new vscode.Range(new vscode.Position(0, 0), end), laidOut)];
+}
+
+function provideDocumentFormattingEdits(document, options, token) {
+  return formattingEdits(document, false, token);
+}
+
+// The command "CommerceOS API: Format, a line for each member".
+async function formatExpanded() {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor || editor.document.languageId !== LANGUAGE) {
+    return;
+  }
+  const edits = await formattingEdits(editor.document, true, undefined);
+  if (edits.length) {
+    await editor.edit((builder) => edits.forEach((edit) => builder.replace(edit.range, edit.newText)));
+  }
+}
+
 function activate(context) {
   context.subscriptions.push(
-    vscode.languages.registerCompletionItemProvider(LANGUAGE, { provideCompletionItems }, '"', '/', '~', '@')
+    vscode.languages.registerCompletionItemProvider(LANGUAGE, { provideCompletionItems }, '"', '/', '~', '@'),
+    vscode.languages.registerDocumentFormattingEditProvider(LANGUAGE, { provideDocumentFormattingEdits }),
+    vscode.commands.registerCommand('commerceosApi.formatExpanded', formatExpanded)
   );
 }
 

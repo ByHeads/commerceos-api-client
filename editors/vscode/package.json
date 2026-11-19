@@ -1,7 +1,7 @@
 {
   "name": "commerceos-api",
   "displayName": "CommerceOS .api files",
-  "description": "Syntax highlighting and completions for the .api batch files of the CommerceOS API client",
+  "description": "Syntax highlighting, completions and formatting for the .api batch files of the CommerceOS API client",
   "version": "0.0.0",
   "publisher": "heads",
   "license": "MIT",
@@ -14,10 +14,12 @@
   },
   "main": "./extension.js",
   "activationEvents": [
-    "onLanguage:commerceos-api"
+    "onLanguage:commerceos-api",
+    "onCommand:commerceosApi.formatExpanded"
   ],
   "categories": [
-    "Programming Languages"
+    "Programming Languages",
+    "Formatters"
   ],
   "contributes": {
     "languages": [
@@ -46,9 +48,24 @@
         "commerceosApi.binary": {
           "type": "string",
           "default": "",
-          "description": "The CommerceOS API client that is asked what can stand at the cursor. Empty: the `api` on the PATH."
+          "description": "The CommerceOS API client that is asked what can stand at the cursor and how a file is laid out. Empty: the `api` on the PATH."
         }
       }
+    },
+    "commands": [
+      {
+        "command": "commerceosApi.formatExpanded",
+        "title": "Format, a line for each member",
+        "category": "CommerceOS API"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "commerceosApi.formatExpanded",
+          "when": "editorLangId == commerceos-api"
+        }
+      ]
     }
   }
 }
