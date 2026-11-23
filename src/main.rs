@@ -1555,6 +1555,9 @@ struct OperationItem {
     parameters: Option<Vec<PathParameter>>,
     #[serde(default, deserialize_with = "lenient")]
     tags: Option<Vec<String>>,
+    /// What the operation takes as its body, written as a response is.
+    #[serde(default, deserialize_with = "lenient", rename = "requestBody")]
+    request_body: Option<ResponseItem>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1655,6 +1658,7 @@ struct BackgroundLoadResult {
     endpoints: Vec<String>,
     schema_props: HashMap<String, Vec<String>>,
     endpoint_types: HashMap<String, String>,
+    body_schemas: HashMap<String, String>,
     param_types: HashMap<String, String>,
     endpoint_schemas: HashMap<String, String>,
     indexer_info: HashMap<String, IndexerInfo>,
@@ -1736,6 +1740,9 @@ struct AppState {
     endpoints: Vec<String>,
     schema_props: HashMap<String, Vec<String>>,
     endpoint_types: HashMap<String, String>,
+    /// The schema of the body an endpoint takes that can't be read (a
+    /// method, as `/yoro` is): its path -> the schema's name.
+    body_schemas: HashMap<String, String>,
     param_types: HashMap<String, String>,  // endpoint pattern -> parameter type name
     endpoint_schemas: HashMap<String, String>,  // endpoint path -> schema name (via tags x-type)
     indexer_info: HashMap<String, IndexerInfo>,  // schema name -> x-indexer info
@@ -1843,6 +1850,7 @@ impl AppState {
             endpoints: Vec::new(),
             schema_props: HashMap::new(),
             endpoint_types: HashMap::new(),
+            body_schemas: HashMap::new(),
             param_types: HashMap::new(),
             endpoint_schemas: HashMap::new(),
             indexer_info: HashMap::new(),
@@ -19307,6 +19315,7 @@ fn apply_spec(state: &mut AppState, result: BackgroundLoadResult) {
     };
     state.schema_props = result.schema_props;
     state.endpoint_types = result.endpoint_types;
+    state.body_schemas = result.body_schemas;
     state.param_types = result.param_types;
     state.endpoint_schemas = result.endpoint_schemas;
     state.indexer_info = result.indexer_info;
@@ -19665,6 +19674,20 @@ fn index_spec(spec: ApiSpec, result: &mut BackgroundLoadResult) {
             }
         }
 
+        // An endpoint that can't be read is a method: what it takes is not
+        // what it holds, and is said by the body of its write.
+        if item.get.is_none() {
+            let takes = [&item.put, &item.post, &item.patch]
+                .into_iter()
+                .flatten()
+                .filter_map(|op| op.request_body.as_ref()?.content.as_ref()?.get("application/json")?.schema.as_ref())
+                .filter_map(|schema| extract_schema_name(schema.ref_path.as_deref()?))
+                .find(|name| result.schema_props.contains_key(name));
+            if let Some(name) = takes {
+                result.body_schemas.insert(path.clone(), name);
+            }
+        }
+
         if let Some(get_op) = &item.get {
             if let Some(op_tags) = &get_op.tags {
                 for tag_name in op_tags {
@@ -19772,6 +19795,13 @@ struct JsonFrame {
     existing: Vec<String>,
 }
 
+/// The schema of the body the method at `uri` takes (`/yoro`), where the
+/// spec has one. An operator behind it works on its answer, not on its body.
+fn method_body_schema<'a>(state: &'a AppState, uri: &str) -> Option<&'a String> {
+    let path = uri.split('~').next().unwrap_or(uri).trim_end_matches('/');
+    state.body_schemas.get(path)
+}
+
 /// Read the JSON body up to the cursor: which schema the cursor is in, the
 /// keys already there, and whether a key or a value is being typed.
 fn json_context_at_cursor(state: &AppState) -> Option<JsonContext> {
@@ -19781,9 +19811,15 @@ fn json_context_at_cursor(state: &AppState) -> Option<JsonContext> {
 
     // The body describes one of what the URI holds (PUT /people takes a
     // person, not a collection).
-    let resolve_uri = format!("{}/", uri.trim_end_matches('/'));
-    let (base_schema, _, _) = resolve_type_at_path(state, &resolve_uri);
-    let base_schema = item_schema(state, base_schema?);
+    // A method takes what its write says, which is no item of a collection.
+    let base_schema = match method_body_schema(state, uri) {
+        Some(takes) => takes.clone(),
+        None => {
+            let resolve_uri = format!("{}/", uri.trim_end_matches('/'));
+            let (base_schema, _, _) = resolve_type_at_path(state, &resolve_uri);
+            item_schema(state, base_schema?)
+        }
+    };
 
     let cursor_byte = char_to_byte_idx(&state.input, state.cursor_pos);
     if cursor_byte < body_start {
@@ -20668,6 +20704,116 @@ fn get_json_completion_ghost(state: &AppState) -> Option<String> {
     json_completions(state, &ctx).first().and_then(|first| ghost_of(first)).filter(|ghost| !ghost.is_empty())
 }
 
+/// The body whose `template` is a URI: what a yoro request takes.
+const TEMPLATE_SCHEMA: &str = "yoro parameters";
+/// Where each of a yoro request's `args` goes in its template.
+const TEMPLATE_ARG: &str = "{arg}";
+/// What `last_tab_input` holds while Tab goes through the URIs of a template.
+const TEMPLATE_TAB: &str = "template";
+
+/// The URI being typed as the `template` of a yoro body: the byte it starts
+/// at, behind the opening quote, and what is typed of it up to the cursor.
+struct TemplateUri {
+    start: usize,
+    typed: String,
+}
+
+fn template_at_cursor(state: &AppState) -> Option<TemplateUri> {
+    if !cursor_inside_brackets(&state.input, state.cursor_pos) {
+        return None;
+    }
+    let ctx = json_context_at_cursor(state)?;
+    let in_template = ctx.pos == JsonPos::Value
+        && ctx.in_string
+        && ctx.element.is_none()
+        && ctx.schema == TEMPLATE_SCHEMA
+        && ctx.current_key == "template";
+    let cursor_byte = char_to_byte_idx(&state.input, state.cursor_pos);
+    in_template.then(|| TemplateUri { start: ctx.token_start, typed: state.input[ctx.token_start..cursor_byte].to_string() })
+}
+
+/// Whether the cursor of a template stands in the middle of a word, where
+/// nothing completes: what is written there would be left behind it. The
+/// closing quote of the string ends a word as a blank ends one on the line.
+fn template_cursor_in_a_word(state: &AppState) -> bool {
+    let cursor_byte = char_to_byte_idx(&state.input, state.cursor_pos);
+    let in_a_word = |c: char| !(c.is_whitespace() || matches!(c, '"' | '/' | '~' | '(' | ')' | '?' | '&' | ',' | '='));
+    state.input[cursor_byte..].chars().next().is_some_and(in_a_word)
+}
+
+/// What may follow `typed` in a template: what follows it as the URI of a
+/// request, and `{arg}` wherever a segment or a value starts. Where the URI
+/// has something to offer `{arg}` is the last of the list, and typing its
+/// `{` leaves it alone.
+fn template_completions(state: &AppState, typed: &str) -> Vec<String> {
+    // Nothing for a string not begun, as for a line without a URI, and
+    // nothing behind an escape: the text is then not the URI as it is read.
+    if typed.is_empty() || typed.contains(['\\', '\n']) {
+        return Vec::new();
+    }
+    let mut completions = get_completions(state, typed);
+    let word_start = typed.rfind(['/', '=', '(', ',', '<', '>']).map_or(0, |at| at + 1);
+    if TEMPLATE_ARG.starts_with(&typed[word_start..]) {
+        completions.push(format!("{}{}", &typed[..word_start], TEMPLATE_ARG));
+    }
+    completions.retain(|completion| completion != typed);
+    completions
+}
+
+/// Whether Tab is going through the URIs of a template and `typed` is the
+/// one it wrote last.
+fn cycling_template(state: &AppState, typed: &str) -> bool {
+    state.last_tab_input == TEMPLATE_TAB
+        && state.completions.len() > 1
+        && state.completions.get(state.completion_idx).is_some_and(|written| written == typed)
+}
+
+/// Text as it stands in a JSON string.
+fn json_string_text(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Tab and Shift+Tab in the template of a yoro body: the URI completes as
+/// it does on the line, and the string stays open, since a URI can always go
+/// on. Returns whether the cursor is in a template at all.
+fn handle_template_tab(state: &mut AppState, reverse: bool) -> bool {
+    let Some(template) = template_at_cursor(state) else { return false };
+    if template_cursor_in_a_word(state) {
+        return true;
+    }
+    if cycling_template(state, &template.typed) {
+        let step = if reverse { state.completions.len() - 1 } else { 1 };
+        state.completion_idx = (state.completion_idx + step) % state.completions.len();
+    } else if reverse {
+        // No list that Tab has gone into: nothing to go back in.
+        return true;
+    } else {
+        state.completions = template_completions(state, &template.typed);
+        state.completion_idx = 0;
+        state.last_tab_input = TEMPLATE_TAB.to_string();
+    }
+    let Some(completion) = state.completions.get(state.completion_idx) else {
+        state.last_tab_input.clear();
+        return true;
+    };
+    let written = json_string_text(completion);
+    let cursor_byte = char_to_byte_idx(&state.input, state.cursor_pos);
+    state.cursor_pos = char_len(&state.input[..template.start]) + char_len(&written);
+    state.input.replace_range(template.start..cursor_byte, &written);
+    true
+}
+
+/// The ghost in the template of a yoro body: what Tab would add there. None
+/// where the cursor is in no template.
+fn template_ghost(state: &AppState) -> Option<String> {
+    let template = template_at_cursor(state)?;
+    if template_cursor_in_a_word(state) || cycling_template(state, &template.typed) {
+        return Some(String::new());
+    }
+    let first = template_completions(state, &template.typed).into_iter().next();
+    Some(first.as_deref().and_then(|first| rest_behind(first, &template.typed)).map(json_string_text).unwrap_or_default())
+}
+
 /// The bracket that closes what the cursor is in, and how deep that is
 /// nested, when the cursor stands after a complete value: there Tab closes.
 fn pending_closer(input: &str, cursor_pos: usize) -> Option<(char, usize)> {
@@ -20807,6 +20953,8 @@ fn backtab_pressed(state: &mut AppState) -> bool {
     }
     if cursor_in_file_path(state) {
         handle_file_tab_completion_reverse(state);
+    } else if state.config.complete && with_chain_segment_view(state, |state| handle_template_tab(state, true)) {
+        // The template of a yoro body, which is a URI.
     } else if state.config.experimental && cursor_inside_brackets(&state.input, state.cursor_pos) {
         with_chain_segment_view(state, |state| handle_json_tab_completion(state, true, true));
     } else if state.config.complete {
@@ -20830,6 +20978,11 @@ fn tab_pressed(state: &mut AppState) -> bool {
     if !state.config.complete {
         state.status_msg = "completion not available on this server".to_string();
         state.status_msg_at = Some(std::time::Instant::now());
+        return true;
+    }
+    // The template of a yoro body is a URI and completes as one, with `-x`
+    // and without.
+    if with_chain_segment_view(state, |state| handle_template_tab(state, false)) {
         return true;
     }
     if state.config.experimental && cursor_inside_brackets(&state.input, state.cursor_pos) {
@@ -20922,6 +21075,11 @@ fn in_or_behind_file_path(state: &AppState) -> bool {
 }
 
 fn get_completion_ghost(state: &AppState) -> String {
+    if !in_or_behind_file_path(state) {
+        if let Some(ghost) = template_ghost(state) {
+            return ghost;
+        }
+    }
     // JSON body completion ghost text (experimental only). Not in a file
     // path, which Tab completes first: the `[` of `@export[1].json` opens
     // no body.
@@ -21080,6 +21238,11 @@ fn get_body_bracket_ghost(state: &AppState, parts: &[&str], uri: &str) -> String
 }
 
 fn get_completion_ghost_at_cursor(state: &AppState) -> String {
+    if !in_or_behind_file_path(state) {
+        if let Some(ghost) = template_ghost(state) {
+            return ghost;
+        }
+    }
     if state.config.experimental && cursor_inside_brackets(&state.input, state.cursor_pos) && !in_or_behind_file_path(state) {
         // With text behind the cursor too: Tab writes there (the rest of a
         // value in front of its closing quote, a closer in front of an outer
@@ -34153,6 +34316,170 @@ mod tests {
     /// With the cursor anywhere in a line, in a URI, a body or a path, Tab
     /// writes exactly where a ghost is drawn: a ghost that Tab does not
     /// write and a Tab that writes unannounced are both found here.
+    // ── Completion: the template of a yoro body is a URI ──
+
+    /// A prompt that has loaded `COMPLETION_SPEC` and a `/yoro` beside it,
+    /// as the server has it: a method that can only be written, whose body
+    /// is named by its `requestBody`.
+    fn completing_template(marked: &str, experimental: bool) -> AppState {
+        let mut spec: Value = serde_json::from_str(COMPLETION_SPEC).unwrap();
+        spec["paths"]["/yoro"] = serde_json::json!({ "put": {
+            "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/yoro parameters" } } } },
+            "responses": {}
+        } });
+        spec["components"]["schemas"]["yoro parameters"] = serde_json::json!({ "type": "object", "properties": {
+            "args": { "type": "array", "items": { "$ref": "#/components/schemas/strict string" } },
+            "template": { "$ref": "#/components/schemas/strict string" }
+        } });
+        let spec: ApiSpec = serde_json::from_value(spec).expect("the fixture is a spec");
+        let mut result = BackgroundLoadResult { complete: true, connected: true, ..Default::default() };
+        index_spec(spec, &mut result);
+        result.mapped_types = strings(&["com.heads.csv", "com.heads.sql"]);
+        assert_eq!(result.body_schemas["/yoro"], "yoro parameters");
+        let mut state = test_state();
+        apply_background_result(&mut state, result);
+        state.config.experimental = experimental;
+        state.input = marked.replace('^', "");
+        state.cursor_pos = marked.find('^').map_or(char_len(marked), |at| char_len(&marked[..at]));
+        state
+    }
+
+    /// The ghost on `marked` and the line after Tab, in a prompt that knows
+    /// `/yoro`.
+    fn template_ghost_then_tab(marked: &str, experimental: bool) -> (String, String) {
+        let mut state = completing_template(marked, experimental);
+        let ghost = render_input_content(&mut state, 200).2;
+        tab_pressed(&mut state);
+        (ghost, shown(&state))
+    }
+
+    #[test]
+    fn the_template_of_a_yoro_body_completes_as_a_uri() {
+        // With `-x` and without: it is the completion of a URI, in another place.
+        for experimental in [false, true] {
+            for (marked, ghost, after) in [
+                // An endpoint, an operator and what it takes, as on the line.
+                (r#"PUT /yoro {"template": "/peo^"#, "ple", r#"PUT /yoro {"template": "/people^"#),
+                (r#"PUT /yoro {"template": "/people~wh^"#, "ere(", r#"PUT /yoro {"template": "/people~where(^"#),
+                (r#"PUT /yoro {"template": "/people~where(ac^"#, "tive", r#"PUT /yoro {"template": "/people~where(active^"#),
+                (r#"PUT /yoro {"template": "/people~map(com.heads.c^"#, "sv)", r#"PUT /yoro {"template": "/people~map(com.heads.csv)^"#),
+                // In front of the closing quote, which stays: the string is
+                // not closed by Tab, since a URI can always go on.
+                (r#"PUT /yoro {"template": "/peo^"}"#, "ple", r#"PUT /yoro {"template": "/people^"}"#),
+                (r#"PUT /yoro {"args": ["1"], "template": "/peo^" }"#, "ple", r#"PUT /yoro {"args": ["1"], "template": "/people^" }"#),
+                // In front of a delimiter of the URI.
+                (r#"PUT /yoro {"template": "/peo^~take(5)"}"#, "ple", r#"PUT /yoro {"template": "/people^~take(5)"}"#),
+                // `{arg}` wherever a segment or a value starts.
+                (r#"PUT /yoro {"template": "/people/com.mi6.id=^"#, "{arg}", r#"PUT /yoro {"template": "/people/com.mi6.id={arg}^"#),
+                (r#"PUT /yoro {"template": "/people~take(^"#, "{arg}", r#"PUT /yoro {"template": "/people~take({arg}^"#),
+                (r#"PUT /yoro {"template": "/people~where(givenName>^"#, "{arg}", r#"PUT /yoro {"template": "/people~where(givenName>{arg}^"#),
+                (r#"PUT /yoro {"template": "/people/{^"#, "arg}", r#"PUT /yoro {"template": "/people/{arg}^"#),
+                (r#"PUT /yoro {"template": "/people/{a^"}"#, "rg}", r#"PUT /yoro {"template": "/people/{arg}^"}"#),
+                (r#"PUT /yoro {"template": "{^"#, "arg}", r#"PUT /yoro {"template": "{arg}^"#),
+                // Behind one the URI goes on as behind an identifier.
+                (r#"PUT /yoro {"template": "/people/{arg}~ju^"#, "st(", r#"PUT /yoro {"template": "/people/{arg}~just(^"#),
+                (r#"PUT /yoro {"template": "/people/{arg}/giv^"#, "enName", r#"PUT /yoro {"template": "/people/{arg}/givenName^"#),
+                // In each body of a chain, and in a body of several lines.
+                (r#"GET /about && PUT /yoro {"template": "/peo^"} && GET /pets"#, "ple", r#"GET /about && PUT /yoro {"template": "/people^"} && GET /pets"#),
+                ("PUT /yoro {\n  \"template\": \"/peo^\n}", "ple", "PUT /yoro {\n  \"template\": \"/people^\n}"),
+                // Behind an operator of the request too: it is still a yoro.
+                (r#"PUT /yoro~just(results) {"template": "/peo^"#, "ple", r#"PUT /yoro~just(results) {"template": "/people^"#),
+            ] {
+                assert_eq!(template_ghost_then_tab(marked, experimental), (ghost.to_string(), after.to_string()), "-x {experimental}: {marked}");
+            }
+            // Nothing: a string not begun, the middle of a word, and behind
+            // an escape, where the text is not the URI as it is read.
+            for marked in [
+                r#"PUT /yoro {"template": "^"#,
+                r#"PUT /yoro {"template": "/pe^ople"}"#,
+                r#"PUT /yoro {"template": "/people/^{arg}"}"#,
+                r#"PUT /yoro {"template": "/people~where(name=\"a\")~wh^"#,
+                // A complete `{arg}` has nothing more of its own.
+                r#"PUT /yoro {"template": "/people~take({arg}^"#,
+                // No template: another key, an element of `args`, the same
+                // key in the body of another endpoint.
+                r#"PUT /yoro {"args": ["/peo^"#,
+                r#"PUT /yoro {"other": "/peo^"#,
+                r#"PUT /people [{"template": "/peo^"#,
+                r#"PUT /zoo {"template": "/peo^"#,
+            ] {
+                assert_eq!(template_ghost_then_tab(marked, experimental), (String::new(), marked.to_string()), "-x {experimental}: {marked}");
+            }
+        }
+    }
+
+    #[test]
+    fn tab_goes_through_the_uris_of_a_template_and_shift_tab_back() {
+        for experimental in [false, true] {
+            let line = |uri: &str| format!("PUT /yoro {{\"template\": \"{uri}^\"}}");
+            let mut state = completing_template(&line("/pe"), experimental);
+            let ghost = |state: &mut AppState| render_input_content(state, 200).2;
+            assert_eq!(ghost(&mut state), "ople");
+            tab_pressed(&mut state);
+            assert_eq!(shown(&state), line("/people"));
+            assert_eq!(state.completions, strings(&["/people", "/people/find", "/pets"]));
+            // While Tab is choosing, the ghost promises nothing of the first.
+            assert_eq!(ghost(&mut state), "");
+            tab_pressed(&mut state);
+            assert_eq!(shown(&state), line("/people/find"));
+            tab_pressed(&mut state);
+            assert_eq!(shown(&state), line("/pets"));
+            tab_pressed(&mut state);
+            assert_eq!(shown(&state), line("/people"));
+            backtab_pressed(&mut state);
+            assert_eq!(shown(&state), line("/pets"));
+            backtab_pressed(&mut state);
+            assert_eq!(shown(&state), line("/people/find"));
+
+            // Shift+Tab without a list Tab has gone into writes nothing.
+            let mut state = completing_template(&line("/pe"), experimental);
+            backtab_pressed(&mut state);
+            assert_eq!(shown(&state), line("/pe"));
+
+            // Where the URI has something to offer, `{arg}` is the last of it.
+            let mut state = completing_template(&line("/people/"), experimental);
+            tab_pressed(&mut state);
+            assert_eq!(state.completions.last().map(String::as_str), Some("/people/{arg}"));
+            assert!(state.completions.len() > 1 && state.completions[0] != "/people/{arg}");
+        }
+    }
+
+    #[test]
+    fn the_body_of_a_method_completes_from_what_its_write_takes() {
+        // `/yoro` can't be read: nothing said what its body holds, and no key
+        // of it completed.
+        assert_eq!(template_ghost_then_tab("PUT /yoro {^", true), (" \"args\":".to_string(), "PUT /yoro { \"args\":^".to_string()));
+        assert_eq!(template_ghost_then_tab(r#"PUT /yoro {"te^"#, true), ("mplate\":".to_string(), r#"PUT /yoro {"template":^"#.to_string()));
+        // `template` is a string: no bracket opens behind it.
+        assert_eq!(template_ghost_then_tab(r#"PUT /yoro {"template":^"#, true), (String::new(), r#"PUT /yoro {"template":^"#.to_string()));
+        // Behind the template Tab closes the body, as behind any value.
+        assert_eq!(template_ghost_then_tab(r#"PUT /yoro {"template": "/people"^"#, true), ("}".to_string(), r#"PUT /yoro {"template": "/people"}^"#.to_string()));
+        // Keys are the `-x` completion still.
+        assert_eq!(template_ghost_then_tab("PUT /yoro {^", false), (String::new(), "PUT /yoro {^".to_string()));
+
+        // Only a schema with members is one to complete from, and only of
+        // an endpoint that can't be read: `/people` takes a person.
+        let state = completing_template("", true);
+        assert_eq!(state.body_schemas.len(), 1);
+    }
+
+    #[test]
+    fn tab_writes_in_a_template_where_a_ghost_is_drawn_and_nowhere_else() {
+        for line in [
+            r#"PUT /yoro {"template": "/pe/{arg}/gi~wh(ac)", "args": ["/pe", "2"]} && GET /pe"#,
+            "PUT /yoro {\n  \"args\": [\"1\"],\n  \"template\": \"/people~take({a\"\n}",
+        ] {
+            for cursor in 0..=char_len(line) {
+                let at = char_to_byte_idx(line, cursor);
+                for experimental in [false, true] {
+                    let marked = format!("{}^{}", &line[..at], &line[at..]);
+                    let (ghost, after) = template_ghost_then_tab(&marked, experimental);
+                    assert_eq!(after.replace('^', "") != line, !ghost.is_empty(), "-x {experimental}: {marked:?} with ghost {ghost:?} became {after:?}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn tab_writes_where_a_ghost_is_drawn_and_nowhere_else() {
         for line in [

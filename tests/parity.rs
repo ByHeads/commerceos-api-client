@@ -405,9 +405,15 @@ const PROMPT_SPEC: &str = r##"{
     "/people/find": { "get": { "responses": {} } },
     "/people/{index}": { "get": { "responses": { "200": { "content": { "application/json": {
       "schema": { "$ref": "#/components/schemas/person" } } } } } } },
-    "/pets": { "get": { "responses": {} } }
+    "/pets": { "get": { "responses": {} } },
+    "/yoro": { "put": { "requestBody": { "content": { "application/json": {
+      "schema": { "$ref": "#/components/schemas/yoro parameters" } } } }, "responses": {} } }
   },
   "components": { "schemas": {
+    "yoro parameters": { "type": "object",
+      "properties": {
+        "args": { "type": "array", "items": { "$ref": "#/components/schemas/strict string" } },
+        "template": { "$ref": "#/components/schemas/strict string" } } },
     "people": { "type": "array",
       "x-indexer": { "indexType": "COS database key or common identifiers", "returnType": "person?" },
       "x-array-members": { "count": { "$ref": "#/components/schemas/number" } } },
@@ -7219,6 +7225,41 @@ fn tab_completes_the_uri_from_the_servers_spec() {
     prompt.send(b"\t");
     prompt.pump(Duration::from_millis(100));
     assert_eq!(entered(&mut prompt, &server), ["GET /people/find"], "{}", screen_tail(&prompt));
+}
+
+/// The template of a yoro body is a URI, and completes as the URI of the
+/// line does: without `-x`, with `{arg}` where a value starts, and with the
+/// string left open.
+#[cfg(unix)]
+#[test]
+fn tab_completes_the_template_of_a_yoro_body() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    for flags in [&[][..], &["-x"][..]] {
+        let mut prompt = open_completing(&server, dir.path(), flags);
+        let lines: &[(&[&str], &str)] = &[
+            (&["PUT /yoro {\"template\": \"/peo", "\t", "\"}"], "PUT /yoro {\"template\": \"/people\"}"),
+            (&["PUT /yoro {\"template\": \"/pe", "\t", "\t", "\"}"], "PUT /yoro {\"template\": \"/people/find\"}"),
+            (&["PUT /yoro {\"template\": \"/pe", "\t", "\t", SHIFT_TAB, "\"}"], "PUT /yoro {\"template\": \"/people\"}"),
+            (
+                &["PUT /yoro {\"template\": \"/peo", "\t", "/com.mi6.id=", "\t", "~ju", "\t", "gi", "\t", ")\", \"args\": [\"007\"]}"],
+                "PUT /yoro {\"template\": \"/people/com.mi6.id={arg}~just(givenName)\", \"args\": [\"007\"]}",
+            ),
+            // In the second body of a chain.
+            (
+                &["GET /one && PUT /yoro {\"template\": \"/pet", "\t", "\"}"],
+                "GET /one; PUT /yoro {\"template\": \"/pets\"}",
+            ),
+        ];
+        for (keys, sent) in lines {
+            let shown = press(&mut prompt, keys);
+            assert_eq!(entered(&mut prompt, &server).join("; "), *sent, "{flags:?} {keys:?}: {shown}");
+            prompt.pump(Duration::from_millis(150));
+        }
+        // What Tab would add is shown ahead of the cursor.
+        let shown = press(&mut prompt, &["PUT /yoro {\"template\": \"/people/com.mi6.id="]);
+        assert!(shown.contains("com.mi6.id={arg}"), "{flags:?}: {shown}");
+    }
 }
 
 /// A request pasted on a new line under another is a second line, as in a

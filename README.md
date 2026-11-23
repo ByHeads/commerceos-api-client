@@ -261,6 +261,11 @@ one-shot mode, with tab completion for endpoints, operators, properties, and fil
 - **Endpoints are completed from the server's API spec**, and from what the server lists at the
   base of the API for the connection's credentials: the collections the spec leaves out, such
   as `/oauth2-clients` and `/user-roles` for a key that holds `admin`.
+- **The `template` of a yoro body is completed as a URI.** In `PUT /yoro {"template": "/pe`,
+  `tab` writes what it writes on the line: endpoints, identifiers, members, operators and what
+  they take, with `shift+tab` back through the list. `{arg}` is offered wherever a segment or
+  a value starts: at once where nothing else is (`/products/com.example.sku=`, `~take(`), last
+  of the list elsewhere, and on a typed `{`. The string is left open, since a URI can go on.
 - **Typing a body promotes GET to PUT**; on an array endpoint the opening `[` is added for you.
 - **`ctrl+space` cycles** PUT → PATCH → POST → GET. Switching to GET stashes the body; switching back restores it.
 - **Enter on a body method without a body** opens a multi-line editor: `ctrl+d` sends, `esc` cancels. A `> file` on the line is kept and applied when the body is sent.
