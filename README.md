@@ -272,7 +272,10 @@ one-shot mode, with tab completion for endpoints, operators, properties, and fil
   `cl/sv.api` runs on a later line and `tab` completes inside the repository; run the `import`
   line again to pick up a branch that has moved. A pasted block
   of several lines runs line by line. Pasting a request line, a directive or a block replaces
-  whatever is on the line, so a paste over the starting `GET /` is just the paste. `esc` stops a wait; a failed assert or a declined confirm
+  whatever is on the line, so a paste over the starting `GET /` is just the paste. In an input
+  of several lines it replaces the line the cursor is on and no other: start a new line
+  (`ctrl+n`, `alt+enter` or `shift+enter`) and paste the next request there, and Enter sends
+  them one after the other, as a file would. `esc` stops a wait; a failed assert or a declined confirm
   stops the rest of the line. A mistyped request says `not a request or .api file` instead of
   re-sending the last one.
 - **`tab` completes the file to run.** On a line that is a path (`se`, `shared/`, `~/seeds/`,

@@ -7221,6 +7221,49 @@ fn tab_completes_the_uri_from_the_servers_spec() {
     assert_eq!(entered(&mut prompt, &server), ["GET /people/find"], "{}", screen_tail(&prompt));
 }
 
+/// A request pasted on a new line under another is a second line, as in a
+/// file: Enter sends both. It took the place of the first.
+#[cfg(unix)]
+#[test]
+fn a_request_pasted_on_a_new_line_is_a_second_request() {
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut prompt = open_completing(&server, dir.path(), &[]);
+
+    // ctrl+n starts the new line, and a terminal pastes a line break as `\r`.
+    press(&mut prompt, &["GET /receipts/receiptID=126/payments~just(identifiers) ", "\x0e"]);
+    prompt.paste("GET /receipts/receiptID=127/payments~just(identifiers) \r");
+    prompt.pump(Duration::from_millis(120));
+    prompt.send(b"\x0e");
+    prompt.pump(Duration::from_millis(120));
+    prompt.paste("get /receipts/receiptID=128/payments\r");
+    prompt.pump(Duration::from_millis(120));
+    server.take();
+    prompt.send(b"\r");
+    pump_until(&mut prompt, Duration::from_secs(6), |_| server.seen() >= 3);
+    assert_eq!(
+        server.take(),
+        [
+            "GET /receipts/receiptID=126/payments~just(identifiers)",
+            "GET /receipts/receiptID=127/payments~just(identifiers)",
+            "GET /receipts/receiptID=128/payments",
+        ],
+        "{}",
+        screen_tail(&prompt)
+    );
+
+    // On a line that has text, the paste takes that line's place only.
+    drop(prompt);
+    let mut prompt = open_completing(&server, dir.path(), &[]);
+    press(&mut prompt, &["GET /one", "\x0e", "GET /old"]);
+    prompt.paste("GET /two");
+    prompt.pump(Duration::from_millis(120));
+    server.take();
+    prompt.send(b"\r");
+    pump_until(&mut prompt, Duration::from_secs(6), |_| server.seen() >= 2);
+    assert_eq!(server.take(), ["GET /one", "GET /two"], "{}", screen_tail(&prompt));
+}
+
 /// A ghost is drawn where Tab then writes it: at the cursor, with the rest of
 /// the line left as it is, and on the row it will stand on. Where no ghost
 /// is drawn, Tab writes nothing.

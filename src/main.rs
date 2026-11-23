@@ -15549,12 +15549,17 @@ fn handle_paste<W: Write>(
     if !inside_body && !inside_uri && !continues && paste_is_api_text(paste) {
         // Normalize the method to uppercase, like typed promotion does.
         state.stashed_body.clear();
-        state.input = if paste_starts_with_method(paste) {
+        let pasted = if paste_starts_with_method(paste) {
             uppercase_method_token(paste.trim_end())
         } else {
             paste.trim_end().to_string()
         };
-        state.cursor_pos = char_len(&state.input);
+        // In an input of several lines the paste is one of them: it takes
+        // the place of the line the cursor is on, which on a new, empty line
+        // is that of nothing, and the other lines stay.
+        let (line_start, line_end) = program_line_bounds_at(&state.input, cursor_byte);
+        state.cursor_pos = char_len(&state.input[..line_start]) + char_len(&pasted);
+        state.input.replace_range(line_start..line_end, &pasted);
         // Pasting a full request line is an explicit method choice.
         state.method_auto_promoted = false;
         state.status_msg.clear();
@@ -16928,6 +16933,15 @@ fn body_span_at(input: &str, byte_pos: usize) -> Option<BodySpan> {
 /// requests of their own, not this one's body. A line break inside a body's
 /// brackets or inside a string is part of the body.
 fn request_bounds_at(input: &str, byte_pos: usize) -> (usize, usize) {
+    let (line_start, line_end) = program_line_bounds_at(input, byte_pos);
+    let (seg_start, seg_end) = chain_segment_bounds_at(&input[line_start..line_end], byte_pos - line_start);
+    (line_start + seg_start, line_start + seg_end)
+}
+
+/// Byte range `[start, end)` of the line containing `byte_pos`, as a `.api`
+/// file has lines: a line break inside a body's brackets or inside a string
+/// is part of the line it is in.
+fn program_line_bounds_at(input: &str, byte_pos: usize) -> (usize, usize) {
     let mut line_start = 0usize;
     let mut line_end = input.len();
     let mut depth = 0i32;
@@ -16954,8 +16968,7 @@ fn request_bounds_at(input: &str, byte_pos: usize) -> (usize, usize) {
             _ => {}
         }
     }
-    let (seg_start, seg_end) = chain_segment_bounds_at(&input[line_start..line_end], byte_pos - line_start);
-    (line_start + seg_start, line_start + seg_end)
+    (line_start, line_end)
 }
 
 /// Byte range `[start, end)` of the `&&` chain segment containing `byte_pos` —
@@ -22978,6 +22991,53 @@ mod tests {
         state.cursor_pos = char_len(&state.input);
         handle_paste(&mut state, "/a\r/b\r", &mut out).unwrap();
         assert_eq!(state.input, "/a\n/b");
+    }
+
+    #[test]
+    fn a_paste_into_an_input_of_several_lines_is_one_of_its_lines() {
+        let pasted = |marked: &str, paste: &str| {
+            let mut state = test_state();
+            state.input = marked.replace('^', "");
+            state.cursor_pos = marked.find('^').map_or(char_len(marked), |at| char_len(&marked[..at]));
+            handle_paste(&mut state, paste, &mut sink()).unwrap();
+            shown(&state)
+        };
+        // The user's case: a second request on the new line under the first.
+        // It replaced the first.
+        assert_eq!(pasted("GET /receipts/receiptID=126/payments \n^", "GET /receipts/receiptID=127/payments \r"),
+            "GET /receipts/receiptID=126/payments \nGET /receipts/receiptID=127/payments^");
+        for (marked, paste, after) in [
+            // A method is written in upper case, as on a line of its own.
+            ("GET /a\n^", "get /b", "GET /a\nGET /b^"),
+            // A line of blanks is an empty one.
+            ("GET /a\n  ^", "GET /b", "GET /a\nGET /b^"),
+            // An empty line between two others.
+            ("GET /a\n^\nGET /c", "GET /b", "GET /a\nGET /b^\nGET /c"),
+            // Anything that is a line of a file.
+            ("GET /a\n^", "assert /x", "GET /a\nassert /x^"),
+            ("GET /a\n^", "# a note", "GET /a\n# a note^"),
+            ("GET /a\n^", "seed.api", "GET /a\nseed.api^"),
+            // A block of lines.
+            ("GET /a\n^", "assert /x\rsleep 1\r", "GET /a\nassert /x\nsleep 1^"),
+            // On a line that has text the paste takes that line's place,
+            // and no other's.
+            ("GET /a\nGET /old^", "GET /b", "GET /a\nGET /b^"),
+            ("GET /a\nGET /o^ld\nGET /c", "GET /b", "GET /a\nGET /b^\nGET /c"),
+            ("GET /o^ld\nGET /c", "GET /b", "GET /b^\nGET /c"),
+            // The lines of a body are its request's: they go with it.
+            ("GET /a\nPUT /x {\n  \"a\": 1\n}^", "GET /b", "GET /a\nGET /b^"),
+            ("PUT /x {\n  \"a\": 1\n}\n^", "GET /b", "PUT /x {\n  \"a\": 1\n}\nGET /b^"),
+            // One line, of one row or of several, is replaced as before.
+            ("GET /^", "GET /b", "GET /b^"),
+            ("GET /old^", "assert /x", "assert /x^"),
+            ("PUT /x {\n  \"a\": 1\n}^", "GET /b", "GET /b^"),
+            // In a body the paste is body text, on whatever line.
+            ("GET /a\nPUT /x {\n  ^\n}", "GET /b", "GET /a\nPUT /x {\n  GET /b^\n}"),
+        ] {
+            assert_eq!(pasted(marked, paste), after, "{paste:?} pasted into {marked:?}");
+        }
+        // What was built that way runs as a file's lines.
+        assert!(matches!(classify_prompt_line("GET /a\nGET /b"), PromptLine::Program));
     }
 
     #[test]

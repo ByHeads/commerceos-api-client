@@ -1202,7 +1202,10 @@ checks the current
 connection, and `seed.api` runs the file with each request logged as if typed.
 A pasted block of several lines runs line by line, as a file would; pasting a
 request line, a directive or a block replaces whatever is on the line, so a
-paste over the starting `GET /` is just the paste. Tab on a
+paste over the starting `GET /` is just the paste. In an input of several
+lines (a new line is `ctrl+n`, `alt+enter` or `shift+enter`) it replaces the
+line the cursor is on and no other, so a request pasted on a new, empty line
+is a second request, sent after the first. Tab on a
 line that is a path (`se`, `shared/`, `~/seeds/`) completes it to a directory
 or a `.api` file; a path starting with `/` completes as a URI. A block or a
 file carries on past a plain line that is answered with an error status, and
