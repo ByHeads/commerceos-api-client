@@ -1597,6 +1597,9 @@ struct SchemaDefinition {
     all_of: Option<Vec<SchemaRef>>,
     #[serde(default, deserialize_with = "lenient", rename = "x-indexer")]
     x_indexer: Option<IndexerInfo>,
+    /// What a collection is a collection of: `people` of `person`.
+    #[serde(default, deserialize_with = "lenient", rename = "x-conceptOf")]
+    x_concept_of: Option<String>,
     #[serde(default, deserialize_with = "lenient_map_option", rename = "x-array-members")]
     x_array_members: Option<HashMap<String, ArrayMemberInfo>>,
     #[serde(default, deserialize_with = "lenient_map_option", rename = "x-primitive-members")]
@@ -1661,6 +1664,7 @@ struct BackgroundLoadResult {
     additional_props_key: HashMap<String, String>,
     additional_props_value: HashMap<String, String>,
     array_schemas: std::collections::HashSet<String>,
+    concept_of: HashMap<String, String>,  // collection schema → the schema of its elements
     schema_types: HashMap<String, String>,  // schema → its JSON type (object, array, string, …)
     array_endpoints: std::collections::HashSet<String>,
     enum_values: HashMap<String, HashMap<String, Vec<String>>>,  // schema → prop → enum values
@@ -1741,6 +1745,7 @@ struct AppState {
     additional_props_key: HashMap<String, String>,  // schema name -> additionalProperties key type (e.g., "date-time")
     additional_props_value: HashMap<String, String>,  // schema name -> the schema of a map's values, where the spec says
     array_schemas: std::collections::HashSet<String>,  // schemas that are array types (for fallback detection)
+    concept_of: HashMap<String, String>,  // collection schema → the schema of its elements (`x-conceptOf`)
     schema_types: HashMap<String, String>,  // schema → its JSON type, for what a property's value starts with
     array_endpoints: std::collections::HashSet<String>,  // endpoints that return arrays (response has items)
     enum_values: HashMap<String, HashMap<String, Vec<String>>>,  // schema → prop → enum values
@@ -1755,6 +1760,12 @@ struct AppState {
     /// Where the API spec of this connection arrives. The prompt is open
     /// before it is there (`load_spec_behind`, `take_spec`).
     spec_rx: Option<std::sync::mpsc::Receiver<BackgroundLoadResult>>,
+    /// The roots the server lists for this connection's credentials, each
+    /// with the schema it names: where the collections come from that the
+    /// spec has no path for (`add_listed_roots`).
+    listed_roots: Vec<(String, String)>,
+    /// Where that listing arrives (`load_spec_behind`, `take_root_listing`).
+    root_listing_rx: Option<std::sync::mpsc::Receiver<Vec<(String, String)>>>,
     completions: Vec<String>,
     completion_idx: usize,
     last_tab_input: String,
@@ -1841,6 +1852,7 @@ impl AppState {
             additional_props_key: HashMap::new(),
             additional_props_value: HashMap::new(),
             array_schemas: std::collections::HashSet::new(),
+            concept_of: HashMap::new(),
             schema_types: HashMap::new(),
             array_endpoints: std::collections::HashSet::new(),
             enum_values: HashMap::new(),
@@ -1850,6 +1862,8 @@ impl AppState {
             mapped_types: Vec::new(),
             mapped_types_rx: None,
             spec_rx: None,
+            listed_roots: Vec::new(),
+            root_listing_rx: None,
             completions: Vec::new(),
             completion_idx: 0,
             last_tab_input: String::new(),
@@ -14430,7 +14444,8 @@ fn run_interactive(config: Config, op_selector: Option<String>, from_setup: bool
         }
         }
         take_mapped_types(&mut state);
-        if take_spec(&mut state) {
+        let spec_arrived = take_spec(&mut state);
+        if take_root_listing(&mut state) || spec_arrived {
             render(&mut stdout, &mut state)?;
         }
         // Animate loading spinner
@@ -19126,8 +19141,10 @@ const FIRST_ENDPOINT: &str = "/about";
 
 /// Take the answer of a connection that was just made, and start reading
 /// what completion goes by: the API spec and the mapped types, each on a
-/// thread of its own. The prompt takes them when they are there (`take_spec`,
-/// `take_mapped_types`) and is open meanwhile.
+/// thread of its own, and the roots the server lists for the credentials
+/// (`fetch_listed_roots`). The prompt takes them when they are there
+/// (`take_spec`, `take_mapped_types`, `take_root_listing`) and is open
+/// meanwhile.
 ///
 /// What was on its way for the connection before is dropped: its receivers
 /// are replaced, so a spec that arrives late is never another server's.
@@ -19139,6 +19156,8 @@ fn apply_connection(state: &mut AppState, result: BackgroundLoadResult) {
 fn load_spec_behind(state: &mut AppState) {
     state.spec_rx = None;
     state.mapped_types_rx = None;
+    state.root_listing_rx = None;
+    state.listed_roots.clear();
     if !state.config.complete {
         return;
     }
@@ -19157,6 +19176,11 @@ fn load_spec_behind(state: &mut AppState) {
     let (tx, rx) = std::sync::mpsc::channel();
     thread::spawn(move || { let _ = tx.send(fetch_mapped_type_names(&config)); });
     state.mapped_types_rx = Some(rx);
+
+    let config = state.config.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || { let _ = tx.send(fetch_listed_roots(&config)); });
+    state.root_listing_rx = Some(rx);
 }
 
 /// Take the API spec once it has arrived. `true` when it did, and the
@@ -19279,6 +19303,7 @@ fn apply_spec(state: &mut AppState, result: BackgroundLoadResult) {
     state.additional_props_key = result.additional_props_key;
     state.additional_props_value = result.additional_props_value;
     state.array_schemas = result.array_schemas;
+    state.concept_of = result.concept_of;
     state.schema_types = result.schema_types;
     state.array_endpoints = result.array_endpoints;
     state.enum_values = result.enum_values;
@@ -19286,6 +19311,95 @@ fn apply_spec(state: &mut AppState, result: BackgroundLoadResult) {
     state.subtypes = result.subtypes;
     state.parent_types = result.parent_types;
     state.spec = result.spec;
+    // The listing may have been there first.
+    add_listed_roots(state);
+}
+
+/// The roots the server lists at the base of the API for the credentials it
+/// is asked with, each with the schema it names: `GET /api/v1/` answers
+/// `{ "oauth2-clients": { "type": "oauth2 clients", … }, … }`. It is where a
+/// collection is read from that the spec leaves out: the spec is one
+/// document for every caller, and has no path for what only an admin
+/// reaches.
+///
+/// Empty when there is no listing to be had: no answer, an error status, or
+/// an answer that is not an object. Completion does not depend on it, so
+/// that is not said anywhere.
+fn fetch_listed_roots(config: &Config) -> Vec<(String, String)> {
+    let url = format!("{}{}/", config.base_uri, config.api_path);
+    let mut request = timed(http_client_for(config.timeout_secs).get(&url), 10);
+
+    if let Some(authorization) = auth_header(config) {
+        request = request.header("Authorization", authorization);
+    }
+
+    request.send().ok()
+        .filter(|resp| resp.status().is_success())
+        .and_then(|resp| resp.json::<serde_json::Value>().ok())
+        .map(|listing| listed_roots(&listing))
+        .unwrap_or_default()
+}
+
+/// The entries of a root listing that name a type, in the order of their
+/// names. An entry without one is a directory of entries (`admin`), and is
+/// not read.
+fn listed_roots(listing: &serde_json::Value) -> Vec<(String, String)> {
+    let Some(entries) = listing.as_object() else { return Vec::new() };
+    let mut roots: Vec<(String, String)> = entries
+        .iter()
+        .filter(|(name, _)| !name.is_empty() && !name.contains(|c: char| c.is_whitespace() || "/{}~?#".contains(c)))
+        .filter_map(|(name, entry)| Some((name.clone(), entry.get("type")?.as_str()?.to_string())))
+        .collect();
+    roots.sort();
+    roots
+}
+
+/// Take the root listing once it has arrived. `true` when it gave
+/// completion an endpoint, and the prompt is to be drawn again.
+fn take_root_listing(state: &mut AppState) -> bool {
+    let Some(rx) = &state.root_listing_rx else { return false };
+    match rx.try_recv() {
+        Ok(roots) => state.listed_roots = roots,
+        Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+    }
+    state.root_listing_rx = None;
+    add_listed_roots(state)
+}
+
+/// Give completion the listed collections that the spec has no path for, as
+/// the spec would have given them: `/oauth2-clients` is then an endpoint
+/// that carries an array of `oauth2 client`, and its identifiers, members
+/// and operators complete from the schemas the spec does have.
+///
+/// A root is taken when the schema it names is a collection in the spec: an
+/// array with an indexer that says what it is a collection of. That leaves
+/// out what the listing holds besides: the operators (`count`, `flat`), the
+/// methods (`log`) and the single objects (`me`), which it does not tell
+/// apart. A path the spec has is the spec's.
+///
+/// It is called when either of the two arrives, and adds nothing twice.
+fn add_listed_roots(state: &mut AppState) -> bool {
+    let mut added = false;
+    for (name, schema) in &state.listed_roots {
+        let path = format!("/{name}");
+        if state.endpoints.contains(&path)
+            || !state.array_schemas.contains(schema)
+            || !state.indexer_info.contains_key(schema)
+        {
+            continue;
+        }
+        let Some(element) = state.concept_of.get(schema) else { continue };
+        state.endpoint_schemas.insert(path.clone(), schema.clone());
+        state.endpoint_types.insert(path.clone(), element.clone());
+        state.array_endpoints.insert(path.clone());
+        state.endpoints.push(path);
+        added = true;
+    }
+    if added {
+        state.endpoints.sort();
+    }
+    added
 }
 
 fn load_openapi_spec_into(config: &Config, result: &mut BackgroundLoadResult) {
@@ -19357,6 +19471,9 @@ fn index_spec(spec: ApiSpec, result: &mut BackgroundLoadResult) {
             }
             if let Some(indexer) = &schema.x_indexer {
                 result.indexer_info.insert(name.clone(), indexer.clone());
+            }
+            if let Some(element) = &schema.x_concept_of {
+                result.concept_of.insert(name.clone(), element.clone());
             }
             if schema.schema_type.as_deref() == Some("array") {
                 result.array_schemas.insert(name.clone());
@@ -30338,6 +30455,7 @@ mod tests {
       },
       "components": { "schemas": {
         "people": { "type": "array", "items": { "$ref": "#/components/schemas/person" },
+          "x-conceptOf": "person",
           "x-indexer": { "indexType": "COS database key or common identifiers", "returnType": "person?" },
           "x-array-members": {
             "count": { "$ref": "#/components/schemas/number" },
@@ -30419,10 +30537,206 @@ mod tests {
             "length": { "$ref": "#/components/schemas/number" },
             "upper": { "$ref": "#/components/schemas/strict string" },
             "chars": { "type": "array", "items": { "$ref": "#/components/schemas/strict string" } } } },
+        "oauth2 clients": { "type": "array", "items": { "$ref": "#/components/schemas/oauth2 client" },
+          "x-conceptOf": "oauth2 client",
+          "x-indexer": { "indexType": "COS database key or oauth2 client identifiers", "returnType": "oauth2 client?" },
+          "x-array-members": { "count": { "$ref": "#/components/schemas/number" } } },
+        "oauth2 client": { "type": "object",
+          "properties": {
+            "identifiers": { "$ref": "#/components/schemas/oauth2 client identifiers" },
+            "isConfidential": { "type": "boolean" } } },
+        "oauth2 client identifiers": { "type": "object", "properties": { "key": {}, "clientID": {} } },
         "boolean": { "type": "boolean" },
         "number": { "type": "number" }
       } }
     }"##;
+
+    /// What a server lists at the base of the API: collections, operators,
+    /// methods, single objects and a directory, with nothing to tell them
+    /// apart but the schema each names.
+    const ROOT_LISTING: &str = r#"{
+      "oauth2-clients": { "type": "oauth2 clients", "description": "A set of OAuth2 clients" },
+      "people": { "type": "agents", "description": "the spec has this path, and says otherwise" },
+      "count": { "type": "count", "description": "An operator" },
+      "flat": { "type": "animals", "description": "An operator that is an array with an indexer" },
+      "measure-rects": { "type": "assigned labels", "description": "An array that is no concept" },
+      "log": { "type": "void method" },
+      "me": { "type": "agent" },
+      "ghosts": { "type": "a schema the spec lacks" },
+      "odd": { "type": 7 },
+      "a/b": { "type": "oauth2 clients" },
+      "admin": { "purge": { "type": "purge method" }, "oauth2-twins": { "type": "oauth2 clients" } }
+    }"#;
+
+    fn root_listing() -> Vec<(String, String)> {
+        listed_roots(&serde_json::from_str(ROOT_LISTING).unwrap())
+    }
+
+    /// A prompt that has the spec and the listing, with `marked` on its line.
+    fn completing_listed(marked: &str) -> AppState {
+        let mut state = completing(marked);
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.root_listing_rx = Some(rx);
+        tx.send(root_listing()).unwrap();
+        assert!(take_root_listing(&mut state));
+        state
+    }
+
+    #[test]
+    fn a_listed_collection_the_spec_leaves_out_completes_as_one_it_has() {
+        // Without the listing there is nothing behind `/oa`.
+        assert_eq!(tabbed("GET /oa"), "GET /oa^");
+
+        let tabbed = |marked: &str| {
+            let mut state = completing_listed(marked);
+            tab_pressed(&mut state);
+            shown(&state)
+        };
+        assert_eq!(tabbed("GET /oa"), "GET /oauth2-clients^");
+        assert_eq!(tabbed("/oauth2-clients~wi"), "/oauth2-clients~with(^");
+        let state = completing_listed("");
+        let complete = |uri: &str| get_completions(&state, uri);
+        // Its identifiers and members, and the members of an element.
+        assert_eq!(complete("/oauth2-clients/"), strings(&["/oauth2-clients/clientID=", "/oauth2-clients/count"]));
+        assert_eq!(
+            complete("/oauth2-clients/clientID=erp/"),
+            strings(&["/oauth2-clients/clientID=erp/identifiers", "/oauth2-clients/clientID=erp/isConfidential"])
+        );
+        assert_eq!(
+            resolve_type_at_path(&state, "/oauth2-clients/clientID=erp").0,
+            Some("oauth2 client".to_string())
+        );
+        // A body for it is a list of objects, as for `/people`.
+        assert_eq!(expected_body_shape(&state, "/oauth2-clients"), expected_body_shape(&state, "/people"));
+        let mut state = completing_listed("PUT /oauth2-clients {");
+        auto_wrap_array_body(&mut state, '{');
+        assert_eq!(shown(&state), "PUT /oauth2-clients [{^");
+
+        // Only a collection is taken: no operator, no method, no single
+        // object, nothing of a directory, no schema the spec lacks.
+        let mut state = completing_listed("");
+        let mut without = completing("");
+        without.endpoints.push("/oauth2-clients".to_string());
+        without.endpoints.sort();
+        assert_eq!(state.endpoints, without.endpoints);
+        for uri in ["/co", "/fl", "/me", "/lo", "/gh", "/ad", "/od", "/a"] {
+            assert_eq!(get_completions(&state, uri), get_completions(&completing(""), uri), "{uri}");
+        }
+
+        // A path the spec has is the spec's, whatever the listing says of it.
+        assert_eq!(state.endpoint_schemas["/people"], "people");
+        assert_eq!(state.endpoint_types["/people"], "person");
+
+        // Nothing is added twice.
+        assert!(!add_listed_roots(&mut state));
+        assert_eq!(state.endpoints, without.endpoints);
+    }
+
+    #[test]
+    fn the_listing_and_the_spec_arrive_in_either_order() {
+        let spec_first = completing_listed("");
+
+        // The listing first: there is no spec to read it by yet.
+        let mut state = test_state();
+        state.config.complete = true;
+        state.endpoints = vec![FIRST_ENDPOINT.to_string()];
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.root_listing_rx = Some(rx);
+        assert!(!take_root_listing(&mut state), "still on its way");
+        assert!(state.root_listing_rx.is_some());
+        tx.send(root_listing()).unwrap();
+        assert!(!take_root_listing(&mut state), "nothing to draw again");
+        assert!(state.root_listing_rx.is_none());
+        assert_eq!(state.endpoints, strings(&[FIRST_ENDPOINT]));
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.spec_rx = Some(rx);
+        tx.send(indexed_spec()).unwrap();
+        assert!(take_spec(&mut state));
+        assert_eq!(state.endpoints, spec_first.endpoints);
+        assert_eq!(state.endpoint_types["/oauth2-clients"], "oauth2 client");
+        assert!(state.array_endpoints.contains("/oauth2-clients"));
+
+        // A reader that went away without a word is no listing.
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<(String, String)>>();
+        let mut state = completing("");
+        state.root_listing_rx = Some(rx);
+        drop(tx);
+        assert!(!take_root_listing(&mut state));
+        assert!(state.root_listing_rx.is_none());
+        assert_eq!(state.endpoints, completing("").endpoints);
+        assert!(state.status_msg.is_empty(), "{}", state.status_msg);
+    }
+
+    #[test]
+    fn another_connection_drops_the_roots_of_the_one_before() {
+        // To a server without a spec, while a listing is on its way.
+        let mut state = completing_listed("");
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.root_listing_rx = Some(rx);
+        apply_connection(&mut state, BackgroundLoadResult { connected: true, ..Default::default() });
+        assert!(tx.send(root_listing()).is_err(), "nothing waits for it");
+        assert!(!take_root_listing(&mut state));
+        assert!(state.listed_roots.is_empty() && state.endpoints.is_empty());
+        assert!(get_completions(&state, "/oa").is_empty());
+
+        // To a server whose spec has the same schemas: the roots the other
+        // server listed are not this one's.
+        let mut state = completing_listed("");
+        state.listed_roots = root_listing();
+        apply_background_result(&mut state, indexed_spec());
+        state.root_listing_rx = None;
+        state.listed_roots.clear();
+        apply_spec(&mut state, indexed_spec());
+        assert!(!state.endpoints.contains(&"/oauth2-clients".to_string()));
+    }
+
+    #[test]
+    fn a_listing_that_is_not_one_leaves_completion_as_it_is() {
+        let listing = |reply: &str| {
+            let (url, served) = serve_once(reply.as_bytes().to_vec());
+            let config = Config {
+                base_uri: url.trim_end_matches("/lib.tar.gz").to_string(),
+                ..Config::default()
+            };
+            let roots = fetch_listed_roots(&config);
+            served.join().unwrap();
+            roots
+        };
+        let answer = |status: &str, body: &str| {
+            format!("HTTP/1.1 {status}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+        };
+        assert_eq!(
+            listing(&answer("200 OK", ROOT_LISTING)),
+            [
+                ("count", "count"), ("flat", "animals"), ("ghosts", "a schema the spec lacks"), ("log", "void method"),
+                ("me", "agent"), ("measure-rects", "assigned labels"), ("oauth2-clients", "oauth2 clients"),
+                ("people", "agents"),
+            ].map(|(name, schema)| (name.to_string(), schema.to_string()))
+        );
+        for reply in [
+            answer("404 Not Found", r#"{"error":"not found"}"#),
+            answer("401 Unauthorized", ""),
+            answer("500 Internal Server Error", ROOT_LISTING),
+            answer("200 OK", r#"[{"type":"oauth2 clients"}]"#),
+            answer("200 OK", "people, pets"),
+            answer("200 OK", ""),
+        ] {
+            assert!(listing(&reply).is_empty(), "{reply}");
+        }
+        // No server there.
+        let config = Config { base_uri: "http://127.0.0.1:9".to_string(), ..Config::default() };
+        assert!(fetch_listed_roots(&config).is_empty());
+
+        // No listing: what the spec gives, and not a word about it.
+        let mut state = completing("GET /oa");
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.root_listing_rx = Some(rx);
+        tx.send(Vec::new()).unwrap();
+        assert!(!take_root_listing(&mut state));
+        assert_eq!(state.endpoints, completing("").endpoints);
+        assert!(state.status_msg.is_empty(), "{}", state.status_msg);
+        assert!(!tab_pressed(&mut state) || shown(&state) == "GET /oa^");
+    }
 
     /// The spec is read behind the prompt: it is taken when it has arrived,
     /// and one that was on its way for the connection before never is.

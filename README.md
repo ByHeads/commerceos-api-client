@@ -258,6 +258,9 @@ once each, which the command says. Run it again after an update of the client. `
 Start `api` without a URI. The prompt takes the same `METHOD URI [BODY] [> file]` line as
 one-shot mode, with tab completion for endpoints, operators, properties, and file paths.
 
+- **Endpoints are completed from the server's API spec**, and from what the server lists at the
+  base of the API for the connection's credentials: the collections the spec leaves out, such
+  as `/oauth2-clients` and `/user-roles` for a key that holds `admin`.
 - **Typing a body promotes GET to PUT**; on an array endpoint the opening `[` is added for you.
 - **`ctrl+space` cycles** PUT → PATCH → POST → GET. Switching to GET stashes the body; switching back restores it.
 - **Enter on a body method without a body** opens a multi-line editor: `ctrl+d` sends, `esc` cancels. A `> file` on the line is kept and applied when the body is sent.
