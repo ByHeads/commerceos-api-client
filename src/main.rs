@@ -285,6 +285,7 @@ fn exit_process(code: i32) -> ! {
     // has failed is not tried again (and does not lead back here).
     let _ = Out.flush();
     release_clipboard();
+    op_finish_list_read();
     std::process::exit(code)
 }
 
@@ -4940,6 +4941,7 @@ impl Drop for ClipboardGuard {
 fn main() {
     install_panic_hook();
     let _clipboard = ClipboardGuard;
+    let _op_list = OpListGuard;
     let args = match Args::try_parse() {
         Ok(args) => args,
         Err(e) => {
@@ -5877,6 +5879,16 @@ const OP_TIMEOUT_SECS: u64 = 30;
 /// their own threads so a child writing more than the pipe buffer can't deadlock
 /// against our wait. Returns `Ok(None)` when the deadline passed.
 fn output_with_timeout(cmd: &mut Command, timeout: Duration) -> io::Result<Option<std::process::Output>> {
+    output_unless_called_off(cmd, timeout, &AtomicBool::new(false))
+}
+
+/// `output_with_timeout`, for a command that may no longer be wanted before
+/// it has ended: it is killed when `called_off` is set, as at its deadline.
+fn output_unless_called_off(
+    cmd: &mut Command,
+    timeout: Duration,
+    called_off: &AtomicBool,
+) -> io::Result<Option<std::process::Output>> {
     use std::process::Stdio;
 
     // What a pipe has given so far, read on a thread of its own, which
@@ -5921,7 +5933,7 @@ fn output_with_timeout(cmd: &mut Command, timeout: Duration) -> io::Result<Optio
                 return Ok(Some(std::process::Output { status, stdout: taken(&stdout_read), stderr: taken(&stderr_read) }));
             }
             None => {
-                if Instant::now() >= deadline {
+                if Instant::now() >= deadline || called_off.load(Ordering::Relaxed) {
                     let _ = child.kill();
                     let _ = child.wait();
                     return Ok(None);
@@ -5934,10 +5946,10 @@ fn output_with_timeout(cmd: &mut Command, timeout: Duration) -> io::Result<Optio
 
 /// Run an `op` command, mapping both failure modes to a message the user can act
 /// on. `context` names what was being read, e.g. "the environment list".
-fn op_read(args: &[&str], context: &str) -> Result<std::process::Output, String> {
+fn op_read(args: &[&str], context: &str, called_off: &AtomicBool) -> Result<std::process::Output, String> {
     let mut cmd = Command::new("op");
     cmd.args(args);
-    match output_with_timeout(&mut cmd, Duration::from_secs(OP_TIMEOUT_SECS)) {
+    match output_unless_called_off(&mut cmd, Duration::from_secs(OP_TIMEOUT_SECS), called_off) {
         Ok(Some(output)) => Ok(output),
         Ok(None) => Err(format!(
             "1Password did not respond within {}s while reading {}.\n\
@@ -5972,39 +5984,58 @@ fn command_exists(program: &str) -> bool {
         .is_ok()
 }
 
-fn get_1password_credentials(selector: &str) -> Result<(String, String), String> {
-    // Check that the `op` command is there by running it: that it can't be
-    // started is the answer, on every platform (there is no `which` to ask
-    // on Windows).
-    if !command_exists("op") {
-        return Err("1Password CLI is required for this option (try: brew install 1password-cli)".to_string());
+/// Where 1Password keeps the list of environments.
+const OP_LIST_REF: &str = "op://Shared/COS environments/environments.json";
+
+/// How long a run that is done waits for its read of the environment list,
+/// so that the next run has it. Both reads of a run start together, so the
+/// list is as a rule there when the key's request has been answered.
+const OP_LIST_PATIENCE: Duration = Duration::from_secs(2);
+
+/// The environment list as a run last read it from 1Password, kept so that
+/// the next run reads the key without reading the list first. It holds base
+/// URLs and `op://` references and no key.
+fn op_list_cache_file() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".cache").join("api").join("1p-environments.json"))
+}
+
+/// Write a file that only its owner can read, in one step: beside it, and
+/// then in its place.
+fn write_private_file(path: &std::path::Path, contents: &[u8]) -> io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
     }
-
-    // Validate selector format
-    if !selector.contains('/') {
-        return Err(format!(
-            "invalid selector {}, should be of format <organization>/<environment>",
-            selector
-        ));
+    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(format!(".tmp-{}", std::process::id()));
+    let tmp = path.with_file_name(name);
+    let _ = fs::remove_file(&tmp);
+    let written = create_private(&tmp)
+        .and_then(|mut file| file.write_all(contents).and_then(|()| file.flush()))
+        .and_then(|()| fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
+    written
+}
 
-    // Read environments.json from 1Password
-    let output = op_read(
-        &["read", "op://Shared/COS environments/environments.json"],
-        "the environment list",
-    )?;
-
+/// Read the environment list from 1Password, and keep it for the next run.
+fn op_read_list(called_off: &AtomicBool) -> Result<Value, String> {
+    let output = op_read(&["read", OP_LIST_REF], "the environment list", called_off)?;
     if !output.status.success() {
         return Err(format!("could not read from 1Password.{}", op_stderr_detail(&output)));
     }
-
-    let env_data: Value = serde_json::from_slice(&output.stdout)
+    let list: Value = serde_json::from_slice(&output.stdout)
         .map_err(|e| format!("could not parse environments.json: {}", e))?;
+    // A list that could not be kept is read again by the next run.
+    if let Some(file) = op_list_cache_file() {
+        let _ = write_private_file(&file, &output.stdout);
+    }
+    Ok(list)
+}
 
-    let (url, key_ref) = op_environment(&env_data, selector)?;
-
-    // Read the actual key from the reference
-    let key_output = op_read(&["read", &key_ref], "the API key")?;
+/// Read the API key of `selector` from the reference its entry names.
+fn op_read_key(key_ref: &str, selector: &str) -> Result<String, String> {
+    let key_output = op_read(&["read", key_ref], "the API key", &AtomicBool::new(false))?;
 
     if !key_output.status.success() {
         let stderr_msg = String::from_utf8_lossy(&key_output.stderr).trim().to_string();
@@ -6027,18 +6058,204 @@ fn get_1password_credentials(selector: &str) -> Result<(String, String), String>
         return Err(hint);
     }
 
-    let api_key = String::from_utf8_lossy(&key_output.stdout)
-        .trim()
-        .to_string();
-
+    let api_key = String::from_utf8_lossy(&key_output.stdout).trim().to_string();
     if api_key.is_empty() {
+        return Err(format!("1Password returned an empty key for '{}'.", selector));
+    }
+    Ok(api_key)
+}
+
+/// The environment list being read from 1Password beside a run that took
+/// its entry from the list the last run kept.
+struct OpListRead {
+    selector: String,
+    /// What the run is using: the base URL and the key reference of the
+    /// kept list's entry, and the key that was read by it.
+    url: String,
+    key_ref: String,
+    key: String,
+    /// The list as 1Password has it now, once it is read.
+    read: Arc<(std::sync::Mutex<Option<Result<Value, String>>>, std::sync::Condvar)>,
+    called_off: Arc<AtomicBool>,
+}
+
+impl OpListRead {
+    /// The list, waited for until `patience` has passed. `None` when it is
+    /// not read by then.
+    fn waited_for(&self, patience: Duration) -> Option<Result<Value, String>> {
+        let (read, ended) = &*self.read;
+        let slot = read.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (slot, _) = ended
+            .wait_timeout_while(slot, patience, |list| list.is_none())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        slot.clone()
+    }
+}
+
+fn op_list_read() -> std::sync::MutexGuard<'static, Option<OpListRead>> {
+    static READ: std::sync::Mutex<Option<OpListRead>> = std::sync::Mutex::new(None);
+    READ.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Start reading the environment list on a thread of its own.
+fn op_start_list_read(selector: &str, url: &str, key_ref: &str) {
+    let read = Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new()));
+    let called_off = Arc::new(AtomicBool::new(false));
+    let (thread_read, thread_called_off) = (Arc::clone(&read), Arc::clone(&called_off));
+    thread::spawn(move || {
+        let list = op_read_list(&thread_called_off);
+        let (slot, ended) = &*thread_read;
+        *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(list);
+        ended.notify_all();
+    });
+    *op_list_read() = Some(OpListRead {
+        selector: selector.to_string(),
+        url: url.to_string(),
+        key_ref: key_ref.to_string(),
+        key: String::new(),
+        read,
+        called_off,
+    });
+}
+
+/// Why a newer entry of 1Password's list could not be used for a request
+/// that was refused: for whoever sent the request to say.
+fn op_note() -> std::sync::MutexGuard<'static, Option<String>> {
+    static NOTE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    NOTE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The `url` lines a program that is running has passed, its own and each
+/// import's: a connection that 1Password's newer list names is not changed
+/// to while one of them refuses it.
+fn gates_in_force() -> std::sync::MutexGuard<'static, Vec<Vec<UrlCondition>>> {
+    static GATES: std::sync::Mutex<Vec<Vec<UrlCondition>>> = std::sync::Mutex::new(Vec::new());
+    GATES.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn program_gates(program: &BulkProgram) -> Vec<Vec<UrlCondition>> {
+    std::iter::once(program.url_conditions.clone())
+        .chain(program.import_gates.iter().map(|gate| gate.conditions.clone()))
+        .collect()
+}
+
+/// The connection 1Password's list names now, for a `--1p` connection that
+/// was refused (`401`) or did not answer: `Ok` with the base URL and the key
+/// of the entry when it is not the one the run took from the kept list.
+/// `None` when there is nothing newer to go by: the connection is not the
+/// one read from the kept list, the entry is as it was, or this was asked
+/// before. `Err` is why a newer entry could not be used.
+///
+/// The list is waited for. It is asked for once: what it says then is the
+/// last word, so a second refusal stands.
+fn op_newer_connection(base_uri: &str, api_key: &str) -> Option<Result<(String, String), String>> {
+    let reading = {
+        let mut slot = op_list_read();
+        if !slot.as_ref().is_some_and(|r| r.url == base_uri && r.key == api_key) {
+            return None;
+        }
+        slot.take()?
+    };
+    op_newer_entry(&reading)
+}
+
+fn op_newer_entry(reading: &OpListRead) -> Option<Result<(String, String), String>> {
+    // The read has a deadline of its own, so this ends.
+    let list = match reading.waited_for(Duration::from_secs(OP_TIMEOUT_SECS + 5)) {
+        Some(Ok(list)) => list,
+        Some(Err(e)) => {
+            return Some(Err(format!("the environment list could not be read from 1Password again: {}", e)));
+        }
+        None => return None,
+    };
+    let (url, key_ref) = match op_environment(&list, &reading.selector) {
+        Ok(entry) => entry,
+        Err(e) => return Some(Err(e)),
+    };
+    if url == reading.url && key_ref == reading.key_ref {
+        return None;
+    }
+    if url != reading.url {
+        let refusal = gates_in_force().iter().find_map(|gate| evaluate_url_gate(gate, &url).err());
+        if refusal.is_some() {
+            return Some(Err(format!(
+                "1Password now names {} for '{}', which the `url` lines of this run do not allow",
+                url, reading.selector
+            )));
+        }
+    }
+    Some(op_read_key(&key_ref, &reading.selector).map(|key| (url, key)))
+}
+
+/// Let a run that is ending have its read of the environment list, for the
+/// next run: waited for a moment, and called off when it takes longer.
+fn op_finish_list_read() {
+    let Some(reading) = op_list_read().take() else {
+        return;
+    };
+    if reading.waited_for(OP_LIST_PATIENCE).is_none() {
+        reading.called_off.store(true, Ordering::Relaxed);
+        reading.waited_for(Duration::from_millis(500));
+    }
+}
+
+/// Ends the read of the environment list when `main` returns, as
+/// `exit_process` does when the process ends there.
+struct OpListGuard;
+
+impl Drop for OpListGuard {
+    fn drop(&mut self) {
+        op_finish_list_read();
+    }
+}
+
+/// The base URL and the API key of the environment `selector` names in
+/// 1Password.
+///
+/// The key is read by the entry of the list the last run kept, where it has
+/// one for the selector, and the list is read again beside it: one wait for
+/// `op` in the place of two. What that newer list says is asked only when
+/// the connection is refused or does not answer (`op_newer_connection`).
+fn get_1password_credentials(selector: &str) -> Result<(String, String), String> {
+    // Check that the `op` command is there by running it: that it can't be
+    // started is the answer, on every platform (there is no `which` to ask
+    // on Windows).
+    if !command_exists("op") {
+        return Err("1Password CLI is required for this option (try: brew install 1password-cli)".to_string());
+    }
+
+    // Validate selector format
+    if !selector.contains('/') {
         return Err(format!(
-            "1Password returned an empty key for '{}'.",
+            "invalid selector {}, should be of format <organization>/<environment>",
             selector
         ));
     }
 
-    Ok((url, api_key))
+    let kept = op_list_cache_file()
+        .and_then(|file| fs::read(file).ok())
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|list| op_environment(&list, selector).ok());
+    if let Some((url, key_ref)) = kept {
+        op_start_list_read(selector, &url, &key_ref);
+        return match op_read_key(&key_ref, selector) {
+            Ok(key) => {
+                if let Some(reading) = op_list_read().as_mut() {
+                    reading.key = key.clone();
+                }
+                Ok((url, key))
+            }
+            // The reference may be what is out of date: the newer list says.
+            Err(e) => match op_list_read().take().and_then(|reading| op_newer_entry(&reading)) {
+                Some(Ok(connection)) => Ok(connection),
+                _ => Err(e),
+            },
+        };
+    }
+
+    let list = op_read_list(&AtomicBool::new(false))?;
+    let (url, key_ref) = op_environment(&list, selector)?;
+    Ok((url, op_read_key(&key_ref, selector)?))
 }
 
 /// The environment `selector` (`<organization>/<environment>`) names in the
@@ -13236,6 +13453,7 @@ fn run_bulk_program(config: &mut Config, contents: &str, base_dir: Option<&std::
         errln!("error: {}", e);
         exit_process(1);
     }
+    *gates_in_force() = program_gates(&program);
 
     for warning in &program.describe_warnings {
         errln!("warning: {}", warning);
@@ -13720,6 +13938,9 @@ struct Sent {
     response: reqwest::blocking::Response,
     /// A renewed OAuth2 token, for the caller to keep for the next request.
     new_token: Option<String>,
+    /// The base URL and the key 1Password's newer list names, which the
+    /// request was sent to in the end: for the caller to keep too.
+    new_connection: Option<(String, String)>,
 }
 
 /// Send a request, known as a write while it is in flight if it is one
@@ -13735,8 +13956,37 @@ fn send_built(built: BuiltRequest) -> Result<reqwest::blocking::Response, reqwes
 /// credentials means the token ran out: a new one is fetched, once, and the
 /// same request (`parts`, built again with the new token) is sent again. The
 /// second answer is the answer, 401 or not.
+///
+/// A 401 or no answer at all on a `--1p` connection that was read by the
+/// environment list the last run kept may mean that the list is out of
+/// date: the request is sent again, once, to what the newer list names,
+/// where that is another URL or another key (`op_newer_connection`).
 fn send_request(config: &Config, parts: &RequestParts, built: BuiltRequest) -> Result<Sent, reqwest::Error> {
-    let response = send_built(built)?;
+    let first = send_built(built);
+    let stale = match &first {
+        Ok(response) => response.status().as_u16() == 401,
+        Err(e) => e.is_connect(),
+    };
+    if stale {
+        match op_newer_connection(&config.base_uri, &config.api_key) {
+            Some(Ok((base_uri, api_key))) => {
+                let mut newer = config.clone();
+                newer.base_uri = base_uri.clone();
+                newer.api_key = api_key.clone();
+                if let Ok(again) = build_request(&newer, parts) {
+                    return Ok(Sent {
+                        response: send_built(again)?,
+                        new_token: None,
+                        new_connection: Some((base_uri, api_key)),
+                    });
+                }
+            }
+            // Said by whoever sent the request, under its answer.
+            Some(Err(e)) => *op_note() = Some(e),
+            None => {}
+        }
+    }
+    let response = first?;
     let renewable = response.status().as_u16() == 401
         && !config.oauth2_client_id.is_empty()
         && !config.oauth2_client_secret.is_empty();
@@ -13746,11 +13996,11 @@ fn send_request(config: &Config, parts: &RequestParts, built: BuiltRequest) -> R
             let mut renewed = config.clone();
             renewed.token = token.clone();
             if let Ok(again) = build_request(&renewed, parts) {
-                return Ok(Sent { response: send_built(again)?, new_token: Some(token) });
+                return Ok(Sent { response: send_built(again)?, new_token: Some(token), new_connection: None });
             }
         }
     }
-    Ok(Sent { response, new_token: None })
+    Ok(Sent { response, new_token: None, new_connection: None })
 }
 
 /// Why a streamed response did not get where it was going.
@@ -14149,10 +14399,19 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
         io::stderr().is_terminal() && !config.silent && !config.quiet,
     );
 
-    let resp = match send_request(config, &parts, built) {
+    let sent = send_request(config, &parts, built);
+    if let Some(note) = op_note().take() {
+        ticker.stop();
+        errln!("warning: {}", note);
+    }
+    let resp = match sent {
         Ok(sent) => {
             if let Some(token) = sent.new_token {
                 config.token = token;
+            }
+            if let Some((base_uri, api_key)) = sent.new_connection {
+                config.base_uri = base_uri;
+                config.api_key = api_key;
             }
             sent.response
         }
@@ -16143,6 +16402,9 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     // A token renewed on a 401, handed back for the requests that follow.
     let renewed_token: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
     let thread_renewed = Arc::clone(&renewed_token);
+    // The connection of 1Password's newer list, handed back the same way.
+    let newer_connection: Arc<std::sync::Mutex<Option<(String, String)>>> = Arc::new(std::sync::Mutex::new(None));
+    let thread_newer = Arc::clone(&newer_connection);
     let thread_config = state.config.clone();
     // The outfile as it was written, for a message about it.
     let outfile_written = state.display_outfile.clone();
@@ -16154,6 +16416,7 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
         let sent = send_request(&thread_config, &parts, built).map_err(|e| RequestFailure::of(e, &failure_base_uri));
         let result = sent.and_then(|sent| {
             *thread_renewed.lock().unwrap() = sent.new_token;
+            *thread_newer.lock().unwrap() = sent.new_connection;
             let resp = sent.response;
             let status = resp.status();
             thread_progress.headers_arrived(&resp);
@@ -16292,6 +16555,11 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     if let Some(token) = renewed_token.lock().unwrap().take() {
         state.config.token = token;
     }
+    if let Some((base_uri, api_key)) = newer_connection.lock().unwrap().take() {
+        state.config.base_uri = base_uri;
+        state.config.api_key = api_key;
+    }
+    let op_note = op_note().take();
 
     // What this request means for a `&&` chain. Captured before the body is
     // consumed by the outfile/clipboard branches below.
@@ -16451,6 +16719,14 @@ fn execute_request(state: &mut AppState, stdout: &mut io::Stdout) -> io::Result<
     // status line, where it stays.
     let in_program = state.chain_input.is_some();
     if let Some(note) = export_note.filter(|_| !state.config.quiet && !state.config.check_only) {
+        if in_program {
+            block.push_note(&format!("↳ {}", note).dimmed().to_string());
+        }
+        state.status_msg = note;
+        state.status_msg_at = Some(Instant::now());
+    }
+    // Why the request was not sent again to what 1Password names now.
+    if let Some(note) = op_note {
         if in_program {
             block.push_note(&format!("↳ {}", note).dimmed().to_string());
         }
@@ -16700,7 +16976,9 @@ fn run_program_line(state: &mut AppState, stdout: &mut io::Stdout, line: &str) -
 
     // Published so every per-request input restore shows the typed line.
     state.chain_input = Some(line.to_string());
+    *gates_in_force() = program_gates(&program);
     let result = run_program_steps(state, stdout, &program.steps);
+    gates_in_force().clear();
     // Stopped inside a file or not: what a file had set was that file's.
     state.config.file = Settings::default();
     state.config.apply_settings();
@@ -19507,7 +19785,23 @@ fn background_load(config: &Config, op_selector: Option<String>) -> BackgroundLo
         }
     }
 
-    let (connected, complete, streaming) = match check_connection(&config) {
+    let mut checked = check_connection(&config);
+    // Refused, or no answer: the list the last run kept may be out of date.
+    let mut note = String::new();
+    if matches!(checked, Err(401) | Ok((false, _, _))) {
+        match op_newer_connection(&config.base_uri, &config.api_key) {
+            Some(Ok((uri, key))) => {
+                config.base_uri = uri.clone();
+                config.api_key = key.clone();
+                base_uri = Some(uri);
+                api_key = Some(key);
+                checked = check_connection(&config);
+            }
+            Some(Err(e)) => note = format!("\n{}", e),
+            None => {}
+        }
+    }
+    let (connected, complete, streaming) = match checked {
         Ok(v) => v,
         Err(status) => {
             return BackgroundLoadResult {
@@ -19515,8 +19809,9 @@ fn background_load(config: &Config, op_selector: Option<String>) -> BackgroundLo
                 base_uri,
                 api_key,
                 error: Some(format!(
-                    "HTTP/1.1 {}",
-                    format!("{} {}", status, if status == 401 { "Unauthorized" } else { "Forbidden" }).red()
+                    "HTTP/1.1 {}{}",
+                    format!("{} {}", status, if status == 401 { "Unauthorized" } else { "Forbidden" }).red(),
+                    note
                 )),
                 ..Default::default()
             };

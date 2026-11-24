@@ -13058,3 +13058,351 @@ fn a_connection_that_cannot_be_used_still_opens_the_prompt_at_a_terminal() {
     let (sent, shown) = run_pasted(&mut prompt, &server, "GET /picked");
     assert_eq!(sent, ["GET /picked"], "{shown}");
 }
+
+// ----- `--1p`: the environment list of 1Password, kept between runs -----
+
+/// An `op` that answers from the files of `dir/op`: `list.json` is the
+/// environment list, and any other reference is read from the file named as
+/// its last segment (`op://v/item/good` is `op/good`). A file that is not
+/// there is a failed read. Every call is a line of `op/log`, and
+/// `FAKE_OP_LIST_SLEEP` is how many seconds a read of the list takes.
+fn fake_op(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let home = dir.join("op");
+    let bin = dir.join("op-bin");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    let script = format!(
+        "#!/bin/sh\n\
+         echo \"$*\" >> '{home}/log'\n\
+         [ \"$1\" = --version ] && {{ echo 2.0.0; exit 0; }}\n\
+         case \"$2\" in\n\
+         *environments.json) [ -n \"$FAKE_OP_LIST_SLEEP\" ] && sleep \"$FAKE_OP_LIST_SLEEP\"; file='{home}/list.json' ;;\n\
+         *) file=\"{home}/${{2##*/}}\" ;;\n\
+         esac\n\
+         [ -f \"$file\" ] || {{ echo \"[ERROR] could not read secret '$2'\" >&2; exit 1; }}\n\
+         cat \"$file\"\n",
+        home = home.display()
+    );
+    std::fs::write(bin.join("op"), script).unwrap();
+    std::fs::set_permissions(bin.join("op"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+fn url_of(server: &RecordingServer) -> String {
+    format!("http://127.0.0.1:{}", server.port)
+}
+
+/// An environment list with the one environment `heads/test`.
+fn op_list(url: &str, key_file: &str) -> String {
+    format!(r#"{{"heads":{{"test":{{"url":"{url}","key":"op://Shared/COS/{key_file}"}}}}}}"#)
+}
+
+/// A directory for a `--1p heads/test` run: the keys `good` (the key `k`)
+/// and `bad` (the key `nokey`, which the server refuses) in 1Password.
+struct OnePassword {
+    dir: tempfile::TempDir,
+}
+
+impl OnePassword {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        fake_op(dir.path());
+        let op = OnePassword { dir };
+        op.has("good", "k\n");
+        op.has("bad", "nokey\n");
+        op
+    }
+
+    fn has(&self, name: &str, text: &str) {
+        std::fs::write(self.dir.path().join("op").join(name), text).unwrap();
+    }
+
+    fn has_not(&self, name: &str) {
+        let _ = std::fs::remove_file(self.dir.path().join("op").join(name));
+    }
+
+    /// The list the last run kept.
+    fn kept_file(&self) -> PathBuf {
+        self.dir.path().join(".cache/api/1p-environments.json")
+    }
+
+    fn keep(&self, list: &str) {
+        std::fs::create_dir_all(self.kept_file().parent().unwrap()).unwrap();
+        std::fs::write(self.kept_file(), list).unwrap();
+    }
+
+    fn kept(&self) -> String {
+        std::fs::read_to_string(self.kept_file()).unwrap_or_default()
+    }
+
+    /// What `op` was asked since the last call, sorted: two reads of one run
+    /// are started together.
+    fn asked(&self) -> Vec<String> {
+        let log = self.dir.path().join("op/log");
+        let mut lines: Vec<String> =
+            std::fs::read_to_string(&log).unwrap_or_default().lines().map(str::to_string).collect();
+        let _ = std::fs::remove_file(log);
+        lines.sort();
+        lines
+    }
+
+    fn cmd(&self) -> std::process::Command {
+        let d = self.dir.path();
+        let mut cmd = api_bare(d);
+        cmd.env("PATH", format!("{}:{}", d.join("op-bin").display(), std::env::var("PATH").unwrap()))
+            .env_remove("FAKE_OP_LIST_SLEEP")
+            .args(["--1p", "heads/test"]);
+        cmd
+    }
+
+    fn run(&self, server: &RecordingServer, args: &[&str]) -> (Ran, Vec<String>) {
+        let mut cmd = self.cmd();
+        cmd.args(args);
+        // The heads are cleared when the next run starts, so they are read here.
+        let ran = ran(server, cmd);
+        (ran, authorizations(server))
+    }
+}
+
+/// The authorization of every request a run sent.
+fn authorizations(server: &RecordingServer) -> Vec<String> {
+    let heads = server.heads();
+    heads.iter().map(|h| h.split("authorization=").nth(1).unwrap().split(';').next().unwrap().to_string()).collect()
+}
+
+const READ_LIST: &str = "read op://Shared/COS environments/environments.json";
+/// The keys `k` and `nokey`, as they are sent.
+const KEY_K: &str = "Basic Oms=";
+const KEY_NOKEY: &str = "Basic Om5va2V5";
+
+/// The first `--1p` run reads the list and then the key, and keeps the list,
+/// for its owner alone. The next run reads the key by the kept list, and the
+/// list beside it.
+#[test]
+fn a_1p_run_keeps_the_environment_list_for_the_next() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = RecordingServer::start();
+    let op = OnePassword::new();
+    let list = op_list(&url_of(&server), "good");
+    op.has("list.json", &list);
+
+    let (first, auth) = op.run(&server, &["GET", "/one"]);
+    assert_eq!((first.sent, first.code, auth), (vec!["GET /one".to_string()], Some(0), vec![KEY_K.to_string()]), "{}", first.stderr);
+    assert_eq!(op.asked(), ["--version", READ_LIST, "read op://Shared/COS/good"]);
+    assert_eq!(op.kept(), list);
+    let mode = std::fs::metadata(op.kept_file()).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+
+    // The list in 1Password has a member more: the run goes by the kept
+    // one, and keeps the new.
+    let newer = list.replacen('{', r#"{"other":{},"#, 1);
+    op.has("list.json", &newer);
+    let (second, auth) = op.run(&server, &["GET", "/two"]);
+    assert_eq!((second.sent, second.code, auth), (vec!["GET /two".to_string()], Some(0), vec![KEY_K.to_string()]), "{}", second.stderr);
+    assert_eq!(op.asked(), ["--version", READ_LIST, "read op://Shared/COS/good"]);
+    assert_eq!(op.kept(), newer);
+    assert!(!second.stderr.contains("warning"), "nothing is said about the list: {}", second.stderr);
+}
+
+/// A kept list that can't be read as one, or has no entry for the selector,
+/// is no kept list: the run reads the list first.
+#[test]
+fn a_kept_1p_list_without_the_environment_is_read_again_first() {
+    let server = RecordingServer::start();
+    let op = OnePassword::new();
+    let list = op_list(&url_of(&server), "good");
+    op.has("list.json", &list);
+    for kept in ["{ not json", r#"{"heads":{"other":{"url":"http://127.0.0.1:1","key":"op://Shared/COS/bad"}}}"#] {
+        op.keep(kept);
+        let (run, auth) = op.run(&server, &["GET", "/one"]);
+        assert_eq!((run.sent, run.code, auth), (vec!["GET /one".to_string()], Some(0), vec![KEY_K.to_string()]), "{kept}: {}", run.stderr);
+        assert_eq!(op.kept(), list, "{kept}");
+        op.asked();
+    }
+    // An environment that is in neither is said to be in none.
+    op.has("list.json", r#"{"heads":{}}"#);
+    op.keep("{}");
+    let (run, _) = op.run(&server, &["GET", "/one"]);
+    assert_eq!((run.sent.len(), run.code), (0, Some(1)));
+    assert!(run.stderr.contains("could not find an environment by 'heads/test'"), "{}", run.stderr);
+}
+
+/// A `401` on a connection read by the kept list: where the newer list
+/// names another key, the request is sent once more with that key, for one
+/// request and in a batch, whose later requests have it too.
+#[test]
+fn a_refused_1p_key_is_read_again_by_the_newer_list() {
+    let server = RecordingServer::start();
+    let op = OnePassword::new();
+    let d = op.dir.path();
+    op.has("list.json", &op_list(&url_of(&server), "good"));
+
+    op.keep(&op_list(&url_of(&server), "bad"));
+    let (one, auth) = op.run(&server, &["GET", "/one"]);
+    assert_eq!((one.sent, one.code), (vec!["GET /one".to_string(), "GET /one".to_string()], Some(0)), "{}", one.stderr);
+    assert_eq!(auth, [KEY_NOKEY, KEY_K]);
+    assert_eq!(op.asked(), ["--version", READ_LIST, "read op://Shared/COS/bad", "read op://Shared/COS/good"]);
+    assert_eq!(one.stderr.matches("401").count(), 0, "only the answer is shown: {}", one.stderr);
+    assert_eq!(op.kept(), op_list(&url_of(&server), "good"));
+
+    op.keep(&op_list(&url_of(&server), "bad"));
+    std::fs::write(d.join("two.api"), "PUT /a {\"n\":1}\nGET /b\n").unwrap();
+    let (batch, auth) = op.run(&server, &["-sfa", "two.api"]);
+    assert_eq!(batch.sent, ["PUT /a {\"n\":1}", "PUT /a {\"n\":1}", "GET /b"], "{}", batch.stderr);
+    assert_eq!((batch.code, auth), (Some(0), vec![KEY_NOKEY.to_string(), KEY_K.to_string(), KEY_K.to_string()]));
+    assert_eq!(batch.stdout.matches("└─HTTP/1.1 200 OK").count(), 2, "{}", batch.stdout);
+}
+
+/// Where the newer list says what the kept one said, a `401` is the answer:
+/// the key was read from 1Password by this run. So is the `401` of a key the
+/// newer list names.
+#[test]
+fn a_refused_1p_key_that_the_newer_list_names_too_is_refused() {
+    let server = RecordingServer::start();
+    let op = OnePassword::new();
+    op.has("list.json", &op_list(&url_of(&server), "bad"));
+    op.keep(&op_list(&url_of(&server), "bad"));
+    let (same, auth) = op.run(&server, &["-f", "GET", "/one"]);
+    assert_eq!((same.sent, same.code, auth), (vec!["GET /one".to_string()], Some(1), vec![KEY_NOKEY.to_string()]), "{}", same.stderr);
+    assert_eq!(op.asked(), ["--version", READ_LIST, "read op://Shared/COS/bad"]);
+
+    // Another reference to a key that is refused as well: sent twice, and
+    // the second answer stands.
+    op.has("worse", "nokey\n");
+    op.has("list.json", &op_list(&url_of(&server), "worse"));
+    let (other, _) = op.run(&server, &["-f", "GET", "/one"]);
+    assert_eq!((other.sent.len(), other.code), (2, Some(1)), "{}", other.stderr);
+}
+
+/// A kept list whose URL nothing answers at: the request goes to the URL
+/// the newer list names.
+#[test]
+fn a_1p_environment_that_moved_is_found_by_the_newer_list() {
+    let server = RecordingServer::start();
+    let op = OnePassword::new();
+    op.has("list.json", &op_list(&url_of(&server), "good"));
+    op.keep(&op_list("http://127.0.0.1:1", "good"));
+    let (run, auth) = op.run(&server, &["PUT", "/found", "{\"a\":1}"]);
+    assert_eq!((run.sent, run.code, auth), (vec!["PUT /found {\"a\":1}".to_string()], Some(0), vec![KEY_K.to_string()]), "{}", run.stderr);
+    assert!(!run.stderr.contains("Is COS running"), "{}", run.stderr);
+
+    // Where the newer list names the same, nothing answering is what is said.
+    op.has("list.json", &op_list("http://127.0.0.1:1", "good"));
+    op.keep(&op_list("http://127.0.0.1:1", "good"));
+    let (gone, _) = op.run(&server, &["GET", "/found"]);
+    assert_eq!((gone.sent.len(), gone.code), (0, Some(1)));
+    assert!(gone.stderr.contains("Is COS running on 127.0.0.1:1?"), "{}", gone.stderr);
+}
+
+/// The `url` lines of a file hold for the URL the newer list names: a
+/// request is not sent on to an environment the file does not allow.
+#[test]
+fn a_url_gate_holds_for_what_the_newer_1p_list_names() {
+    let server = RecordingServer::start();
+    let op = OnePassword::new();
+    let d = op.dir.path();
+    op.has("list.json", &op_list(&url_of(&server), "good"));
+    op.keep(&op_list("http://127.0.0.1:1", "good"));
+    std::fs::write(d.join("gated.api"), "url has 127.0.0.1:1\nPUT /gated {\"a\":1}\n").unwrap();
+    let (run, _) = op.run(&server, &["-sa", "gated.api"]);
+    assert_eq!((run.sent.len(), run.code), (0, Some(1)), "{}", run.stderr);
+    let said = format!(
+        "warning: 1Password now names {} for 'heads/test', which the `url` lines of this run do not allow",
+        url_of(&server)
+    );
+    assert!(run.stderr.contains(&said), "{}", run.stderr);
+
+    // A file that allows both is sent on.
+    op.keep(&op_list("http://127.0.0.1:1", "good"));
+    std::fs::write(d.join("both.api"), format!("url has 127.0.0.1:1\nurl is {}\nPUT /gated {{\"a\":1}}\n", url_of(&server))).unwrap();
+    let (run, _) = op.run(&server, &["-sa", "both.api"]);
+    assert_eq!((run.sent, run.code), (vec!["PUT /gated {\"a\":1}".to_string()], Some(0)), "{}", run.stderr);
+}
+
+/// A kept reference that 1Password no longer has: the key is read by the
+/// newer list, before anything is sent.
+#[test]
+fn a_kept_1p_reference_that_is_gone_is_read_by_the_newer_list() {
+    let server = RecordingServer::start();
+    let op = OnePassword::new();
+    op.has("list.json", &op_list(&url_of(&server), "good"));
+    op.keep(&op_list(&url_of(&server), "gone"));
+    let (run, auth) = op.run(&server, &["GET", "/one"]);
+    assert_eq!((run.sent, run.code, auth), (vec!["GET /one".to_string()], Some(0), vec![KEY_K.to_string()]), "{}", run.stderr);
+
+    // And where the newer list names it too, that is the error, as before.
+    op.has("list.json", &op_list(&url_of(&server), "gone"));
+    op.keep(&op_list(&url_of(&server), "gone"));
+    let (run, _) = op.run(&server, &["GET", "/one"]);
+    assert_eq!((run.sent.len(), run.code), (0, Some(1)));
+    assert!(run.stderr.contains("could not read API key for 'heads/test' from 1Password."), "{}", run.stderr);
+}
+
+/// A list that can't be read beside the key stops nothing and leaves the
+/// kept list as it is. It is said only where it was needed: on a `401`.
+#[test]
+fn a_1p_list_that_cant_be_read_again_is_said_on_a_401_only() {
+    let server = RecordingServer::start();
+    let op = OnePassword::new();
+    op.has_not("list.json");
+    let kept = op_list(&url_of(&server), "good");
+    op.keep(&kept);
+    let (run, _) = op.run(&server, &["GET", "/one"]);
+    assert_eq!((run.sent, run.code), (vec!["GET /one".to_string()], Some(0)));
+    assert!(!run.stderr.contains("warning"), "{}", run.stderr);
+    assert_eq!(op.kept(), kept);
+
+    let kept = op_list(&url_of(&server), "bad");
+    op.keep(&kept);
+    let (run, _) = op.run(&server, &["-f", "GET", "/one"]);
+    assert_eq!((run.sent.len(), run.code), (1, Some(1)));
+    assert!(
+        run.stderr.contains("warning: the environment list could not be read from 1Password again: could not read from 1Password.\n[ERROR] could not read secret"),
+        "{}",
+        run.stderr
+    );
+    assert_eq!(op.kept(), kept);
+}
+
+/// A run that is done waits a moment for its read of the list, so that a
+/// short run keeps it too, and no longer than that.
+#[test]
+fn a_1p_run_waits_a_moment_for_the_list_and_no_longer() {
+    let server = RecordingServer::start();
+    let op = OnePassword::new();
+    let kept = op_list(&url_of(&server), "good");
+    let newer = kept.replacen('{', r#"{"other":{},"#, 1);
+    op.has("list.json", &newer);
+
+    op.keep(&kept);
+    let mut cmd = op.cmd();
+    cmd.env("FAKE_OP_LIST_SLEEP", "1").args(["GET", "/one"]);
+    let run = ran(&server, cmd);
+    assert_eq!((run.sent.len(), run.code), (1, Some(0)), "{}", run.stderr);
+    assert_eq!(op.kept(), newer, "a list that came within the moment is kept");
+
+    op.keep(&kept);
+    let mut cmd = op.cmd();
+    cmd.env("FAKE_OP_LIST_SLEEP", "20").args(["GET", "/one"]);
+    let started = Instant::now();
+    let run = ran(&server, cmd);
+    assert_eq!((run.sent.len(), run.code), (1, Some(0)), "{}", run.stderr);
+    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    assert_eq!(op.kept(), kept);
+}
+
+/// At the prompt a session starts on what the newer list names, where the
+/// kept list's key is refused.
+#[test]
+fn the_prompt_starts_on_what_the_newer_1p_list_names() {
+    let server = RecordingServer::start();
+    let op = OnePassword::new();
+    op.has("list.json", &op_list(&url_of(&server), "good"));
+    op.keep(&op_list(&url_of(&server), "bad"));
+    let mut prompt = pty::Prompt::open(op.cmd());
+    prompt.wait_ready(Duration::from_secs(10));
+    let (sent, shown) = run_pasted(&mut prompt, &server, "GET /typed");
+    assert_eq!(sent, ["GET /typed"], "{shown}");
+    assert!(shown.contains("200 OK"), "{shown}");
+}
