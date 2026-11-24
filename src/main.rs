@@ -285,7 +285,6 @@ fn exit_process(code: i32) -> ! {
     // has failed is not tried again (and does not lead back here).
     let _ = Out.flush();
     release_clipboard();
-    op_finish_list_read();
     std::process::exit(code)
 }
 
@@ -4941,7 +4940,6 @@ impl Drop for ClipboardGuard {
 fn main() {
     install_panic_hook();
     let _clipboard = ClipboardGuard;
-    let _op_list = OpListGuard;
     let args = match Args::try_parse() {
         Ok(args) => args,
         Err(e) => {
@@ -5879,15 +5877,17 @@ const OP_TIMEOUT_SECS: u64 = 30;
 /// their own threads so a child writing more than the pipe buffer can't deadlock
 /// against our wait. Returns `Ok(None)` when the deadline passed.
 fn output_with_timeout(cmd: &mut Command, timeout: Duration) -> io::Result<Option<std::process::Output>> {
-    output_unless_called_off(cmd, timeout, &AtomicBool::new(false))
+    output_with_timeout_into(cmd, timeout, None)
 }
 
-/// `output_with_timeout`, for a command that may no longer be wanted before
-/// it has ended: it is killed when `called_off` is set, as at its deadline.
-fn output_unless_called_off(
+/// `output_with_timeout`, with what the command writes to stdout written to
+/// `into` where one is given: the `stdout` of the result is then empty. A
+/// command that outlives this process can go on writing to a file, where a
+/// pipe would have ended under it.
+fn output_with_timeout_into(
     cmd: &mut Command,
     timeout: Duration,
-    called_off: &AtomicBool,
+    into: Option<fs::File>,
 ) -> io::Result<Option<std::process::Output>> {
     use std::process::Stdio;
 
@@ -5908,7 +5908,11 @@ fn output_unless_called_off(
         read
     }
 
-    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    match into {
+        Some(file) => cmd.stdout(file),
+        None => cmd.stdout(Stdio::piped()),
+    };
+    let mut child = cmd.stderr(Stdio::piped()).spawn()?;
     let (ended, pipes_ended) = std::sync::mpsc::channel();
     let stdout_read = drain(child.stdout.take(), ended.clone());
     let stderr_read = drain(child.stderr.take(), ended);
@@ -5933,7 +5937,7 @@ fn output_unless_called_off(
                 return Ok(Some(std::process::Output { status, stdout: taken(&stdout_read), stderr: taken(&stderr_read) }));
             }
             None => {
-                if Instant::now() >= deadline || called_off.load(Ordering::Relaxed) {
+                if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
                     return Ok(None);
@@ -5946,10 +5950,10 @@ fn output_unless_called_off(
 
 /// Run an `op` command, mapping both failure modes to a message the user can act
 /// on. `context` names what was being read, e.g. "the environment list".
-fn op_read(args: &[&str], context: &str, called_off: &AtomicBool) -> Result<std::process::Output, String> {
+fn op_read(args: &[&str], context: &str, into: Option<fs::File>) -> Result<std::process::Output, String> {
     let mut cmd = Command::new("op");
     cmd.args(args);
-    match output_unless_called_off(&mut cmd, Duration::from_secs(OP_TIMEOUT_SECS), called_off) {
+    match output_with_timeout_into(&mut cmd, Duration::from_secs(OP_TIMEOUT_SECS), into) {
         Ok(Some(output)) => Ok(output),
         Ok(None) => Err(format!(
             "1Password did not respond within {}s while reading {}.\n\
@@ -5987,11 +5991,6 @@ fn command_exists(program: &str) -> bool {
 /// Where 1Password keeps the list of environments.
 const OP_LIST_REF: &str = "op://Shared/COS environments/environments.json";
 
-/// How long a run that is done waits for its read of the environment list,
-/// so that the next run has it. Both reads of a run start together, so the
-/// list is as a rule there when the key's request has been answered.
-const OP_LIST_PATIENCE: Duration = Duration::from_secs(2);
-
 /// The environment list as a run last read it from 1Password, kept so that
 /// the next run reads the key without reading the list first. It holds base
 /// URLs and `op://` references and no key.
@@ -6019,8 +6018,8 @@ fn write_private_file(path: &std::path::Path, contents: &[u8]) -> io::Result<()>
 }
 
 /// Read the environment list from 1Password, and keep it for the next run.
-fn op_read_list(called_off: &AtomicBool) -> Result<Value, String> {
-    let output = op_read(&["read", OP_LIST_REF], "the environment list", called_off)?;
+fn op_read_list() -> Result<Value, String> {
+    let output = op_read(&["read", OP_LIST_REF], "the environment list", None)?;
     if !output.status.success() {
         return Err(format!("could not read from 1Password.{}", op_stderr_detail(&output)));
     }
@@ -6033,16 +6032,105 @@ fn op_read_list(called_off: &AtomicBool) -> Result<Value, String> {
     Ok(list)
 }
 
+/// What the names of the files start with that a list is read into behind a
+/// run: `1p-environments.next-<pid>.json`, beside the kept list.
+const OP_NEXT_LIST: &str = "1p-environments.next-";
+
+/// How old a file of a list that is not whole is before it is taken for
+/// one that nothing writes to any more.
+const OP_NEXT_LIST_LIFE: Duration = Duration::from_secs(120);
+
+/// Read the environment list behind a run that has its key, for the next
+/// run. `op` writes it to a file of its own beside the kept list, and not to
+/// a pipe: a run that ends first does not wait for it, and `op` reads on to
+/// its end. The list is put in the place of the kept one here when this run
+/// is still there, and by the next run when it is not (`op_take_left_lists`).
+fn op_read_list_behind() -> Result<Value, String> {
+    let (kept, next) = op_list_cache_file()
+        .map(|kept| {
+            let next = kept.with_file_name(format!("{}{}.json", OP_NEXT_LIST, std::process::id()));
+            (kept, next)
+        })
+        .ok_or_else(|| "no home directory to keep the environment list in".to_string())?;
+    if let Some(dir) = next.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let _ = fs::remove_file(&next);
+    let into = create_private(&next).map_err(|e| format!("could not write {}: {}", next.display(), e))?;
+    let read = op_read(&["read", OP_LIST_REF], "the environment list", Some(into)).and_then(|output| {
+        if !output.status.success() {
+            return Err(format!("could not read from 1Password.{}", op_stderr_detail(&output)));
+        }
+        let bytes = fs::read(&next).map_err(|e| format!("could not read {}: {}", next.display(), e))?;
+        serde_json::from_slice::<Value>(&bytes).map_err(|e| format!("could not parse environments.json: {}", e))
+    });
+    match &read {
+        Ok(_) => {
+            let _ = fs::rename(&next, &kept);
+        }
+        Err(_) => {
+            let _ = fs::remove_file(&next);
+        }
+    }
+    read
+}
+
+/// Put the list that a run before this one left behind in the place of the
+/// kept one: the newest that is whole, where it is newer than the kept
+/// list. A file that is no list yet is left to the `op` that may still write
+/// to it, for two minutes.
+fn op_take_left_lists() {
+    let Some(kept) = op_list_cache_file() else { return };
+    let Some(entries) = kept.parent().and_then(|dir| fs::read_dir(dir).ok()) else { return };
+    let modified = |path: &std::path::Path| fs::metadata(path).and_then(|m| m.modified()).ok();
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !entry.file_name().to_string_lossy().starts_with(OP_NEXT_LIST) {
+            continue;
+        }
+        let Some(written) = modified(&path) else { continue };
+        let whole = fs::read(&path).ok().is_some_and(|bytes| serde_json::from_slice::<Value>(&bytes).is_ok_and(|list| list.is_object()));
+        if !whole {
+            if written.elapsed().is_ok_and(|age| age > OP_NEXT_LIST_LIFE) {
+                let _ = fs::remove_file(&path);
+            }
+            continue;
+        }
+        match &newest {
+            Some((at, _)) if *at >= written => {
+                let _ = fs::remove_file(&path);
+            }
+            _ => {
+                if let Some((_, older)) = newest.replace((written, path)) {
+                    let _ = fs::remove_file(older);
+                }
+            }
+        }
+    }
+    if let Some((written, path)) = newest {
+        if modified(&kept).is_some_and(|at| at > written) || fs::rename(&path, &kept).is_err() {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+/// Why a key could not be read, and whether the reference it was read by
+/// may be what is wrong: not when `op` gave no answer or was not let in,
+/// where a second read would only ask to be let in a second time.
+struct KeyReadFailure {
+    message: String,
+    reference_in_doubt: bool,
+}
+
 /// Read the API key of `selector` from the reference its entry names.
-fn op_read_key(key_ref: &str, selector: &str) -> Result<String, String> {
-    let key_output = op_read(&["read", key_ref], "the API key", &AtomicBool::new(false))?;
+fn op_read_key(key_ref: &str, selector: &str) -> Result<String, KeyReadFailure> {
+    let failed = |message: String, reference_in_doubt: bool| KeyReadFailure { message, reference_in_doubt };
+    let key_output = op_read(&["read", key_ref], "the API key", None).map_err(|e| failed(e, false))?;
 
     if !key_output.status.success() {
-        let stderr_msg = String::from_utf8_lossy(&key_output.stderr).trim().to_string();
-        let hint = if stderr_msg.to_lowercase().contains("access")
-            || stderr_msg.to_lowercase().contains("permission")
-            || stderr_msg.to_lowercase().contains("not found")
-        {
+        let stderr_msg = String::from_utf8_lossy(&key_output.stderr).trim().to_lowercase();
+        let hint = if stderr_msg.contains("access") || stderr_msg.contains("permission") || stderr_msg.contains("not found") {
             format!(
                 "no access to the API key for '{}' in 1Password.\n\
                  Ask the environment owner to grant you access.",
@@ -6055,12 +6143,12 @@ fn op_read_key(key_ref: &str, selector: &str) -> Result<String, String> {
                 op_stderr_detail(&key_output)
             )
         };
-        return Err(hint);
+        return Err(failed(hint, !stderr_msg.contains("authoriz")));
     }
 
     let api_key = String::from_utf8_lossy(&key_output.stdout).trim().to_string();
     if api_key.is_empty() {
-        return Err(format!("1Password returned an empty key for '{}'.", selector));
+        return Err(failed(format!("1Password returned an empty key for '{}'.", selector), true));
     }
     Ok(api_key)
 }
@@ -6076,7 +6164,6 @@ struct OpListRead {
     key: String,
     /// The list as 1Password has it now, once it is read.
     read: Arc<(std::sync::Mutex<Option<Result<Value, String>>>, std::sync::Condvar)>,
-    called_off: Arc<AtomicBool>,
 }
 
 impl OpListRead {
@@ -6097,13 +6184,15 @@ fn op_list_read() -> std::sync::MutexGuard<'static, Option<OpListRead>> {
     READ.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Start reading the environment list on a thread of its own.
-fn op_start_list_read(selector: &str, url: &str, key_ref: &str) {
+/// Start reading the environment list on a thread of its own, for a run
+/// that has read `key` by the kept list's entry. Not before the key is
+/// there: in a terminal that 1Password has not let in yet, each `op` that
+/// is started asks to be, and two at once ask twice.
+fn op_start_list_read(selector: &str, url: &str, key_ref: &str, key: &str) {
     let read = Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new()));
-    let called_off = Arc::new(AtomicBool::new(false));
-    let (thread_read, thread_called_off) = (Arc::clone(&read), Arc::clone(&called_off));
+    let thread_read = Arc::clone(&read);
     thread::spawn(move || {
-        let list = op_read_list(&thread_called_off);
+        let list = op_read_list_behind();
         let (slot, ended) = &*thread_read;
         *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(list);
         ended.notify_all();
@@ -6112,9 +6201,8 @@ fn op_start_list_read(selector: &str, url: &str, key_ref: &str) {
         selector: selector.to_string(),
         url: url.to_string(),
         key_ref: key_ref.to_string(),
-        key: String::new(),
+        key: key.to_string(),
         read,
-        called_off,
     });
 }
 
@@ -6156,66 +6244,46 @@ fn op_newer_connection(base_uri: &str, api_key: &str) -> Option<Result<(String, 
         }
         slot.take()?
     };
-    op_newer_entry(&reading)
-}
-
-fn op_newer_entry(reading: &OpListRead) -> Option<Result<(String, String), String>> {
     // The read has a deadline of its own, so this ends.
-    let list = match reading.waited_for(Duration::from_secs(OP_TIMEOUT_SECS + 5)) {
-        Some(Ok(list)) => list,
-        Some(Err(e)) => {
+    let list = match reading.waited_for(Duration::from_secs(OP_TIMEOUT_SECS + 5))? {
+        Ok(list) => list,
+        Err(e) => {
             return Some(Err(format!("the environment list could not be read from 1Password again: {}", e)));
         }
-        None => return None,
     };
-    let (url, key_ref) = match op_environment(&list, &reading.selector) {
+    op_newer_entry(&list, &reading.selector, &reading.url, &reading.key_ref)
+}
+
+/// The connection `list` names for `selector`, where its entry is not the
+/// `url` and `key_ref` of the kept list.
+fn op_newer_entry(list: &Value, selector: &str, url: &str, key_ref: &str) -> Option<Result<(String, String), String>> {
+    let (newer_url, newer_ref) = match op_environment(list, selector) {
         Ok(entry) => entry,
         Err(e) => return Some(Err(e)),
     };
-    if url == reading.url && key_ref == reading.key_ref {
+    if newer_url == url && newer_ref == key_ref {
         return None;
     }
-    if url != reading.url {
-        let refusal = gates_in_force().iter().find_map(|gate| evaluate_url_gate(gate, &url).err());
+    if newer_url != url {
+        let refusal = gates_in_force().iter().find_map(|gate| evaluate_url_gate(gate, &newer_url).err());
         if refusal.is_some() {
             return Some(Err(format!(
                 "1Password now names {} for '{}', which the `url` lines of this run do not allow",
-                url, reading.selector
+                newer_url, selector
             )));
         }
     }
-    Some(op_read_key(&key_ref, &reading.selector).map(|key| (url, key)))
-}
-
-/// Let a run that is ending have its read of the environment list, for the
-/// next run: waited for a moment, and called off when it takes longer.
-fn op_finish_list_read() {
-    let Some(reading) = op_list_read().take() else {
-        return;
-    };
-    if reading.waited_for(OP_LIST_PATIENCE).is_none() {
-        reading.called_off.store(true, Ordering::Relaxed);
-        reading.waited_for(Duration::from_millis(500));
-    }
-}
-
-/// Ends the read of the environment list when `main` returns, as
-/// `exit_process` does when the process ends there.
-struct OpListGuard;
-
-impl Drop for OpListGuard {
-    fn drop(&mut self) {
-        op_finish_list_read();
-    }
+    Some(op_read_key(&newer_ref, selector).map(|key| (newer_url, key)).map_err(|e| e.message))
 }
 
 /// The base URL and the API key of the environment `selector` names in
 /// 1Password.
 ///
 /// The key is read by the entry of the list the last run kept, where it has
-/// one for the selector, and the list is read again beside it: one wait for
-/// `op` in the place of two. What that newer list says is asked only when
-/// the connection is refused or does not answer (`op_newer_connection`).
+/// one for the selector, and the list is read again behind it, when the key
+/// is there: one wait for `op` in the place of two. What that newer list
+/// says is asked only when the connection is refused or does not answer
+/// (`op_newer_connection`).
 fn get_1password_credentials(selector: &str) -> Result<(String, String), String> {
     // Check that the `op` command is there by running it: that it can't be
     // started is the answer, on every platform (there is no `which` to ask
@@ -6232,30 +6300,31 @@ fn get_1password_credentials(selector: &str) -> Result<(String, String), String>
         ));
     }
 
+    op_take_left_lists();
     let kept = op_list_cache_file()
         .and_then(|file| fs::read(file).ok())
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
         .and_then(|list| op_environment(&list, selector).ok());
     if let Some((url, key_ref)) = kept {
-        op_start_list_read(selector, &url, &key_ref);
         return match op_read_key(&key_ref, selector) {
             Ok(key) => {
-                if let Some(reading) = op_list_read().as_mut() {
-                    reading.key = key.clone();
-                }
+                op_start_list_read(selector, &url, &key_ref, &key);
                 Ok((url, key))
             }
-            // The reference may be what is out of date: the newer list says.
-            Err(e) => match op_list_read().take().and_then(|reading| op_newer_entry(&reading)) {
-                Some(Ok(connection)) => Ok(connection),
-                _ => Err(e),
-            },
+            // The reference may be what is out of date: the list says.
+            Err(failure) if failure.reference_in_doubt => {
+                match op_read_list().ok().and_then(|list| op_newer_entry(&list, selector, &url, &key_ref)) {
+                    Some(Ok(connection)) => Ok(connection),
+                    _ => Err(failure.message),
+                }
+            }
+            Err(failure) => Err(failure.message),
         };
     }
 
-    let list = op_read_list(&AtomicBool::new(false))?;
+    let list = op_read_list()?;
     let (url, key_ref) = op_environment(&list, selector)?;
-    Ok((url, op_read_key(&key_ref, selector)?))
+    Ok((url, op_read_key(&key_ref, selector).map_err(|e| e.message)?))
 }
 
 /// The environment `selector` (`<organization>/<environment>`) names in the

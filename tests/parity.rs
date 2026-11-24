@@ -13064,8 +13064,9 @@ fn a_connection_that_cannot_be_used_still_opens_the_prompt_at_a_terminal() {
 /// An `op` that answers from the files of `dir/op`: `list.json` is the
 /// environment list, and any other reference is read from the file named as
 /// its last segment (`op://v/item/good` is `op/good`). A file that is not
-/// there is a failed read. Every call is a line of `op/log`, and
-/// `FAKE_OP_LIST_SLEEP` is how many seconds a read of the list takes.
+/// there is a failed read. Every call is a line of `op/log`, its start and
+/// its end are lines of `op/order`, and `FAKE_OP_LIST_SLEEP` is how many
+/// seconds a read of the list takes.
 fn fake_op(dir: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let home = dir.join("op");
@@ -13076,6 +13077,8 @@ fn fake_op(dir: &Path) -> PathBuf {
         "#!/bin/sh\n\
          echo \"$*\" >> '{home}/log'\n\
          [ \"$1\" = --version ] && {{ echo 2.0.0; exit 0; }}\n\
+         echo \"start ${{2##*/}}\" >> '{home}/order'\n\
+         trap 'echo \"end ${{2##*/}}\" >> \"{home}/order\"' EXIT\n\
          case \"$2\" in\n\
          *environments.json) [ -n \"$FAKE_OP_LIST_SLEEP\" ] && sleep \"$FAKE_OP_LIST_SLEEP\"; file='{home}/list.json' ;;\n\
          *) file=\"{home}/${{2##*/}}\" ;;\n\
@@ -13136,15 +13139,67 @@ impl OnePassword {
         std::fs::read_to_string(self.kept_file()).unwrap_or_default()
     }
 
-    /// What `op` was asked since the last call, sorted: two reads of one run
-    /// are started together.
+    /// What `op` was asked since the last call, sorted. The list is read
+    /// behind a run, which does not wait for it: so this waits until
+    /// nothing more is asked.
     fn asked(&self) -> Vec<String> {
-        let log = self.dir.path().join("op/log");
-        let mut lines: Vec<String> =
-            std::fs::read_to_string(&log).unwrap_or_default().lines().map(str::to_string).collect();
-        let _ = std::fs::remove_file(log);
+        let mut lines = self.lines_of("log");
         lines.sort();
         lines
+    }
+
+    /// The starts and the ends of the reads since the last call, in order.
+    fn order(&self) -> Vec<String> {
+        self.lines_of("order")
+    }
+
+    fn lines_of(&self, name: &str) -> Vec<String> {
+        let log = self.dir.path().join("op").join(name);
+        let read = || std::fs::read_to_string(&log).unwrap_or_default();
+        let (mut text, mut since) = (read(), Instant::now());
+        while since.elapsed() < Duration::from_millis(300) {
+            std::thread::sleep(Duration::from_millis(25));
+            let now = read();
+            if now != text {
+                (text, since) = (now, Instant::now());
+            }
+        }
+        let _ = std::fs::remove_file(log);
+        text.lines().map(str::to_string).collect()
+    }
+
+    /// The lists that reads behind runs left for the next run to keep.
+    fn left(&self) -> Vec<String> {
+        let dir = self.kept_file().parent().unwrap().to_path_buf();
+        let mut left: Vec<String> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("1p-environments.next-"))
+            .map(|e| std::fs::read_to_string(e.path()).unwrap_or_default())
+            .collect();
+        left.sort();
+        left
+    }
+
+    /// What is left that holds something.
+    fn whole_left(&self) -> Vec<String> {
+        self.left().into_iter().filter(|l| !l.is_empty()).collect()
+    }
+
+    /// Whether the next run goes by `list`: it is the kept one, or the one
+    /// a read behind the last run left. Waited for, since that read is not.
+    fn next_run_has(&self, list: &str) -> bool {
+        let started = Instant::now();
+        loop {
+            let left = self.left();
+            let whole: Vec<&String> = left.iter().filter(|l| !l.is_empty()).collect();
+            let has = if whole.is_empty() { self.kept() == list } else { whole.iter().all(|l| *l == list) };
+            if has || started.elapsed() > Duration::from_secs(5) {
+                return has;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 
     fn cmd(&self) -> std::process::Command {
@@ -13178,7 +13233,8 @@ const KEY_NOKEY: &str = "Basic Om5va2V5";
 
 /// The first `--1p` run reads the list and then the key, and keeps the list,
 /// for its owner alone. The next run reads the key by the kept list, and the
-/// list beside it.
+/// list behind it, when the key is there: two reads at once ask twice to be
+/// let in, in a terminal 1Password has not let in yet.
 #[test]
 fn a_1p_run_keeps_the_environment_list_for_the_next() {
     use std::os::unix::fs::PermissionsExt;
@@ -13190,7 +13246,7 @@ fn a_1p_run_keeps_the_environment_list_for_the_next() {
     let (first, auth) = op.run(&server, &["GET", "/one"]);
     assert_eq!((first.sent, first.code, auth), (vec!["GET /one".to_string()], Some(0), vec![KEY_K.to_string()]), "{}", first.stderr);
     assert_eq!(op.asked(), ["--version", READ_LIST, "read op://Shared/COS/good"]);
-    assert_eq!(op.kept(), list);
+    assert!(op.next_run_has(&list), "{:?} {:?}", op.kept(), op.left());
     let mode = std::fs::metadata(op.kept_file()).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
 
@@ -13198,11 +13254,15 @@ fn a_1p_run_keeps_the_environment_list_for_the_next() {
     // one, and keeps the new.
     let newer = list.replacen('{', r#"{"other":{},"#, 1);
     op.has("list.json", &newer);
+    op.order();
     let (second, auth) = op.run(&server, &["GET", "/two"]);
     assert_eq!((second.sent, second.code, auth), (vec!["GET /two".to_string()], Some(0), vec![KEY_K.to_string()]), "{}", second.stderr);
     assert_eq!(op.asked(), ["--version", READ_LIST, "read op://Shared/COS/good"]);
-    assert_eq!(op.kept(), newer);
+    assert!(op.next_run_has(&newer), "{:?} {:?}", op.kept(), op.left());
     assert!(!second.stderr.contains("warning"), "nothing is said about the list: {}", second.stderr);
+    assert_eq!(op.order(), ["start good", "end good", "start environments.json", "end environments.json"]);
+    let mode = std::fs::metadata(op.kept_file()).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "the list that was read behind the run is its owner's alone too");
 }
 
 /// A kept list that can't be read as one, or has no entry for the selector,
@@ -13217,7 +13277,7 @@ fn a_kept_1p_list_without_the_environment_is_read_again_first() {
         op.keep(kept);
         let (run, auth) = op.run(&server, &["GET", "/one"]);
         assert_eq!((run.sent, run.code, auth), (vec!["GET /one".to_string()], Some(0), vec![KEY_K.to_string()]), "{kept}: {}", run.stderr);
-        assert_eq!(op.kept(), list, "{kept}");
+        assert!(op.next_run_has(&list), "{:?} {:?}", op.kept(), op.left());
         op.asked();
     }
     // An environment that is in neither is said to be in none.
@@ -13244,7 +13304,7 @@ fn a_refused_1p_key_is_read_again_by_the_newer_list() {
     assert_eq!(auth, [KEY_NOKEY, KEY_K]);
     assert_eq!(op.asked(), ["--version", READ_LIST, "read op://Shared/COS/bad", "read op://Shared/COS/good"]);
     assert_eq!(one.stderr.matches("401").count(), 0, "only the answer is shown: {}", one.stderr);
-    assert_eq!(op.kept(), op_list(&url_of(&server), "good"));
+    assert!(op.next_run_has(&op_list(&url_of(&server), "good")), "{:?} {:?}", op.kept(), op.left());
 
     op.keep(&op_list(&url_of(&server), "bad"));
     std::fs::write(d.join("two.api"), "PUT /a {\"n\":1}\nGET /b\n").unwrap();
@@ -13351,7 +13411,7 @@ fn a_1p_list_that_cant_be_read_again_is_said_on_a_401_only() {
     let (run, _) = op.run(&server, &["GET", "/one"]);
     assert_eq!((run.sent, run.code), (vec!["GET /one".to_string()], Some(0)));
     assert!(!run.stderr.contains("warning"), "{}", run.stderr);
-    assert_eq!(op.kept(), kept);
+    assert!(op.next_run_has(&kept), "{:?} {:?}", op.kept(), op.left());
 
     let kept = op_list(&url_of(&server), "bad");
     op.keep(&kept);
@@ -13362,34 +13422,81 @@ fn a_1p_list_that_cant_be_read_again_is_said_on_a_401_only() {
         "{}",
         run.stderr
     );
-    assert_eq!(op.kept(), kept);
+    assert!(op.next_run_has(&kept), "{:?} {:?}", op.kept(), op.left());
 }
 
-/// A run that is done waits a moment for its read of the list, so that a
-/// short run keeps it too, and no longer than that.
+/// A run that is done does not wait for its read of the list. `op` reads on
+/// behind it, into a file of its own, and the next run keeps that list.
 #[test]
-fn a_1p_run_waits_a_moment_for_the_list_and_no_longer() {
+fn a_1p_run_does_not_wait_for_the_list_and_the_next_run_keeps_it() {
     let server = RecordingServer::start();
     let op = OnePassword::new();
-    let kept = op_list(&url_of(&server), "good");
-    let newer = kept.replacen('{', r#"{"other":{},"#, 1);
-    op.has("list.json", &newer);
-
+    let kept = op_list(&url_of(&server), "bad");
+    let newer = op_list(&url_of(&server), "good");
+    op.has("list.json", &kept);
     op.keep(&kept);
-    let mut cmd = op.cmd();
-    cmd.env("FAKE_OP_LIST_SLEEP", "1").args(["GET", "/one"]);
-    let run = ran(&server, cmd);
-    assert_eq!((run.sent.len(), run.code), (1, Some(0)), "{}", run.stderr);
-    assert_eq!(op.kept(), newer, "a list that came within the moment is kept");
+    op.has("bad", "k\n");
 
-    op.keep(&kept);
+    // The list changes in 1Password while the read of it is on its way.
     let mut cmd = op.cmd();
-    cmd.env("FAKE_OP_LIST_SLEEP", "20").args(["GET", "/one"]);
+    cmd.env("FAKE_OP_LIST_SLEEP", "3").args(["GET", "/one"]);
     let started = Instant::now();
     let run = ran(&server, cmd);
     assert_eq!((run.sent.len(), run.code), (1, Some(0)), "{}", run.stderr);
-    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    assert!(started.elapsed() < Duration::from_millis(2500), "{:?}", started.elapsed());
+    assert_eq!((op.kept(), op.left()), (kept.clone(), vec![String::new()]), "the list is still being read");
+    op.has("list.json", &newer);
+    op.has("bad", "nokey\n");
+    let whole = Instant::now();
+    while op.left() != [newer.clone()] && whole.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(op.left(), [newer.clone()]);
+    op.asked();
+
+    // The next run goes by it: the key `good`, at once. Its own read of
+    // the list fails, so what is kept after it is what the run before left.
+    op.has_not("list.json");
+    let (next, auth) = op.run(&server, &["GET", "/two"]);
+    assert_eq!((next.sent, next.code, auth), (vec!["GET /two".to_string()], Some(0), vec![KEY_K.to_string()]), "{}", next.stderr);
+    assert_eq!(op.asked(), ["--version", READ_LIST, "read op://Shared/COS/good"]);
+    // (That failed read ended behind the run, which leaves its empty file
+    // to a later run to remove.)
+    assert_eq!((op.kept(), op.whole_left()), (newer, vec![]));
+}
+
+/// A file that is no list yet is one `op` may still write to: it is not
+/// kept and not removed. One that is older than the kept list is removed.
+#[test]
+fn a_1p_list_that_is_not_whole_is_not_kept() {
+    let server = RecordingServer::start();
+    let op = OnePassword::new();
+    let kept = op_list(&url_of(&server), "good");
+    op.has_not("list.json");
+    let cache = op.kept_file().parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(cache.join("1p-environments.next-1.json"), r#"{"heads":{"test":{"url":"http://127.0.0.1:1","#).unwrap();
+    std::fs::write(cache.join("1p-environments.next-2.json"), op_list("http://127.0.0.1:1", "bad")).unwrap();
+    std::thread::sleep(Duration::from_millis(1100));
+    op.keep(&kept);
+    let (run, auth) = op.run(&server, &["GET", "/one"]);
+    assert_eq!((run.sent, run.code, auth), (vec!["GET /one".to_string()], Some(0), vec![KEY_K.to_string()]), "{}", run.stderr);
+    op.asked();
     assert_eq!(op.kept(), kept);
+    assert_eq!(op.whole_left(), [r#"{"heads":{"test":{"url":"http://127.0.0.1:1","#]);
+}
+
+/// A key that could not be read because `op` was not let in is not read
+/// again by the list: that would ask to be let in a second time.
+#[test]
+fn a_1p_key_that_was_not_authorized_is_not_asked_for_twice() {
+    let server = RecordingServer::start();
+    let op = OnePassword::new();
+    op.has("list.json", &op_list(&url_of(&server), "good"));
+    op.keep(&op_list(&url_of(&server), "authorization-dismissed"));
+    let (run, _) = op.run(&server, &["GET", "/one"]);
+    assert_eq!((run.sent.len(), run.code), (0, Some(1)), "{}", run.stderr);
+    assert_eq!(op.asked(), ["--version", "read op://Shared/COS/authorization-dismissed"]);
 }
 
 /// At the prompt a session starts on what the newer list names, where the
