@@ -69,7 +69,7 @@ dependencies = [
 
 [[package]]
 name = "api-rust"
-version = "3.4.3"
+version = "3.4.4"
 dependencies = [
  "arboard",
  "assert_cmd",
