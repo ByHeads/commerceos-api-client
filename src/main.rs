@@ -2129,13 +2129,14 @@ fn find_body_start(input: &str) -> Option<usize> {
     }
 }
 
-/// Apply JSON syntax highlighting to a string. Returns ANSI-colored version.
-/// If `cursor_char_pos` is Some, returns (before_cursor, char_at_cursor, after_cursor) split
-/// in the highlighted output, preserving correct highlighting state across the split.
-fn highlight_json_split(s: &str, cursor_char_pos: Option<usize>) -> (String, Option<char>, String) {
-    let full = highlight_json_typing(s, cursor_char_pos.map(|pos| char_to_byte_idx(s, pos)));
+/// Split a coloured text around the character the cursor is on, counted in
+/// the characters that are seen: what stands before it, the character, and
+/// what stands after it with the colour the cursor is in taken up again.
+/// The last is that colour alone, for a cursor cell that is drawn in it.
+/// With no cursor, or one behind the text, all of it is before.
+fn split_highlighted(full: String, cursor_char_pos: Option<usize>) -> (String, Option<char>, String, String) {
     match cursor_char_pos {
-        None => (full, None, String::new()),
+        None => (full, None, String::new(), String::new()),
         Some(pos) => {
             // Walk the highlighted string, counting only non-ANSI characters,
             // tracking the active ANSI color so we can restore it after the cursor
@@ -2183,10 +2184,10 @@ fn highlight_json_split(s: &str, cursor_char_pos: Option<usize>) -> (String, Opt
                     } else {
                         full[ce..].to_string()
                     };
-                    (before, Some(cursor_ch), after)
+                    (before, Some(cursor_ch), after, color_at_split)
                 }
                 _ => {
-                    (full, None, String::new())
+                    (full, None, String::new(), String::new())
                 }
             }
         }
@@ -2495,17 +2496,44 @@ fn first_bracket(text: &str) -> Option<usize> {
     None
 }
 
-/// Colour the JSON in `s`. Only what stands inside brackets is coloured: a
-/// URI, an outfile or the `&&` of a chain around a body is left as it is.
-/// What is no JSON where it stands is drawn as wrong.
-fn highlight_json(s: &str) -> String {
-    highlight_json_typing(s, None)
+/// Where the body of a line starts that has one in brackets, in bytes of
+/// `segment`: one line of the input, or one request of a chain on it. A
+/// request has it behind its URI, an `assert` and a `sleep while` behind
+/// the URI of theirs, a `set` and an `import` line as their object, and a
+/// line that starts with `{` is one (a describe block). Nothing else is a
+/// body, whatever brackets it holds: a URI, an `@file`, an outfile.
+fn line_body_start(segment: &str) -> Option<usize> {
+    let lead = segment.len() - segment.trim_start().len();
+    let text = &segment[lead..];
+    if text.starts_with('{') {
+        return Some(lead);
+    }
+    let offset = |word: &str| word.as_ptr() as usize - segment.as_ptr() as usize;
+    let object = |word: &str| word.starts_with('{').then(|| offset(word));
+    let mut words = text.split_whitespace();
+    let first = words.next()?;
+    let not_or_request = |words: &mut std::str::SplitWhitespace<'_>| {
+        let word = words.next()?;
+        if word.eq_ignore_ascii_case("not") { words.next().map(offset) } else { Some(offset(word)) }
+    };
+    let request_from = match first.to_ascii_lowercase().as_str() {
+        "set" => return object(words.next()?),
+        "import" => return object(words.nth(2)?),
+        "assert" => not_or_request(&mut words)?,
+        "sleep" => {
+            words.find(|word| word.eq_ignore_ascii_case("while"))?;
+            not_or_request(&mut words)?
+        }
+        _ => lead,
+    };
+    let start = request_from + find_body_start(&segment[request_from..])?;
+    segment[start..].starts_with(['{', '[']).then_some(start)
 }
 
-/// `highlight_json`, told where the cursor is (a byte of `s`): the word that
-/// ends there is one being typed, and is not drawn as wrong for what it is
-/// not yet.
-fn highlight_json_typing(s: &str, typing_at: Option<usize>) -> String {
+/// The body that `s` starts with, coloured, and the byte of `s` it ends at.
+/// `typing_at` is where the cursor is (a byte of `s`): the word that ends
+/// there is one being typed, and is not drawn as wrong for what it is not yet.
+fn paint_body(s: &str, typing_at: Option<usize>) -> (String, usize) {
     let r = "\x1b[0m";
     let colour = |piece: BodyPiece| match piece {
         BodyPiece::Key => "\x1b[38;5;110m",     // keys: soft blue
@@ -2525,21 +2553,52 @@ fn highlight_json_typing(s: &str, typing_at: Option<usize>) -> String {
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let mut out = String::with_capacity(s.len() * 2);
-    let mut at = 0;
-    while let Some(start) = first_bracket(&s[at..]).map(|found| at + found) {
-        out.push_str(&s[at..start]);
-        let scan = scan_body(&s[start..], typing_at.and_then(|cursor| cursor.checked_sub(start)));
-        let mut drawn = start;
-        for &(from, to, piece) in &scan.pieces {
-            out.push_str(&s[drawn..start + from]);
-            out.push_str(&paint(colour(piece), &s[start + from..start + to]));
-            drawn = start + to;
-        }
-        out.push_str(&s[drawn..start + scan.end]);
-        at = start + scan.end;
+    let scan = scan_body(s, typing_at);
+    let mut out = String::with_capacity(scan.end * 2);
+    let mut drawn = 0;
+    for &(from, to, piece) in &scan.pieces {
+        out.push_str(&s[drawn..from]);
+        out.push_str(&paint(colour(piece), &s[from..to]));
+        drawn = to;
     }
-    out.push_str(&s[at..]);
+    out.push_str(&s[drawn..scan.end]);
+    (out, scan.end)
+}
+
+/// The input with the JSON of its bodies coloured, and nothing else of it:
+/// each line is read as the line of a file it is, and each request of a
+/// chain has its own body. A URI, an `@file`, an outfile and the message of
+/// a `confirm` are left as they are, whatever brackets, digits or `true`
+/// they hold. `typing_at` is the cursor, in bytes of the input.
+fn highlight_bodies(input: &str, typing_at: Option<usize>) -> String {
+    let mut out = String::with_capacity(input.len() * 2);
+    let mut drawn = 0;
+    let mut at = 0;
+    loop {
+        let (line_start, line_end) = program_line_bounds_at(input, at);
+        let line = &input[line_start..line_end];
+        // All of a `confirm` line is its question.
+        let is_question = line.split_whitespace().next().is_some_and(|first| first.eq_ignore_ascii_case("confirm"));
+        let mut segment_at = 0;
+        while !is_question {
+            let (from, to) = chain_segment_bounds_at(line, segment_at);
+            if let Some(start) = line_body_start(&line[from..to]).map(|start| line_start + from + start).filter(|&start| start >= drawn) {
+                let (painted, len) = paint_body(&input[start..line_start + to], typing_at.and_then(|cursor| cursor.checked_sub(start)));
+                out.push_str(&input[drawn..start]);
+                out.push_str(&painted);
+                drawn = start + len;
+            }
+            if to >= line.len() {
+                break;
+            }
+            segment_at = to + 2;
+        }
+        if line_end >= input.len() {
+            break;
+        }
+        at = line_end + 1;
+    }
+    out.push_str(&input[drawn..]);
     out
 }
 
@@ -18619,38 +18678,16 @@ fn render_input_content(state: &mut AppState, width: usize) -> (String, u16, Str
     // ghost is drawn below (appended vs. inserted before the rest of the line).
     let cursor_at_end = state.cursor_pos == input_char_len;
 
-    // Apply JSON syntax highlighting to the full body as one unit, then split at cursor
-    let body_start = find_body_start(&state.input);
-    let (hl_before, hl_at_cursor, hl_after) = if state.config.experimental {
-        if let Some(bs) = body_start {
-            let body = &state.input[bs..];
-            let prefix = &state.input[..bs];
-            let body_start_char = char_len(&state.input[..bs]);
-            if cursor_byte >= bs && state.cursor_pos < input_char_len {
-                // Cursor is inside body
-                let cursor_in_body = state.cursor_pos - body_start_char;
-                let (hb, hc, ha) = highlight_json_split(body, Some(cursor_in_body));
-                (format!("{}{}", prefix, hb), hc.unwrap_or(' '), ha)
-            } else if cursor_byte < bs {
-                // Cursor is on URL line — highlight full body, split prefix at cursor
-                let highlighted_body = highlight_json(body);
-                let prefix_before = &state.input[..cursor_byte];
-                let prefix_after = if state.cursor_pos < input_char_len {
-                    let next_byte = char_to_byte_idx(&state.input, state.cursor_pos + 1);
-                    &state.input[next_byte..bs]
-                } else {
-                    ""
-                };
-                (prefix_before.to_string(), at_cursor, format!("{}{}", prefix_after, highlighted_body))
-            } else {
-                // Cursor at end, past body
-                (format!("{}{}", prefix, highlight_json(body)), ' ', String::new())
-            }
-        } else {
-            (before_cursor.to_string(), at_cursor, after_cursor.to_string())
-        }
+    // The bodies of the input coloured, and the whole split at the cursor.
+    // An input that got no colour is split as the text it is.
+    let coloured = if state.config.experimental { highlight_bodies(&state.input, Some(cursor_byte)) } else { String::new() };
+    let (hl_before, hl_at_cursor, hl_after, cursor_colour) = if !state.config.experimental || coloured == state.input {
+        (before_cursor.to_string(), at_cursor, after_cursor.to_string(), String::new())
+    } else if state.cursor_pos < input_char_len {
+        let (before, at, after, colour) = split_highlighted(coloured, Some(state.cursor_pos));
+        (before, at.unwrap_or(' '), after, colour)
     } else {
-        (before_cursor.to_string(), at_cursor, after_cursor.to_string())
+        (coloured, ' ', String::new(), String::new())
     };
 
     let mut rendered = String::new();
@@ -18678,7 +18715,13 @@ fn render_input_content(state: &mut AppState, width: usize) -> (String, u16, Str
             // hl_after must be verbatim: trimming a leading '\n' here would
             // swallow a following blank line, undercounting input rows and
             // making the block shift on redraw.
+            // The character the cursor was on is drawn behind the ghost,
+            // in the colour it has in its body.
+            rendered.push_str(&cursor_colour);
             rendered.push(hl_at_cursor);
+            if !cursor_colour.is_empty() {
+                rendered.push_str("\x1b[0m");
+            }
             rendered.push_str(&hl_after);
         }
     } else {
@@ -31347,6 +31390,21 @@ mod tests {
         }
     }
 
+    /// The colours of `body` as the body of a request: what follows it on
+    /// the line (an outfile, the rest of a chain) is read as that.
+    fn highlight_json(body: &str) -> String {
+        highlight_bodies(&format!("PUT /x {body}"), None).strip_prefix("PUT /x ").expect("the request is not coloured").to_string()
+    }
+
+    /// The same, split around the character the cursor is on, counted in
+    /// the characters of `body`.
+    fn highlight_json_split(body: &str, cursor_char_pos: Option<usize>) -> (String, Option<char>, String) {
+        let line = format!("PUT /x {body}");
+        let typing_at = cursor_char_pos.map(|pos| char_to_byte_idx(&line, pos + 7));
+        let (before, at, after, _) = split_highlighted(highlight_bodies(&line, typing_at), cursor_char_pos.map(|pos| pos + 7));
+        (before.strip_prefix("PUT /x ").expect("the request is not coloured").to_string(), at, after)
+    }
+
     /// The line with a `^` where the cursor is.
     fn shown(state: &AppState) -> String {
         let at = char_to_byte_idx(&state.input, state.cursor_pos);
@@ -34754,6 +34812,83 @@ mod tests {
         // The word the cursor is behind is being typed, and not wrong yet.
         assert_eq!(highlight_json_split("[tru, 1]", Some(4)).0, format!("{}tru", b("[")));
         assert!(highlight_json_split("[tru, 1]", Some(6)).0.starts_with(&format!("{}{}, ", b("["), wrong("tru"))));
+    }
+
+    #[test]
+    fn only_the_bodies_of_an_input_are_coloured() {
+        let r = "\x1b[0m";
+        let paint = |code: u8, text: &str| format!("\x1b[38;5;{code}m{text}{r}");
+        let (b, k, v, n, l) = (
+            |text: &str| paint(245, text),
+            |text: &str| paint(110, text),
+            |text: &str| paint(114, text),
+            |text: &str| paint(179, text),
+            |text: &str| paint(176, text),
+        );
+        let x1 = format!("{}{}: {}{}", b("{"), k("\"x\""), n("1"), b("}"));
+        // What stands behind a body is not JSON: the colours ran on to the
+        // end of the input, into the brackets, digits and `true` of a URI,
+        // an outfile and a question.
+        for (input, coloured) in [
+            ("PUT /a {\"x\": 1} && GET /people/com.x.id=[A#1]", format!("PUT /a {x1} && GET /people/com.x.id=[A#1]")),
+            ("PUT /a {\"x\": 1} && GET /x~where(a={1})", format!("PUT /a {x1} && GET /x~where(a={{1}})")),
+            ("PUT /a {\"x\": 1} > out[1].json", format!("PUT /a {x1} > out[1].json")),
+            ("PUT /a {\"x\": 1} > out[1].json && PUT /b/true/12 {\"x\": 1}", format!("PUT /a {x1} > out[1].json && PUT /b/true/12 {x1}")),
+            ("PUT /a {\"x\": 1}\nGET /x~where(a=[1,true])", format!("PUT /a {x1}\nGET /x~where(a=[1,true])")),
+            ("PUT /a {\"x\": 1}\nconfirm Delete [1] items?", format!("PUT /a {x1}\nconfirm Delete [1] items?")),
+            // Each request of a chain has its body, and each line of an
+            // input its own: the first line decided for all of them.
+            ("PUT /a {\"x\": 1} || POST /b [true]", format!("PUT /a {x1} || POST /b {}{}{}", b("["), l("true"), b("]"))),
+            ("# seed\nPUT /b {\"x\": 1}", format!("# seed\nPUT /b {x1}")),
+            ("sleep 2\nPUT /b {\"x\": 1}\nGET /c/true/12", format!("sleep 2\nPUT /b {x1}\nGET /c/true/12")),
+            ("GET /a\n/b {\"x\": 1}", format!("GET /a\n/b {x1}")),
+            // The object of a line that is no request, and the request of
+            // an `assert` and of a `sleep while`.
+            ("set {\"raw\": true}", format!("set {}{}: {}{}", b("{"), k("\"raw\""), l("true"), b("}"))),
+            ("import git cl {\"url\": \"u\"}", format!("import git cl {}{}: {}{}", b("{"), k("\"url\""), v("\"u\""), b("}"))),
+            ("assert PUT /e {\"x\": 1}", format!("assert PUT /e {x1}")),
+            ("assert not /e {\"x\": 1}", format!("assert not /e {x1}")),
+            ("sleep 5 while not PUT /e {\"x\": 1}", format!("sleep 5 while not PUT /e {x1}")),
+            ("{\"x\": 1}\nGET /a", format!("{x1}\nGET /a")),
+        ] {
+            assert_eq!(highlight_bodies(input, None), coloured, "{input:?}");
+        }
+        // No body in brackets, no colour.
+        for input in [
+            "GET /people/com.x.id=[A#1]",
+            "PUT /x @export[1].json",
+            "PUT /x @rows[1].csv~map(a.b.c) > out[2].json",
+            "PUT /flags/open true",
+            "PUT /note \"a [1] b\"",
+            "confirm Seed {1} and [true]?",
+            "set @settings[1].json",
+            "shared/seed[1].api",
+            "sleep 2",
+            "",
+        ] {
+            assert_eq!(highlight_bodies(input, None), input, "{input:?}");
+        }
+        // A body that is still open runs to the end of what there is, over
+        // the lines that are its own.
+        assert_eq!(
+            highlight_bodies("GET /a\nPUT /b {\n  \"x\": 1,\n  \"y\": [", None),
+            format!("GET /a\nPUT /b {}\n  {}: {},\n  {}: {}", b("{"), k("\"x\""), n("1"), k("\"y\""), b("["))
+        );
+    }
+
+    #[test]
+    fn the_character_under_a_ghost_keeps_its_colour() {
+        // Behind a ghost drawn in the middle of a body, the character the
+        // cursor was on had no colour between two halves that had.
+        let key = "\x1b[38;5;110m";
+        let mut state = completing_body(r#"PUT /people [{"gi^": "Ann"}]"#);
+        let (drawn, _, ghost) = render_input_content(&mut state, 200);
+        assert_eq!(ghost, "venName");
+        assert!(drawn.contains(&format!("\x1b[38;5;240menName\x1b[0m{key}\"\x1b[0m")), "{drawn:?}");
+        // Without `-x` nothing of the line has a colour of its own.
+        let mut state = completing(r#"PUT /people [{"gi^": "Ann"}]"#);
+        let (drawn, _, _) = render_input_content(&mut state, 200);
+        assert!(!drawn.contains("38;5;110") && !drawn.contains("38;5;245"), "{drawn:?}");
     }
 
     // ── Completion: what the review of the body completion found ──
