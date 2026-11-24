@@ -16941,9 +16941,16 @@ fn body_span_at(input: &str, byte_pos: usize) -> Option<BodySpan> {
 /// requests of their own, not this one's body. A line break inside a body's
 /// brackets or inside a string is part of the body.
 fn request_bounds_at(input: &str, byte_pos: usize) -> (usize, usize) {
+    let (start, end, _) = request_segment_at(input, byte_pos);
+    (start, end)
+}
+
+/// `request_bounds_at`, and whether a `&&` or `||` stands behind the request:
+/// it is then a segment of a chain that goes on, and not the end of its line.
+fn request_segment_at(input: &str, byte_pos: usize) -> (usize, usize, bool) {
     let (line_start, line_end) = program_line_bounds_at(input, byte_pos);
     let (seg_start, seg_end) = chain_segment_bounds_at(&input[line_start..line_end], byte_pos - line_start);
-    (line_start + seg_start, line_start + seg_end)
+    (line_start + seg_start, line_start + seg_end, line_start + seg_end < line_end)
 }
 
 /// Byte range `[start, end)` of the line containing `byte_pos`, as a `.api`
@@ -16955,9 +16962,19 @@ fn program_line_bounds_at(input: &str, byte_pos: usize) -> (usize, usize) {
     let mut depth = 0i32;
     let mut in_string = false;
     let mut escape = false;
-    for (i, ch) in input.char_indices() {
+    // A line that is a comment holds no string and no bracket: a quote in
+    // it opens nothing that the lines under it would be part of.
+    let comment_line = |start: usize| input[start..].trim_start_matches([' ', '\t']).starts_with('#');
+    let mut in_comment = comment_line(0);
+    // Nor does a comment of a body: read as the blanks the body parser
+    // takes it for, one for each character.
+    let blanked = without_body_comments(input);
+    for ((i, _), ch) in input.char_indices().zip(blanked.chars()) {
         if escape {
             escape = false;
+            continue;
+        }
+        if in_comment && ch != '\n' {
             continue;
         }
         match ch {
@@ -16972,6 +16989,7 @@ fn program_line_bounds_at(input: &str, byte_pos: usize) -> (usize, usize) {
                 }
                 line_start = i + 1;
                 depth = 0;
+                in_comment = comment_line(line_start);
             }
             _ => {}
         }
@@ -17027,7 +17045,7 @@ fn chain_segment_bounds_at(input: &str, byte_pos: usize) -> (usize, usize) {
 /// Byte offset just past the final top-level `&&` of `input` — the start of the
 /// chain's last segment (0 when the line isn't chained).
 fn last_chain_segment_start(input: &str) -> usize {
-    chain_segment_bounds_at(input, input.len()).0
+    request_bounds_at(input, input.len()).0
 }
 
 /// Whether the cursor stands in the blanks between a chain segment and the
@@ -17036,8 +17054,8 @@ fn last_chain_segment_start(input: &str) -> usize {
 /// be drawn a blank away from where Tab writes, so there is neither.
 fn cursor_behind_chain_segment(state: &AppState) -> bool {
     let cursor_byte = char_to_byte_idx(&state.input, state.cursor_pos.min(char_len(&state.input)));
-    let (seg_start, seg_end) = chain_segment_bounds_at(&state.input, cursor_byte);
-    seg_end < state.input.len() && cursor_byte > seg_start + state.input[seg_start..seg_end].trim_end().len()
+    let (seg_start, seg_end, chain_goes_on) = request_segment_at(&state.input, cursor_byte);
+    chain_goes_on && cursor_byte > seg_start + state.input[seg_start..seg_end].trim_end().len()
 }
 
 /// Run `f` with the cursor's `&&` segment presented as if it were the whole
@@ -17055,7 +17073,9 @@ fn cursor_behind_chain_segment(state: &AppState) -> bool {
 /// completion path runs under the same view.
 fn with_chain_segment_view<R>(state: &mut AppState, f: impl FnOnce(&mut AppState) -> R) -> R {
     let cursor_byte = char_to_byte_idx(&state.input, state.cursor_pos.min(char_len(&state.input)));
-    let (seg_start, seg_end) = chain_segment_bounds_at(&state.input, cursor_byte);
+    // The request the cursor is in: its line of an input of several, and in
+    // that line its segment. The other lines are requests of their own.
+    let (seg_start, seg_end, chain_goes_on) = request_segment_at(&state.input, cursor_byte);
     if seg_start == 0 && seg_end == state.input.len() {
         return f(state);
     }
@@ -17068,7 +17088,7 @@ fn with_chain_segment_view<R>(state: &mut AppState, f: impl FnOnce(&mut AppState
     let segment = &state.input[seg_start..seg_end];
     let lead_ws = segment.len() - segment.trim_start().len();
     let view_start = seg_start + lead_ws;
-    let view_end = if seg_end < state.input.len() {
+    let view_end = if chain_goes_on {
         view_start + segment.trim().len()
     } else {
         seg_end
@@ -18311,7 +18331,10 @@ fn render_input_content(state: &mut AppState, width: usize) -> (String, u16, Str
     // Inside the view, "cursor at end" means at the end of the cursor's SEGMENT
     // (e.g. just before ` && …`), so editing an earlier segment gets the same
     // ghosts as a standalone line.
-    let chained = chain_segment_bounds_at(&state.input, 0) != (0, state.input.len());
+    let chained = {
+        let cursor_byte = char_to_byte_idx(&state.input, state.cursor_pos.min(char_len(&state.input)));
+        request_bounds_at(&state.input, cursor_byte) != program_line_bounds_at(&state.input, cursor_byte)
+    };
     // The parameter hint is read in the same view: it is the hint of the URI
     // the cursor's segment has, not of the first one on the line.
     let behind_segment = cursor_behind_chain_segment(state);
@@ -21442,7 +21465,7 @@ fn cursor_in_file_path(state: &AppState) -> bool {
 /// `cursor_pos` is in chars, like `state.cursor_pos`.
 fn extract_file_path_context(input: &str, cursor_pos: usize) -> Option<FilePathContext> {
     let cursor_byte = char_to_byte_idx(input, cursor_pos.min(char_len(input)));
-    let (seg_start, seg_end) = chain_segment_bounds_at(input, cursor_byte);
+    let (seg_start, seg_end) = request_bounds_at(input, cursor_byte);
     let segment = &input[seg_start..seg_end];
 
     // ` >` (outfile, including ` >>` append) takes precedence over ` @`, as
@@ -34316,6 +34339,91 @@ mod tests {
     /// With the cursor anywhere in a line, in a URI, a body or a path, Tab
     /// writes exactly where a ghost is drawn: a ghost that Tab does not
     /// write and a Tab that writes unannounced are both found here.
+    // ── Completion: each line of an input of several is a request of its own ──
+
+    #[test]
+    fn a_line_under_another_completes_as_a_line_of_its_own() {
+        // The first line's URI was read for every line: nothing completed
+        // on a second one, in its URI, its body or its outfile.
+        for experimental in [false, true] {
+            for (marked, ghost, after) in [
+                ("GET /pets\nGET /peo^", "ple", "GET /pets\nGET /people^"),
+                ("GET /pets\nGET /people~wh^", "ere(", "GET /pets\nGET /people~where(^"),
+                ("GET /pets\nGET /peo^\nGET /about", "ple", "GET /pets\nGET /people^\nGET /about"),
+                ("GET /peo^\nGET /pets", "ple", "GET /people^\nGET /pets"),
+                // Under a request with a body of several lines, and in a
+                // chain on the second line.
+                ("PUT /zoo {\n  \"a\": 1\n}\nGET /peo^", "ple", "PUT /zoo {\n  \"a\": 1\n}\nGET /people^"),
+                ("GET /pets\nGET /about && GET /peo^ && GET /pets", "ple", "GET /pets\nGET /about && GET /people^ && GET /pets"),
+                // Under a comment line, whatever it holds.
+                ("# the \"big one [\nGET /peo^", "ple", "# the \"big one [\nGET /people^"),
+                // The template of a yoro body.
+                ("GET /pets\nPUT /yoro {\"template\": \"/peo^", "ple", "GET /pets\nPUT /yoro {\"template\": \"/people^"),
+            ] {
+                assert_eq!(template_ghost_then_tab(marked, experimental), (ghost.to_string(), after.to_string()), "-x {experimental}: {marked:?}");
+            }
+            // The body of a line is that line's: `template` under a yoro
+            // line is text in the body of another endpoint.
+            let marked = "PUT /yoro {\"args\": []}\nPUT /zoo {\"template\": \"/peo^";
+            assert_eq!(template_ghost_then_tab(marked, experimental), (String::new(), marked.to_string()), "-x {experimental}");
+        }
+        // Under `-x`: the keys of the line's own endpoint, on its own line.
+        for (marked, ghost, after) in [
+            ("GET /pets\nPUT /people [{\"gi^", "venName\":", "GET /pets\nPUT /people [{\"givenName\":^"),
+            ("PUT /people [{\"gi^\nGET /pets", "venName\":", "PUT /people [{\"givenName\":^\nGET /pets"),
+            // A body on one line is closed on that line: the line break
+            // in front of its request is not one of the body.
+            ("GET /pets\nPUT /people [{\"name\": \"b\"^", "}", "GET /pets\nPUT /people [{\"name\": \"b\"}^"),
+            // The brackets a body opens with.
+            ("GET /pets\nPUT /people ^", "[{ ", "GET /pets\nPUT /people [{\n  ^\n}]"),
+        ] {
+            assert_eq!(template_ghost_then_tab(marked, true), (ghost.to_string(), after.to_string()), "{marked:?}");
+        }
+        // A body file and an outfile of a second line are paths.
+        let ctx = extract_file_path_context("GET /pets\nGET /people > ou", 26).expect("an outfile");
+        assert_eq!((ctx.partial.as_str(), ctx.path_start), ("ou", 24));
+        assert!(extract_file_path_context("GET /pets > out.json\nGET /people", 32).is_none());
+        // A file to run is completed on a line alone, as before.
+        assert!(extract_file_path_context("GET /pets\nse", 12).is_none());
+    }
+
+    #[test]
+    fn a_body_typed_on_a_second_line_promotes_and_wraps_as_on_the_first() {
+        let typed = |marked: &str, c: char| {
+            let mut state = completing_template(marked, true);
+            let at = char_to_byte_idx(&state.input, state.cursor_pos);
+            state.input.insert(at, c);
+            state.cursor_pos += 1;
+            auto_promote_method_on_body_start(&mut state, c);
+            auto_wrap_array_body(&mut state, c);
+            shown(&state)
+        };
+        assert_eq!(typed("GET /people ^", '{'), "PUT /people [{^");
+        assert_eq!(typed("GET /pets\nGET /people ^", '{'), "GET /pets\nPUT /people [{^");
+        // The first line is left as it is.
+        assert_eq!(typed("GET /people\nGET /zoo ^", '{'), "GET /people\nPUT /zoo {^");
+    }
+
+    #[test]
+    fn a_program_line_ends_at_a_line_break_that_is_not_of_its_body() {
+        for (input, at, line) in [
+            ("GET /a\nGET /b", 0, "GET /a"),
+            ("GET /a\nGET /b", 6, "GET /a"),
+            ("GET /a\nGET /b", 7, "GET /b"),
+            ("PUT /x {\n  \"a\": 1\n}\nGET /b", 12, "PUT /x {\n  \"a\": 1\n}"),
+            ("PUT /x {\"a\": \"one\ntwo\"}\nGET /b", 3, "PUT /x {\"a\": \"one\ntwo\"}"),
+            // A bracket or a quote in a comment of a body opens nothing…
+            ("PUT /x {\n  \"a\": 1 // }\n}\nGET /b", 3, "PUT /x {\n  \"a\": 1 // }\n}"),
+            ("PUT /x {\n  # the \"big one\n}\nGET /b", 30, "GET /b"),
+            // …and neither does one in a line that is a comment.
+            ("# the \"big one\nGET /a\nGET /b", 16, "GET /a"),
+            ("  # [ {\nGET /a", 9, "GET /a"),
+        ] {
+            let (start, end) = program_line_bounds_at(input, at);
+            assert_eq!(&input[start..end], line, "{input:?} at {at}");
+        }
+    }
+
     // ── Completion: the template of a yoro body is a URI ──
 
     /// A prompt that has loaded `COMPLETION_SPEC` and a `/yoro` beside it,

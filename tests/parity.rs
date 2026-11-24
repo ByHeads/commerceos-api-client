@@ -7293,6 +7293,15 @@ fn a_request_pasted_on_a_new_line_is_a_second_request() {
         screen_tail(&prompt)
     );
 
+    // Tab completes on the line the cursor is on, from that line's own URI.
+    drop(prompt);
+    let mut prompt = open_completing(&server, dir.path(), &[]);
+    press(&mut prompt, &["GET /one", "\x0e", "GET /peo", "\t", "~wi", "\t", "na", "\t", ")"]);
+    server.take();
+    prompt.send(b"\r");
+    pump_until(&mut prompt, Duration::from_secs(6), |_| server.seen() >= 2);
+    assert_eq!(server.take(), ["GET /one", "GET /people~with(name)"], "{}", screen_tail(&prompt));
+
     // On a line that has text, the paste takes that line's place only.
     drop(prompt);
     let mut prompt = open_completing(&server, dir.path(), &[]);
