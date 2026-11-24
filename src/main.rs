@@ -15128,7 +15128,11 @@ fn handle_key_event(
         // Regular character input
         (modifiers, KeyCode::Char(c)) if types_a_character(modifiers) => {
             // Smart closing bracket: remove trailing comma and fix indentation
-            if (c == '}' || c == ']') && state.config.experimental && cursor_inside_brackets(&state.input, state.cursor_pos) {
+            if (c == '}' || c == ']')
+                && state.config.experimental
+                && cursor_inside_brackets(&state.input, state.cursor_pos)
+                && !cursor_in_body_text(&state.input, state.cursor_pos)
+            {
                 close_bracket_typed(state, c);
             } else {
                 let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
@@ -16435,6 +16439,25 @@ fn show_program_status(state: &mut AppState, stdout: &mut io::Stdout, msg: Strin
     state.status_msg = msg;
     state.status_msg_at = Some(Instant::now());
     render(stdout, state)
+}
+
+/// Whether the cursor (in chars) stands in a string or in a comment of a
+/// body: what is typed there is text, a `}` and a `]` too.
+fn cursor_in_body_text(input: &str, cursor_pos: usize) -> bool {
+    if in_body_comment(input, cursor_pos) {
+        return true;
+    }
+    let (mut in_string, mut escape) = (false, false);
+    for ch in without_body_comments(input).chars().take(cursor_pos) {
+        if escape {
+            escape = false;
+        } else if ch == '\\' && in_string {
+            escape = true;
+        } else if ch == '"' {
+            in_string = !in_string;
+        }
+    }
+    in_string
 }
 
 /// A `}` or `]` typed inside a body under `-x`: written at the cursor, with
@@ -19882,7 +19905,18 @@ fn json_context_at_cursor(state: &AppState) -> Option<JsonContext> {
                         last_key = std::mem::take(&mut current_string);
                         pos = JsonPos::AfterKey;
                     }
-                    JsonPos::Value => pos = JsonPos::AfterValue,
+                    JsonPos::Value => {
+                        // The `@type` an object names is the type it is of:
+                        // its keys are that type's from there on.
+                        if let Some(frame) = frames.last_mut().filter(|frame| !frame.is_array && last_key == "@type") {
+                            let named = state.subtypes.get(&frame.schema).is_some_and(|subs| subs.contains(&current_string))
+                                && state.schema_props.contains_key(&current_string);
+                            if named {
+                                frame.schema = current_string.clone();
+                            }
+                        }
+                        pos = JsonPos::AfterValue;
+                    }
                     _ => {}
                 }
                 token_start = None;
@@ -19984,7 +20018,22 @@ fn json_context_at_cursor(state: &AppState) -> Option<JsonContext> {
                 partial.clear();
                 token_start = None;
             }
-            ' ' | '\n' | '\r' | '\t' => {}
+            ' ' | '\n' | '\r' | '\t' => {
+                // A word without quotes ends at a blank: what is typed
+                // behind it is no more of it.
+                if !partial.is_empty() {
+                    match pos {
+                        JsonPos::Key => {
+                            last_key = std::mem::take(&mut partial);
+                            pos = JsonPos::AfterKey;
+                        }
+                        JsonPos::Value => pos = JsonPos::AfterValue,
+                        _ => {}
+                    }
+                    partial.clear();
+                    token_start = None;
+                }
+            }
             _ => {
                 // A key or a value without quotes (a number, true, false, null)
                 if partial.is_empty() {
@@ -20267,6 +20316,13 @@ fn cycling_json_type(state: &AppState) -> bool {
         && state.completions.get(state.completion_idx).is_some_and(|c| c.contains('\x00'))
 }
 
+/// Whether nothing stands between the cursor (in chars) and the end of its
+/// line. A comment of the body is nothing: a key can be written in front
+/// of it.
+fn rest_of_line_is_blank(input: &str, cursor_pos: usize) -> bool {
+    without_body_comments(input).chars().skip(cursor_pos).take_while(|&c| c != '\n').all(char::is_whitespace)
+}
+
 fn handle_json_tab_completion(state: &mut AppState, reverse: bool, apply: bool) {
     let Some(ctx) = json_context_at_cursor(state) else { return };
     let cursor_byte = char_to_byte_idx(&state.input, state.cursor_pos);
@@ -20280,11 +20336,8 @@ fn handle_json_tab_completion(state: &mut AppState, reverse: bool, apply: bool) 
 
     // Don't offer completions when cursor is on a line that already has content after cursor
     // (e.g. cursor on the " of "identifiers": { — don't insert a new key before it)
-    if ctx.partial.is_empty() {
-        let line_end = state.input[cursor_byte..].find('\n').map_or(state.input.len(), |p| cursor_byte + p);
-        if !state.input[cursor_byte..line_end].trim().is_empty() {
-            return;
-        }
+    if ctx.partial.is_empty() && !rest_of_line_is_blank(&state.input, state.cursor_pos) {
+        return;
     }
 
     // Tab on the `"@type": "…"` the last Tab wrote: the next subtype, in its place.
@@ -20381,6 +20434,12 @@ fn handle_json_tab_completion(state: &mut AppState, reverse: bool, apply: bool) 
         state.last_tab_input.clear();
     } else {
         state.cursor_pos = cursor_after_replacement;
+        // An array that was opened is what is typed in from here on: the
+        // list its `[` was the one entry of has nothing more to say.
+        if replacement.ends_with('[') {
+            state.completions.clear();
+            state.last_tab_input.clear();
+        }
     }
 }
 
@@ -20694,7 +20753,12 @@ fn get_json_completion_ghost(state: &AppState) -> Option<String> {
         // A word typed without its quote gets it from Tab, in front of
         // what is typed: the ghost is what comes behind.
         let unquoted = || text.trim_start().strip_prefix('"').and_then(|rest| rest.strip_prefix(typed));
-        text.strip_prefix(typed).or_else(|| unquoted().filter(|_| !typed.is_empty())).map(str::to_string)
+        // So does a word typed right behind a `:` or a bracket get its
+        // blank, in front of it too.
+        let set_off = || text.trim_start().strip_prefix(typed);
+        text.strip_prefix(typed)
+            .or_else(|| set_off().or_else(unquoted).filter(|_| !typed.is_empty()))
+            .map(str::to_string)
     };
 
     // If completions are populated from a json trigger, use them
@@ -20718,11 +20782,8 @@ fn get_json_completion_ghost(state: &AppState) -> Option<String> {
     if next.is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '@' | '-' | '?')) {
         return None;
     }
-    if ctx.partial.is_empty() {
-        let line_end = state.input[cursor_byte..].find('\n').map_or(state.input.len(), |p| cursor_byte + p);
-        if !state.input[cursor_byte..line_end].trim().is_empty() {
-            return None;
-        }
+    if ctx.partial.is_empty() && !rest_of_line_is_blank(&state.input, state.cursor_pos) {
+        return None;
     }
     json_completions(state, &ctx).first().and_then(|first| ghost_of(first)).filter(|ghost| !ghost.is_empty())
 }
@@ -20885,6 +20946,12 @@ fn pending_closer(input: &str, cursor_pos: usize) -> Option<(char, usize)> {
     }
     // Not inside an unclosed string, and not after a key
     if in_str || is_key {
+        return None;
+    }
+    // Nor in front of what is no end of the value: more of it (`12^3`), or
+    // the next member (`"x"^, "b": 2`). A bracket would cut it off.
+    let goes_on = |c: char| c.is_alphanumeric() || matches!(c, ',' | ':' | '"' | '{' | '[' | '-' | '.' | '_');
+    if input[byte_idx..].trim_start_matches([' ', '\t']).chars().next().is_some_and(goes_on) {
         return None;
     }
     // Nothing is pending where the bracket is closed behind the cursor
@@ -34339,6 +34406,113 @@ mod tests {
     /// With the cursor anywhere in a line, in a URI, a body or a path, Tab
     /// writes exactly where a ghost is drawn: a ghost that Tab does not
     /// write and a Tab that writes unannounced are both found here.
+    // ── Completion: what the review of the body completion found ──
+
+    #[test]
+    fn a_bracket_tab_wrote_leaves_no_ghost_of_itself() {
+        // The list its `[` was the one entry of stayed, and the ghost
+        // showed ` [` behind the bracket: a Tab there wrote nothing.
+        let mut state = completing_template("PUT /yoro { \"args\": ^", true);
+        assert_eq!(render_input_content(&mut state, 200).2, "[");
+        tab_pressed(&mut state);
+        assert_eq!(shown(&state), "PUT /yoro { \"args\": [^");
+        assert!(state.completions.is_empty() && state.last_tab_input.is_empty());
+        assert_eq!(render_input_content(&mut state, 200).2, "");
+        // An array of objects goes on with the object's bracket.
+        let mut state = completing_body("PUT /yard {\"tags\": ^");
+        tab_pressed(&mut state);
+        let after = shown(&state);
+        assert_eq!(after, "PUT /yard {\"tags\": [^");
+        assert_eq!(ghost_then_tab(&after, true), ("{".to_string(), "PUT /yard {\"tags\": [{ ^".to_string()));
+        // One of strings has nothing to go on with.
+        assert_eq!(ghost_then_tab("PUT /yard {\"codes\": [^", true), (String::new(), "PUT /yard {\"codes\": [^".to_string()));
+    }
+
+    #[test]
+    fn a_closer_is_not_written_in_front_of_what_goes_on() {
+        for marked in [
+            // More of the value, and the next member.
+            "PUT /people [{\"rank\": 12^3",
+            "PUT /people [{ \"name\": \"x\"^, \"givenName\": \"y\"",
+            "PUT /people [{ \"name\": \"x\" ^, \"givenName\": \"y\"",
+            "PUT /people [{ \"name\": \"x\"^ \"givenName\": \"y\"",
+            "PUT /people [{ \"active\": true^{",
+        ] {
+            assert_eq!(ghost_then_tab(marked, true), (String::new(), marked.to_string()), "{marked}");
+        }
+        // In front of the end of the body, an outfile, a comment and a
+        // closer of what is around it, there is one.
+        for (marked, after) in [
+            ("PUT /people [{\"rank\": 12^", "PUT /people [{\"rank\": 12}^"),
+            ("PUT /people [{\"rank\": 12^ > out.json", "PUT /people [{\"rank\": 12}^ > out.json"),
+            ("PUT /people [{\"rank\": 12^]", "PUT /people [{\"rank\": 12}^]"),
+            ("PUT /people [{\"rank\": 12^ // twelve", "PUT /people [{\"rank\": 12}^ // twelve"),
+        ] {
+            assert_eq!(ghost_then_tab(marked, true), ("}".to_string(), after.to_string()), "{marked}");
+        }
+    }
+
+    #[test]
+    fn tab_writes_a_word_without_quotes_only_where_its_ghost_is() {
+        // Right behind a `:` or a bracket the word gets its blank from Tab,
+        // in front of it: there was no ghost, and Tab wrote all the same.
+        for (marked, ghost, after) in [
+            ("PUT /people [{\"active\":t^", "rue", "PUT /people [{\"active\": true^"),
+            ("PUT /people [{\"active\":^", " true", "PUT /people [{\"active\": true^"),
+            ("PUT /people [{na^", "me\":", "PUT /people [{ \"name\":^"),
+        ] {
+            let mut state = completing_body(marked);
+            assert_eq!(render_input_content(&mut state, 200).2, ghost, "{marked}");
+            tab_pressed(&mut state);
+            assert_eq!(shown(&state), after, "{marked}");
+        }
+        // A blank ends a word: Tab behind it took the word and the blank
+        // away and wrote the key in their place.
+        for marked in ["PUT /people [{ na ^", "PUT /people [{\n  na\n  ^", "PUT /people [{\"status\": ne ^"] {
+            assert_eq!(ghost_then_tab(marked, true).1, marked, "{marked}");
+        }
+        // The word is a value that was typed: behind it the body closes.
+        assert_eq!(ghost_then_tab("PUT /people [{\"active\": true ^", true), ("}".to_string(), "PUT /people [{\"active\": true }^".to_string()));
+        // And a key without quotes is one still, with its blank or without.
+        assert_eq!(body_tabbed("PUT /people [{ name : \"x\", gi^"), "PUT /people [{ name : \"x\", \"givenName\":^");
+        assert_eq!(body_tabbed("PUT /people [{ name: \"x\", na^"), "PUT /people [{ name: \"x\", na^");
+    }
+
+    #[test]
+    fn a_closer_typed_in_a_string_or_a_comment_is_that_character() {
+        // The comma in front of it was taken away, as in front of a closer
+        // of the body.
+        assert!(cursor_in_body_text("PUT /people [{\"name\": \"a, ", 26));
+        assert!(cursor_in_body_text("PUT /people [{\"name\": \"a\\\", ", 28));
+        assert!(cursor_in_body_text("PUT /people [{\n  // a, ", 23));
+        assert!(cursor_in_body_text("PUT /people [{ /* a, ", 21));
+        assert!(!cursor_in_body_text("PUT /people [{\"name\": \"a\", ", 27));
+        assert!(!cursor_in_body_text("PUT /people [{\"name\": \"a // b\", ", 32));
+        assert!(!cursor_in_body_text("PUT /people [{ /* a */ ", 23));
+    }
+
+    #[test]
+    fn the_type_an_object_names_is_the_type_its_keys_are_of() {
+        // `givenName` is a person's and no agent's: with the `@type` Tab
+        // had just written, it did not complete.
+        assert_eq!(body_tabbed(r#"PUT /agents [{"@type": "person", "giv"#), r#"PUT /agents [{"@type": "person", "givenName":^"#);
+        // Before the type is named, and in an object that names none, the
+        // keys are the base type's.
+        assert_eq!(body_tabbed(r#"PUT /agents [{"giv"#), r#"PUT /agents [{"giv^"#);
+        assert_eq!(body_tabbed(r#"PUT /agents [{"@type": "person"}, {"giv"#), r#"PUT /agents [{"@type": "person"}, {"giv^"#);
+        // A type the spec does not have narrows nothing.
+        assert_eq!(body_tabbed(r#"PUT /agents [{"@type": "robot", "na"#), r#"PUT /agents [{"@type": "robot", "name":^"#);
+    }
+
+    #[test]
+    fn a_comment_behind_the_cursor_is_no_text_behind_it() {
+        assert_eq!(body_tabbed("PUT /people [{\n  \"gi^ // todo\n}]"), "PUT /people [{\n  \"givenName\":^ // todo\n}]");
+        let mut state = completing_body("PUT /people [{\n  ^ // todo\n}]");
+        assert_eq!(render_input_content(&mut state, 200).2, "\"identifiers\": {");
+        // Text behind it still is.
+        assert_eq!(body_tabbed("PUT /people [{\n  ^ \"name\": 1\n}]"), "PUT /people [{\n  ^ \"name\": 1\n}]");
+    }
+
     // ── Completion: each line of an input of several is a request of its own ──
 
     #[test]
