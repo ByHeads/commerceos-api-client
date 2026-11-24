@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 3.4.4
 
 - **`--1p` asks to be let in once in a new terminal, where 3.4.3 asked twice.** 3.4.3 read the key and the environment list from 1Password at the same moment, and in a terminal 1Password has not let in yet, each `op` that is started asks to be: two approvals for one run. The key is now read first, alone, and the list only when the key is there, in a terminal that is let in by then. A session at the prompt still opens after one wait for `op`. **A run that is done no longer waits for its read of the list** (3.4.3 waited up to two seconds): `op` reads on behind the run, into a file of its own beside the kept list (`~/.cache/api/1p-environments.next-<pid>.json`, for its owner alone), and the next run keeps that list if it is whole. A file that is no list is left alone for two minutes, for the `op` that may still write to it, and removed after. A key that could not be read because `op` was not let in, or gave no answer, is not read again by the list, which would ask a second time.
 
