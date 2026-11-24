@@ -2133,7 +2133,7 @@ fn find_body_start(input: &str) -> Option<usize> {
 /// If `cursor_char_pos` is Some, returns (before_cursor, char_at_cursor, after_cursor) split
 /// in the highlighted output, preserving correct highlighting state across the split.
 fn highlight_json_split(s: &str, cursor_char_pos: Option<usize>) -> (String, Option<char>, String) {
-    let full = highlight_json(s);
+    let full = highlight_json_typing(s, cursor_char_pos.map(|pos| char_to_byte_idx(s, pos)));
     match cursor_char_pos {
         None => (full, None, String::new()),
         Some(pos) => {
@@ -2193,148 +2193,353 @@ fn highlight_json_split(s: &str, cursor_char_pos: Option<usize>) -> (String, Opt
     }
 }
 
+/// What a piece of a JSON body is, for the colour it is drawn in.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum BodyPiece {
+    Bracket,
+    Key,
+    /// The key `@type`.
+    TypeKey,
+    Text,
+    Number,
+    Literal,
+    Comment,
+    /// What is no JSON where it stands: it stops the body from being read.
+    Wrong,
+}
+
+/// A JSON body read as far as it goes, by the grammar and not by its
+/// brackets alone.
+struct BodyScan {
+    /// The pieces that have a colour, in order: where each starts and ends,
+    /// in bytes of the text read.
+    pieces: Vec<(usize, usize, BodyPiece)>,
+    /// The closers of the brackets still open at the end, outermost first.
+    open: Vec<char>,
+    /// The text ends behind a whole value: a `,` or the closer may follow.
+    after_value: bool,
+    /// Something in the text can't stand where it does.
+    broken: bool,
+    /// The byte behind the bracket that closed the body, or the end of the
+    /// text where it is still open.
+    end: usize,
+}
+
+/// What the grammar takes next.
+#[derive(Clone, Copy, PartialEq)]
+enum BodyWant {
+    Value,
+    ValueOrClose,
+    Key,
+    KeyOrClose,
+    Colon,
+    CommaOrClose,
+}
+
+/// Read the body that `text` starts with, at its `{` or `[`, up to the
+/// bracket that closes it or the end of the text. A word that ends at
+/// `typing_at` (a byte of the text) or at the end is one being typed, and
+/// is not held against the body for what it is not yet.
+///
+/// Read as the request parser reads a body: `//`, `#` and `/* */` are
+/// comments, and a string may hold a line break. One thing is let pass that
+/// is no JSON, as completion has always let it: a key without its quotes is
+/// drawn as wrong and does not break the body.
+fn scan_body(text: &str, typing_at: Option<usize>) -> BodyScan {
+    let mut scan = BodyScan { pieces: Vec::new(), open: Vec::new(), after_value: false, broken: false, end: text.len() };
+    let mut want = BodyWant::Value;
+    // The key that waits for its `:`, as an index into the pieces.
+    let mut pending_key: Option<usize> = None;
+    // Whether the text ends in the middle of something: a string, a
+    // comment, a word that is not yet a value.
+    let mut unfinished = false;
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    // A key that got something else than its `:` is what is wrong there.
+    macro_rules! key_without_colon {
+        () => {
+            if let Some(key) = pending_key.take() {
+                scan.pieces[key].2 = BodyPiece::Wrong;
+            }
+            scan.broken = true;
+        };
+    }
+    while i < text.len() {
+        let ch = text[i..].chars().next().unwrap();
+        let in_object = scan.open.last() == Some(&'}');
+        if ch.is_whitespace() {
+            i += ch.len_utf8();
+            continue;
+        }
+        // A comment, where the body parser takes one: inside the brackets.
+        let next = bytes.get(i + 1).copied();
+        if !scan.open.is_empty() && (ch == '#' || (ch == '/' && matches!(next, Some(b'/') | Some(b'*')))) {
+            let end = if ch == '/' && next == Some(b'*') {
+                match text[i + 2..].find("*/") {
+                    Some(close) => i + 2 + close + 2,
+                    None => {
+                        unfinished = true;
+                        text.len()
+                    }
+                }
+            } else {
+                let end = text[i..].find('\n').map_or(text.len(), |at| i + at);
+                unfinished = end == text.len();
+                end
+            };
+            scan.pieces.push((i, end, BodyPiece::Comment));
+            i = end;
+            continue;
+        }
+        match ch {
+            '"' => {
+                let mut end = i + 1;
+                let mut closed = false;
+                let mut escape = false;
+                for (at, c) in text[i + 1..].char_indices() {
+                    end = i + 1 + at + c.len_utf8();
+                    if escape {
+                        escape = false;
+                    } else if c == '\\' {
+                        escape = true;
+                    } else if c == '"' {
+                        closed = true;
+                        break;
+                    }
+                }
+                unfinished = !closed;
+                let name = text[i + 1..end].trim_end_matches('"');
+                let key = if name == "@type" { BodyPiece::TypeKey } else { BodyPiece::Key };
+                let piece = match want {
+                    BodyWant::Key | BodyWant::KeyOrClose => {
+                        pending_key = Some(scan.pieces.len());
+                        want = BodyWant::Colon;
+                        key
+                    }
+                    BodyWant::Value | BodyWant::ValueOrClose => {
+                        want = BodyWant::CommaOrClose;
+                        BodyPiece::Text
+                    }
+                    BodyWant::Colon => {
+                        key_without_colon!();
+                        want = BodyWant::CommaOrClose;
+                        BodyPiece::Text
+                    }
+                    // No comma in front of it.
+                    BodyWant::CommaOrClose => {
+                        scan.broken = true;
+                        if in_object {
+                            want = BodyWant::Colon;
+                        }
+                        BodyPiece::Wrong
+                    }
+                };
+                scan.pieces.push((i, end, piece));
+                i = end;
+            }
+            '{' | '[' => {
+                let piece = match want {
+                    BodyWant::Value | BodyWant::ValueOrClose => BodyPiece::Bracket,
+                    BodyWant::Colon => {
+                        key_without_colon!();
+                        BodyPiece::Bracket
+                    }
+                    _ => {
+                        scan.broken = true;
+                        BodyPiece::Wrong
+                    }
+                };
+                scan.pieces.push((i, i + 1, piece));
+                scan.open.push(if ch == '{' { '}' } else { ']' });
+                want = if ch == '{' { BodyWant::KeyOrClose } else { BodyWant::ValueOrClose };
+                pending_key = None;
+                i += 1;
+            }
+            '}' | ']' => {
+                if scan.open.last() != Some(&ch) {
+                    // A closer of something that is not open here.
+                    scan.broken = true;
+                    scan.pieces.push((i, i + 1, BodyPiece::Wrong));
+                    i += 1;
+                    continue;
+                }
+                let piece = match want {
+                    BodyWant::KeyOrClose | BodyWant::ValueOrClose | BodyWant::CommaOrClose => BodyPiece::Bracket,
+                    BodyWant::Colon => {
+                        key_without_colon!();
+                        BodyPiece::Bracket
+                    }
+                    // Behind a comma or a colon, where a member or a value
+                    // is still owed.
+                    BodyWant::Key | BodyWant::Value => {
+                        scan.broken = true;
+                        BodyPiece::Wrong
+                    }
+                };
+                scan.pieces.push((i, i + 1, piece));
+                scan.open.pop();
+                pending_key = None;
+                want = BodyWant::CommaOrClose;
+                i += 1;
+                if scan.open.is_empty() {
+                    scan.end = i;
+                    break;
+                }
+            }
+            ':' => {
+                if want == BodyWant::Colon {
+                    pending_key = None;
+                } else {
+                    scan.broken = true;
+                    scan.pieces.push((i, i + 1, BodyPiece::Wrong));
+                }
+                want = BodyWant::Value;
+                i += 1;
+            }
+            ',' => {
+                match want {
+                    BodyWant::CommaOrClose => {}
+                    BodyWant::Colon => {
+                        key_without_colon!();
+                    }
+                    _ => {
+                        scan.broken = true;
+                        scan.pieces.push((i, i + 1, BodyPiece::Wrong));
+                    }
+                }
+                want = if in_object { BodyWant::Key } else { BodyWant::Value };
+                i += 1;
+            }
+            _ => {
+                // A word without quotes, up to what ends one.
+                let ends_word = |at: usize, c: char| {
+                    c.is_whitespace()
+                        || matches!(c, '{' | '}' | '[' | ']' | ':' | ',' | '"' | '#')
+                        || (c == '/' && matches!(bytes.get(at + 1), Some(b'/') | Some(b'*')))
+                };
+                let end = text[i..]
+                    .char_indices()
+                    .skip(1)
+                    .find(|&(at, c)| ends_word(i + at, c))
+                    .map_or(text.len(), |(at, _)| i + at);
+                let word = &text[i..end];
+                let being_typed = end == text.len() || typing_at == Some(end);
+                let value = if matches!(word, "true" | "false" | "null") {
+                    Some(BodyPiece::Literal)
+                } else if serde_json::from_str::<serde_json::Number>(word).is_ok() {
+                    Some(BodyPiece::Number)
+                } else {
+                    None
+                };
+                let as_value = |scan: &mut BodyScan, unfinished: &mut bool| match value {
+                    Some(piece) => Some(piece),
+                    None if being_typed => {
+                        *unfinished = end == text.len();
+                        None
+                    }
+                    None => {
+                        scan.broken = true;
+                        Some(BodyPiece::Wrong)
+                    }
+                };
+                let piece = match want {
+                    BodyWant::Value | BodyWant::ValueOrClose => {
+                        want = BodyWant::CommaOrClose;
+                        as_value(&mut scan, &mut unfinished)
+                    }
+                    // A key without its quotes: wrong, and let pass.
+                    BodyWant::Key | BodyWant::KeyOrClose => {
+                        want = BodyWant::Colon;
+                        pending_key = (!being_typed).then_some(scan.pieces.len());
+                        unfinished = end == text.len();
+                        (!being_typed).then_some(BodyPiece::Wrong)
+                    }
+                    BodyWant::Colon => {
+                        key_without_colon!();
+                        want = BodyWant::CommaOrClose;
+                        as_value(&mut scan, &mut unfinished)
+                    }
+                    BodyWant::CommaOrClose => {
+                        scan.broken = true;
+                        if in_object {
+                            want = BodyWant::Colon;
+                        }
+                        Some(BodyPiece::Wrong)
+                    }
+                };
+                if let Some(piece) = piece {
+                    scan.pieces.push((i, end, piece));
+                }
+                i = end;
+            }
+        }
+    }
+    scan.after_value = want == BodyWant::CommaOrClose && !unfinished && !scan.open.is_empty();
+    scan
+}
+
+/// Where the first `{` or `[` of `text` stands that is in no string.
+fn first_bracket(text: &str) -> Option<usize> {
+    let (mut in_string, mut escape) = (false, false);
+    for (at, ch) in text.char_indices() {
+        if escape {
+            escape = false;
+        } else if ch == '\\' && in_string {
+            escape = true;
+        } else if ch == '"' {
+            in_string = !in_string;
+        } else if !in_string && matches!(ch, '{' | '[') {
+            return Some(at);
+        }
+    }
+    None
+}
+
 /// Colour the JSON in `s`. Only what stands inside brackets is coloured: a
 /// URI, an outfile or the `&&` of a chain around a body is left as it is.
+/// What is no JSON where it stands is drawn as wrong.
 fn highlight_json(s: &str) -> String {
-    if s.is_empty() {
-        return String::new();
-    }
-    let r = "\x1b[0m";
-    let c_key = "\x1b[38;5;110m";     // keys: soft blue
-    let c_str = "\x1b[38;5;114m";     // string values: green
-    let c_num = "\x1b[38;5;179m";     // numbers: yellow
-    let c_bool = "\x1b[38;5;176m";    // booleans/null: magenta
-    let c_brace = "\x1b[38;5;245m";   // brackets/braces: gray
-    let c_at = "\x1b[38;5;147m";      // @type key: light purple
+    highlight_json_typing(s, None)
+}
 
-    let mut out = String::with_capacity(s.len() * 2);
-    let chars: Vec<char> = s.chars().collect();
-    let len = chars.len();
-    let mut i = 0;
-    let mut in_string = false;
-    let mut string_start = 0;
-    let mut is_key = false; // in an object, after { or , we expect a key
-    let mut escape = false;
-    // The brackets that are open, innermost last.
-    let mut open: Vec<char> = Vec::new();
-    let string_color = |is_key: bool, inside: bool, content: &str| {
-        if !inside {
-            ""
-        } else if !is_key {
-            c_str
-        } else if content.contains("@type") {
-            c_at
-        } else {
-            c_key
-        }
+/// `highlight_json`, told where the cursor is (a byte of `s`): the word that
+/// ends there is one being typed, and is not drawn as wrong for what it is
+/// not yet.
+fn highlight_json_typing(s: &str, typing_at: Option<usize>) -> String {
+    let r = "\x1b[0m";
+    let colour = |piece: BodyPiece| match piece {
+        BodyPiece::Key => "\x1b[38;5;110m",     // keys: soft blue
+        BodyPiece::Text => "\x1b[38;5;114m",    // string values: green
+        BodyPiece::Number => "\x1b[38;5;179m",  // numbers: yellow
+        BodyPiece::Literal => "\x1b[38;5;176m", // booleans/null: magenta
+        BodyPiece::Bracket => "\x1b[38;5;245m", // brackets/braces: gray
+        BodyPiece::TypeKey => "\x1b[38;5;147m", // @type key: light purple
+        BodyPiece::Comment => "\x1b[38;5;242m", // comments: dim
+        BodyPiece::Wrong => "\x1b[38;5;203m",   // no JSON where it stands: red
     };
-    // A string may run over several lines (a raw newline in it is allowed):
-    // each line carries its own colour, so a row is coloured whichever rows
-    // are drawn above it.
+    // A string or a comment may run over several lines: each line carries
+    // its own colour, so a row is coloured whichever rows are drawn above it.
     let paint = |color: &str, text: &str| {
-        if color.is_empty() {
-            return text.to_string();
-        }
         text.split('\n')
             .map(|line| if line.is_empty() { String::new() } else { format!("{}{}{}", color, line, r) })
             .collect::<Vec<_>>()
             .join("\n")
     };
-
-    while i < len {
-        let ch = chars[i];
-
-        if escape {
-            escape = false;
-            i += 1;
-            continue;
+    let mut out = String::with_capacity(s.len() * 2);
+    let mut at = 0;
+    while let Some(start) = first_bracket(&s[at..]).map(|found| at + found) {
+        out.push_str(&s[at..start]);
+        let scan = scan_body(&s[start..], typing_at.and_then(|cursor| cursor.checked_sub(start)));
+        let mut drawn = start;
+        for &(from, to, piece) in &scan.pieces {
+            out.push_str(&s[drawn..start + from]);
+            out.push_str(&paint(colour(piece), &s[start + from..start + to]));
+            drawn = start + to;
         }
-
-        if in_string {
-            if ch == '\\' {
-                escape = true;
-                i += 1;
-                continue;
-            }
-            if ch == '"' {
-                // End of string — collect the whole string and colorize
-                let string_content: String = chars[string_start..=i].iter().collect();
-                out.push_str(&paint(string_color(is_key, !open.is_empty(), &string_content), &string_content));
-                in_string = false;
-                i += 1;
-                continue;
-            }
-            i += 1;
-            continue;
-        }
-
-        match ch {
-            '"' => {
-                in_string = true;
-                string_start = i;
-                i += 1;
-            }
-            '{' | '}' | '[' | ']' => {
-                out.push_str(&format!("{}{}{}", c_brace, ch, r));
-                if ch == '{' || ch == '[' {
-                    open.push(ch);
-                    is_key = ch == '{';
-                } else {
-                    open.pop();
-                    is_key = false;
-                }
-                i += 1;
-            }
-            ':' => {
-                out.push(ch);
-                is_key = false;
-                i += 1;
-            }
-            ',' => {
-                out.push(ch);
-                // A key follows in an object, a value in an array.
-                is_key = open.last() == Some(&'{');
-                i += 1;
-            }
-            't' | 'f' | 'n' if !open.is_empty() => {
-                // Check for true/false/null
-                let remaining: String = chars[i..].iter().take(5).collect();
-                if remaining.starts_with("true") {
-                    out.push_str(&format!("{}true{}", c_bool, r));
-                    i += 4;
-                } else if remaining.starts_with("false") {
-                    out.push_str(&format!("{}false{}", c_bool, r));
-                    i += 5;
-                } else if remaining.starts_with("null") {
-                    out.push_str(&format!("{}null{}", c_bool, r));
-                    i += 4;
-                } else {
-                    out.push(ch);
-                    i += 1;
-                }
-            }
-            '0'..='9' | '-' if !open.is_empty() => {
-                // Number
-                let start = i;
-                while i < len && (chars[i].is_ascii_digit() || chars[i] == '.' || chars[i] == '-' || chars[i] == 'e' || chars[i] == 'E' || chars[i] == '+') {
-                    i += 1;
-                }
-                let num: String = chars[start..i].iter().collect();
-                out.push_str(&format!("{}{}{}", c_num, num, r));
-            }
-            _ => {
-                out.push(ch);
-                i += 1;
-            }
-        }
+        out.push_str(&s[drawn..start + scan.end]);
+        at = start + scan.end;
     }
-
-    // Handle unterminated string (user is still typing)
-    if in_string {
-        let string_content: String = chars[string_start..].iter().collect();
-        out.push_str(&paint(string_color(is_key, !open.is_empty(), &string_content), &string_content));
-    }
-
+    out.push_str(&s[at..]);
     out
 }
 
@@ -19877,6 +20082,11 @@ fn json_context_at_cursor(state: &AppState) -> Option<JsonContext> {
     if in_body_comment(&state.input, state.cursor_pos) {
         return None;
     }
+    // Nor in a body that is no JSON up to the cursor: what a key or a value
+    // would be offered for is not known where the grammar is broken.
+    if state.input[body_start..].starts_with(['{', '[']) && scan_body(&state.input[body_start..cursor_byte], None).broken {
+        return None;
+    }
     let blanked = without_body_comments(&state.input);
     let read = blanked.chars().skip(char_len(&state.input[..body_start]));
 
@@ -20906,59 +21116,29 @@ fn pending_closer(input: &str, cursor_pos: usize) -> Option<(char, usize)> {
     if in_body_comment(input, cursor_pos) {
         return None;
     }
-    let input = &without_body_comments(input);
+    // The body up to the cursor, read by the grammar: a bracket is owed
+    // only behind a whole value of a body that is JSON so far. One that is
+    // not (a key without its `:`, a value without its comma, a closer of
+    // something else) is not closed over what is wrong in it.
     let byte_idx = char_to_byte_idx(input, cursor_pos);
-    let before = input[..byte_idx].trim_end();
-    // Only after a closing quote, a closing bracket, or a value that needs
-    // neither: a literal or a number.
-    if !before.ends_with(['"', '}', ']']) {
-        // Behind the character, however many bytes it takes: a no-break
-        // space is a blank of two.
-        let word_start = before
-            .char_indices()
-            .rev()
-            .find(|(_, c)| c.is_whitespace() || matches!(c, ',' | ':' | '[' | '{'))
-            .map_or(0, |(at, c)| at + c.len_utf8());
-        let word = &before[word_start..];
-        if !matches!(word, "true" | "false" | "null") && serde_json::from_str::<serde_json::Number>(word).is_err() {
-            return None;
-        }
-    }
-    // Walk bracket stack and key/value state to determine if we're after a complete value
-    let mut stack = Vec::new();
-    let mut in_str = false;
-    let mut esc = false;
-    let mut is_key = true;
-    for ch in input[..byte_idx].chars() {
-        if esc { esc = false; continue; }
-        if ch == '\\' && in_str { esc = true; continue; }
-        if ch == '"' { in_str = !in_str; continue; }
-        if !in_str {
-            match ch {
-                '{' => { stack.push('}'); is_key = true; },
-                '[' => { stack.push(']'); is_key = false; },
-                '}' | ']' => { stack.pop(); is_key = false; },
-                ':' => { is_key = false; },
-                ',' => { is_key = stack.last() == Some(&'}'); },
-                _ => {}
-            }
-        }
-    }
-    // Not inside an unclosed string, and not after a key
-    if in_str || is_key {
+    let scan = body_scan_to(input, byte_idx)?;
+    if scan.broken || !scan.after_value {
         return None;
     }
+    let closer = *scan.open.last()?;
+    let blanked = without_body_comments(input);
+    let behind: String = blanked.chars().skip(cursor_pos).collect();
     // Nor in front of what is no end of the value: more of it (`12^3`), or
     // the next member (`"x"^, "b": 2`). A bracket would cut it off.
     let goes_on = |c: char| c.is_alphanumeric() || matches!(c, ',' | ':' | '"' | '{' | '[' | '-' | '.' | '_');
-    if input[byte_idx..].trim_start_matches([' ', '\t']).chars().next().is_some_and(goes_on) {
+    if behind.trim_start_matches([' ', '\t']).chars().next().is_some_and(goes_on) {
         return None;
     }
     // Nothing is pending where the bracket is closed behind the cursor
     // already: writing it again would leave one too many.
     let mut depth = 0i32;
     let (mut in_str, mut esc) = (false, false);
-    for ch in input[byte_idx..].chars() {
+    for ch in behind.chars() {
         if esc { esc = false; continue; }
         if ch == '\\' && in_str { esc = true; continue; }
         if ch == '"' { in_str = !in_str; continue; }
@@ -20968,7 +21148,7 @@ fn pending_closer(input: &str, cursor_pos: usize) -> Option<(char, usize)> {
                 // The first bracket that closes at this level: ours, or
                 // (`[{"a": "b"^]`) the one around it, with ours still open.
                 '}' | ']' if depth == 0 => {
-                    if stack.last() == Some(&ch) {
+                    if closer == ch {
                         return None;
                     }
                     break;
@@ -20978,7 +21158,19 @@ fn pending_closer(input: &str, cursor_pos: usize) -> Option<(char, usize)> {
             }
         }
     }
-    stack.last().map(|&closer| (closer, stack.len()))
+    Some((closer, scan.open.len()))
+}
+
+/// The body of the request on `input`, read from its first bracket up to
+/// `byte_idx`. None where no bracket is open in front of that byte.
+fn body_scan_to(input: &str, byte_idx: usize) -> Option<BodyScan> {
+    // Behind the URI where the line is a request, and anywhere on a line
+    // that is none: the object of a `set` line closes as a body does.
+    let from = find_body_start(input).filter(|&start| start <= byte_idx).unwrap_or(0);
+    let start = from + first_bracket(&input[from..byte_idx])?;
+    let scan = scan_body(&input[start..byte_idx], None);
+    // A body that was closed in front of the cursor is not what it is in.
+    (scan.end == byte_idx - start && !scan.open.is_empty()).then_some(scan)
 }
 
 /// Returns closing bracket ghost text (e.g. "}") when cursor is after a complete value.
@@ -32239,7 +32431,8 @@ mod tests {
             highlight_json("{\"a\": \"b\nc"),
             format!("{}{}: {string}\"b{r}\n{string}c{r}", b('{'), k("\"a\""))
         );
-        assert_eq!(highlight_json("{tru, nul, fals, x"), format!("{}tru, nul, fals, x", b('{')));
+        assert_eq!(highlight_json("[tru"), format!("{}tru", b('[')));
+        assert_eq!(highlight_json("[true, nul"), format!("{}{}, nul", b('['), l("true")));
 
         // Split at the cursor, the colour the cursor is in goes on after it.
         let full = highlight_json(r#"{"a": 1}"#);
@@ -34406,6 +34599,163 @@ mod tests {
     /// With the cursor anywhere in a line, in a URI, a body or a path, Tab
     /// writes exactly where a ghost is drawn: a ghost that Tab does not
     /// write and a Tab that writes unannounced are both found here.
+    // ── A body read by the grammar: what closes, and what is drawn as wrong ──
+
+    #[test]
+    fn a_body_is_read_by_its_grammar() {
+        let read = |text: &str| {
+            let scan = scan_body(text, None);
+            let wrong: Vec<&str> =
+                scan.pieces.iter().filter(|piece| piece.2 == BodyPiece::Wrong).map(|&(from, to, _)| &text[from..to]).collect();
+            (scan.broken, scan.after_value, scan.open.iter().collect::<String>(), wrong.join(" "))
+        };
+        let fine = |after_value: bool, open: &str| (false, after_value, open.to_string(), String::new());
+        // JSON so far: what is open, and whether a value has just ended.
+        assert_eq!(read("{"), fine(false, "}"));
+        assert_eq!(read("{\"a\""), fine(false, "}"));
+        assert_eq!(read("{\"a\":"), fine(false, "}"));
+        assert_eq!(read("{\"a\": 1"), fine(true, "}"));
+        assert_eq!(read("{\"a\": 1,"), fine(false, "}"));
+        assert_eq!(read("{\"a\": [1, {\"b\": null}"), fine(true, "}]"));
+        assert_eq!(read("[\"x\", -1.5e3, true "), fine(true, "]"));
+        assert_eq!(read("[[], {}"), fine(true, "]"));
+        // Unfinished: a string, a word that is no value yet, a comment.
+        assert_eq!(read("{\"a\": \"b"), fine(false, "}"));
+        assert_eq!(read("{\"a\": tru"), fine(false, "}"));
+        assert_eq!(read("{\"a\": -"), fine(false, "}"));
+        assert_eq!(read("{\"a\": 1 // one"), fine(false, "}"));
+        assert_eq!(read("{\"a\": 1 /* one"), fine(false, "}"));
+        // A comment that has ended is nothing, whatever it holds.
+        assert_eq!(read("{\"a\": 1 /* } \" */"), fine(true, "}"));
+        assert_eq!(read("{\n  // }\n  \"a\": 1"), fine(true, "}"));
+        assert_eq!(read("{\n  # don't \"quote\n  \"a\": 1"), fine(true, "}"));
+        // A body that is closed is read to its closer and no further.
+        assert_eq!(scan_body("{\"a\": 1} > out[1].json", None).end, 8);
+        assert_eq!(read("{\"a\": 1} > out[1].json"), fine(false, ""));
+
+        // Broken, and what is wrong in it. A key without its `:` is the
+        // key: the screenshot's `{ "/people/{arg}", …`.
+        assert_eq!(read("{ \"template\": { \"/people/{arg}\", \"args\": [ \"123\"] }"), (true, true, "}".to_string(), "\"/people/{arg}\"".to_string()));
+        assert_eq!(read("{\"a\" \"b\""), (true, true, "}".to_string(), "\"a\"".to_string()));
+        assert_eq!(read("{\"a\"}"), (true, false, String::new(), "\"a\"".to_string()));
+        // A value without its comma is what stands where the comma should.
+        assert_eq!(read("{\"a\": \"b\" \"c\""), (true, false, "}".to_string(), "\"c\"".to_string()));
+        assert_eq!(read("[1 2"), (true, true, "]".to_string(), "2".to_string()));
+        // A comma or a colon that nothing asked for, and a closer behind one.
+        assert_eq!(read("{\"a\": , \"b\": 1"), (true, true, "}".to_string(), ",".to_string()));
+        assert_eq!(read("{, \"b\": 1"), (true, true, "}".to_string(), ",".to_string()));
+        assert_eq!(read("[\"a\": 1"), (true, true, "]".to_string(), ":".to_string()));
+        assert_eq!(read("[1,]"), (true, false, String::new(), "]".to_string()));
+        assert_eq!(read("{\"a\":}"), (true, false, String::new(), "}".to_string()));
+        // A closer of something that is not open there.
+        assert_eq!(read("{\"a\": [1, 2}"), (true, true, "}]".to_string(), "}".to_string()));
+        // A word that is no value, where it is not being typed.
+        assert_eq!(read("{\"a\": nullable, \"b\": v2, \"c\": 2024-01-01, \"d\": 1"), (true, true, "}".to_string(), "nullable v2 2024-01-01".to_string()));
+        // A key without quotes is wrong and lets the body be read, as
+        // completion reads it.
+        assert_eq!(read("{ name: \"x\""), (false, true, "}".to_string(), "name".to_string()));
+
+        // The word the cursor is behind is one being typed.
+        let scan = scan_body("[tru, 1]", Some(4));
+        assert!(!scan.broken && scan.pieces.iter().all(|piece| piece.2 != BodyPiece::Wrong));
+        assert!(scan_body("[tru, 1]", Some(7)).broken);
+    }
+
+    #[test]
+    fn a_closer_is_offered_only_in_a_body_that_is_json_so_far() {
+        // The screenshot: a `{` too many behind `"template":`, and a `}`
+        // offered at the end as if the body were whole but for it.
+        for marked in [
+            "PUT /yoro { \"template\": { \"/people/{arg}\", \"args\": [ \"123\"] }^",
+            "PUT /people [{ \"name\": \"b\" \"c\"^",
+            "PUT /people [{ \"name\": , \"b\": 1^",
+            "PUT /people [{ \"name\": [1, 2}^",
+            "PUT /people [{ \"name\": [1,], \"b\": 2^",
+            "PUT /people [1 2^",
+            "PUT /people [\"a\": 1^",
+            "PUT /people [{ \"name\": nullable, \"b\": 2^",
+        ] {
+            assert_eq!(template_ghost_then_tab(marked, true), (String::new(), marked.to_string()), "{marked}");
+        }
+        // Nor a key or a value, where what they would be of is not known.
+        for marked in ["PUT /people [{ \"name\" , ^", "PUT /people [{ \"name\" , \"gi^", "PUT /people [{ \"name\": \"x\" \"active\": ^"] {
+            assert_eq!(template_ghost_then_tab(marked, true), (String::new(), marked.to_string()), "{marked}");
+        }
+        // With the brace gone the yoro body closes, and so does the object
+        // of a line that is no request.
+        for (marked, after) in [
+            ("PUT /yoro { \"template\": \"/people/{arg}\", \"args\": [ \"123\"]^", "PUT /yoro { \"template\": \"/people/{arg}\", \"args\": [ \"123\"]}^"),
+            ("PUT /people [{ name: \"x\"^", "PUT /people [{ name: \"x\"}^"),
+            ("set {\"raw\": true^", "set {\"raw\": true}^"),
+        ] {
+            assert_eq!(template_ghost_then_tab(marked, true), ("}".to_string(), after.to_string()), "{marked}");
+        }
+    }
+
+    #[test]
+    fn a_body_is_drawn_with_what_is_wrong_in_it_and_its_comments() {
+        let r = "\x1b[0m";
+        let paint = |code: u8, text: &str| format!("\x1b[38;5;{code}m{text}{r}");
+        let (b, k, v, n, l) = (
+            |text: &str| paint(245, text),
+            |text: &str| paint(110, text),
+            |text: &str| paint(114, text),
+            |text: &str| paint(179, text),
+            |text: &str| paint(176, text),
+        );
+        let (wrong, comment, at) = (|text: &str| paint(203, text), |text: &str| paint(242, text), |text: &str| paint(147, text));
+        // The screenshot: the string that has no `:` is no key.
+        assert_eq!(
+            highlight_json("{ \"template\": { \"/people/{arg}\", \"args\": [ \"123\"] }"),
+            format!("{} {}: {} {}, {}: {} {}{} {}", b("{"), k("\"template\""), b("{"), wrong("\"/people/{arg}\""), k("\"args\""), b("["), v("\"123\""), b("]"), b("}"))
+        );
+        // A value without its comma, a closer of something else, a comma
+        // nothing asked for.
+        assert_eq!(highlight_json("{\"a\": 1 \"b\": 2}"), format!("{}{}: {} {}: {}{}", b("{"), k("\"a\""), n("1"), wrong("\"b\""), n("2"), b("}")));
+        assert_eq!(highlight_json("{\"a\": [1}"), format!("{}{}: {}{}{}", b("{"), k("\"a\""), b("["), n("1"), wrong("}")));
+        assert_eq!(highlight_json("[1,, 2]"), format!("{}{},{} {}{}", b("["), n("1"), wrong(","), n("2"), b("]")));
+        // A literal and a number are whole words, and a word that is
+        // neither is wrong where it is not being typed.
+        assert_eq!(
+            highlight_json("{\"a\": nullable, \"b\": v2, \"c\": 2024-01-01, \"d\": tru"),
+            format!("{}{}: {}, {}: {}, {}: {}, {}: tru", b("{"), k("\"a\""), wrong("nullable"), k("\"b\""), wrong("v2"), k("\"c\""), wrong("2024-01-01"), k("\"d\""))
+        );
+        assert_eq!(highlight_json("[null, -1.5e3, -, 1.2.3]"), format!("{}{}, {}, {}, {}{}", b("["), l("null"), n("-1.5e3"), wrong("-"), wrong("1.2.3"), b("]")));
+        // Only `@type` is the type key.
+        assert_eq!(highlight_json("{\"@type\": 1, \"not@typed\": 2}"), format!("{}{}: {}, {}: {}{}", b("{"), at("\"@type\""), n("1"), k("\"not@typed\""), n("2"), b("}")));
+        assert_eq!(highlight_json("{\"@ty"), format!("{}{}", b("{"), k("\"@ty")));
+        // A comment is dim to its end, and nothing in it is JSON: a quote
+        // in one coloured the rest of the body as a string, a `}` ended
+        // the colours, and a number and `true` had theirs.
+        assert_eq!(
+            highlight_json("{\n  // don't \"quote\n  \"a\": 1\n}"),
+            format!("{}\n  {}\n  {}: {}\n{}", b("{"), comment("// don't \"quote"), k("\"a\""), n("1"), b("}"))
+        );
+        assert_eq!(highlight_json("{ // }\n \"a\": 1 }"), format!("{} {}\n {}: {} {}", b("{"), comment("// }"), k("\"a\""), n("1"), b("}")));
+        assert_eq!(highlight_json("{ # 3 items, true\n \"a\": 1 }"), format!("{} {}\n {}: {} {}", b("{"), comment("# 3 items, true"), k("\"a\""), n("1"), b("}")));
+        assert_eq!(
+            highlight_json("[1, /* two\n three */ 4]"),
+            format!("{}{}, {}\n{} {}{}", b("["), n("1"), comment("/* two"), comment(" three */"), n("4"), b("]"))
+        );
+        // In a string a marker is text.
+        assert_eq!(highlight_json("[\"a // b # c\"]"), format!("{}{}{}", b("["), v("\"a // b # c\""), b("]")));
+        // Every character is there once, coloured or not.
+        for body in ["{ \"a\": { \"b\", \"c\": [ 1 2 }", "{\n // x\n \"å\": nullable, tru: 1,, }", "[\"日本\", /* 👍 */ -]"] {
+            let mut shown = String::new();
+            let mut coloured = highlight_json(body);
+            while let Some(at) = coloured.find('\x1b') {
+                shown.push_str(&coloured[..at]);
+                let end = at + coloured[at..].find('m').expect("a colour ends in m") + 1;
+                coloured = coloured[end..].to_string();
+            }
+            shown.push_str(&coloured);
+            assert_eq!(shown, body, "{body:?}");
+        }
+        // The word the cursor is behind is being typed, and not wrong yet.
+        assert_eq!(highlight_json_split("[tru, 1]", Some(4)).0, format!("{}tru", b("[")));
+        assert!(highlight_json_split("[tru, 1]", Some(6)).0.starts_with(&format!("{}{}, ", b("["), wrong("tru"))));
+    }
+
     // ── Completion: what the review of the body completion found ──
 
     #[test]
