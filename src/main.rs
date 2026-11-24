@@ -20657,6 +20657,23 @@ fn cycling_json_key(state: &AppState) -> bool {
         && state.input[cursor_byte..].starts_with(&cycle.written[written_at..])
 }
 
+/// Whether a key that nobody started to type has to wait for a line of its
+/// own: in an object that is laid out on lines (it was opened on a line
+/// above the cursor's), behind something on the cursor's line. A member of
+/// such an object starts a line, so none is offered behind `"a": 1, `, and
+/// Tab writes none there. A comment in front of the cursor is nothing.
+fn key_waits_for_a_new_line(state: &AppState, ctx: &JsonContext) -> bool {
+    if ctx.pos != JsonPos::Key || ctx.in_string || !ctx.partial.is_empty() {
+        return false;
+    }
+    let cursor_pos = state.cursor_pos.min(char_len(&state.input));
+    let blanked: String = without_body_comments(&state.input).chars().take(cursor_pos).collect();
+    let line = blanked.matches('\n').count();
+    let in_front = blanked.rsplit('\n').next().unwrap_or("");
+    let (open, _) = open_bracket_lines(&state.input, cursor_pos);
+    open.last().is_some_and(|&opened| opened < line) && !in_front.trim().is_empty()
+}
+
 /// Whether nothing stands between the cursor (in chars) and the end of its
 /// line. A comment of the body is nothing: a key can be written in front
 /// of it.
@@ -20708,6 +20725,9 @@ fn handle_json_tab_completion(state: &mut AppState, reverse: bool, apply: bool) 
     // Don't offer completions when cursor is on a line that already has content after cursor
     // (e.g. cursor on the " of "identifiers": { — don't insert a new key before it)
     if ctx.partial.is_empty() && !rest_of_line_is_blank(&state.input, state.cursor_pos) {
+        return;
+    }
+    if key_waits_for_a_new_line(state, &ctx) {
         return;
     }
 
@@ -21138,6 +21158,9 @@ fn get_json_completion_ghost(state: &AppState) -> Option<String> {
     }
     let ctx = json_context_at_cursor(state)?;
     if !matches!(ctx.pos, JsonPos::Key | JsonPos::Value) {
+        return None;
+    }
+    if key_waits_for_a_new_line(state, &ctx) {
         return None;
     }
     let cursor_byte = char_to_byte_idx(&state.input, state.cursor_pos);
@@ -36753,6 +36776,47 @@ mod tests {
         assert_eq!(shown(&state), "POST /agents {\"@t^");
         tab_pressed(&mut state);
         assert_eq!(shown(&state), first);
+    }
+
+    /// In a body that is laid out on lines a member starts a line: no key
+    /// is offered behind another member, and Tab writes none there.
+    #[test]
+    fn a_key_is_not_offered_behind_a_member_of_an_object_laid_out_on_lines() {
+        let ghost = |marked: &str| render_input_content(&mut completing_body(marked), 200).2;
+        let open = "PUT /people [{\n  \"identifiers\": {\n    \"com.heads.foo\": \"123\"\n  },\n  \"givenName\": \"Joe\",";
+        // The reported case, with the blank behind the comma and without.
+        for behind in [" ^", "^", "   ^"] {
+            let marked = format!("{open}{behind}\n}}]");
+            assert_eq!(ghost(&marked), "", "{marked}");
+            assert_eq!(body_tabbed(&marked), marked);
+        }
+        // On the next line it is offered, and written.
+        let marked = format!("{open}\n  ^\n}}]");
+        assert_eq!(ghost(&marked), "\"addresses\": {");
+        assert!(body_tabbed(&marked).starts_with(&format!("{open}\n  \"addresses\": {{\n")));
+        // As Enter leaves the cursor there.
+        let mut state = completing_body(&format!("{open}^\n}}]"));
+        enter_inside_brackets(&mut state);
+        assert_eq!(shown(&state), marked);
+        assert_eq!(render_input_content(&mut state, 200).2, "\"addresses\": {");
+        // Behind the bracket of a line above, and behind a member of a
+        // block inside the body.
+        assert_eq!(ghost("PUT /people [{\n  \"identifiers\": {\n    \"com.mi6.id\": \"7\", ^\n  }\n}]"), "");
+        // A comment in front of the cursor is nothing.
+        assert_eq!(ghost("PUT /people [{\n  /* next */ ^\n}]"), "\"identifiers\": {");
+
+        // A key that was started is completed where it stands.
+        assert_eq!(ghost(&format!("{open} \"ad^\n}}]")), "dresses\": {");
+        assert_eq!(ghost(&format!("{open} ad^\n}}]")), "dresses\": {");
+        assert!(!ghost(&format!("{open} \"^\n}}]")).is_empty());
+        // An object written on one line takes its keys on that line: a
+        // body of one line, and one of a body that has lines.
+        assert_eq!(ghost("PUT /people [{\"givenName\": \"Joe\", ^"), "\"identifiers\": {");
+        assert_eq!(ghost("PUT /people [\n  {\"givenName\": \"Joe\", ^"), "\"identifiers\": {");
+        assert_eq!(ghost("PUT /people [{\n  \"identifiers\": {^"), " \"com.mi6.id\":");
+        // A value is offered behind its key, and a bracket behind a value.
+        assert_eq!(ghost("PUT /people [{\n  \"active\": ^\n}]"), "true");
+        assert_eq!(body_tabbed("PUT /people [{\n  \"active\": true^"), "PUT /people [{\n  \"active\": true\n}^");
     }
 
     /// The line and the ghost behind the cursor, as the prompt draws them.
