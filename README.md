@@ -266,6 +266,11 @@ one-shot mode, with tab completion for endpoints, operators, properties, and fil
   they take, with `shift+tab` back through the list. `{arg}` is offered wherever a segment or
   a value starts: at once where nothing else is (`/products/com.example.sku=`, `~take(`), last
   of the list elsewhere, and on a typed `{`. The string is left open, since a URI can go on.
+- **`tab` goes through a list and `shift+tab` back.** Where several things can stand (endpoints,
+  operators, paths, the settings of a `set` line, the kind of an `import`), `tab` writes the
+  first and each press the next in its place, round from the last to the first. `shift+tab`
+  goes back, and from the first to the line as it was typed. Any other key keeps what stands
+  there.
 - **Typing a body promotes GET to PUT**; on an array endpoint the opening `[` is added for you.
 - **`ctrl+space` cycles** PUT → PATCH → POST → GET. Switching to GET stashes the body; switching back restores it.
 - **Enter on a body method without a body** opens a multi-line editor: `ctrl+d` sends, `esc` cancels. A `> file` on the line is kept and applied when the body is sent.

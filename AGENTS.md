@@ -1167,7 +1167,10 @@ GET /people~count > /tmp/count.json          # as the server answers, nulls incl
 - **At the prompt** a `set` line changes what the session has set. Tab
   behind `set ` writes the opening of the object with the first setting
   (`set {"export": `) and goes through the seven; behind `set {"in` it
-  completes the name. [`ctrl+t` opens the same settings as a
+  completes the name. Behind the `:` of a switch it writes `true` and goes
+  on to `false`, and behind a `,` it goes through the settings the line
+  does not name yet. Shift+Tab goes back, and from the first to the line
+  as it was typed. [`ctrl+t` opens the same settings as a
   menu](#the-settings-menu-ctrlt). The session stands where the command line stands for a
   batch: what it has set holds for every line typed after it and for a file
   run from the prompt, and a `set` line in that file does not turn it off

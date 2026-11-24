@@ -1778,6 +1778,10 @@ struct AppState {
     /// The key or the value Tab wrote into a body from a list of several,
     /// which the next Tab or Shift+Tab takes back for another of the list.
     key_cycle: Option<KeyCycle>,
+    /// The line and the cursor as they were before Tab went into the list
+    /// it is going through (of URIs, paths or settings): what Shift+Tab on
+    /// the first of the list goes back to.
+    tab_origin: Option<(String, usize)>,
     last_tab_input: String,
     completion_uri_suffix: String,  // URI text after cursor for mid-URI completion
     connection_alias: String,  // Current connection alias (for Ctrl+S pre-fill)
@@ -1878,6 +1882,7 @@ impl AppState {
             completions: Vec::new(),
             completion_idx: 0,
             key_cycle: None,
+            tab_origin: None,
             last_tab_input: String::new(),
             completion_uri_suffix: String::new(),
             connection_alias: String::new(),
@@ -14998,6 +15003,7 @@ fn handle_key_event(
                 state.completions.clear();
                 state.completion_idx = 0;
                 state.key_cycle = None;
+                state.tab_origin = None;
                 state.last_tab_input.clear();
                 state.completion_uri_suffix.clear();
                 render(stdout, state)?;
@@ -15468,6 +15474,7 @@ fn reset_for_input<W: Write>(
         state.completions.clear();
         state.completion_idx = 0;
         state.key_cycle = None;
+        state.tab_origin = None;
         state.last_tab_input.clear();
         state.completion_uri_suffix.clear();
     }
@@ -20656,6 +20663,28 @@ fn key_waits_for_a_new_line(state: &AppState, ctx: &JsonContext) -> bool {
     open.last().is_some_and(|&opened| opened < line) && !in_front.trim().is_empty()
 }
 
+/// Whether a key or a value that nobody started to type can be written at
+/// the cursor: with nothing behind it on its line, and a value also in
+/// front of what ends it (`"status": ^}`, `"status": "^",`). In front of
+/// anything else it would be written into what stands there.
+fn room_to_complete(state: &AppState, ctx: &JsonContext) -> bool {
+    if rest_of_line_is_blank(&state.input, state.cursor_pos) {
+        return true;
+    }
+    if ctx.pos != JsonPos::Value {
+        return false;
+    }
+    let rest: String =
+        without_body_comments(&state.input).chars().skip(state.cursor_pos).take_while(|&c| c != '\n').collect();
+    // In its quotes, the one that closes them is the value's own.
+    let rest = match (ctx.in_string, rest.strip_prefix('"')) {
+        (true, Some(behind_quote)) => behind_quote,
+        (true, None) => return false,
+        (false, _) => rest.as_str(),
+    };
+    rest.trim_start().starts_with([',', '}', ']'])
+}
+
 /// Whether nothing stands between the cursor (in chars) and the end of its
 /// line. A comment of the body is nothing: a key can be written in front
 /// of it.
@@ -20707,7 +20736,7 @@ fn handle_json_tab_completion(state: &mut AppState, reverse: bool, apply: bool) 
 
     // Don't offer completions when cursor is on a line that already has content after cursor
     // (e.g. cursor on the " of "identifiers": { — don't insert a new key before it)
-    if ctx.partial.is_empty() && !rest_of_line_is_blank(&state.input, state.cursor_pos) {
+    if ctx.partial.is_empty() && !room_to_complete(state, &ctx) {
         return;
     }
     if key_waits_for_a_new_line(state, &ctx) {
@@ -20731,6 +20760,7 @@ fn handle_json_tab_completion(state: &mut AppState, reverse: bool, apply: bool) 
         // would be a new one, of values, and its last would be written.
         return;
     } else {
+        state.tab_origin = None;
         state.completions = completions;
         state.completion_idx = 0;
         // Use tab_key for applied completions so cycling works on subsequent Tab presses
@@ -20874,6 +20904,29 @@ fn cycling_uri(state: &AppState, uri: &str) -> bool {
     state.completions.len() > 1 && !state.last_tab_input.is_empty() && state.completions.iter().any(|c| c == uri)
 }
 
+/// Tab goes into a new list: the line as it stands is what Shift+Tab on the
+/// first of the list goes back to.
+fn start_tab_list(state: &mut AppState) {
+    state.tab_origin = Some((state.input.clone(), state.cursor_pos));
+}
+
+/// Shift+Tab on the first of the list Tab is going through: the line as it
+/// was before Tab wrote any of it, and no list. Returns whether that was
+/// where the list stood.
+fn back_from_the_first(state: &mut AppState) -> bool {
+    if state.completion_idx != 0 {
+        return false;
+    }
+    if let Some((input, cursor)) = state.tab_origin.take() {
+        state.input = input;
+        state.cursor_pos = cursor;
+    }
+    state.completions.clear();
+    state.last_tab_input.clear();
+    state.completion_uri_suffix.clear();
+    true
+}
+
 fn handle_tab_completion(state: &mut AppState) {
     // Format: [METHOD] URI [BODY] [> outfile]
     let at = line_uri_at(&state.input, char_to_byte_idx(&state.input, state.cursor_pos));
@@ -20927,7 +20980,11 @@ fn handle_tab_completion(state: &mut AppState) {
     };
 
     if !is_cycling {
-        state.completions = get_completions(state, &uri);
+        // As `start_tab_list` does it, with the line still being read.
+        state.tab_origin = Some((state.input.clone(), state.cursor_pos));
+        // What is typed is not one of them: Tab on a URI that is whole
+        // writes the next that starts so, as the ghost there shows.
+        state.completions = get_completions(state, &uri).into_iter().filter(|completion| *completion != uri).collect();
         state.completion_idx = 0;
         state.last_tab_input = current_base;
         state.completion_uri_suffix = uri_after.clone();
@@ -20949,15 +21006,14 @@ fn handle_tab_completion_reverse(state: &mut AppState) {
         return;
     }
 
+    // Back from the first is what was typed.
+    if back_from_the_first(state) {
+        return;
+    }
+    state.completion_idx -= 1;
+
     // The method, and the suffix after the URI (body/outfile, not including uri_after)
     let at = line_uri_at(&state.input, char_to_byte_idx(&state.input, state.cursor_pos));
-
-    // Cycle backward
-    if state.completion_idx == 0 {
-        state.completion_idx = state.completions.len() - 1;
-    } else {
-        state.completion_idx -= 1;
-    }
 
     let (input, cursor) =
         uri_completed(&state.input, &at, &state.completions[state.completion_idx], &state.completion_uri_suffix);
@@ -20977,7 +21033,7 @@ fn replace_file_path_span(state: &mut AppState, path_start: usize, path_end: usi
 }
 
 fn handle_file_tab_completion(state: &mut AppState) {
-    let ctx = match extract_file_path_context(&state.input, state.cursor_pos) {
+    let ctx = match tab_file_context(state) {
         Some(ctx) => ctx,
         None => return,
     };
@@ -21013,6 +21069,7 @@ fn handle_file_tab_completion(state: &mut AppState) {
                 return;
             }
             if !is_cycling {
+                start_tab_list(state);
                 state.completions = state.mapped_types.iter()
                     .filter(|name| inside.is_empty() || name.to_lowercase().starts_with(&inside.to_lowercase()))
                     .map(|name| format!("{})", name))
@@ -21052,6 +21109,7 @@ fn handle_file_tab_completion(state: &mut AppState) {
     };
 
     if !is_cycling {
+        start_tab_list(state);
         state.completions = file_completions_for(&ctx);
         state.completion_idx = 0;
         state.last_tab_input = state.input.clone();
@@ -21068,17 +21126,17 @@ fn handle_file_tab_completion_reverse(state: &mut AppState) {
         return;
     }
 
-    let ctx = match extract_file_path_context(&state.input, state.cursor_pos) {
+    let ctx = match tab_file_context(state) {
         Some(ctx) => ctx,
         None => return,
     };
     let (path_start, path_end) = (ctx.path_start, ctx.path_end);
 
-    if state.completion_idx == 0 {
-        state.completion_idx = state.completions.len() - 1;
-    } else {
-        state.completion_idx -= 1;
+    // Back from the first is what was typed.
+    if back_from_the_first(state) {
+        return;
     }
+    state.completion_idx -= 1;
 
     let completion = state.completions[state.completion_idx].clone();
 
@@ -21145,7 +21203,7 @@ fn get_json_completion_ghost(state: &AppState) -> Option<String> {
     if next.is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '@' | '-' | '?')) {
         return None;
     }
-    if ctx.partial.is_empty() && !rest_of_line_is_blank(&state.input, state.cursor_pos) {
+    if ctx.partial.is_empty() && !room_to_complete(state, &ctx) {
         return None;
     }
     json_completions(state, &ctx).first().and_then(|first| ghost_of(first)).filter(|ghost| !ghost.is_empty())
@@ -21229,12 +21287,17 @@ fn handle_template_tab(state: &mut AppState, reverse: bool) -> bool {
         return true;
     }
     if cycling_template(state, &template.typed) {
+        // Back from the first is what was typed.
+        if reverse && back_from_the_first(state) {
+            return true;
+        }
         let step = if reverse { state.completions.len() - 1 } else { 1 };
         state.completion_idx = (state.completion_idx + step) % state.completions.len();
     } else if reverse {
         // No list that Tab has gone into: nothing to go back in.
         return true;
     } else {
+        start_tab_list(state);
         state.completions = template_completions(state, &template.typed);
         state.completion_idx = 0;
         state.last_tab_input = TEMPLATE_TAB.to_string();
@@ -21531,7 +21594,7 @@ fn get_completion_ghost(state: &AppState) -> String {
     }
 
     // File completion ghost text (works even without API completion)
-    if let Some(ctx) = extract_file_path_context(&state.input, state.cursor_pos) {
+    if let Some(ctx) = tab_file_context(state).filter(|ctx| !setting_value_is_whole(state, ctx)) {
         let partial = &ctx.partial;
         if ctx.is_include && could_become_a_keyword(partial) {
             return String::new();
@@ -21627,7 +21690,7 @@ fn get_completion_ghost(state: &AppState) -> String {
 
     // The first completion, and what it would add to what is typed
     let completions = get_completions(state, &uri);
-    if let Some(ghost) = completions.first().and_then(|completion| rest_behind(completion, &uri)) {
+    if let Some(ghost) = completions.iter().find(|completion| **completion != uri).and_then(|completion| rest_behind(completion, &uri)) {
         if !ghost.is_empty() {
             return ghost.to_string();
         }
@@ -21715,7 +21778,12 @@ fn get_completion_ghost_at_cursor(state: &AppState) -> String {
         return String::new();
     }
 
-    get_completions(state, uri).first().and_then(|completion| rest_behind(completion, uri)).unwrap_or_default().to_string()
+    get_completions(state, uri)
+        .iter()
+        .find(|completion| completion.as_str() != uri)
+        .and_then(|completion| rest_behind(completion, uri))
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// What `completion` adds to what is typed. A completion may differ from
@@ -21754,9 +21822,12 @@ struct FilePathContext {
     is_append: bool,
     /// The line itself is a path to a `.api` file to run.
     is_include: bool,
-    /// No path at all: the first setting of a `set` line (`{"include-nulls": `),
-    /// which is completed and shown ahead the same way.
+    /// No path at all: a word of a `set` line (a setting as `{"include-nulls": `,
+    /// a value) or the kind of an `import`, which is completed and shown
+    /// ahead the same way.
     is_setting: bool,
+    /// The words that can stand there, where it is no path.
+    words: Vec<String>,
 }
 
 const DIRECTIVES: [&str; 6] = ["sleep", "assert", "confirm", "url", "import", "set"];
@@ -21773,7 +21844,10 @@ fn include_path_context(input: &str, seg_start: usize, seg_end: usize) -> Option
     let partial = input.trim();
     let first_word = partial.split_whitespace().next()?;
     if first_word.eq_ignore_ascii_case("set") {
-        return setting_name_context(input);
+        return setting_member_context(input).or_else(|| setting_name_context(input));
+    }
+    if first_word.eq_ignore_ascii_case("import") {
+        return import_kind_context(input);
     }
     if starts_a_request(first_word)
         || first_word.starts_with('/')
@@ -21791,6 +21865,7 @@ fn include_path_context(input: &str, seg_start: usize, seg_end: usize) -> Option
         is_append: false,
         is_include: true,
         is_setting: false,
+        words: Vec::new(),
     })
 }
 
@@ -21800,6 +21875,38 @@ fn setting_opening(name: &str) -> String {
     format!("{{\"{}\": ", name)
 }
 
+/// What a later setting of a `set` line is written as, up to where its
+/// value goes.
+fn setting_member(name: &str) -> String {
+    format!("\"{}\": ", name)
+}
+
+/// The values of a setting that Tab writes: a switch is on or off. A name
+/// and a number of seconds are typed.
+fn setting_values(name: &str) -> &'static [&'static str] {
+    match name {
+        "export" | "timeout" => &[],
+        name if SETTING_NAMES.contains(&name) => &["true", "false"],
+        _ => &[],
+    }
+}
+
+/// A place where one of `words` is typed, from `start` to the end of the
+/// line. None where what is typed there starts none of them.
+fn words_context(input: &str, start: usize, words: Vec<String>) -> Option<FilePathContext> {
+    let partial = &input[start..];
+    words.iter().any(|word| word.starts_with(partial)).then(|| FilePathContext {
+        path_start: start,
+        path_end: input.len(),
+        partial: partial.to_string(),
+        is_outfile: false,
+        is_append: false,
+        is_include: false,
+        is_setting: true,
+        words,
+    })
+}
+
 /// The first setting being typed on a `set` line, from the blank behind
 /// `set` up to the end of the line: `{"in` of `set {"in`, or nothing yet.
 /// Not once a value follows it: the name is whole then.
@@ -21807,19 +21914,141 @@ fn setting_name_context(input: &str) -> Option<FilePathContext> {
     let behind_set = input.len() - input.trim_start().len() + "set".len();
     let rest = &input[behind_set..];
     let name = rest.trim_start();
-    if name.len() == rest.len() || !SETTING_NAMES.iter().any(|setting| setting_opening(setting).starts_with(name)) {
+    if name.len() == rest.len() {
         return None;
     }
-    let path_start = input.len() - name.len();
-    Some(FilePathContext {
-        path_start,
-        path_end: input.len(),
-        partial: name.to_string(),
-        is_outfile: false,
-        is_append: false,
-        is_include: false,
-        is_setting: true,
-    })
+    words_context(input, input.len() - name.len(), SETTING_NAMES.iter().map(|name| setting_opening(name)).collect())
+}
+
+/// The object of a `set` line as far as it is typed.
+struct TypedSetLine {
+    /// Each setting that has its `:`: where it starts (the first at the
+    /// `{`), and its name.
+    members: Vec<(usize, String)>,
+    /// The last `,` or `:` outside a string, or the `{`.
+    sep: char,
+    /// Where what is typed behind it starts.
+    at: usize,
+}
+
+/// Read a `set` line that is one line and has its `{`. None for any other
+/// line, and for an object that is closed or holds another.
+fn scan_set_line(input: &str) -> Option<TypedSetLine> {
+    if input.contains('\n') {
+        return None;
+    }
+    let lead = input.len() - input.trim_start().len();
+    if !input.get(lead..lead + 3)?.eq_ignore_ascii_case("set") {
+        return None;
+    }
+    let rest = &input[lead + 3..];
+    let body = rest.trim_start();
+    if body.len() == rest.len() || !body.starts_with('{') {
+        return None;
+    }
+    let open = input.len() - body.len();
+    let behind_blanks = |at: usize| input.len() - input[at..].trim_start().len();
+    let mut members = Vec::new();
+    let (mut member_start, mut sep, mut at) = (open, '{', open + 1);
+    let (mut string_start, mut escape, mut last_string) = (None, false, None);
+    for (i, c) in body.char_indices().skip(1).map(|(i, c)| (open + i, c)) {
+        if let Some(start) = string_start {
+            if escape {
+                escape = false;
+            } else if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                last_string = Some(input[start + 1..i].to_string());
+                string_start = None;
+            }
+            continue;
+        }
+        match c {
+            '"' => string_start = Some(i),
+            ':' => {
+                members.push((member_start, last_string.take()?));
+                (sep, at) = (':', i + 1);
+            }
+            ',' => {
+                (sep, at) = (',', i + 1);
+                member_start = behind_blanks(i + 1);
+            }
+            '{' | '[' | '}' | ']' => return None,
+            _ => {}
+        }
+    }
+    Some(TypedSetLine { members, sep, at: behind_blanks(at) })
+}
+
+/// The settings a `set` line does not name yet, those of `members` being
+/// named.
+fn settings_left(members: &[(usize, String)]) -> impl Iterator<Item = &'static str> + '_ {
+    SETTING_NAMES.iter().copied().filter(|name| !members.iter().any(|(_, named)| named == name))
+}
+
+/// What is typed behind the last `:` or `,` of a `set` line: the value of
+/// a switch, or the next setting.
+fn setting_member_context(input: &str) -> Option<FilePathContext> {
+    let line = scan_set_line(input)?;
+    let words: Vec<String> = match line.sep {
+        ':' => setting_values(&line.members.last()?.1).iter().map(|value| value.to_string()).collect(),
+        ',' => settings_left(&line.members).map(setting_member).collect(),
+        _ => return None,
+    };
+    words_context(input, line.at, words)
+}
+
+/// The setting a `set` line ends in, with its `:` and nothing behind it, as
+/// the name it is: what Tab is at while it goes through the settings. Read
+/// without it, the place is that of the setting's value.
+fn setting_written_context(input: &str) -> Option<FilePathContext> {
+    let line = scan_set_line(input)?;
+    let (&(start, _), named) = line.members.split_last()?;
+    if line.sep != ':' || line.at != input.len() {
+        return None;
+    }
+    let words = match named.is_empty() {
+        true => settings_left(named).map(setting_opening).collect(),
+        false => settings_left(named).map(setting_member).collect(),
+    };
+    words_context(input, start, words)
+}
+
+/// The kind of an `import` being typed, behind the blank that follows the
+/// word: `gi` of `import gi`, or nothing yet. Not once an alias follows it.
+fn import_kind_context(input: &str) -> Option<FilePathContext> {
+    let behind_import = input.len() - input.trim_start().len() + "import".len();
+    let rest = input.get(behind_import..)?;
+    let kind = rest.trim_start();
+    if kind.len() == rest.len() {
+        return None;
+    }
+    words_context(input, input.len() - kind.len(), IMPORT_KINDS.iter().map(|kind| format!("{} ", kind)).collect())
+}
+
+/// Whether Tab is going through a list and `written` is one of it.
+fn tab_wrote(state: &AppState, written: &str) -> bool {
+    state.completions.len() > 1 && !state.last_tab_input.is_empty() && state.completions.iter().any(|c| c == written)
+}
+
+/// The path or the word Tab completes at the cursor. As
+/// `extract_file_path_context` reads the line, but for a setting that Tab
+/// has just written from a list of several: that is the name the next Tab
+/// replaces, where the line alone reads as the place of its value.
+fn tab_file_context(state: &AppState) -> Option<FilePathContext> {
+    if state.completions.len() > 1 && !state.last_tab_input.is_empty() {
+        if let Some(name) = setting_written_context(&state.input).filter(|name| tab_wrote(state, &name.partial)) {
+            return Some(name);
+        }
+    }
+    extract_file_path_context(&state.input, state.cursor_pos)
+}
+
+/// Whether `ctx` is the value of a switch that is written whole, with Tab
+/// not going through its values: there is nothing to complete, and Tab is
+/// free to close the object behind it.
+fn setting_value_is_whole(state: &AppState, ctx: &FilePathContext) -> bool {
+    ctx.is_setting && matches!(ctx.partial.as_str(), "true" | "false") && !tab_wrote(state, &ctx.partial)
 }
 
 /// Whether `partial` may still be the start of a method or a directive, in
@@ -21860,8 +22089,9 @@ fn cursor_behind_file_path(state: &AppState) -> bool {
 /// Whether the cursor is in the file path of its `&&` segment (an outfile,
 /// an `@file` body or an include), where Tab completes a path.
 fn cursor_in_file_path(state: &AppState) -> bool {
-    extract_file_path_context(&state.input, state.cursor_pos)
-        .is_some_and(|ctx| state.cursor_pos >= char_len(&state.input[..ctx.path_start]))
+    tab_file_context(state).is_some_and(|ctx| {
+        state.cursor_pos >= char_len(&state.input[..ctx.path_start]) && !setting_value_is_whole(state, &ctx)
+    })
 }
 
 /// Find the file-path region at the cursor, scoped to the cursor's `&&`
@@ -21907,6 +22137,7 @@ fn extract_file_path_context(input: &str, cursor_pos: usize) -> Option<FilePathC
                 is_append,
                 is_include: false,
                 is_setting: false,
+                words: Vec::new(),
             });
         }
     }
@@ -22040,8 +22271,8 @@ fn get_include_completions(partial: &str) -> Vec<String> {
 fn file_completions_for(ctx: &FilePathContext) -> Vec<String> {
     if ctx.is_setting {
         // As they are listed: what the ghost shows ahead is what is left
-        // of the opening as it was typed.
-        SETTING_NAMES.iter().map(|name| setting_opening(name)).filter(|opening| opening.starts_with(&ctx.partial)).collect()
+        // of the word as it was typed.
+        ctx.words.iter().filter(|word| word.starts_with(&ctx.partial)).cloned().collect()
     } else if ctx.is_include {
         get_include_completions(&ctx.partial)
     } else if ctx.is_outfile && !ctx.is_append {
@@ -26678,7 +26909,15 @@ mod tests {
         assert_eq!(state.input, format!("{}/seed.api", base));
         handle_file_tab_completion(&mut state);
         assert_eq!(state.input, format!("{}/seeds/", base));
+        // Back from the first is what was typed.
         handle_file_tab_completion_reverse(&mut state);
+        assert_eq!(state.input, format!("{}/se", base));
+        handle_file_tab_completion(&mut state);
+        handle_file_tab_completion(&mut state);
+        assert_eq!(state.input, format!("{}/seed.api", base));
+        handle_file_tab_completion_reverse(&mut state);
+        assert_eq!(state.input, format!("{}/seeds/", base));
+        handle_file_tab_completion(&mut state);
         assert_eq!(state.input, format!("{}/seed.api", base));
 
         // The completed line is one the parser reads as that file.
@@ -31965,11 +32204,26 @@ mod tests {
             seen.push(shown(&state));
         }
         assert_eq!(seen, ["GET /people^", "GET /people/find^", "GET /pets^", "GET /people^"]);
-        // Shift+Tab goes the other way, and round.
-        assert!(backtab_pressed(&mut state));
-        assert_eq!(shown(&state), "GET /pets^");
+        // Shift+Tab goes the other way: back from the first is what was
+        // typed, and there is no list to go back in from there.
+        tab_pressed(&mut state);
+        tab_pressed(&mut state);
         assert!(backtab_pressed(&mut state));
         assert_eq!(shown(&state), "GET /people/find^");
+        assert!(backtab_pressed(&mut state));
+        assert_eq!(shown(&state), "GET /people^");
+        assert!(backtab_pressed(&mut state));
+        assert_eq!(shown(&state), "GET /pe^");
+        assert!(state.completions.is_empty());
+        assert!(!backtab_pressed(&mut state));
+        assert_eq!(shown(&state), "GET /pe^");
+        // A URI that is whole is not one of its own list: Tab writes the
+        // next that starts so, and Shift+Tab is the URI again.
+        let mut state = completing("GET /people");
+        tab_pressed(&mut state);
+        assert_eq!(shown(&state), "GET /people/find^");
+        backtab_pressed(&mut state);
+        assert_eq!(shown(&state), "GET /people^");
 
         // Without a method, and after one alone.
         assert_eq!(tabbed("/pe"), "/people^");
@@ -32025,10 +32279,14 @@ mod tests {
         let mut state = completing("GET /pe^ > out.json");
         tab_pressed(&mut state);
         assert_eq!(shown(&state), "GET /people^ > out.json");
-        backtab_pressed(&mut state);
+        tab_pressed(&mut state);
+        tab_pressed(&mut state);
         assert_eq!(shown(&state), "GET /pets^ > out.json");
         backtab_pressed(&mut state);
         assert_eq!(shown(&state), "GET /people/find^ > out.json");
+        backtab_pressed(&mut state);
+        backtab_pressed(&mut state);
+        assert_eq!(shown(&state), "GET /pe^ > out.json");
 
         // With nothing to cycle through, Shift+Tab does nothing.
         let mut state = completing("GET /pe");
@@ -32077,8 +32335,11 @@ mod tests {
         assert_eq!(ghost("GET pe"), "");
         assert_eq!(ghost("GET"), "");
         assert_eq!(ghost(""), "");
-        assert_eq!(ghost("GET /people"), "");
+        assert_eq!(ghost("GET /pets"), "");
         assert_eq!(ghost("GET /zzz"), "");
+        // A URI that is whole and the start of another: the other, which
+        // is what Tab writes.
+        assert_eq!(ghost("GET /people"), "/find");
         assert_eq!(ghost("^GET /zzz"), "");
         // Without a spec there is nothing to go by.
         let mut state = completing("GET /pe");
@@ -32135,7 +32396,13 @@ mod tests {
             "PUT /people @data.csv~map(ärende)^",
             "PUT /people @data.csv~map(com.heads.csv)^",
         ]);
+        // Back from the first is the operator with no name in it.
         backtab_pressed(&mut state);
+        assert_eq!(shown(&state), "PUT /people @data.csv~map(^");
+        assert!(state.completions.is_empty());
+        tab_pressed(&mut state);
+        tab_pressed(&mut state);
+        tab_pressed(&mut state);
         assert_eq!(shown(&state), "PUT /people @data.csv~map(ärende)^");
         backtab_pressed(&mut state);
         assert_eq!(shown(&state), "PUT /people @data.csv~map(com.heads.sql)^");
@@ -32502,7 +32769,9 @@ mod tests {
         assert_eq!(ghost("POST /settings "), "{ ");
         assert_eq!(ghost("PUT /pets "), "[ ");
         assert_eq!(ghost("GET /people "), "");
-        assert_eq!(ghost("PUT /people"), "");
+        // Behind the URI with no blank yet, it is the URI that goes on.
+        assert_eq!(ghost("PUT /people"), "/find");
+        assert_eq!(ghost("PUT /pets"), "");
         assert_eq!(body_tabbed("PUT /people "), "PUT /people [{\n  ^\n}]");
         assert_eq!(body_tabbed("POST /settings "), "POST /settings {\n  ^\n}");
         assert_eq!(body_tabbed("PUT /pets "), "PUT /pets [\n  ^\n]");
@@ -35376,7 +35645,13 @@ mod tests {
             assert_eq!(shown(&state), line("/pets"));
             tab_pressed(&mut state);
             assert_eq!(shown(&state), line("/people"));
+            // Back from the first is what was typed.
             backtab_pressed(&mut state);
+            assert_eq!(shown(&state), line("/pe"));
+            assert_eq!(ghost(&mut state), "ople");
+            tab_pressed(&mut state);
+            tab_pressed(&mut state);
+            tab_pressed(&mut state);
             assert_eq!(shown(&state), line("/pets"));
             backtab_pressed(&mut state);
             assert_eq!(shown(&state), line("/people/find"));
@@ -35627,11 +35902,17 @@ mod tests {
             let line = |uri: &str| format!("{lead}GET {uri}^{behind}");
             tab_pressed(&mut state);
             assert_eq!(shown(&state), line("/people"));
-            backtab_pressed(&mut state);
+            tab_pressed(&mut state);
+            tab_pressed(&mut state);
             assert_eq!(shown(&state), line("/pets"));
             backtab_pressed(&mut state);
             assert_eq!(shown(&state), line("/people/find"));
             backtab_pressed(&mut state);
+            assert_eq!(shown(&state), line("/people"));
+            // Back from the first is what was typed, with what stood behind.
+            backtab_pressed(&mut state);
+            assert_eq!(shown(&state), line("/pe"));
+            tab_pressed(&mut state);
             assert_eq!(shown(&state), line("/people"));
             tab_pressed(&mut state);
             assert_eq!(shown(&state), line("/people/find"));
@@ -36282,8 +36563,14 @@ mod tests {
         let line = |name: &&str| format!(r#"set {{"{name}": ^"#);
         let all: Vec<String> = SETTING_NAMES.iter().chain(SETTING_NAMES.first()).map(line).collect();
         assert_eq!(seen, all);
+        // Back from the first is the line with no setting.
         assert!(backtab_pressed(&mut state));
-        assert_eq!(shown(&state), line(SETTING_NAMES.last().unwrap()));
+        assert_eq!(shown(&state), "set ^");
+        tab_pressed(&mut state);
+        tab_pressed(&mut state);
+        tab_pressed(&mut state);
+        assert!(backtab_pressed(&mut state));
+        assert_eq!(shown(&state), line(&SETTING_NAMES[1]));
         // Nothing to add to a name that is no setting, to the line in words,
         // behind a value, or behind `set` with no blank yet.
         for line in [
@@ -36292,7 +36579,11 @@ mod tests {
             "set in^",
             r#"set {"timeout": 3^"#,
             r#"set {"export": null^"#,
-            r#"set {"raw": true, "in^"#,
+            r#"set {"export": ^"#,
+            r#"set {"timeout": ^"#,
+            r#"set {"raw": true, "ra^"#,
+            r#"set {"raw": tru^e"#,
+            r#"set {"raw": {^"#,
             "set @se^",
         ] {
             let (ghost, after) = ghost_then_tab(line, false);
@@ -36831,6 +37122,138 @@ mod tests {
         assert_eq!(after("GET /about && PUT /people [{\"status\":^", "tt"), "GET /about && PUT /people [{\"status\": \"old\"^");
         assert_eq!(after("GET /about && PUT /people [{\"status\":^", "ttbb"), "GET /about && PUT /people [{\"status\":^");
         assert_eq!(after("GET /about && PUT /people [{\"active\": ^", "ttb"), "GET /about && PUT /people [{\"active\": true^");
+    }
+
+    /// The line after the keys of `keys` on `marked`: `t` is Tab, `b`
+    /// Shift+Tab and `e` Esc, as the key handler does it.
+    fn keyed(marked: &str, experimental: bool, keys: &str) -> String {
+        let mut state = completing(marked);
+        state.config.experimental = experimental;
+        for key in keys.chars() {
+            match key {
+                't' => drop(tab_pressed(&mut state)),
+                'b' => drop(backtab_pressed(&mut state)),
+                _ => {
+                    state.completions.clear();
+                    state.completion_idx = 0;
+                    state.key_cycle = None;
+                    state.tab_origin = None;
+                    state.last_tab_input.clear();
+                    state.completion_uri_suffix.clear();
+                }
+            }
+        }
+        shown(&state)
+    }
+
+    /// A value is offered in front of what ends it, as at the end of the
+    /// line: `{"status": ^}` offered nothing where `{"status": "o^"}` did.
+    #[test]
+    fn a_value_is_completed_in_front_of_the_bracket_or_comma_behind_it() {
+        let ghost = |marked: &str| render_input_content(&mut completing_body(marked), 200).2;
+        for (line, offered, first, second) in [
+            ("PUT /people [{\"status\": ^}]", "\"new\"", "PUT /people [{\"status\": \"new\"^}]", "PUT /people [{\"status\": \"old\"^}]"),
+            ("PUT /people [{\"status\":^}]", " \"new\"", "PUT /people [{\"status\": \"new\"^}]", "PUT /people [{\"status\": \"old\"^}]"),
+            ("PUT /people [{\"status\": \"^\"}]", "new", "PUT /people [{\"status\": \"new\"^}]", "PUT /people [{\"status\": \"old\"^}]"),
+            ("PUT /people [{\"active\": ^, \"name\": \"x\"}]", "true", "PUT /people [{\"active\": true^, \"name\": \"x\"}]", "PUT /people [{\"active\": false^, \"name\": \"x\"}]"),
+            ("PUT /people [{\n  \"status\": ^ // which\n}]", "\"new\"", "PUT /people [{\n  \"status\": \"new\"^ // which\n}]", "PUT /people [{\n  \"status\": \"old\"^ // which\n}]"),
+        ] {
+            assert_eq!(ghost(line), offered, "{line}");
+            assert_eq!(keyed(line, true, "t"), first, "{line}");
+            assert_eq!(keyed(line, true, "tt"), second, "{line}");
+            assert_eq!(keyed(line, true, "ttbb"), line, "{line}");
+        }
+        // Esc keeps the value, and the bracket behind it is the one there.
+        assert_eq!(keyed("PUT /people [{\"status\": ^}]", true, "tet"), "PUT /people [{\"status\": \"new\"^}]");
+        // Not in front of anything else, and no key in front of a bracket.
+        for line in [
+            "PUT /people [{\"status\": ^\"old\"}]",
+            "PUT /people [{\"status\": ^x}]",
+            "PUT /people [{\"status\": \"^x\"}]",
+            "PUT /people [{^}]",
+            "PUT /people [{\"name\": \"x\", ^}]",
+        ] {
+            assert_eq!(ghost(line), "", "{line}");
+            assert_eq!(keyed(line, true, "t"), line, "{line}");
+        }
+    }
+
+    /// Behind the `:` of a switch Tab writes `true` and goes on to `false`,
+    /// and behind a `,` the settings the line does not name yet.
+    #[test]
+    fn tab_completes_the_values_and_the_later_settings_of_a_set_line() {
+        for experimental in [false, true] {
+            let after = |line: &str, keys: &str| keyed(line, experimental, keys);
+            let ghost = |line: &str| ghost_then_tab(line, experimental).0;
+            // The value of a switch, with the blank behind the `:` or without.
+            assert_eq!(ghost(r#"set {"include-nulls": ^"#), "true");
+            assert_eq!(after(r#"set {"include-nulls": ^"#, "t"), r#"set {"include-nulls": true^"#);
+            assert_eq!(after(r#"set {"include-nulls": ^"#, "tt"), r#"set {"include-nulls": false^"#);
+            assert_eq!(after(r#"set {"include-nulls": ^"#, "ttt"), r#"set {"include-nulls": true^"#);
+            assert_eq!(after(r#"set {"include-nulls": ^"#, "ttb"), r#"set {"include-nulls": true^"#);
+            assert_eq!(after(r#"set {"include-nulls": ^"#, "ttbb"), r#"set {"include-nulls": ^"#);
+            assert_eq!(after(r#"set {"raw":^"#, "tt"), r#"set {"raw":false^"#);
+            assert_eq!(ghost(r#"set {"raw": f^"#), "alse");
+            assert_eq!(after(r#"set {"raw": f^"#, "t"), r#"set {"raw": false^"#);
+            assert_eq!(after(r#"SET {"export": "com.x.id", "fail-fast": t^"#, "t"), r#"SET {"export": "com.x.id", "fail-fast": true^"#);
+            // A name and a number are typed.
+            assert_eq!(ghost(r#"set {"export": ^"#), "");
+            assert_eq!(ghost(r#"set {"timeout": ^"#), "");
+            assert_eq!(ghost(r#"set {"nulls": ^"#), "");
+
+            // The next setting: those the line does not name, in their order.
+            assert_eq!(ghost(r#"set {"raw": true, ^"#), r#""export": "#);
+            assert_eq!(after(r#"set {"raw": true, ^"#, "t"), r#"set {"raw": true, "export": ^"#);
+            assert_eq!(after(r#"set {"raw": true, ^"#, "tt"), r#"set {"raw": true, "include-nulls": ^"#);
+            assert_eq!(after(r#"set {"raw": true, ^"#, "ttt"), r#"set {"raw": true, "fail-fast": ^"#);
+            assert_eq!(after(r#"set {"raw": true, ^"#, "tttttt"), r#"set {"raw": true, "timeout": ^"#);
+            assert_eq!(after(r#"set {"raw": true, ^"#, "ttttttt"), r#"set {"raw": true, "export": ^"#);
+            assert_eq!(after(r#"set {"raw": true, ^"#, "tttb"), r#"set {"raw": true, "include-nulls": ^"#);
+            assert_eq!(after(r#"set {"raw": true, ^"#, "ttbb"), r#"set {"raw": true, ^"#);
+            assert_eq!(ghost(r#"set {"raw": true, "in^"#), r#"clude-nulls": "#);
+            assert_eq!(after(r#"set {"raw": true, "in^"#, "t"), r#"set {"raw": true, "include-nulls": ^"#);
+            assert_eq!(after(r#"set {"raw": true,^"#, "t"), r#"set {"raw": true,"export": ^"#);
+            // Tab is at the setting it wrote, not at the value behind it:
+            // no value is shown while it goes through the settings, and
+            // one is once it has stopped.
+            let mut state = completing(r#"set {"raw": true, ^"#);
+            state.config.experimental = experimental;
+            tab_pressed(&mut state);
+            tab_pressed(&mut state);
+            assert_eq!(render_input_content(&mut state, 200).2, "");
+            assert_eq!(after(r#"set {"raw": true, ^"#, "ttet"), r#"set {"raw": true, "include-nulls": true^"#);
+            assert_eq!(after("set ^", "ttet"), r#"set {"include-nulls": true^"#);
+            assert_eq!(ghost(r#"set {"raw": true, "include-nulls": ^"#), "true");
+        }
+        // A value that is whole has nothing to add: with `-x` Tab closes
+        // the object behind it, as the ghost says.
+        assert_eq!(ghost_then_tab(r#"set {"raw": true^"#, true), ("}".to_string(), r#"set {"raw": true}^"#.to_string()));
+        assert_eq!(keyed(r#"set {"raw": ^"#, true, "tet"), r#"set {"raw": true}^"#);
+        assert_eq!(ghost_then_tab(r#"set {"raw": true^"#, false), (String::new(), r#"set {"raw": true^"#.to_string()));
+    }
+
+    /// Behind `import` Tab writes the kind and goes through the three.
+    #[test]
+    fn tab_completes_the_kind_of_an_import() {
+        for experimental in [false, true] {
+            let after = |line: &str, keys: &str| keyed(line, experimental, keys);
+            let ghost = |line: &str| ghost_then_tab(line, experimental).0;
+            assert_eq!(ghost("import ^"), "git ");
+            assert_eq!(after("import ^", "t"), "import git ^");
+            assert_eq!(after("import ^", "tt"), "import dir ^");
+            assert_eq!(after("import ^", "ttt"), "import archive ^");
+            assert_eq!(after("import ^", "tttt"), "import git ^");
+            assert_eq!(after("import ^", "ttb"), "import git ^");
+            assert_eq!(after("import ^", "ttbb"), "import ^");
+            assert_eq!(ghost("import a^"), "rchive ");
+            assert_eq!(after("IMPORT  d^", "t"), "IMPORT  dir ^");
+            assert_eq!(after("import git^", "t"), "import git ^");
+            // Nothing for a word that is no kind, behind the kind, or
+            // behind `import` with no blank yet.
+            for line in ["import x^", "import git ^", "import git cl^", "import^", "import GIT^"] {
+                assert_eq!((ghost(line).as_str(), after(line, "t").as_str()), ("", line), "{line}");
+            }
+        }
     }
 
     /// The line and the ghost behind the cursor, as the prompt draws them.

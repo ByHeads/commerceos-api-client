@@ -7175,7 +7175,9 @@ fn tab_completes_the_uri_from_the_servers_spec() {
         (&["GET /pe", "\t", "\t"], "GET /people/find"),
         (&["GET /pe", "\t", "\t", "\t", "\t"], "GET /people"),
         (&["GET /pe", "\t", "\t", SHIFT_TAB], "GET /people"),
-        (&["GET /pe", "\t", SHIFT_TAB], "GET /pets"),
+        // Shift+Tab on the first is what was typed, and Tab starts again.
+        (&["GET /pe", "\t", SHIFT_TAB, "ts"], "GET /pets"),
+        (&["GET /pe", "\t", SHIFT_TAB, "\t", "\t", "\t"], "GET /pets"),
         (&["/pet", "\t"], "GET /pets"),
         (&["GET /people~wi", "\t", "na", "\t", ")"], "GET /people~with(name)"),
         // In an operator that follows another, and in one inside another.
@@ -7196,7 +7198,7 @@ fn tab_completes_the_uri_from_the_servers_spec() {
     // With an outfile on the line, Tab and Shift+Tab in the URI leave it.
     let mut keys = vec!["GET /pe > out.json"];
     keys.extend(std::iter::repeat(LEFT).take(11));
-    keys.extend(["\t", SHIFT_TAB]);
+    keys.extend(["\t", "\t", "\t", SHIFT_TAB, "\t"]);
     let shown = press(&mut prompt, &keys);
     assert_eq!(entered(&mut prompt, &server), ["GET /pets"], "{shown}");
     assert!(d.join("out.json").is_file(), "{shown}");
