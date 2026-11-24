@@ -7379,13 +7379,14 @@ fn a_ghost_is_drawn_where_tab_writes_it() {
     // cell, and the ghost is on the row Tab writes it on.
     let body: &[&str] = &["PUT /people [{", "\r", "\"name\": \"x\""];
     let mark = prompt.screen.len();
-    assert_eq!(input_rows(&mut prompt, body), ["PUT /people [{", "    \"name\": \"x\"", "  }"]);
+    assert_eq!(input_rows(&mut prompt, body), ["PUT /people [{", "  \"name\": \"x\"", "}"]);
     let drawn = &prompt.screen[mark..];
-    assert!(drawn.contains("\x1b[48;5;247m\x1b[38;5;0m \x1b[0m\x1b[38;5;240m\r\n  }\x1b[0m"), "{drawn:?}");
-    let closed = [body, &["\t"]].concat();
-    assert_eq!(input_rows(&mut prompt, &closed), ["PUT /people [{", "    \"name\": \"x\"", "  }", "]"]);
+    assert!(drawn.contains("\x1b[48;5;247m\x1b[38;5;0m \x1b[0m\x1b[38;5;240m\r\n}\x1b[0m"), "{drawn:?}");
+    // The `]` of the `[{` goes behind its `}`.
+    let closed = [body, &["\t", "\t"]].concat();
+    assert_eq!(input_rows(&mut prompt, &closed), ["PUT /people [{", "  \"name\": \"x\"", "}]"]);
     press(&mut prompt, &[body, &["\t", "\t"]].concat());
-    assert_eq!(sent(&mut prompt), ["PUT /people [{\n    \"name\": \"x\"\n  }\n]"]);
+    assert_eq!(sent(&mut prompt), ["PUT /people [{\n  \"name\": \"x\"\n}]"]);
     // A literal ends a value as a string does. (The `[` is the prompt's,
     // for an endpoint that takes a list.)
     assert_eq!(input_rows(&mut prompt, &["PUT /agents {\"name\": null"]), ["PUT /agents [{\"name\": null}"]);
@@ -7449,10 +7450,11 @@ fn tab_completes_a_body_from_the_servers_spec_under_x() {
     assert_eq!(body_of(&sent, "PUT /people "), serde_json::json!([{"name": "x", "givenName": "y"}]), "{shown}");
 
     // A closing bracket typed after a comma takes the comma away, and on a
-    // line of its own takes the indent of what it closes.
+    // line of its own takes the indent of what it closes. `[{` on one line
+    // is one level of it.
     let shown = press(&mut prompt, &["PUT /people [{\"name\": \"x\",", "\r", "}", "]"]);
     let sent = entered(&mut prompt, &server);
-    assert_eq!(sent, ["PUT /people [{\n    \"name\": \"x\"\n  }]"], "{shown}");
+    assert_eq!(sent, ["PUT /people [{\n  \"name\": \"x\"\n}]"], "{shown}");
     // In a body that has lines, Enter goes to a new one: indented after a
     // comma, between a pair of brackets, and out again after a closing one.
     let shown = press(&mut prompt, &["PUT /people ", "\t", "\"name\": \"x\",", "\r", "\"givenName\": \"y\"", END]);

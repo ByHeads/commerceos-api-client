@@ -2012,7 +2012,10 @@ fn cursor_inside_brackets(input: &str, cursor_pos: usize) -> bool {
 /// equivalent position in the formatted output.
 fn reformat_json_multiline(json: &str, cursor_offset: usize) -> (String, usize) {
     let mut out = String::new();
+    // The indent level, and for each open bracket whether it added one: a
+    // `[` with a `{` behind it shares the level of that `{`.
     let mut depth: usize = 0;
+    let mut adds_level: Vec<bool> = Vec::new();
     let mut in_string = false;
     let mut escape = false;
     let mut new_cursor = 0usize;
@@ -2050,20 +2053,24 @@ fn reformat_json_multiline(json: &str, cursor_offset: usize) -> (String, usize) 
                 out.push(ch);
             }
             '{' | '[' => {
-                depth += 1;
                 out.push(ch);
                 // Peek ahead: if [ is followed by { (skipping whitespace), keep them on same line
-                let rest: String = json.chars().skip(src_char_idx + 1).collect();
-                let next_nws = rest.chars().find(|c| !c.is_whitespace());
+                let next_nws = json.chars().skip(src_char_idx + 1).find(|c| !c.is_whitespace());
                 if ch == '[' && next_nws == Some('{') {
-                    // Don't add newline — the { will handle it
+                    // Don't add newline — the { will handle it, and the
+                    // level is the one it adds.
+                    adds_level.push(false);
                 } else {
+                    adds_level.push(true);
+                    depth += 1;
                     out.push('\n');
                     out.push_str(&"  ".repeat(depth));
                 }
             }
             '}' | ']' => {
-                depth = depth.saturating_sub(1);
+                if adds_level.pop().unwrap_or(true) {
+                    depth = depth.saturating_sub(1);
+                }
                 // Don't add extra newline before ] if it follows } (keep }] together)
                 let last_nws = out.chars().rev().find(|c| !c.is_whitespace());
                 if ch == ']' && last_nws == Some('}') {
@@ -16749,7 +16756,7 @@ fn close_bracket_typed(state: &mut AppState, c: char) {
     if line_content.chars().all(|ch| ch == ' ' || ch == '\t') {
         // Current line is only whitespace — replace with proper dedented indent.
         // A closer in a comment closes nothing, so the depth is the body's.
-        let depth_after = body_depth_at(&new_before, char_len(&new_before)).saturating_sub(1);
+        let depth_after = body_indent_at(&new_before, char_len(&new_before)).saturating_sub(1);
         let indent = "  ".repeat(depth_after);
         new_before = format!("{}{}", &new_before[..line_start], indent);
     }
@@ -16767,6 +16774,57 @@ fn close_bracket_typed(state: &mut AppState, c: char) {
 /// line with more closers than openers before the cursor would give.
 fn body_depth_at(input: &str, cursor_pos: usize) -> usize {
     bracket_depth_at(&without_body_comments(input), cursor_pos).max(0) as usize
+}
+
+/// How many levels a new line at the cursor is indented by: the brackets
+/// that are open there, those that were opened on one line counted once.
+/// `[{` is one level, as Tab writes it: its members stand two blanks in and
+/// its `}]` in the first column.
+fn body_indent_at(input: &str, cursor_pos: usize) -> usize {
+    let (mut open, _) = open_bracket_lines(input, cursor_pos);
+    open.dedup();
+    open.len()
+}
+
+/// Whether the bracket that closes what the cursor is in belongs on the
+/// line the cursor is on: directly behind the closer of a bracket that was
+/// opened on the same line as its own. The `]` of a `[{` goes behind the `}`.
+fn closer_joins_line(input: &str, cursor_pos: usize) -> bool {
+    let (open, closed) = open_bracket_lines(input, cursor_pos);
+    closed.is_some() && closed == open.last().copied()
+}
+
+/// The line each bracket that is open at the cursor was opened on, and the
+/// line of the one whose closer the cursor is directly behind, if any. A
+/// bracket in a string or in a comment of the body is none.
+fn open_bracket_lines(input: &str, cursor_pos: usize) -> (Vec<usize>, Option<usize>) {
+    let blanked = without_body_comments(input);
+    let mut open: Vec<usize> = Vec::new();
+    let mut closed = None;
+    let (mut line, mut in_string, mut escape) = (0usize, false, false);
+    for ch in blanked.chars().take(cursor_pos) {
+        if ch == '\n' {
+            line += 1;
+        }
+        closed = None;
+        if escape {
+            escape = false;
+        } else if in_string {
+            match ch {
+                '\\' => escape = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+        } else {
+            match ch {
+                '"' => in_string = true,
+                '{' | '[' => open.push(line),
+                '}' | ']' => closed = open.pop(),
+                _ => {}
+            }
+        }
+    }
+    (open, closed)
 }
 
 fn enter_inside_brackets(state: &mut AppState) {
@@ -16803,7 +16861,7 @@ fn enter_inside_brackets(state: &mut AppState) {
             let on_blank_indented_line = line_before_cursor.chars().all(|c| c == ' ');
 
             if !on_blank_indented_line {
-                let depth = body_depth_at(&state.input, state.cursor_pos);
+                let depth = body_indent_at(&state.input, state.cursor_pos);
                 let last_nws = state.input[..byte_idx].chars().rev()
                     .find(|c| !c.is_whitespace());
 
@@ -16823,7 +16881,7 @@ fn enter_inside_brackets(state: &mut AppState) {
 
             } else {
             // Body is already multi-line — normal Enter behavior
-            let depth = body_depth_at(&state.input, state.cursor_pos);
+            let depth = body_indent_at(&state.input, state.cursor_pos);
             let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
 
             let char_before = if state.cursor_pos > 0 {
@@ -16855,10 +16913,9 @@ fn enter_inside_brackets(state: &mut AppState) {
                 state.input.insert_str(byte_idx, &insert);
                 state.cursor_pos += 1 + depth * 2;
             } else {
-                // After a closing bracket without comma, de-indent to
-                // the enclosing bracket's level (ready to close it too)
-                let extra = if matches!(last_nws, Some('}') | Some(']')) { 2 } else { 1 };
-                let dedent = depth.saturating_sub(extra);
+                // Behind a value with no comma, a closed bracket too: the
+                // line of the bracket that closes what the cursor is in.
+                let dedent = depth.saturating_sub(1);
                 let indent = "  ".repeat(dedent);
                 let insert = format!("\n{}", indent);
                 state.input.insert_str(byte_idx, &insert);
@@ -16867,7 +16924,7 @@ fn enter_inside_brackets(state: &mut AppState) {
             }
     } else {
         // No body found — just insert newline
-        let depth = body_depth_at(&state.input, state.cursor_pos);
+        let depth = body_indent_at(&state.input, state.cursor_pos);
         let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
         let indent = "  ".repeat(depth);
         let insert = format!("\n{}", indent);
@@ -21201,7 +21258,8 @@ fn pending_closer(input: &str, cursor_pos: usize) -> Option<(char, usize)> {
             }
         }
     }
-    Some((closer, scan.open.len()))
+    // The level its line is indented from, not the number of brackets open.
+    Some((closer, body_indent_at(input, cursor_pos)))
 }
 
 /// The body of the request on `input`, read from its first bracket up to
@@ -21220,7 +21278,7 @@ fn body_scan_to(input: &str, byte_idx: usize) -> Option<BodyScan> {
 fn get_closing_brackets_ghost(input: &str, cursor_pos: usize) -> String {
     let Some((closer, depth)) = pending_closer(input, cursor_pos) else { return String::new() };
     let byte_idx = char_to_byte_idx(input, cursor_pos);
-    if !input[..byte_idx].contains('\n') {
+    if !input[..byte_idx].contains('\n') || closer_joins_line(input, cursor_pos) {
         return closer.to_string();
     }
     // Formatted to match what Tab inserts: on a line of its own, indented
@@ -21243,7 +21301,7 @@ fn get_closing_brackets_ghost(input: &str, cursor_pos: usize) -> String {
 fn close_pending_bracket(state: &mut AppState) -> bool {
     let Some((closer, depth)) = pending_closer(&state.input, state.cursor_pos) else { return false };
     let byte_idx = char_to_byte_idx(&state.input, state.cursor_pos);
-    if state.input[..byte_idx].contains('\n') {
+    if state.input[..byte_idx].contains('\n') && !closer_joins_line(&state.input, state.cursor_pos) {
         let indent = "  ".repeat(depth.saturating_sub(1));
         let line_start = state.input[..byte_idx].rfind('\n').map_or(0, |p| p + 1);
         if state.input[line_start..byte_idx].chars().all(|c| c == ' ') {
@@ -32396,7 +32454,9 @@ mod tests {
     fn tab_after_a_complete_value_closes_the_bracket_it_is_in() {
         let closer = |input: &str| pending_closer(input, char_len(input));
         assert_eq!(closer(r#"PUT /x {"a": "b""#), Some(('}', 1)));
-        assert_eq!(closer(r#"PUT /x {"a": [1, "x""#), Some((']', 2)));
+        // The number is the level of indent, and brackets of one line are one.
+        assert_eq!(closer(r#"PUT /x {"a": [1, "x""#), Some((']', 1)));
+        assert_eq!(closer("PUT /x {\n  \"a\": [\n    1"), Some((']', 2)));
         assert_eq!(closer(r#"PUT /x {"a": {"b": "c"}"#), Some(('}', 1)));
         assert_eq!(closer(r#"PUT /x [{"a": "}"}  "#), Some((']', 1)));
         assert_eq!(closer(r#"PUT /x {"a": "b\"""#), Some(('}', 1)));
@@ -33010,6 +33070,71 @@ mod tests {
             let json = |body: &str| serde_json::from_str::<Value>(body).unwrap();
             assert_eq!((&before.0, &before.1, json(&before.2)), (&after.0, &after.1, json(&after.2)), "{line}");
         }
+    }
+
+    /// The same, with the cursor shown.
+    fn entered_at(line: &str) -> String {
+        let mut state = completing_body(line);
+        enter_inside_brackets(&mut state);
+        shown(&state)
+    }
+
+    #[test]
+    fn brackets_opened_on_one_line_indent_by_one_level() {
+        // The reported bug: `[{` is one level, as Tab writes it, and Enter
+        // behind the `},` of a member wrote four blanks for its two brackets.
+        let open = "PUT /people [{\n  \"identifiers\": {\n    \"com.foo.heads\": \"123\"\n  }";
+        assert_eq!(entered_at(&format!("{open},^\n}}]")), format!("{open},\n  ^\n}}]"));
+        // In the object of the member it is one more.
+        assert_eq!(
+            entered_at("PUT /people [{\n  \"identifiers\": {\n    \"a\": \"1\",^\n  }\n}]"),
+            "PUT /people [{\n  \"identifiers\": {\n    \"a\": \"1\",\n    ^\n  }\n}]"
+        );
+        // Behind a value with no comma: the line of the bracket that closes.
+        assert_eq!(entered_at(&format!("{open}^")), format!("{open}\n^"));
+        assert_eq!(entered_at("PUT /people [{\n  \"a\": 1^"), "PUT /people [{\n  \"a\": 1\n^");
+        assert_eq!(entered_at("PUT /x {\n  \"a\": {\n    \"b\": {\n      \"c\": 1\n    }^"), "PUT /x {\n  \"a\": {\n    \"b\": {\n      \"c\": 1\n    }\n  ^");
+        // Between two brackets, also where two were opened on the line.
+        assert_eq!(entered_at("PUT /people [{\n  \"a\": [{^}]\n}]"), "PUT /people [{\n  \"a\": [{\n    ^\n  }]\n}]");
+        // Brackets on lines of their own are a level each, as before.
+        assert_eq!(entered_at("PUT /people [\n  {\n    \"a\": 1,^"), "PUT /people [\n  {\n    \"a\": 1,\n    ^");
+
+        assert_eq!(body_indent_at("PUT /people [{", 99), 1);
+        assert_eq!(body_indent_at("PUT /people [{\n  \"a\": {", 99), 2);
+        assert_eq!(body_indent_at("PUT /people [{\n  \"a\": {}", 99), 1);
+        assert_eq!(body_indent_at("PUT /people [\n  {", 99), 2);
+        assert_eq!(body_indent_at("PUT /x {\"a\": \"[{\", // [[\n", 99), 1);
+        assert_eq!(body_indent_at("}}} {", 99), 1);
+
+        // A body on one line is laid out the same way.
+        assert_eq!(
+            entered_at(r#"PUT /people [{"identifiers":{"a":"1"},^"b":2}]"#),
+            "PUT /people [{\n  \"identifiers\": {\n    \"a\": \"1\"\n  },\n  ^\"b\": 2\n}]"
+        );
+        let laid_out = |json: &str| reformat_json_multiline(json, char_len(json)).0;
+        assert_eq!(laid_out(r#"[{"a":1},{"b":[{"c":2}]}]"#), "[{\n  \"a\": 1\n},\n{\n  \"b\": [{\n    \"c\": 2\n  }]\n}]");
+        assert_eq!(laid_out(r#"[1,{"a":2}]"#), "[\n  1,\n  {\n    \"a\": 2\n  }]");
+
+        // A closer that is typed, and the one Tab writes and the ghost shows.
+        for (marked, c, after) in [
+            ("PUT /people [{\n  \"a\": 1,\n  ^", '}', "PUT /people [{\n  \"a\": 1\n}^"),
+            ("PUT /people [{\n  \"a\": {\n    \"b\": 1\n    ^", '}', "PUT /people [{\n  \"a\": {\n    \"b\": 1\n  }^"),
+        ] {
+            let mut state = completing_body(marked);
+            close_bracket_typed(&mut state, c);
+            assert_eq!(shown(&state), after, "{marked}");
+        }
+        let mut state = completing_body("PUT /people [{\n  \"a\": 1");
+        assert_eq!(get_completion_ghost(&state), "\n}");
+        assert!(tab_pressed(&mut state));
+        assert_eq!(shown(&state), "PUT /people [{\n  \"a\": 1\n}^");
+        // The `]` of the `[{` goes behind its `}`, as Tab opened them.
+        assert_eq!(get_completion_ghost(&state), "]");
+        assert!(tab_pressed(&mut state));
+        assert_eq!(shown(&state), "PUT /people [{\n  \"a\": 1\n}]^");
+        // Not behind the closer of a bracket of another line.
+        let state = completing_body("PUT /x [\n  {\n    \"a\": 1\n  }");
+        assert_eq!(get_completion_ghost(&state), "\n]");
     }
 
     #[test]
@@ -34558,7 +34683,7 @@ mod tests {
     fn a_literal_or_a_number_ends_a_value_that_tab_closes_behind() {
         let closer = |input: &str| pending_closer(input, char_len(input));
         assert_eq!(closer(r#"PUT /x {"a": true"#), Some(('}', 1)));
-        assert_eq!(closer(r#"PUT /x {"a": [false, null"#), Some((']', 2)));
+        assert_eq!(closer(r#"PUT /x {"a": [false, null"#), Some((']', 1)));
         assert_eq!(closer(r#"PUT /x {"a": -1.5e3  "#), Some(('}', 1)));
         assert_eq!(closer(r#"PUT /x [1, 2"#), Some((']', 1)));
         // Not a word that is none of them, or a key without its quotes.
