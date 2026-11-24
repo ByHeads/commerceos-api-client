@@ -1775,6 +1775,9 @@ struct AppState {
     root_listing_rx: Option<std::sync::mpsc::Receiver<Vec<(String, String)>>>,
     completions: Vec<String>,
     completion_idx: usize,
+    /// The key Tab wrote into a body from a list of several, which the next
+    /// Tab or Shift+Tab takes back for another of the list.
+    key_cycle: Option<KeyCycle>,
     last_tab_input: String,
     completion_uri_suffix: String,  // URI text after cursor for mid-URI completion
     connection_alias: String,  // Current connection alias (for Ctrl+S pre-fill)
@@ -1874,6 +1877,7 @@ impl AppState {
             root_listing_rx: None,
             completions: Vec::new(),
             completion_idx: 0,
+            key_cycle: None,
             last_tab_input: String::new(),
             completion_uri_suffix: String::new(),
             connection_alias: String::new(),
@@ -1893,6 +1897,16 @@ impl AppState {
             last_paste_at: None,
         }
     }
+}
+
+/// A key that Tab wrote into a body: the request as it was before the first
+/// Tab, and as it is with the key in it. Both with their cursor, in chars,
+/// and both as the segment of a chain the completion saw.
+struct KeyCycle {
+    before: String,
+    before_cursor: usize,
+    written: String,
+    written_cursor: usize,
 }
 
 // Convert character index to byte index for safe UTF-8 string slicing
@@ -14983,6 +14997,7 @@ fn handle_key_event(
             if !state.completions.is_empty() {
                 state.completions.clear();
                 state.completion_idx = 0;
+                state.key_cycle = None;
                 state.last_tab_input.clear();
                 state.completion_uri_suffix.clear();
                 render(stdout, state)?;
@@ -15452,6 +15467,7 @@ fn reset_for_input<W: Write>(
     if completions {
         state.completions.clear();
         state.completion_idx = 0;
+        state.key_cycle = None;
         state.last_tab_input.clear();
         state.completion_uri_suffix.clear();
     }
@@ -18666,7 +18682,7 @@ fn copy_curl(state: &AppState) -> Result<(), String> {
 fn tab_goes_to_the_next(state: &AppState) -> bool {
     let in_body = state.config.experimental
         && (state.last_tab_input.starts_with("json:") || state.last_tab_input.starts_with("json_ghost:"));
-    !in_body || cycling_json_value(state) || cycling_json_type(state)
+    !in_body || cycling_json_value(state) || cycling_json_type(state) || cycling_json_key(state)
 }
 
 fn render_input_content(state: &mut AppState, width: usize) -> (String, u16, String) {
@@ -20626,6 +20642,21 @@ fn cycling_json_type(state: &AppState) -> bool {
         && state.completions.get(state.completion_idx).is_some_and(|c| c.contains('\x00'))
 }
 
+/// Whether the last Tab wrote a key that is one of several, block and all,
+/// and nothing was typed since: the next Tab writes the next key in its
+/// place, and Shift+Tab the one before. Read in the whole input as in the
+/// segment the key was written in.
+fn cycling_json_key(state: &AppState) -> bool {
+    let Some(cycle) = &state.key_cycle else { return false };
+    if state.completions.len() < 2 || !state.last_tab_input.starts_with("json:") {
+        return false;
+    }
+    let cursor_byte = char_to_byte_idx(&state.input, state.cursor_pos.min(char_len(&state.input)));
+    let written_at = char_to_byte_idx(&cycle.written, cycle.written_cursor);
+    state.input[..cursor_byte].ends_with(&cycle.written[..written_at])
+        && state.input[cursor_byte..].starts_with(&cycle.written[written_at..])
+}
+
 /// Whether nothing stands between the cursor (in chars) and the end of its
 /// line. A comment of the body is nothing: a key can be written in front
 /// of it.
@@ -20634,6 +20665,36 @@ fn rest_of_line_is_blank(input: &str, cursor_pos: usize) -> bool {
 }
 
 fn handle_json_tab_completion(state: &mut AppState, reverse: bool, apply: bool) {
+    // Tab on the key the last Tab wrote: the next key of the list in its
+    // place, with the block it opens. Shift+Tab is the one before, and from
+    // the first the request as it was before any was written.
+    if apply {
+        if let Some(cycle) = state.key_cycle.take() {
+            let live = state.completions.len() > 1
+                && state.last_tab_input.starts_with("json:")
+                && state.input == cycle.written
+                && state.cursor_pos == cycle.written_cursor;
+            if live {
+                state.input = cycle.before.clone();
+                state.cursor_pos = cycle.before_cursor;
+                if reverse && state.completion_idx == 0 {
+                    state.completions.clear();
+                    state.last_tab_input.clear();
+                    return;
+                }
+                let count = state.completions.len();
+                state.completion_idx = (state.completion_idx + if reverse { count - 1 } else { 1 }) % count;
+                match json_context_at_cursor(state) {
+                    Some(ctx) => apply_json_completion(state, &ctx),
+                    None => {
+                        state.completions.clear();
+                        state.last_tab_input.clear();
+                    }
+                }
+                return;
+            }
+        }
+    }
     let Some(ctx) = json_context_at_cursor(state) else { return };
     let cursor_byte = char_to_byte_idx(&state.input, state.cursor_pos);
 
@@ -20716,9 +20777,18 @@ fn handle_json_tab_completion(state: &mut AppState, reverse: bool, apply: bool) 
     if !apply {
         return; // Preview only — completions populated for ghost text
     }
+    apply_json_completion(state, &ctx);
+}
 
+/// Write the completion Tab is at into the body, at the cursor.
+fn apply_json_completion(state: &mut AppState, ctx: &JsonContext) {
+    let cursor_byte = char_to_byte_idx(&state.input, state.cursor_pos);
+    // A key of several is one Tab goes on from: the request as it is now is
+    // what the next key is written into.
+    let cycles = ctx.pos == JsonPos::Key && state.completions.len() > 1;
+    let before = cycles.then(|| (state.input.clone(), state.cursor_pos));
     let completion = state.completions[state.completion_idx].clone();
-    let (start, replacement, closes_string) = json_completion_edit(state, &ctx, &completion, cursor_byte);
+    let (start, replacement, closes_string) = json_completion_edit(state, ctx, &completion, cursor_byte);
     let end = cursor_byte + usize::from(closes_string);
     let cursor_after_replacement = char_len(&state.input[..start]) + char_len(&replacement);
     state.input.replace_range(start..end, &replacement);
@@ -20740,8 +20810,12 @@ fn handle_json_tab_completion(state: &mut AppState, reverse: bool, apply: bool) 
             state.input.insert_str(cursor_byte_after, " ");
             state.cursor_pos = cursor_after_replacement + 1;
         }
-        state.completions.clear();
-        state.last_tab_input.clear();
+        // What Tab completes next is in the block, unless it is still
+        // going through the keys.
+        if !cycles {
+            state.completions.clear();
+            state.last_tab_input.clear();
+        }
     } else {
         state.cursor_pos = cursor_after_replacement;
         // An array that was opened is what is typed in from here on: the
@@ -20751,6 +20825,12 @@ fn handle_json_tab_completion(state: &mut AppState, reverse: bool, apply: bool) 
             state.last_tab_input.clear();
         }
     }
+    state.key_cycle = before.map(|(before, before_cursor)| KeyCycle {
+        before,
+        before_cursor,
+        written: state.input.clone(),
+        written_cursor: state.cursor_pos,
+    });
 }
 
 /// Where the URI of a request line stands, in bytes, and the method written
@@ -21051,6 +21131,11 @@ fn handle_file_tab_completion_reverse(state: &mut AppState) {
 }
 
 fn get_json_completion_ghost(state: &AppState) -> Option<String> {
+    // Tab is going through the keys: the next press takes this one away,
+    // and what could be written behind it is not what Tab writes.
+    if cycling_json_key(state) {
+        return Some(String::new());
+    }
     let ctx = json_context_at_cursor(state)?;
     if !matches!(ctx.pos, JsonPos::Key | JsonPos::Value) {
         return None;
@@ -21377,7 +21462,8 @@ fn tab_pressed(state: &mut AppState) -> bool {
         // that has `200`): that is what Tab writes, and the bracket waits.
         let more_of_the_value =
             with_chain_segment_view(state, |state| get_json_completion_ghost(state).is_some_and(|ghost| !ghost.is_empty()));
-        if cycling_json_type(state)
+        if cycling_json_key(state)
+            || cycling_json_type(state)
             || cycling_json_value(state)
             || more_of_the_value
             || !with_chain_segment_view(state, close_pending_bracket)
@@ -32300,8 +32386,9 @@ mod tests {
     #[test]
     fn tab_chooses_among_the_subtypes_of_a_type() {
         // A schema with subtypes takes `@type` first, and Tab again changes
-        // it in its place. It used to run on into the other keys and write
-        // one where the value was: `{"@type": "employee"ålder`.
+        // it in its place. Behind the last subtype come the other keys,
+        // each in the place of the one before. It used to write one where
+        // the value was: `{"@type": "employee"ålder`.
         let mut state = completing_body("POST /agents {");
         let mut seen = Vec::new();
         for _ in 0..3 {
@@ -32311,12 +32398,19 @@ mod tests {
         assert_eq!(seen, [
             r#"POST /agents { "@type": "person"^"#,
             r#"POST /agents { "@type": "company"^"#,
-            r#"POST /agents { "@type": "person"^"#,
+            r#"POST /agents { "identifiers": { ^"#,
         ]);
         backtab_pressed(&mut state);
         assert_eq!(shown(&state), r#"POST /agents { "@type": "company"^"#);
+        // Back from the first is the body with nothing written, and from
+        // there Shift+Tab has nothing to go back in.
         backtab_pressed(&mut state);
         backtab_pressed(&mut state);
+        assert_eq!(shown(&state), "POST /agents {^");
+        backtab_pressed(&mut state);
+        assert_eq!(shown(&state), "POST /agents {^");
+        tab_pressed(&mut state);
+        tab_pressed(&mut state);
         assert_eq!(shown(&state), r#"POST /agents { "@type": "company"^"#);
         // Any other key ends the choosing, as the key handler does it: the
         // next Tab closes the object.
@@ -35454,13 +35548,19 @@ mod tests {
             tab_pressed(&mut state);
             state
         };
-        // Two keys start with `g`, and the next Tab does not reach the
-        // second: the key is written whole, with its colon.
+        // Two keys start with `g`: the first is written whole, with its
+        // colon, and the next Tab writes the second in its place.
         let mut state = after_tab(r#"PUT /people [{"g^"#, true);
         assert_eq!((shown(&state).as_str(), state.completions.len()), (r#"PUT /people [{"gdprForgotten":^"#, 2));
+        assert!(counted(&mut state));
+        tab_pressed(&mut state);
+        assert_eq!(shown(&state), r#"PUT /people [{"givenName":^"#);
+        // The only key that starts so is not walked: Tab goes on to its value.
+        let mut state = after_tab(r#"PUT /people [{"gd^"#, true);
+        assert_eq!(shown(&state), r#"PUT /people [{"gdprForgotten":^"#);
         assert!(!counted(&mut state));
         tab_pressed(&mut state);
-        assert!(!shown(&state).contains("givenName"), "{}", shown(&state));
+        assert_eq!(shown(&state), r#"PUT /people [{"gdprForgotten": true^"#);
         // A value in its quotes is one of several, and is closed behind.
         let mut state = after_tab(r#"PUT /people [{"status": ^"#, true);
         assert!(state.completions.len() > 1 && !counted(&mut state), "{}", shown(&state));
@@ -36619,7 +36719,8 @@ mod tests {
     /// used to write the last value of a list of its own.
     #[test]
     fn shift_tab_in_a_body_goes_back_in_tabs_list_and_starts_none() {
-        let mut state = completing_body("PUT /people [{\"g^");
+        // The only key that starts so is no list.
+        let mut state = completing_body("PUT /people [{\"gd^");
         tab_pressed(&mut state);
         assert_eq!(shown(&state), "PUT /people [{\"gdprForgotten\":^");
         backtab_pressed(&mut state);
@@ -36638,7 +36739,7 @@ mod tests {
         assert_eq!(shown(&state), "PUT /people [{\"gdprForgotten\": false^");
 
         // Through the subtypes of the `@type` Tab wrote: back from the
-        // first is the last, and Tab from there the first again.
+        // first is what was typed, and Tab from there the first again.
         let mut state = completing_body("POST /agents {\"@t^");
         tab_pressed(&mut state);
         let first = shown(&state);
@@ -36649,10 +36750,101 @@ mod tests {
         backtab_pressed(&mut state);
         assert_eq!(shown(&state), first);
         backtab_pressed(&mut state);
-        let last = shown(&state);
-        assert_ne!(last, first);
+        assert_eq!(shown(&state), "POST /agents {\"@t^");
         tab_pressed(&mut state);
         assert_eq!(shown(&state), first);
+    }
+
+    /// The line and the ghost behind the cursor, as the prompt draws them.
+    fn shown_with_ghost(state: &mut AppState) -> (String, String) {
+        let ghost = render_input_content(state, 200).2;
+        (shown(state), ghost)
+    }
+
+    /// Tab on a key that is offered writes it, block and all, and Tab again
+    /// writes the next key in its place: it used to complete in the block
+    /// the first had opened. Shift+Tab goes back, to nothing written.
+    #[test]
+    fn tab_goes_through_the_keys_of_an_object_each_in_the_place_of_the_last() {
+        let open = "PUT /people [{\n  \"identifiers\": {\n    \"com.heads.seedID\": \"x\"\n  },\n  ";
+        let start = format!("{open}^\n}}]");
+        let mut state = completing_body(&start);
+        let offered = shown_with_ghost(&mut state);
+        assert_eq!(offered, (start.clone(), "\"addresses\": {".to_string()));
+
+        tab_pressed(&mut state);
+        let addresses = format!("{open}\"addresses\": {{\n    ^\n  }}\n}}]");
+        // Nothing is offered in the block while Tab is at its key, and the
+        // counter says where in the list that is.
+        assert_eq!(shown_with_ghost(&mut state), (addresses.clone(), String::new()));
+        assert!(visible_text(&render_input_content(&mut state, 200).0).contains("(1/"));
+
+        // The next key, where the first was: its block is gone with it.
+        tab_pressed(&mut state);
+        let second = shown(&state);
+        assert!(second.starts_with(open) && !second.contains("addresses") && second.ends_with("\n}]"), "{second}");
+        assert_ne!(second, start);
+        tab_pressed(&mut state);
+        let third = shown(&state);
+        assert!(third.starts_with(open) && third != second && !third.contains("addresses"), "{third}");
+        // And back, through the first to the body as it was, ghost and all.
+        backtab_pressed(&mut state);
+        assert_eq!(shown(&state), second);
+        backtab_pressed(&mut state);
+        assert_eq!(shown(&state), addresses);
+        backtab_pressed(&mut state);
+        assert_eq!(shown_with_ghost(&mut state), offered);
+        assert!(!backtab_pressed(&mut state));
+        assert_eq!(shown(&state), start);
+
+        // Round: Tab on the last key is the first again.
+        tab_pressed(&mut state);
+        let keys = state.completions.len();
+        assert!(keys > 2);
+        for _ in 0..keys {
+            tab_pressed(&mut state);
+        }
+        assert_eq!(shown(&state), addresses);
+        // Shift+Tab from the second is the first, not the body without it.
+        tab_pressed(&mut state);
+        backtab_pressed(&mut state);
+        assert_eq!(shown(&state), addresses);
+
+        // Esc, as the key handler does it, keeps the key: Tab then
+        // completes in its block, as the ghost that is back says.
+        state.completions.clear();
+        state.last_tab_input.clear();
+        state.key_cycle = None;
+        let (_, ghost) = shown_with_ghost(&mut state);
+        assert!(ghost.ends_with(": {") || ghost.ends_with(':'), "{ghost}");
+        tab_pressed(&mut state);
+        assert!(shown(&state).starts_with(&format!("{open}\"addresses\": {{\n    \"")), "{}", shown(&state));
+
+        // A key typed in part is taken back to what was typed.
+        let mut state = completing_body("PUT /people [{\"g^");
+        tab_pressed(&mut state);
+        tab_pressed(&mut state);
+        assert_eq!(shown(&state), "PUT /people [{\"givenName\":^");
+        tab_pressed(&mut state);
+        assert_eq!(shown(&state), "PUT /people [{\"gdprForgotten\":^");
+        backtab_pressed(&mut state);
+        backtab_pressed(&mut state);
+        backtab_pressed(&mut state);
+        assert_eq!(shown(&state), "PUT /people [{\"g^");
+
+        // In the second request of a chain, which is left as it is.
+        let mut state = completing_body("GET /about && PUT /people [{\"g^");
+        tab_pressed(&mut state);
+        tab_pressed(&mut state);
+        assert_eq!(shown(&state), "GET /about && PUT /people [{\"givenName\":^");
+        let mut state = completing_body("PUT /people [{\"g^ && GET /about");
+        tab_pressed(&mut state);
+        assert_eq!(render_input_content(&mut state, 200).2, "");
+        tab_pressed(&mut state);
+        assert_eq!(shown(&state), "PUT /people [{\"givenName\":^ && GET /about");
+        backtab_pressed(&mut state);
+        backtab_pressed(&mut state);
+        assert_eq!(shown(&state), "PUT /people [{\"g^ && GET /about");
     }
 
     /// The ghost is what Tab writes behind what is typed, in whatever case

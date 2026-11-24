@@ -7433,8 +7433,10 @@ fn tab_completes_a_body_from_the_servers_spec_under_x() {
     assert_eq!(body_of(&sent, "POST /agents "), serde_json::json!({"@type": "company", "name": "Acme"}), "{shown}");
 
     // Tab before a body opens the brackets the endpoint takes, on lines of
-    // their own; the object's first key is its identifiers.
-    let shown = press(&mut prompt, &["PUT /people ", "\t", "\t", "\t", " \"007\"", END]);
+    // their own; the object's first key is its identifiers. Tab again is
+    // the next key in its place and Shift+Tab the identifiers again: what
+    // is typed from there is in their block.
+    let shown = press(&mut prompt, &["PUT /people ", "\t", "\t", "\t", SHIFT_TAB, "\"", "\t", " \"007\"", END]);
     let sent = entered(&mut prompt, &server);
     assert_eq!(sent.len(), 1, "{shown}\n{}", screen_tail(&prompt));
     assert_eq!(
