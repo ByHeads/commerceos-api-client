@@ -7,7 +7,7 @@ and lays a file out.
 ## Install
 
 ```sh
-api --install-syntax sublime
+api --install-editor sublime
 ```
 
 writes them to Sublime's `Packages/User` folder, with `API.sublime-commands`

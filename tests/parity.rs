@@ -952,7 +952,7 @@ fn api(port: u16, dir: &Path) -> std::process::Command {
         // The prompt keeps a history file in the home directory: not the
         // real one, when it is a test that types.
         .env("HOME", dir)
-        .env_remove("API_STREAMING")
+        .env_remove("API_STREAM")
         .env_remove("API_CREDENTIALS_FILE")
         .stdin(std::process::Stdio::null());
     cmd
@@ -1194,7 +1194,7 @@ fn a_request_carries_the_same_headers_from_every_entry_point() {
         cmd.args(["--no-keychain", "-b", &format!("http://127.0.0.1:{}", server.port), flag, value, "GET", "/h"])
             .current_dir(dir.path())
             .env("HOME", dir.path())
-            .env_remove("API_STREAMING")
+            .env_remove("API_STREAM")
             .env_remove("API_CREDENTIALS_FILE")
             .stdin(std::process::Stdio::null())
             .output()
@@ -1214,7 +1214,7 @@ fn api_bare(dir: &Path) -> std::process::Command {
         .current_dir(dir)
         .env("NO_COLOR", "1")
         .env("HOME", dir)
-        .env_remove("API_STREAMING")
+        .env_remove("API_STREAM")
         .env_remove("API_CREDENTIALS_FILE")
         .stdin(std::process::Stdio::null());
     cmd
@@ -1345,7 +1345,7 @@ fn a_timeout_is_for_silence_not_for_the_whole_transfer() {
 
 /// What sends nothing is not passed off as a run. A `set` line alone is an
 /// error with a comment behind it as without one, and a document option
-/// (`--imports`, `--describe`, `--assert`) does not drop the file or the
+/// (`--imports`, `--describe`, `--asserts`) does not drop the file or the
 /// request that stands beside it without a word.
 #[test]
 fn what_would_send_nothing_or_drop_a_request_is_an_error() {
@@ -1363,7 +1363,7 @@ fn what_would_send_nothing_or_drop_a_request_is_an_error() {
     let got = run_in(&server, d, &["set {\"include-nulls\":true} # note\nGET /a"]);
     assert_eq!((got.code, &got.sent[..]), (Some(0), &["GET /a".to_string()][..]), "{}", got.stderr);
 
-    for option in ["--imports", "--describe", "--assert"] {
+    for option in ["--imports", "--describe", "--asserts"] {
         let got = run_in(&server, d, &[option, "a.api", "GET", "/people"]);
         assert_eq!((got.code, got.sent.len(), got.stdout.as_str()), (Some(1), 0, ""), "{option}: {}", got.stderr);
         assert_eq!(
@@ -2557,7 +2557,7 @@ fn a_narrow_terminal_gets_no_piece_of_the_splash_box() {
     }
 }
 
-/// `-m` at a terminal wraps the description to the terminal's width.
+/// `-d` at a terminal wraps the description to the terminal's width.
 #[cfg(unix)]
 #[test]
 fn describe_first_wraps_to_the_width_of_the_terminal() {
@@ -2571,7 +2571,7 @@ fn describe_first_wraps_to_the_width_of_the_terminal() {
     )
     .unwrap();
     let mut cmd = api(server.port, d);
-    cmd.args(["-spma", "cat.api"]).env("LANG", "en_GB.UTF-8").env_remove("LC_ALL").env_remove("LC_MESSAGES");
+    cmd.args(["-spda", "cat.api"]).env("LANG", "en_GB.UTF-8").env_remove("LC_ALL").env_remove("LC_MESSAGES");
     let mut prompt = pty::Prompt::open_sized(cmd, 40);
     prompt.wait_for("Run?", Duration::from_secs(10));
     let shown = pty::plain(&prompt.screen);
@@ -6330,7 +6330,7 @@ fn a_menu_key_takes_ctrl_c_back_in_the_settings_menu() {
     assert!(prompt.exited().is_some(), "ctrl+c twice did not leave:\n{}", screen_tail(&prompt));
 }
 
-/// `--no-streaming` keeps streaming off for the session too. The menu's row
+/// `--no-stream` keeps streaming off for the session too. The menu's row
 /// and a typed `set {"stream":true}` say that, not that streaming is on, and a file's
 /// `set {"stream":true}` is passed over by the option's name: the session set nothing.
 #[cfg(unix)]
@@ -6344,16 +6344,16 @@ fn a_session_started_with_no_streaming_says_that_streaming_stays_off() {
     prepare(dir.path());
     std::fs::write(dir.path().join("stream.api"), "set {\"stream\":true}\nGET /keyed > from-file.json\n").unwrap();
     let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("api"));
-    cmd.args(["--no-keychain", "-b", &format!("http://127.0.0.1:{}", server.port), "-k", "streamer", "--no-streaming"])
+    cmd.args(["--no-keychain", "-b", &format!("http://127.0.0.1:{}", server.port), "-k", "streamer", "--no-stream"])
         .current_dir(dir.path())
         .env("NO_COLOR", "1")
         .env("HOME", dir.path())
-        .env_remove("API_STREAMING")
+        .env_remove("API_STREAM")
         .env_remove("API_CREDENTIALS_FILE");
     let mut prompt = Prompt::open_sized(cmd, COLS as u16);
     prompt.wait_ready(Duration::from_secs(15));
     prompt.pump(Duration::from_millis(600));
-    const REFUSED: &str = "streaming is off: the session was started with --no-streaming";
+    const REFUSED: &str = "streaming is off: the session was started with --no-stream";
 
     // The first row of the menu: refused in its last row, and still `off`.
     prompt.send(b"\x14");
@@ -6381,7 +6381,7 @@ fn a_session_started_with_no_streaming_says_that_streaming_stays_off() {
     let (sent, shown, accepts) = run_pasted_accepts(&mut prompt, &server, "stream.api");
     assert_eq!(sent, ["GET /keyed"], "{shown}");
     assert_eq!(accepts, ["application/json"]);
-    assert!(shown.contains("↳ ignored: --no-streaming is set"), "{shown}");
+    assert!(shown.contains("↳ ignored: --no-stream is set"), "{shown}");
     assert!(!shown.contains("the session has"), "{shown}");
 }
 
@@ -8057,7 +8057,7 @@ fn a_refused_default_connection_leaves_nothing_in_the_session() {
 }
 
 /// `--me` sends to the API of the signed-in user, a bearer token after `-t`
-/// is told where it goes now, an option that is none is named, and a
+/// is told where it goes, an option that is none is named, and a
 /// body-less PUT at a terminal reads its body from there.
 #[cfg(unix)]
 #[test]
@@ -8070,9 +8070,9 @@ fn one_shot_corners_of_the_command_line() {
     assert_eq!(ran.sent, ["GET /api/me/v1/x"], "{}", ran.stderr);
 
     let token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJl";
-    let ran = run_in(&server, d, &["-t", token, "GET", "/x"]);
+    let ran = run_bare(&server, d, &["-t", token, "GET", "/x"]);
     assert_eq!(ran.code, Some(1));
-    assert!(ran.stderr.contains("error: -t is now --stream. Use --token <TOKEN> for a bearer token."), "{}", ran.stderr);
+    assert_eq!(ran.stderr.trim(), "error: -t names a tenant. Use --token <TOKEN> for a bearer token.");
     assert!(ran.sent.is_empty());
 
     let ran = run_in(&server, d, &["--no-such-option", "GET", "/x"]);
@@ -10418,6 +10418,160 @@ fn an_option_given_twice_or_without_its_value_is_said_to_be_that() {
     }
 }
 
+/// `-t abc` is the tenant's host. A value that names no tenant, and a `-t`
+/// beside another option that names the host, is refused with nothing sent.
+#[cfg(unix)]
+#[test]
+fn a_tenant_names_its_host_and_takes_the_saved_connection_for_it() {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let local = format!("http://127.0.0.1:{}", server.port);
+    write_credentials(
+        d,
+        &[
+            ("prod", "https://abc.app.heads.com".to_string(), "key", "k-prod", ""),
+            ("one", "dup.app.heads.com".to_string(), "key", "k-one", ""),
+            ("two", "https://DUP.app.heads.com/api/v1".to_string(), "key", "k-two", ""),
+            ("local", local.clone(), "key", "k-local", ""),
+        ],
+        "local",
+    );
+
+    for (args, says) in [
+        (
+            &["-t", "dup", "GET", "/a"][..],
+            "Tenant \"dup\" fits several saved connections: one, two. Name one of them with -c.",
+        ),
+        (
+            &["-t", "abc.app.heads.com", "GET", "/a"],
+            "error: invalid value for -t: a tenant is one name of letters, digits and `-`, as `abc` is for https://abc.app.heads.com. Give a URL with -b.",
+        ),
+        (
+            // The `-t` that turned streaming on, in a line written for it.
+            &["-t", "GET", "/a"],
+            "error: invalid value for -t: GET is a method, not a tenant. -t names a tenant, and --stream turns streaming on.",
+        ),
+        (&["-st", "seed.api"], "error: invalid value for -t: a tenant is one name of letters, digits and `-`, as `abc` is for https://abc.app.heads.com. Give a URL with -b."),
+        (&["-t", "abc", "-b", &local, "GET", "/a"], "error: -t names a tenant's host and -b a base URL: give one of the two"),
+        (&["--tenant", "abc", "--base-url", &local, "GET", "/a"], "error: -t names a tenant's host and -b a base URL: give one of the two"),
+        (&["-t", "abc", "--1p", "heads/test", "GET", "/a"], "error: -t names a tenant's host and --1p one in 1Password: give one of the two"),
+        (&["-t", "abc", "-t", "def", "GET", "/a"], "error: --tenant was given twice"),
+        (&["GET", "/a", "-t"], "error: --tenant needs a value"),
+    ] {
+        let got = run_bare(&server, d, args);
+        assert_eq!((got.code, got.sent.len()), (Some(1), 0), "{args:?}: {}", got.stderr);
+        assert_eq!(got.stderr.trim(), says, "{args:?}");
+        assert_eq!(got.stdout, "", "{args:?}");
+    }
+
+    // Where it would be sent, by the preview, which is declined: the
+    // tenant's host with a saved connection for it, without one, in
+    // capitals, and beside the `-c` that lends its credential.
+    let preview = |args: &[&str]| {
+        let mut cmd = api_bare(d);
+        cmd.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().expect("spawn api");
+        child.stdin.take().unwrap().write_all(b"n\n").unwrap();
+        let out = child.wait_with_output().expect("api runs");
+        assert_eq!(out.status.code(), Some(0), "{args:?}");
+        String::from_utf8_lossy(&out.stderr).to_string()
+    };
+    for (args, host) in [
+        (&["-sp", "-t", "abc", "GET", "/a"][..], "https://abc.app.heads.com"),
+        (&["-sp", "--tenant", "ABC", "GET", "/a"], "https://abc.app.heads.com"),
+        (&["-sp", "-t", "nobody", "GET", "/a"], "https://nobody.app.heads.com"),
+        (&["-sp", "-c", "one", "-t", "dup", "GET", "/a"], "https://dup.app.heads.com"),
+        (&["-sptabc", "GET", "/a"], "https://abc.app.heads.com"),
+    ] {
+        let said = preview(args);
+        assert!(said.starts_with(&format!("Preview — 1 request | GET [{host}]\n")), "{args:?}: {said}");
+    }
+    server.settle(Duration::from_millis(150), Duration::from_secs(1));
+    assert!(server.take().is_empty());
+}
+
+/// `api -` runs the file on stdin, as `-a -` and a bare `-a` do, and a
+/// request behind the `-` is refused. `-a` is no longer in the help and
+/// still runs a file; `--base-uri` is still read as `--base-url`.
+#[test]
+fn a_dash_runs_the_file_on_stdin_and_the_old_spellings_that_are_kept_still_work() {
+    use std::process::Stdio;
+
+    let server = RecordingServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let url = format!("http://127.0.0.1:{}", server.port);
+    std::fs::write(d.join("seed.api"), "GET /one\nPUT /two {\"a\":1}\n").unwrap();
+
+    let piped = |args: &[&str]| {
+        server.take();
+        let mut cmd = api(server.port, d);
+        cmd.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn api");
+        child.stdin.take().unwrap().write_all(b"GET /one\nPUT /two {\"a\":1}\n").unwrap();
+        let out = child.wait_with_output().expect("api runs");
+        server.settle(Duration::from_millis(150), Duration::from_secs(3));
+        // The log without the time each request took.
+        let log: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|line| match line.rsplit_once(' ') {
+                Some((status, _)) if line.starts_with("└─") => status.to_string(),
+                _ => line.to_string(),
+            })
+            .collect();
+        (server.take(), out.status.code(), log)
+    };
+    let (sent, code, log) = piped(&["-s", "-"]);
+    assert_eq!(log.len(), 5, "{log:?}");
+    assert_eq!((sent.clone(), code), (vec!["GET /one".to_string(), "PUT /two {\"a\":1}".to_string()], Some(0)));
+    for args in [&["-sa", "-"][..], &["-sa"], &["-s", "seed.api"], &["-sa", "seed.api"], &["-s", "--all", "seed.api"]] {
+        assert_eq!(piped(args), (sent.clone(), code, log.clone()), "{args:?}");
+    }
+
+    for (args, says) in [
+        (&["-", "GET", "/a"][..], "error: - runs the file on stdin and GET /a is a request: give one of the two"),
+        (&["-", "seed.api"], "error: - runs the file on stdin and seed.api is a request: give one of the two"),
+        (&["--format", "seed.api", "-"], "error: --format seed.api prints a document and - runs the file on stdin: give one of the two"),
+        (&["-a", "seed.api", "GET", "/a"], "error: -a seed.api runs a file and GET /a is a request: give one of the two"),
+        (&["-s", "seed.api", "GET", "/a"], "error: seed.api runs a file and GET /a is a request: give one of the two"),
+        (&["seed.api", "/a", "{}"], "error: seed.api runs a file and /a {} is a request: give one of the two"),
+    ] {
+        let got = run_in(&server, d, args);
+        assert_eq!((got.code, got.sent.len()), (Some(1), 0), "{args:?}: {}", got.stderr);
+        assert_eq!(got.stderr.trim(), says, "{args:?}");
+    }
+
+    let got = run_bare(&server, d, &["--base-uri", &url, "-k", "k", "GET", "/a"]);
+    assert_eq!((got.sent, got.code), (vec!["GET /a".to_string()], Some(0)), "{}", got.stderr);
+    let got = run_bare(&server, d, &["--base-url", &url, "--base-uri", &url, "-k", "k", "GET", "/a"]);
+    assert_eq!((got.stderr.trim(), got.sent.len()), ("error: --base-url was given twice", 0));
+
+    // What the help lists, and what it does not.
+    let help = run_bare(&server, d, &["--help"]).stdout;
+    for listed in ["-b, --base-url <URL>", "-t, --tenant <NAME>", "-d, --describe-first", "--asserts <FILE>", "--install-editor <EDITOR>", "--no-stream ", "      --stream ", "      --token <TOKEN>", "-v, --version"] {
+        assert!(help.contains(listed), "{listed}:\n{help}");
+    }
+    for gone in ["--all", "-a,", "--base-uri", "--no-streaming", "--install-syntax", "-m,", "--assert <", "API_STREAMING"] {
+        assert!(!help.contains(gone), "{gone}:\n{help}");
+    }
+    // The names that were given up are no options.
+    for old in ["-m", "--assert", "--no-streaming", "--install-syntax"] {
+        let got = run_in(&server, d, &[old, "seed.api"]);
+        assert_eq!((got.code, got.sent.len()), (Some(1), 0), "{old}");
+        assert_eq!(got.stderr.trim(), format!("error: unexpected option {old}"));
+    }
+}
+
 /// What names no request, or no host to send one to, is refused with nothing
 /// sent: an empty method, a user and a password in a base URL, a saved URL
 /// without a host, and an empty `-b` beside `-c`.
@@ -11136,11 +11290,11 @@ fn every_setting_does_what_its_option_does() {
         "{:?}",
         server.heads()
     );
-    // `--no-streaming` is the one option that keeps a setting off.
-    let got = run_in(&server, d, &["--no-streaming", "-sa", "s.api"]);
+    // `--no-stream` is the one option that keeps a setting off.
+    let got = run_in(&server, d, &["--no-stream", "-sa", "s.api"]);
     assert_eq!(got.code, Some(0), "{}", got.stderr);
     assert!(accepts(&server).iter().all(|accept| !accept.contains("stream=true")), "{:?}", server.heads());
-    assert!(got.stdout.contains("set {\"stream\":true}\n↳ ignored: --no-streaming is set"), "{}", got.stdout);
+    assert!(got.stdout.contains("set {\"stream\":true}\n↳ ignored: --no-stream is set"), "{}", got.stdout);
     assert_eq!(got.stdout.matches("ignored").count(), 1, "{}", got.stdout);
     // The options that are on stay on, and each is named as it was given.
     let got = run_in(&server, d, &["--ndjson", "--stream", "-sa", "s.api"]);
@@ -11149,9 +11303,9 @@ fn every_setting_does_what_its_option_does() {
     assert!(got.stdout.contains("set {\"stream\":false}\n↳ ignored: --stream is set"), "{}", got.stdout);
     assert_eq!(got.stdout.matches("ignored").count(), 2, "{}", got.stdout);
     let mut cmd = api(server.port, d);
-    cmd.env("API_STREAMING", "1").args(["-sa", "s.api"]);
+    cmd.env("API_STREAM", "1").args(["-sa", "s.api"]);
     let got = ran(&server, cmd);
-    assert!(got.stdout.contains("set {\"stream\":false}\n↳ ignored: API_STREAMING is set"), "{}", got.stdout);
+    assert!(got.stdout.contains("set {\"stream\":false}\n↳ ignored: API_STREAM is set"), "{}", got.stdout);
 
     // raw: a file holds the body as the server sent it, not laid out.
     file("GET /keyed > laid-out.json\nset {\"raw\":true}\nGET /keyed > raw.json\nset {\"raw\":false}\nGET /keyed > again.json\n");
@@ -11799,8 +11953,8 @@ fn a_command_line_that_cannot_be_run_sends_nothing() {
     for (args, says) in [
         (&["PUT", "/x", "{\"a\":1"][..], "unclosed body"),
         (&["PUT /x [{\"a\":1}"], "unclosed body"),
-        (&["--describe", "one.api", "--assert", "one.api"], "--describe and --assert each print a document of their own: use one"),
-        (&["--imports", "one.api", "--describe", "one.api", "--assert", "one.api"], "--describe, --assert and --imports each print a document of their own: use one"),
+        (&["--describe", "one.api", "--asserts", "one.api"], "--describe and --asserts each print a document of their own: use one"),
+        (&["--imports", "one.api", "--describe", "one.api", "--asserts", "one.api"], "--describe, --asserts and --imports each print a document of their own: use one"),
         (&["set", "{\"export\":\"com.heads.seedID\"}"], "`set` alone sends nothing"),
         (&["set", "{\"include-nulls\":true}"], "`set` alone sends nothing"),
         (&["set {\n  \"raw\": true,\n  \"ndjson\": true\n}"], "`set` alone sends nothing"),
@@ -12226,14 +12380,14 @@ fn set_lines_change_what_is_sent_asked_for_and_printed() {
     assert!(!std::fs::read_to_string(d.join("s1.json")).unwrap().contains('\n'));
     assert!(std::fs::read_to_string(d.join("s2.json")).unwrap().contains("\n  "));
 
-    // `--no-streaming` keeps the line off: the file is written buffered.
-    let got = run("set {\"stream\":true}\nGET /keyed > n.json\n", &["--no-streaming", "-sa", "s.api"]);
+    // `--no-stream` keeps the line off: the file is written buffered.
+    let got = run("set {\"stream\":true}\nGET /keyed > n.json\n", &["--no-stream", "-sa", "s.api"]);
     assert_eq!(accepts_of(&server), ["application/json"], "{}", got.stderr);
     assert!(std::fs::read_to_string(d.join("n.json")).unwrap().contains("\n  "));
-    assert!(got.stdout.contains("↳ ignored: --no-streaming is set"), "{}", got.stdout);
+    assert!(got.stdout.contains("↳ ignored: --no-stream is set"), "{}", got.stdout);
 }
 
-/// `--assert` reads a file with `set` lines as a run does: the lines are no
+/// `--asserts` reads a file with `set` lines as a run does: the lines are no
 /// assertions and are passed over, and a line that would stop a run stops
 /// the listing.
 #[test]
@@ -12242,12 +12396,12 @@ fn assert_lists_a_file_with_set_lines_and_refuses_one_that_would_not_run() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
     std::fs::write(d.join("a.api"), "set {\"fail-fast\":true}\nPUT /assert {\"api/v1/x\":{\"is\":1}}\nset {\"fail-fast\":false}\nPUT v1/assert {\"api/v1/y\":{\"is not\":null}}\n").unwrap();
-    let got = run_in(&server, d, &["-r", "--assert", "a.api"]);
+    let got = run_in(&server, d, &["-r", "--asserts", "a.api"]);
     assert_eq!((got.code, got.sent.len()), (Some(0), 0), "{}", got.stderr);
     assert_eq!(got.stdout.trim_end(), r#"[{"api/v1/x":{"is":1}},{"api/v1/y":{"is not":null}}]"#);
 
     std::fs::write(d.join("a.api"), "set {\"nulls\":true}\nPUT /assert {\"api/v1/x\":{\"is\":1}}\n").unwrap();
-    for option in ["--assert", "--imports"] {
+    for option in ["--asserts", "--imports"] {
         let got = run_in(&server, d, &[option, "a.api"]);
         assert_eq!((got.code, got.sent.len(), got.stdout.as_str()), (Some(1), 0, ""), "{option}: {}", got.stderr);
         assert!(got.stderr.starts_with("error: ") && got.stderr.contains("unknown setting `nulls`"), "{option}: {}", got.stderr);
@@ -12833,7 +12987,7 @@ fn a_connection_added_in_a_session_loads_behind_its_form() {
 fn a_program_on_stdin_that_is_not_utf8_is_refused() {
     let server = RecordingServer::start();
     let dir = tempfile::tempdir().unwrap();
-    for args in [&["-sa", "-"][..], &["-a", "-"], &["--describe", "-"], &["--assert", "-"], &["--imports", "-"]] {
+    for args in [&["-sa", "-"][..], &["-a", "-"], &["--describe", "-"], &["--asserts", "-"], &["--imports", "-"]] {
         server.take();
         let mut cmd = api(server.port, dir.path());
         cmd.args(args).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
@@ -12880,7 +13034,7 @@ fn a_streamed_response_prints_and_is_judged_as_a_buffered_one() {
     }
 }
 
-/// `-m` prints the describe block of a file named as a one-shot argument
+/// `-d` prints the describe block of a file named as a one-shot argument
 /// too, with no `-a`, and the file runs.
 #[test]
 fn describe_first_works_for_a_file_named_as_an_argument() {
@@ -12894,24 +13048,24 @@ fn describe_first_works_for_a_file_named_as_an_argument() {
     .unwrap();
     std::fs::write(d.join("bare.api"), "GET /products\n").unwrap();
     let mut cmd = api(server.port, d);
-    cmd.args(["-m", "catalog.api"]).env("LANG", "en_US.UTF-8").env_remove("LC_ALL").env_remove("LC_MESSAGES");
+    cmd.args(["-d", "catalog.api"]).env("LANG", "en_US.UTF-8").env_remove("LC_ALL").env_remove("LC_MESSAGES");
     let got = ran(&server, cmd);
     assert_eq!((got.code, &got.sent[..]), (Some(0), &["GET /products".to_string()][..]), "{}", got.stderr);
     assert!(got.stderr.starts_with("Catalog\nhttps://docs.example.com/catalog\n"), "{}", got.stderr);
     // A file with a blank in its name is that file.
     std::fs::copy(d.join("catalog.api"), d.join("my catalog.api")).unwrap();
-    let got = run_in(&server, d, &["-m", "my catalog.api"]);
+    let got = run_in(&server, d, &["-d", "my catalog.api"]);
     assert_eq!((got.code, got.sent.len()), (Some(0), 1), "{}", got.stderr);
     assert!(got.stderr.starts_with("Catalog\n"), "{}", got.stderr);
     // A file without a block prints nothing for it, and a request is no file.
-    for args in [&["-m", "bare.api"][..], &["-m", "GET", "/products"]] {
+    for args in [&["-d", "bare.api"][..], &["-d", "GET", "/products"]] {
         let got = run_in(&server, d, args);
         assert_eq!((got.code, got.sent.len()), (Some(0), 1), "{args:?}: {}", got.stderr);
         assert!(!got.stderr.contains("Catalog"), "{args:?}: {}", got.stderr);
     }
 }
 
-/// A run that stops at the `url` gate or at an import prints no block: `-m`
+/// A run that stops at the `url` gate or at an import prints no block: `-d`
 /// says what is about to run, and that file is not.
 #[test]
 fn describe_first_prints_no_block_for_a_run_that_stops_before_it() {
@@ -12924,7 +13078,7 @@ fn describe_first_prints_no_block_for_a_run_that_stops_before_it() {
     std::fs::write(d.join("open.api"), format!("{block}GET /products\nPUT /x {{\n")).unwrap();
     std::fs::write(d.join("fine.api"), format!("url has 127.0.0.1\n{block}GET /products\n")).unwrap();
     for file in ["gated.api", "lost.api", "open.api"] {
-        for args in [&["-m", file][..], &["-ma", file], &["-sma", file]] {
+        for args in [&["-d", file][..], &["-da", file], &["-sda", file]] {
             let got = run_in(&server, d, args);
             assert_eq!((got.code, got.sent.len()), (Some(1), 0), "{args:?}: {}", got.stderr);
             assert!(got.stderr.contains("error: "), "{args:?}: {}", got.stderr);
@@ -12932,14 +13086,14 @@ fn describe_first_prints_no_block_for_a_run_that_stops_before_it() {
         }
     }
     // The gate that passes is passed first, and the block is then printed.
-    for args in [&["-m", "fine.api"][..], &["-ma", "fine.api"]] {
+    for args in [&["-d", "fine.api"][..], &["-da", "fine.api"]] {
         let got = run_in(&server, d, args);
         assert_eq!((got.code, got.sent.len()), (Some(0), 1), "{args:?}: {}", got.stderr);
         assert!(got.stderr.starts_with("Catalog\n"), "{args:?}: {}", got.stderr);
     }
 }
 
-/// `-m` shows a text in the reader's locale, read from `LC_ALL`, else
+/// `-d` shows a text in the reader's locale, read from `LC_ALL`, else
 /// `LC_MESSAGES`, else `LANG` (`sv_SE.UTF-8` is `sv-SE`). `C` is no locale.
 #[test]
 fn describe_first_reads_the_locale_from_the_environment() {
@@ -12967,7 +13121,7 @@ fn describe_first_reads_the_locale_from_the_environment() {
         (None, None, None, "Catalog"),
     ] {
         let mut cmd = api(server.port, d);
-        cmd.args(["-sma", "catalog.api"]);
+        cmd.args(["-sda", "catalog.api"]);
         for (name, value) in [("LC_ALL", lc_all), ("LC_MESSAGES", lc_messages), ("LANG", lang)] {
             match value {
                 Some(value) => cmd.env(name, value),
@@ -12995,7 +13149,7 @@ fn an_include_that_cannot_be_read_stops_the_batch() {
         ("import dir lib @latin.json\nGET /first\n", "import file is not UTF-8 text: latin.json"),
     ] {
         std::fs::write(d.join("batch.api"), program).unwrap();
-        for args in [&["-sa", "batch.api"][..], &["--assert", "batch.api"]] {
+        for args in [&["-sa", "batch.api"][..], &["--asserts", "batch.api"]] {
             let got = run_in(&server, d, args);
             assert_eq!((got.code, got.sent.len()), (Some(1), 0), "{program:?} {args:?}: {}", got.stderr);
             assert!(got.stderr.contains(says), "{program:?} {args:?}: {}", got.stderr);

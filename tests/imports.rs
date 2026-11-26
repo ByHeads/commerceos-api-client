@@ -192,7 +192,7 @@ fn api(dir: &Path, port: u16) -> Command {
         .current_dir(dir)
         .env("NO_COLOR", "1")
         .env("API_IMPORT_CACHE", dir.join(".import-cache"))
-        .env_remove("API_STREAMING")
+        .env_remove("API_STREAM")
         .env_remove("API_CREDENTIALS_FILE")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -446,8 +446,8 @@ fn directives_and_chains_in_an_imported_file_run_as_they_would_in_the_batch() {
     }
 }
 
-/// A describe block is its file's: `-m` prints the batch's, not the one an
-/// imported file opens with, and neither is sent. `--assert` follows the
+/// A describe block is its file's: `-d` prints the batch's, not the one an
+/// imported file opens with, and neither is sent. `--asserts` follows the
 /// import and lists what both files assert; `--describe` reads the batch
 /// alone, so it answers with nothing fetched.
 #[test]
@@ -459,7 +459,7 @@ fn a_describe_block_in_an_imported_file_stays_there_and_its_assertions_are_liste
         let batch = format!(
             "{BLOCK}\n{import}\nlib/described.api\nPUT /assert {{ \"api/v1/described~count\": {{ \"is not\": 2 }} }}\n"
         );
-        let ran = run_batch(&dir, server.port, "-sma", &batch);
+        let ran = run_batch(&dir, server.port, "-sda", &batch);
         assert!(ran.ok, "{kind}: {}", ran.stderr);
         assert_eq!(
             server.api_requests(),
@@ -474,13 +474,13 @@ fn a_describe_block_in_an_imported_file_stays_there_and_its_assertions_are_liste
         assert!(!ran.stderr.contains("Described fixture"), "{kind}: {}", ran.stderr);
         assert!(!ran.stdout.contains("title"), "{kind}: {}", ran.stdout);
 
-        // Without -m nothing of it is printed.
+        // Without -d nothing of it is printed.
         let ran = run_batch(&dir, server.port, "-sa", &batch);
         assert!(ran.ok && ran.stderr.is_empty(), "{kind}: {}", ran.stderr);
         server.sent();
 
         let mut cmd = api(&dir, server.port);
-        cmd.args(["-r", "--assert", "batch.api"]);
+        cmd.args(["-r", "--asserts", "batch.api"]);
         let ran = finish(cmd, "");
         assert!(ran.ok, "{kind}: {}", ran.stderr);
         assert_eq!(
@@ -492,10 +492,10 @@ fn a_describe_block_in_an_imported_file_stays_there_and_its_assertions_are_liste
             ),
             "{kind}"
         );
-        assert!(server.api_requests().is_empty(), "{kind}: --assert sends nothing");
+        assert!(server.api_requests().is_empty(), "{kind}: --asserts sends nothing");
     }
 
-    // An import that can't be fetched: `--describe` never tries, `--assert`
+    // An import that can't be fetched: `--describe` never tries, `--asserts`
     // has to and says why it could not.
     let batch = format!("{BLOCK}\nimport dir lib {{ \"path\": \"no-such-directory\" }}\nlib/described.api\n");
     std::fs::write(dir.join("batch.api"), batch).unwrap();
@@ -505,7 +505,7 @@ fn a_describe_block_in_an_imported_file_stays_there_and_its_assertions_are_liste
     assert!(ran.ok, "{}", ran.stderr);
     assert_eq!(ran.stdout, "{\"title\":{\"en-US\":\"The batch\"},\"docsLink\":\"https://link-to-docs.com\"}\n");
     let mut cmd = api(&dir, server.port);
-    cmd.args(["--assert", "batch.api"]);
+    cmd.args(["--asserts", "batch.api"]);
     let ran = finish(cmd, "");
     assert!(!ran.ok && ran.stdout.is_empty(), "{}", ran.stdout);
     assert!(ran.stderr.starts_with("error: import lib: not a directory"), "{}", ran.stderr);
@@ -1386,10 +1386,10 @@ fn imports_that_cannot_be_read_print_nothing_and_exit_1() {
     }
     // One document per run.
     let mut cmd = api(&dir, server.port);
-    cmd.args(["--imports", "batch.api", "--assert", "batch.api"]);
+    cmd.args(["--imports", "batch.api", "--asserts", "batch.api"]);
     let ran = finish(cmd, "");
     assert!(!ran.ok);
-    assert_eq!(ran.stderr, "error: --assert and --imports each print a document of their own: use one\n");
+    assert_eq!(ran.stderr, "error: --asserts and --imports each print a document of their own: use one\n");
     assert_eq!(server.sent(), Vec::<String>::new());
 }
 
@@ -2637,9 +2637,9 @@ fn a_pinned_archive_in_the_cache_runs_with_its_token_variable_unset() {
     assert_eq!(server.sent(), Vec::<String>::new());
 }
 
-// ----- --assert -----
+// ----- --asserts -----
 
-/// `--assert` answers what a run would assert, so it follows imports, and
+/// `--asserts` answers what a run would assert, so it follows imports, and
 /// fetches one that is not in the cache: by default the one under the home
 /// directory.
 #[test]
@@ -2651,7 +2651,7 @@ fn listing_assertions_fetches_an_import_into_the_default_cache_under_home() {
     for (kind, import) in each_kind(&dir, &server) {
         std::fs::write(dir.join("batch.api"), format!("{import}\nGET /own\nlib/described.api\n")).unwrap();
         let mut cmd = api(&dir, server.port);
-        cmd.args(["-r", "--assert", "batch.api"]).env_remove("API_IMPORT_CACHE").env("HOME", &home);
+        cmd.args(["-r", "--asserts", "batch.api"]).env_remove("API_IMPORT_CACHE").env("HOME", &home);
         let ran = finish(cmd, "");
         assert!(ran.ok, "{kind}: {}", ran.stderr);
         assert_eq!(ran.stdout.trim(), r#"[{"api/v1/described~count":{"is":1}}]"#, "{kind}");

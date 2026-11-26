@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+**Options were renamed.** A script that gives one of the old names in the table below, other than `-a` and `--base-uri`, has to be changed.
+
+| Up to 3.4.4 | Now | The old name |
+|---|---|---|
+| `-a, --all [FILE]` | `api seed.api`, and `api -` for stdin | still read, no longer in `--help` |
+| `-b, --base-uri` | `-b, --base-url` | `--base-uri` is still read |
+| `-t, --stream` | `--stream` | `-t` is a tenant |
+| `--no-streaming` | `--no-stream` | `unexpected option` |
+| `API_STREAMING` | `API_STREAM` | not read |
+| `-m, --describe-first` | `-d, --describe-first` | `unexpected option` |
+| `--assert <FILE>` | `--asserts <FILE>` | `unexpected option` |
+| `--install-syntax <EDITOR>` | `--install-editor <EDITOR>` | `unexpected option` |
+
+- **`-t <name>` (`--tenant`) names a tenant's host.** `api -t abc GET /people` goes to `https://abc.app.heads.com`, with the credential of the one saved connection for that host, as `-c abc.app.heads.com` chooses it. Where no connection is saved for the host it is `-b` with that URL and no saved credential is sent; `-k` or `--token` gives one, and `-c staging -t abc` lends staging's to the tenant's host. Several saved connections for the host is an error that lists them (`Tenant "abc" fits several saved connections: … Name one of them with -c.`). A name is one word of letters, digits and `-`: a host with its domain, a URL and the name of a method are refused, the last so that `api -t GET /people`, which turned streaming on, is not sent to a host called `get`. `-t` beside `-b` or `--1p` is an error.
+- **A file is run by naming it, and `api -` runs the file on stdin.** `api seed.api` has run a file since 3.2.0, as `api -a seed.api` did, and is now how the documentation writes it: `api -s seed.api`, `api -sf seed.api`, `api -sp seed.api`. `-` is stdin here as it is to `--format` and `--describe`. `-a` and `--all` are still read, with `-a -` and a bare `-a` for stdin, and are no longer in `--help`. A request behind a file's name (`api seed.api GET /people`) is said to be that, `seed.api runs a file and GET /people is a request: give one of the two`, where it was `include not found: seed.api GET /people`.
+- **`--base-url` is the name of `-b`**, as every message and the `url` lines have called it. `--base-uri` is still read.
+- **Streaming has one spelling: `--stream`, `--no-stream`, `API_STREAM`.** `--stream` has no short option any more. `API_STREAMING` is not read: a run that set it buffers its responses until the variable is renamed.
+- **A bearer token is `--token`, with no short option.** `-t <token>` is refused without the token being repeated: `-t names a tenant. Use --token <TOKEN> for a bearer token.`
+- **`-d` is `--describe-first`** (it was `-m`): `api -spd catalog.api`.
+- **`--asserts <file>` lists a file's `PUT /assert` bodies** (it was `--assert`), named as `--imports` is. It does not assert anything, and does not list the lines of the `assert` keyword.
+- **`--install-editor <editor>`** (it was `--install-syntax`) installs what it installed before: highlighting, completions and the format command. Run it once more under the new name only to update an editor; what is installed keeps working.
+
 ## 3.4.4
 
 - **`--1p` asks to be let in once in a new terminal, where 3.4.3 asked twice.** 3.4.3 read the key and the environment list from 1Password at the same moment, and in a terminal 1Password has not let in yet, each `op` that is started asks to be: two approvals for one run. The key is now read first, alone, and the list only when the key is there, in a terminal that is let in by then. A session at the prompt still opens after one wait for `op`. **A run that is done no longer waits for its read of the list** (3.4.3 waited up to two seconds): `op` reads on behind the run, into a file of its own beside the kept list (`~/.cache/api/1p-environments.next-<pid>.json`, for its owner alone), and the next run keeps that list if it is whole. A file that is no list is left alone for two minutes, for the `op` that may still write to it, and removed after. A key that could not be read because `op` was not let in, or gave no answer, is not read again by the list, which would ask a second time.

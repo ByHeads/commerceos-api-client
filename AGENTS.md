@@ -2,7 +2,7 @@
 
 This is a guide for AI agents (and humans) writing `.api` files for the CommerceOS
 API client. A `.api` file is a sequence of HTTP requests, one per logical entry,
-that gets executed in order by `api -a <file>`.
+that gets executed in order by `api <file>`.
 
 ## 1. Quick anatomy
 
@@ -216,7 +216,7 @@ GET /people > clipboard                  # system clipboard, case-insensitive
   (or run with `-f`) before trusting the file. A `>> file` collects answers,
   and a non-2xx body is not one: the file is left as it was, whatever its
   format, and one that is not there is not created. The body goes where it
-  would have gone without the redirect (stdout; nowhere in `-sa` mode, where
+  would have gone without the redirect (stdout; nowhere in silent batch mode, where
   the status line says what happened), and `>> people.json (not appended)`
   stands on stderr in the place of the size line. The batch carries on as
   after any failed request. Under `-f` neither `>` nor `>>` gets an error:
@@ -241,7 +241,7 @@ GET /people > clipboard                  # system clipboard, case-insensitive
 
 ### Always pipe GET responses to a file
 
-In `-sa` mode response bodies are not printed at all, and in `-a` mode stdout is
+In silent batch mode (`-s`) response bodies are not printed at all, and without `-s` stdout is
 pretty-printed and colored; neither is meant to be parsed. To read data back,
 write it to a file and read the file:
 
@@ -255,13 +255,13 @@ Re-running the batch overwrites the files.
 
 ### Streaming large exports (`--stream`)
 
-Off unless asked for, via `--stream` or `API_STREAMING=1` (`--no-streaming`
+Off unless asked for, via `--stream` or `API_STREAM=1` (`--no-stream`
 overrides both), or for some requests of a file by a
 [`"stream"` in a `set` line](#set-object). With it, a response bound for `> file` is written as it
 arrives instead of being held in memory first:
 
 ```sh
-api --stream -sa export.api
+api --stream -s export.api
 ```
 
 - A streamed `> file.json` holds the server's bytes verbatim, not pretty-printed.
@@ -461,7 +461,7 @@ import archive cl {
   read, ahead of the `url` gate, the `-p` preview and the first request. A bad
   URL, a missing ref, a wrong hash or a failed login stops the batch with exit
   1 and nothing sent.
-- **The log says what was used.** In `-sa` mode each import prints one line,
+- **The log says what was used.** In silent batch mode each import prints one line,
   and `-p` lists it above the requests:
   `import cl https://github.com/Polyjuice/cloddy 2.1.0 (a1b2c3d)` for git,
   `import cl https://example.com/cloddy.tar.gz (sha256 9f2c1ab)` for an
@@ -611,15 +611,15 @@ are not opened and imports are not fetched, so it is quick and works offline;
 still with exit 0; a block that would stop a run (out of place, invalid) is
 `error: …` on stderr with exit 1 and nothing on stdout.
 
-### Showing it before a run: `-m`
+### Showing it before a run: `-d`
 
-`-m` (`--describe-first`) prints the block of the file being run, on stderr,
+`-d` (`--describe-first`) prints the block of the file being run, on stderr,
 before anything is sent or asked, so above the `-p` preview when both are
 given. The file has been read by then: its imports are fetched and its `url`
 gate has passed, and a run that stops at one of those prints no block.
 
 ```sh
-api -spma catalog.api
+api -spd catalog.api
 ```
 
 ```
@@ -637,8 +637,8 @@ Run? [Y/n]
   else the first the file has. `title` and `description` are picked
   separately, so a file with an English title and only a Swedish description
   shows both.
-- It works without `-p` too (`api -sma catalog.api`), and for a file named as
-  a one-shot argument (`api -m catalog.api`).
+- It works without `-p` too (`api -sd catalog.api`), and for a file named as
+  a one-shot argument (`api -d catalog.api`).
 - A file without a describe block prints nothing for it. A block in an
   included file is not printed.
 - It has no effect at the interactive prompt.
@@ -650,10 +650,10 @@ the block read and not sent. A JSON object pasted alone is a body, as before.
 A describe block as the whole of a typed line or of the arguments
 (`api '{"title":{}}'`) would send nothing and is an error.
 
-## Listing a file's assertions: `--assert <file>`
+## Listing a file's assertions: `--asserts <file>`
 
 ```sh
-api --assert seed.api
+api --asserts seed.api
 ```
 
 Prints the body of every `PUT /assert` the file sends, in the order it sends
@@ -775,7 +775,7 @@ api --complete seed.api --at 42 < seed.api
 
 Prints what can stand at a place of a `.api` file, as one JSON document on
 stdout. It is what an editor asks on a keystroke: the plugins that
-[`--install-syntax`](#syntax-highlighting-and-completions---install-syntax-editor) installs
+[`--install-editor`](#syntax-highlighting-and-completions---install-editor-editor) installs
 are callers of it. Nothing is sent and no connection is needed.
 
 - **The text is read from stdin**, as the editor has it, saved or not. `<file>`
@@ -911,10 +911,10 @@ is needed.
 - A request, a file to run or a document beside it is an error: `--lsp
   serves an editor and GET /people is a request: give one of the two`.
 
-## Syntax highlighting and completions: `--install-syntax <editor>`
+## Syntax highlighting and completions: `--install-editor <editor>`
 
 ```sh
-api --install-syntax sublime
+api --install-editor sublime
 ```
 
 Installs highlighting for `.api` files in an editor: `sublime`, `vscode`,
@@ -970,12 +970,12 @@ after that client has moved.
     Marketplace: *Settings → Languages & Frameworks → Language Servers*,
     `+`, and under *Template* choose *Import from custom template...* and
     that folder. The server is the client by the path it was run as, so run
-    `--install-syntax rider` again when the client has moved.
+    `--install-editor rider` again when the client has moved.
 - **A file that is there is replaced.** Running it again after an update of
   the client is how the highlighting is updated.
 - An editor that is not one of the six is `error: unknown editor …` with exit
   1. A file to run, a request or a `--describe` beside it is an error too:
-  `--install-syntax vim installs files and GET /people is a request: give one
+  `--install-editor vim installs files and GET /people is a request: give one
   of the two`.
 
 The grammars and what each covers are in `editors/`.
@@ -1014,7 +1014,7 @@ GET /people~take(5) > /tmp/people.json
   non-2xx statuses like 404 are falsy; everything else on a 2xx is truthy.
 - The request is any single-line request (implied `GET` included, bodies allowed).
   It can't be a `&&`/`||` chain and can't write to an outfile.
-- Polls print nothing. In `-sa` mode the loop logs one line when it starts and one
+- Polls print nothing. In silent batch mode the loop logs one line when it starts and one
   when it ends (`↳ waited 1m40s (5 checks)`), so a long pause is explained.
 - There is no maximum wait; ctrl+c stops the run.
 - A 401/403, 5xx, 408/429, or timeout during a poll aborts the whole run with
@@ -1068,16 +1068,16 @@ POST /deploy { "go": true }
   included: `confirm Seed a && b?` asks exactly that, and is not a chain.
 - Enter, `y`, or `yes` continues; anything else prints `aborted` and stops the
   batch with exit 0 (the user declined, so it's not a failure).
-- In `-sa` mode the confirm line is echoed, then the prompt appears on stderr.
+- In silent batch mode the confirm line is echoed, then the prompt appears on stderr.
 - The answer is read from the terminal. With no terminal (CI, cron, an agent's
-  shell) it is read from stdin, so it can be piped: `yes | api -sa file.api`
-  answers every `confirm` with yes, `echo n | api -sa file.api` declines the
+  shell) it is read from stdin, so it can be piped: `yes | api -s file.api`
+  answers every `confirm` with yes, `echo n | api -s file.api` declines the
   first.
 - **A question nobody answered is not a yes.** End of input (no terminal and
   stdin empty or closed, or ctrl+D at a terminal) stops the batch with
   `aborted (could not read confirmation)` and **exit 1**: nothing after the
   `confirm` is sent. An empty line is Enter and still accepts.
-- When the program itself is on stdin (`api -a -`, `cat file.api | api -a`)
+- When the program itself is on stdin (`api -`, `cat file.api | api -`)
   there is nothing left there to answer with, so without a terminal a `confirm`
   in it always stops the run.
 
@@ -1138,16 +1138,16 @@ GET /people~count > /tmp/count.json          # as the server answers, nulls incl
   `"fail-fast"` too: a failed request in an included file is passed as it
   is without the line.
 - **An option on the command line holds for the whole run**, included files
-  too, and no line turns it off or gives it another value. The `-sa` log
+  too, and no line turns it off or gives it another value. The batch log
   says so under a line that asked for something else, once for each setting
   of the line that was kept from what it says: `↳ ignored: -i is set`,
   `↳ ignored: --export com.heads.seedID is set`. A line can only turn a
-  setting on that the command line left alone. `--no-streaming` is the one
+  setting on that the command line left alone. `--no-stream` is the one
   option that keeps a setting off: under it `"stream": true` is ignored.
 - **Only these seven are settings.** What decides where a request goes and
   as whom (`-b`, `-k`, `--token`, `-c`, `--no-keychain`, `--me`) is never a
   file's to set, and neither is what is for the reader of a run (`-s`, `-p`,
-  `-m`). A name that is no setting, a value a setting does not take, an
+  `-d`). A name that is no setting, a value a setting does not take, an
   object with nothing in it, JSON that can't be read or an export name that
   is no namespaced key stops the batch with exit 1 before anything is sent:
   `unknown setting `nulls` (one of export, include-nulls, fail-fast, ndjson,
@@ -1160,7 +1160,7 @@ GET /people~count > /tmp/count.json          # as the server answers, nulls incl
   "include-nulls": true }` ``.
 - A `set` line is a line of its own. In a `&&`/`||` chain it stops the batch
   before anything is sent.
-- The `-p` preview and the `-sa` log list the line where it is written, the
+- The `-p` preview and the batch log list the line where it is written, the
   object on one line as a body is shown (`set
   {"export":"com.heads.seedID","include-nulls":true}`) and an `@file` by its
   name. It is not counted as a request.
@@ -1219,15 +1219,15 @@ before a file that stopped set some of its own.
 
 **One-shot arguments.** The positional arguments are joined into one line. A
 directive, an include, a `&&`/`||` chain, or several lines in one quoted
-argument run through the batch runner exactly like a `-a` file, so
-`api assert /companies/x` exits 1 on failure and `api seed.api` is `api -a
-seed.api`. Quote the `&&` or the whole line so the shell doesn't take it. A plain
+argument run through the batch runner exactly like a file, so
+`api assert /companies/x` exits 1 on failure and `api seed.api` runs the
+file. Quote the `&&` or the whole line so the shell doesn't take it. A plain
 `METHOD URI [BODY]` is sent directly, after the same reading: a `> file` may sit
 in any argument (`api GET /people ">" out.json`, `api GET /people "> out.json"`,
 `api "GET /people > out.json"` are the same), and a body may carry comments or
 raw newlines just as in a file. One plain request is that single request
 however it is quoted: `api -s "GET /people"` prints what `api -s GET /people`
-prints (the body alone, not a `-sa` log), and `echo '{…}' | api "PUT /x"`
+prints (the body alone, not a batch log), and `echo '{…}' | api "PUT /x"`
 sends the piped body.
 
 In both places a mistyped request reports `not a request or .api file`, where
@@ -1263,12 +1263,12 @@ url is https://cos.example.com
 ## 8. Running
 
 ```sh
-api -a parent.api                     # from a file
-cat parent.api | api -a               # from stdin (the dash is implicit)
-api -a -                              # explicit stdin
-api -sa parent.api                    # silent batch mode (see below)
-api -spa parent.api                   # preview the requests, confirm before sending
-api -sfa parent.api                   # stop at the first failed request (see below)
+api parent.api                        # from a file
+cat parent.api | api -                # from stdin
+api -s parent.api                     # silent batch mode (see below)
+api -sp parent.api                    # preview the requests, confirm before sending
+api -sf parent.api                    # stop at the first failed request (see below)
+api -t abc -s parent.api              # against a tenant, https://abc.app.heads.com (see below)
 api --export com.heads.seedID GET /users > users.json   # a response as seed data (see below)
 echo '{"name":"Ann"}' | api PUT /people/com.mi6.id=008  # a body from stdin
 ```
@@ -1286,11 +1286,21 @@ not escaped. A piped body is often not JSON at all (CSV, NDJSON), and a
 ` #` in it is data. JSON with comments goes in a body argument, in a `.api`
 file, or through something that strips them before the pipe.
 
-`-a <file>` and a request are two different runs. Both on one command line
-(`api -sa seed.api GET /people`) is an error, before anything is sent:
-`-a seed.api runs a file and GET /people is a request: give one of the two`.
+**A file is run by naming it**, and `-` is the file on stdin. The name needs
+no `.api` at its end (`api seeds.txt`), and a file that is not there is
+`include not found: sed.api`. `api` with no arguments opens the prompt, so a
+file on stdin is asked for with the `-`.
 
-`--describe`, `--assert`, `--imports`, `--complete` and `--format` each print
+A file and a request are two different runs. Both on one command line
+(`api -s seed.api GET /people`, `api - GET /people`) is an error, before
+anything is sent: `seed.api runs a file and GET /people is a request: give
+one of the two`.
+
+`-a <file>` (`--all`) is how a file was run up to 3.4.4 and is still read,
+with `-a -` or a bare `-a` for stdin: `api -sa seed.api` is `api -s
+seed.api`. It is not in `--help`.
+
+`--describe`, `--asserts`, `--imports`, `--complete` and `--format` each print
 a document about a file and send nothing. A file to run or a request beside one of them is an error
 too: `--imports a.api prints a document and GET /people is a request: give
 one of the two`.
@@ -1313,8 +1323,8 @@ so is one with no value behind it (`--export needs a value`).
   there is none. A question nobody answered (end of input) sends nothing,
   prints `aborted (could not read confirmation)` and exits 1.
 - To print the resolved program without sending anything from a shell with no
-  terminal: `echo n | api -spa file.api`. To run it unattended:
-  `yes | api -spa file.api`, or leave `-p` off.
+  terminal: `echo n | api -sp file.api`. To run it unattended:
+  `yes | api -sp file.api`, or leave `-p` off.
 
 ### Stopping at the first failure (`-f`, `--fail-fast`)
 
@@ -1324,7 +1334,7 @@ exit code is 0. With `-f` the first response of **400 or above** ends the run,
 and so does a redirect that was not followed (below):
 
 ```sh
-api -sfa seed.api
+api -sf seed.api
 ```
 
 ```
@@ -1352,11 +1362,11 @@ PUT /assert {"api/v1/people~count":{"is":3}}
 - A file can ask for it itself with a [`set { "fail-fast": true }` line](#set-object),
   for the requests under the line in that file.
 - **The failing response's body is the last thing on stdout**, exactly as the
-  server sent it, with `-sa` too (where bodies are otherwise not printed). A
+  server sent it, in silent batch mode too (where bodies are otherwise not printed). A
   tool driving the client reads the reason from there; the status line stays
-  where it always is (stdout in `-sa`, stderr otherwise).
+  where it always is (stdout in silent batch mode, stderr otherwise).
 - The server pretty-prints its JSON, so the body is usually several lines. In
-  `-sfa` output it is everything after the last `└─HTTP/1.1 …` line. For a
+  `-sf` output it is everything after the last `└─HTTP/1.1 …` line. For a
   single request (`api -f PUT /assert @asserts.json`) the status line goes to
   stderr and stdout is the body alone, which is the easiest thing to parse.
 - This is how to check conditions with the `/assert` endpoint. `PUT /assert`
@@ -1499,7 +1509,7 @@ Rules:
   `>> file`, the clipboard. An error body is left as the server sent it, so
   `-f` output is unaffected, and request bodies are never touched.
 - It works for one request and in a batch (`api --export com.heads.seedID
-  -sa export.api`, with a `> file` per request). For only some requests of
+  -s export.api`, with a `> file` per request). For only some requests of
   a file, write a [`set { "export": … }` line](#set-object) in it.
 - **At the interactive prompt, export mode is a row of the [settings
   menu](#the-settings-menu-ctrlt)** that `ctrl+t` opens, and `export` shows
@@ -1559,8 +1569,8 @@ the way `ctrl+h` opens the shortcuts:
   as the hint line of the prompt says it: `include-nulls on`, `export on:
   com.heads.seedID`, `timeout 45s`. On a server that does not stream, the
   first row says `streaming not available on this server` and stays off. In
-  a session started with `--no-streaming` it says `streaming is off: the
-  session was started with --no-streaming`, and so does a typed `set
+  a session started with `--no-stream` it says `streaming is off: the
+  session was started with --no-stream`, and so does a typed `set
   {"stream": true}`.
 - **A small terminal gets a smaller menu, not a broken one.** On a narrow
   one a label is cut and the value stays: a row always ends in what the
@@ -1584,7 +1594,7 @@ unlocked desktop session — no good for an agent, a container, or CI. Passing
 `--no-keychain` moves all credential I/O to a plaintext JSON file instead.
 
 ```sh
-api --no-keychain -sa seed.api
+api --no-keychain -s seed.api
 ```
 
 The flag is what activates file mode. `API_CREDENTIALS_FILE` alone does
@@ -1639,7 +1649,7 @@ ignores the variable entirely.
 
 ```sh
 export API_CREDENTIALS_FILE=/run/secrets/api-credentials.json
-api --no-keychain -sa seed.api                 # uses the default connection
+api --no-keychain -s seed.api                 # uses the default connection
 api --no-keychain -c staging GET /people       # pick another by alias
 api --no-keychain -k "$API_KEY" GET /people    # URL from file, key from the CLI
 ```
@@ -1658,6 +1668,33 @@ the file's URL, so one file can serve several keys, for the default
 connection and for one chosen with `-c`. `-b` beside `-c` overrides the URL
 and keeps that connection's stored credential. What the command line gives
 always wins.
+
+**`-t <name>` (`--tenant`) is a tenant's host**: `-t abc` is the base URL
+`https://abc.app.heads.com`.
+
+```sh
+api -t abc GET /people                 # the saved connection for abc.app.heads.com
+api -t abc -k "$API_KEY" GET /people   # the tenant's host, a key from the CLI
+api -c staging -t abc GET /people      # staging's credential, the tenant's host
+```
+
+- **It takes the credential of the one saved connection for that host**, as
+  `-c abc.app.heads.com` does: a connection whose URL is
+  `https://abc.app.heads.com`, saved under any alias. `-k` or `--token`
+  beside it wins over the stored credential.
+- **Where no connection is saved for the host it is `-b` with that URL**:
+  no saved credential is sent, the default connection's neither. Give one
+  with `-k` or `--token`, or lend one with `-c`.
+- Several saved connections for the host is an error that lists them, exit
+  1 with nothing sent: `Tenant "abc" fits several saved connections: abc,
+  abc-admin. Name one of them with -c.`
+- A name is one word of letters, digits and `-`, read in any case. A host
+  with its domain, a URL or a path is refused (`a tenant is one name … Give
+  a URL with -b`), and so is the name of a method: `api -t GET /people` was
+  how streaming was turned on, and is not sent to a host called `get`.
+- `-t` beside `-b` or `--1p` is an error: each of them names the host.
+- A file's `url` lines see the base URL a tenant stands for: `url has
+  abc.app.heads.com` passes under `-t abc`.
 
 `-b` without `-c` uses no saved connection at all: the default connection's
 credential was saved for another host and is not sent to this one. Give the
@@ -1678,7 +1715,7 @@ api --no-keychain -c staging -b http://localhost:5000 GET /people   # staging's 
 or written:
 
 ```sh
-api --no-keychain -b https://cos.example.com -k "$API_KEY" -sa seed.api
+api --no-keychain -b https://cos.example.com -k "$API_KEY" -s seed.api
 ```
 
 **Failure modes to know.** A file that does not exist is an empty store, with
@@ -1741,7 +1778,7 @@ for anything but a local dev key. Saving a connection with `ctrl+s` in
 interactive mode writes to this file too, so an interactive session can create
 it for later non-interactive runs.
 
-### Silent batch mode (`-sa`)
+### Silent batch mode (`-s`)
 
 Prints the env URL once, then each request line followed by a compact
 `└─HTTP/1.1 <status> <time>` line. Response bodies are suppressed (but still
@@ -1764,7 +1801,7 @@ preview and the interactive prompt show it the same way. An `@file` body of
 an imported file is logged with the path its line has (`@data/body.json`),
 not the path in the import cache it was read from.
 
-A reader that stops reading does not stop the batch. With `api -sa seed.api |
+A reader that stops reading does not stop the batch. With `api -s seed.api |
 head -2` every request is still sent; what would have been printed after the
 pipe closed is dropped, and the exit code is the one the requests earned.
 
@@ -1800,15 +1837,15 @@ shared/villains/*.api
 GET /people~with(com.heads.*) > ~/workshop-snapshot.json
 ```
 
-Run it: `api -sa workshop.api`.
+Run it: `api -s workshop.api`.
 
 ## 10. Common pitfalls
 
 - **A body on the line under its request** → `PUT /people/x` with `{ … }` on the next line is not a request with a body: `a describe block must come before the first request (a body starts on the request line)`. Start the body on the request line; it may continue below.
 - **A describe block that is not first** → only comments, blank lines and `url` lines may stand above it. Under an `import`, a `sleep` or a request it stops the batch.
 - **`"title": "Katalog"` in a describe block** → a warning: `title` and `description` are objects of texts by locale, `{ "sv-SE": "Katalog" }`. The batch still runs.
-- **Expecting `--describe` or `-m` to show an included file's block** → both show the block of the file named on the command line only.
-- **Expecting `--assert` to list `assert` lines** → it lists `PUT /assert` bodies. The `assert` keyword is a request judged by truthiness and is not part of the list.
+- **Expecting `--describe` or `-d` to show an included file's block** → both show the block of the file named on the command line only.
+- **Expecting `--asserts` to list `assert` lines** → it lists `PUT /assert` bodies. The `assert` keyword is a request judged by truthiness and is not part of the list.
 - **Trailing comma in JSON** → server returns 500 with a parse error. JSON is strict; don't trail commas in objects/arrays.
 - **A `#` with a blank in front, outside a string** → a comment from there to the end of the line (`GET /x # note`). A body that is not JSON and holds ` #` (`PUT /x a # b`) loses what follows; quote it (`"a # b"`) or send it as an `@file`.
 - **A chain broken over two lines** → `GET /x ||` with the `PUT` on the next line is an error. Write the chain on one line; a body may still span lines.
@@ -1825,7 +1862,7 @@ Run it: `api -sa workshop.api`.
 - **Importing a branch and expecting yesterday's run** → a branch is re-resolved every run. Pin a tag or a SHA, and check the commit in the `import …` log line.
 - **An archive URL without `sha256`** → downloaded again on every run, and whatever it serves that day is what runs. Add the `sha256` from the `import …` log line to pin it.
 - **`token_env` or another host in an imported file** → refused before anything is fetched. Import the second repository or archive from the file you run, next to the first.
-- **`-sa file.api GET /x`** → an error: `-a` runs the file, and the request beside it is neither dropped nor run after it. Give one of the two.
+- **`-s file.api GET /x`** → an error: the file is one run and the request another, and the request beside the file is neither dropped nor run after it. Give one of the two.
 - **`-b https://user:password@host`** → `error: invalid value for -b: a base URL holds no user or password (user@host). Give the credential with -k or --token.` The same URL in the credentials file makes that connection unusable. A saved `url` that names no host (`""`, `"http://"`) does too: `its URL names no host`.
 - **`-b 'https://host/#/orders'`, a URL copied from a browser** → `error: invalid value for -b: a base URL holds no `?` or `#`: it ends at the host, or at a path below it`. Every request's path would be put behind the `#` and sent as part of it, to `/`. The same URL in the credentials file makes that connection unusable.
 - **An empty method** → `api "$METHOD" /people/x '{…}'` with the variable not set is `error: the method is empty: a request is METHOD URI [BODY]`, not a `GET`.
@@ -1833,13 +1870,16 @@ Run it: `api -sa workshop.api`.
 - **`"auth_type": "bearer"` in the credentials file** → `The connection "x" can't be used: its auth_type "bearer" is not "key", "token" or "oauth2".` A bearer token is `"token"`. The three names are read in any case.
 - **`url has localhost:5000/`** → matches nothing: `has` compares text with the base URL as the client has it, which ends at the host. `url is` reads its value as a base URL, so a trailing `/` or `/api/v1` there is fine.
 - **A `\` in a URI** → sent as `%5C`. It is not another way to write `/`, so the escaped quote in `~where(name="a \" b")` arrives as `%5C%22`.
+- **`-t abc.app.heads.com`, `-t https://abc.app.heads.com`** → `error: invalid value for -t: a tenant is one name …`. `-t` takes the name alone (`-t abc`); a host or a URL goes behind `-b`, or behind `-c` to choose the connection saved for it.
+- **`-t <token>`, `-t` in front of a request** → `-t` is a tenant. A bearer token is `--token` and has no short option; streaming is `--stream` and has none either.
+- **`-m`, `--assert`, `--no-streaming`, `API_STREAMING`, `--install-syntax`** → the names up to 3.4.4, now `-d`, `--asserts`, `--no-stream`, `API_STREAM` and `--install-editor`. The old options are `error: unexpected option …`; the old variable is not read, so set `API_STREAM`.
 - **`-b` alone, expecting the default connection's key** → none is sent, and the request is answered `401`. Add `-k`, or `-c <name>` to lend that connection's credential to the other host.
 - **`"token_env": "<the token>"`** → rejected or reported as an unset variable. It takes the *name* of an environment variable, so the secret stays out of the file.
 - **`import dir cl { "path": "cl" }`** → `import alias … clashes`. An alias can't share its name with a file or directory next to the `.api` file; name the alias something else.
 - **Seeding from a plain `GET`** → the response carries `identifiers.key`, a database key of the environment it was read from. Written elsewhere it is refused (`400 failed indexing`: a `key` that names nothing). Read it with `--export <external-id>`, which takes the key out and keeps a lone one as `key?` and under the name.
 - **Writing an export to a server without `key?`** → `400 failed coercion`, `The key 'key?' is not a valid namespaced key`, as soon as the export holds a record that had only a key. Such an export needs a server that knows the optional key.
 - **A `set` line and an included file** → the line is for its own file only: `shared/users.api` included under `set { "export": … }` is not exported, and under `"fail-fast": true` a failed request in it does not stop the batch. Put the `set` line in the included file as well, or run with the option (`--export`, `-f`), which applies to every file.
-- **A `set` line under its option** → the command line wins: under `--export` the name in a `set` line's `"export"` is not used, and `"include-nulls": false` under `-i` turns nothing off. The `-sa` log notes `↳ ignored: … is set`.
+- **A `set` line under its option** → the command line wins: under `--export` the name in a `set` line's `"export"` is not used, and `"include-nulls": false` under `-i` turns nothing off. The batch log notes `↳ ignored: … is set`.
 - **`set { "nulls": true }`, `set { "key": … }`** → `unknown setting`. A setting has the name of its long option (`include-nulls`), in lower case, and only `export`, `include-nulls`, `fail-fast`, `ndjson`, `raw`, `stream` and `timeout` are settings.
 - **`export com.heads.seedID` as a line** → `not a request or .api file: export`. The line is `set { "export": "com.heads.seedID" }`.
 - **`set include-nulls`, `set export off`, the lines 3.4.0 read** → ``a `set` line takes a JSON object: write `set { "include-nulls": true }` ``. A setting is a member of an object now; the message has the line to write.
@@ -1850,7 +1890,7 @@ Run it: `api -sa workshop.api`.
 - **`"timeout": null` to wait for ever** → `null` is the default of ten minutes. No timeout is `"timeout": 0`.
 - **Expecting secrets in an export** → the API masks them (`********`) and `--export` leaves the member out, and warns where (`warning: response had masked data, left out at …`). A password, an API key or a client secret has to be set separately. Read without the masked members (`~just`, `~without`) and the warning is gone.
 - **Expecting `null` where an export had a masked value** → up to 3.3.1 it was written as `null`, and a `PUT` of that export cleared the secret where it was read. The member is now not in the export at all, so a write leaves the secret as it is.
-- **`-p` or `confirm` without a terminal** → up to 3.3.1, end of input was read as Enter, so an unattended `api -spa file.api` or a `confirm` gate sent everything. From 3.4.0 it sends nothing and exits 1 with `aborted (could not read confirmation)`. Pipe the answer (`yes | …`, `echo n | …`); a program read from stdin (`api -a -`) has no stdin left to answer with.
+- **`-p` or `confirm` without a terminal** → up to 3.3.1, end of input was read as Enter, so an unattended `api -sp file.api` or a `confirm` gate sent everything. From 3.4.0 it sends nothing and exits 1 with `aborted (could not read confirmation)`. Pipe the answer (`yes | …`, `echo n | …`); a program read from stdin (`api -a -`) has no stdin left to answer with.
 - **Collecting with `>>` and expecting the errors in the file** → a non-2xx body is not appended: the file keeps what it had, and `>> file (not appended)` is printed under the status line. A `> file` does take an error's body when the run has no `-f`.
 - **A `>` with nothing behind it** → `GET /x >` is an error (``a `>` or `>>` needs a path to write to``), not a request with the body `>`.
 - **Expecting a failed request to stop a batch** → it doesn't, unless the line is an `assert`, a chain or a poll, or the run has `-f`. A plain `PUT /assert {…}` that answers 409 is logged and the next line runs. Run with `-f`.
@@ -1862,7 +1902,7 @@ Run it: `api -sa workshop.api`.
 - **A server that redirects a request round in circles** → `Too many redirects from <host>: the request was never answered.`, exit 1, in a batch as at the prompt. A redirect that ends is followed: a 307 or 308 arrives as the request it was, with its method, body and `Authorization`. The `Authorization` goes along only to the same scheme, host and port: a redirect from `http://` to `https://`, or to another host, arrives without the credential and is answered `401`. Give the address it leads to with `-b`. A 301, 302 or 303 is followed for a `GET` or a `HEAD` only.
 - **A `PUT` logged with `301 Moved Permanently`** → the write was not done: the server (or a proxy in front of it) wants it somewhere else, often `https://` or without a trailing `/`. Send it to the address in the answer's `Location`. Run with `-f` to have a batch stop there.
 - **A `#` in an identifier** → `DELETE /people/com.x.id=A#1` deletes `A#1`: the `#` is sent as `%23`. With a blank in front it is a comment (`DELETE /people/com.x.id=A #1` deletes `A`).
-- **A response with bytes that are not of its charset** → the text shown and written has U+FFFD (`�`) in their place, and stderr says so once for that response: `WARNING: the response held bytes that are not valid UTF-8: each is now U+FFFD (�)`. It is said with `-s` and in `-sa` too, since it is about the data; not for an `assert` or a poll, whose body goes nowhere, nor for a `-sa` line without an outfile. At the prompt it shows in the hint line, and for a request of a file, a block or a chain as a `↳` note under it too. `--stream` to a file writes the bytes as they came, so nothing is replaced there.
+- **A response with bytes that are not of its charset** → the text shown and written has U+FFFD (`�`) in their place, and stderr says so once for that response: `WARNING: the response held bytes that are not valid UTF-8: each is now U+FFFD (�)`. It is said with `-s`, for one request as in a batch, since it is about the data; not for an `assert` or a poll, whose body goes nowhere, nor for a line of a silent batch without an outfile. At the prompt it shows in the hint line, and for a request of a file, a block or a chain as a `↳` note under it too. `--stream` to a file writes the bytes as they came, so nothing is replaced there.
 - **`API_CREDENTIALS_FILE` without `--no-keychain`** → the variable is ignored and the keychain is read instead. A path that names no file fails as silently: no warning, just `Error: no base URL specified`. A file that is there but malformed is reported (`WARNING: could not read …`).
 
 ## 11. Tips for agents
@@ -1872,13 +1912,13 @@ Run it: `api -sa workshop.api`.
 - Use `@file`/`@glob` for large bodies instead of inlining huge JSON blobs.
 - For repeated boilerplate, factor it into a `shared/` directory and use includes.
 - When generating files programmatically, prefer compact single-line JSON bodies — they're easier to grep and diff.
-- Use silent batch mode (`-sa`) when you want to verify that a long seeding script worked without drowning in response bodies.
+- Use silent batch mode (`-s`) when you want to verify that a long seeding script worked without drowning in response bodies.
 - To move data between environments, read it with `--export com.heads.seedID` (or under a `set { "export": "com.heads.seedID" }` line in the `.api` file) into a file and `PUT` the file. Use the same identifier name every time, so a record exported twice is one record. The same file can be written back where it was read: a record is found by its identifiers, and one that had only a key by its `key?`.
 - A file that only works with a setting should say so itself: `set { "fail-fast": true }` above its `PUT /assert` lines, `"include-nulls": true` in a file whose output is applied elsewhere. It then runs the same by hand as from a tool.
-- Add `-f` (`-sfa`) so a failed request stops the batch: check the exit code, and on failure read the error body from the end of stdout (everything after the last `└─HTTP/1.1 …` line; it is usually several lines of JSON). Without it a batch exits 0 however many plain requests failed.
+- Add `-f` (`-sf`) so a failed request stops the batch: check the exit code, and on failure read the error body from the end of stdout (everything after the last `└─HTTP/1.1 …` line; it is usually several lines of JSON). Without it a batch exits 0 however many plain requests failed.
 - Open a file with a [describe block](#describe-block) (`title`, `description`, `docsLink`) so a tool or a person can tell what it does; read one with `api --describe file.api`, which sends nothing.
-- To see what a file checks without running it, `api --assert file.api` prints every `PUT /assert` body it sends as one JSON array.
+- To see what a file checks without running it, `api --asserts file.api` prints every `PUT /assert` body it sends as one JSON array.
 - Lay a file you wrote or changed out with `api --format file.api` before handing it over: it changes blanks only, and what it prints is what an editor's format command would make of the file.
-- When someone asks for `.api` highlighting or completions in their editor, it is `api --install-syntax <editor>`. Don't copy a grammar out of `editors/` by hand: the client holds the one that matches it.
+- When someone asks for `.api` highlighting or completions in their editor, it is `api --install-editor <editor>`. Don't copy a grammar out of `editors/` by hand: the client holds the one that matches it.
 - To read a file of an import yourself, ask `api --imports file.api` for the directory its alias stands for. Don't rebuild a path into the import cache: its layout is the client's own.
 - Run with `--no-keychain` and an absolute `API_CREDENTIALS_FILE` so nothing depends on an unlocked keychain or on the working directory.

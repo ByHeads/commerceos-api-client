@@ -612,7 +612,7 @@ struct Args {
     version: bool,
 
     /// HTTP method (GET, POST, PUT, PATCH, DELETE), or a whole .api line
-    /// (a directive, a && chain, or a file to run)
+    /// (a directive, a && chain, or a file to run; `-` runs the file on stdin)
     #[arg(value_name = "METHOD")]
     method: Option<String>,
 
@@ -624,15 +624,20 @@ struct Args {
     #[arg(value_name = "BODY", num_args = 0.., allow_negative_numbers = true)]
     body: Vec<String>,
 
-    /// Base URI
-    #[arg(short = 'b', long = "base-uri")]
+    /// Base URL of the server (e.g., https://abc.app.heads.com)
+    #[arg(short = 'b', long = "base-url", alias = "base-uri", value_name = "URL")]
     base_uri: Option<String>,
+
+    /// A tenant by its name: `abc` is the base URL https://abc.app.heads.com,
+    /// with the credential of the one saved connection for it
+    #[arg(short = 't', long = "tenant", value_name = "NAME")]
+    tenant: Option<String>,
 
     /// API key for authentication
     #[arg(short = 'k', long = "key")]
     key: Option<String>,
 
-    /// Bearer token for authentication (long form only — `-t` is --stream)
+    /// Bearer token for authentication
     #[arg(long = "token")]
     token: Option<String>,
 
@@ -640,7 +645,7 @@ struct Args {
     #[arg(short = 'c', long = "connection", value_name = "ALIAS_OR_URL")]
     connection: Option<String>,
 
-    /// Get base-uri and key from 1Password
+    /// Get the base URL and key from 1Password
     #[arg(long = "1p", value_name = "SELECTOR", hide = true)]
     one_password: Option<String>,
 
@@ -673,8 +678,10 @@ struct Args {
     #[arg(short = 'x', long = "experimental")]
     experimental: bool,
 
-    /// Bulk mode: execute requests from a file (one per line). Use without value or with `-` to read from stdin.
-    #[arg(short = 'a', long = "all", value_name = "FILE", num_args = 0..=1, default_missing_value = "-")]
+    /// Run a file, or stdin without a value or with `-`. Not in the help:
+    /// a file is run by naming it (`api seed.api`), and stdin by `api -`.
+    /// Kept for the scripts that say `-sa seed.api`.
+    #[arg(short = 'a', long = "all", value_name = "FILE", num_args = 0..=1, default_missing_value = "-", hide = true)]
     all: Option<String>,
 
     /// Preview the request(s) and confirm before sending (default: yes)
@@ -686,7 +693,7 @@ struct Args {
     fail_fast: bool,
 
     /// Print the describe block of the .api file being run before running it
-    #[arg(short = 'm', long = "describe-first")]
+    #[arg(short = 'd', long = "describe-first")]
     describe_first: bool,
 
     /// Print the describe block of a .api file as JSON and send nothing
@@ -695,8 +702,8 @@ struct Args {
 
     /// Print the bodies of every `PUT /assert` a .api file makes, includes
     /// and imports followed, as one JSON array, and send nothing
-    #[arg(long = "assert", value_name = "FILE")]
-    assert: Option<String>,
+    #[arg(long = "asserts", value_name = "FILE")]
+    asserts: Option<String>,
 
     /// Export mode: turn responses into seed data. Database keys are dropped,
     /// and a record with no other identifier keeps its key as `key?` and under
@@ -733,18 +740,18 @@ struct Args {
     #[arg(long = "lsp")]
     lsp: bool,
 
-    /// Install syntax highlighting for .api files in an editor (sublime,
-    /// vscode, cursor, rider, vim or nvim) and send nothing
-    #[arg(long = "install-syntax", value_name = "EDITOR")]
-    install_syntax: Option<String>,
+    /// Install highlighting, completions and formatting for .api files in an
+    /// editor (sublime, vscode, cursor, rider, vim or nvim) and send nothing
+    #[arg(long = "install-editor", value_name = "EDITOR")]
+    install_editor: Option<String>,
 
-    /// Stream the response body instead of buffering it (also: API_STREAMING=1)
-    #[arg(short = 't', long = "stream")]
+    /// Stream the response body instead of buffering it (also: API_STREAM=1)
+    #[arg(long = "stream")]
     stream: bool,
 
-    /// Disable streaming even when --stream or API_STREAMING asked for it
-    #[arg(long = "no-streaming")]
-    no_streaming: bool,
+    /// Disable streaming even when --stream or API_STREAM asked for it
+    #[arg(long = "no-stream")]
+    no_stream: bool,
 
     /// Request timeout in seconds; 0 disables it (default: 600 = 10 minutes)
     #[arg(long = "timeout", value_name = "SECONDS", allow_negative_numbers = true)]
@@ -769,7 +776,7 @@ struct Config {
     /// Streaming is active for this request: the user asked for it and (in the
     /// TUI, where we know) the server advertises `response:streaming`.
     streaming: bool,
-    /// The user asked for streaming via `--stream` or `API_STREAMING`. Kept
+    /// The user asked for streaming via `--stream` or `API_STREAM`. Kept
     /// separate from `streaming` so the TUI can re-derive the effective value
     /// when the server flag arrives, and so ctrl+t has something to toggle.
     stream_requested: bool,
@@ -802,7 +809,7 @@ struct Config {
     expect_falsy: bool,
     /// `-f`: a response of 400 or above ends the run. See `fail_fast_trips`.
     fail_fast: bool,
-    /// `-m`: print the describe block of the file being run before it runs.
+    /// `-d`: print the describe block of the file being run before it runs.
     describe_first: bool,
     /// Export mode, from `--export <name>`, the `"export"` of a `set` line or the
     /// prompt: responses are rewritten as seed data, with `name` as the
@@ -817,9 +824,9 @@ struct Config {
     /// fields requests read (`include_nulls`, `export_id`, `timeout_secs`…)
     /// are made of the two by `apply_settings`.
     file: Settings,
-    /// `--no-streaming`: nothing is streamed, whatever else asks for it.
+    /// `--no-stream`: nothing is streamed, whatever else asks for it.
     no_streaming: bool,
-    /// Streaming was asked for by `API_STREAMING` and not by `--stream`.
+    /// Streaming was asked for by `API_STREAM` and not by `--stream`.
     stream_by_env: bool,
     /// The status of the last response the prompt received, for `-f` there.
     last_status: Option<u16>,
@@ -842,8 +849,8 @@ struct Config {
     /// starts with `@` is that text, not the name of a file to send.
     body_verbatim: bool,
     /// The describe block of the file a one-shot line names (`api -m
-    /// catalog.api`): what `-m` prints, once the run has got as far as a
-    /// `-ma` run gets before it prints one.
+    /// catalog.api`): what `-d` prints, once the run has got as far as a
+    /// `-da` run gets before it prints one.
     named_describe: Option<DescribeBlock>,
 }
 
@@ -4651,7 +4658,7 @@ impl ConnectionFlow {
 /// (written in any case), an address, or a host that has its domain.
 fn url_ghost(url: &str) -> String {
     let localhost_full = "localhost:5000";
-    let suffix = ".app.heads.com";
+    let suffix = TENANT_DOMAIN;
     let lower = url.to_ascii_lowercase();
     let starts_with_digit = url.chars().next().map_or(false, |c| c.is_ascii_digit());
 
@@ -4661,7 +4668,7 @@ fn url_ghost(url: &str) -> String {
         localhost_full[url.len()..].to_string()
     } else if !starts_with_digit
         && !url.starts_with("localhost") && !url.starts_with("127.0.0.1") && !url.starts_with("[::1]")
-        && !url.contains(".app.heads.com")
+        && !url.contains(TENANT_DOMAIN)
     {
         // A port or a path is the end of a host: nothing goes behind it.
         if url.contains(':') || url.contains('/') {
@@ -4940,7 +4947,7 @@ impl Drop for ClipboardGuard {
 fn main() {
     install_panic_hook();
     let _clipboard = ClipboardGuard;
-    let args = match Args::try_parse() {
+    let mut args = match Args::try_parse() {
         Ok(args) => args,
         Err(e) => {
             // Help and version are "success" errors in clap — print them normally
@@ -5002,11 +5009,28 @@ fn main() {
         exit_process(0);
     }
 
-    // `--describe`, `--assert`, `--imports`, `--complete` and `--format` read
+    // `api -` runs the file on stdin, as `-` is stdin to `--format` and to
+    // `--describe`. What stands behind the `-` is a request beside a file,
+    // and is refused as one beside `-a` is, below.
+    let stdin_named = args.all.is_none() && args.method.as_deref() == Some("-");
+    if stdin_named {
+        args.all = Some("-".to_string());
+        args.method = args.uri.take();
+        if !args.body.is_empty() {
+            args.uri = Some(args.body.remove(0));
+        }
+    }
+    // The file a run was given, as an error says it.
+    let file_run = args.all.as_ref().map(|file| match stdin_named {
+        true => "- runs the file on stdin".to_string(),
+        false => format!("-a {} runs a file", file),
+    });
+
+    // `--describe`, `--asserts`, `--imports`, `--complete` and `--format` read
     // a file and print what it says. Nothing is sent, so none of them needs a connection.
     let documents: Vec<&str> = [
         ("--describe", &args.describe),
-        ("--assert", &args.assert),
+        ("--asserts", &args.asserts),
         ("--imports", &args.imports),
         ("--complete", &args.complete),
         ("--format", &args.format),
@@ -5025,25 +5049,25 @@ fn main() {
     let document = [
         ("--imports", &args.imports),
         ("--describe", &args.describe),
-        ("--assert", &args.assert),
+        ("--asserts", &args.asserts),
         ("--complete", &args.complete),
         ("--format", &args.format),
     ]
     .into_iter()
     .find_map(|(option, file)| file.as_ref().map(|file| format!("{} {}", option, file)));
-    // `--install-syntax` writes files for an editor and sends nothing. What
+    // `--install-editor` writes files for an editor and sends nothing. What
     // stands beside it is not dropped without a word either.
-    if let Some(editor) = &args.install_syntax {
+    if let Some(editor) = &args.install_editor {
         let request: Vec<&str> =
             [&args.method, &args.uri].into_iter().flatten().chain(args.body.iter()).map(String::as_str).collect();
-        let beside = match (&document, &args.all) {
+        let beside = match (&document, &file_run) {
             (Some(document), _) => Some(format!("{} prints a document", document)),
-            (None, Some(file)) => Some(format!("-a {} runs a file", file)),
+            (None, Some(file_run)) => Some(file_run.clone()),
             (None, None) if !request.is_empty() => Some(format!("{} is a request", request.join(" "))),
             (None, None) => None,
         };
         if let Some(beside) = beside {
-            errln!("error: --install-syntax {} installs files and {}: give one of the two", editor, beside);
+            errln!("error: --install-editor {} installs files and {}: give one of the two", editor, beside);
             exit_process(1);
         }
         exit_process(install_syntax(editor));
@@ -5051,8 +5075,8 @@ fn main() {
     if let Some(document) = &document {
         let request: Vec<&str> =
             [&args.method, &args.uri].into_iter().flatten().chain(args.body.iter()).map(String::as_str).collect();
-        let beside = match &args.all {
-            Some(file) => Some(format!("-a {} runs a file", file)),
+        let beside = match &file_run {
+            Some(file_run) => Some(file_run.clone()),
             None if !request.is_empty() => Some(format!("{} is a request", request.join(" "))),
             None => None,
         };
@@ -5065,9 +5089,9 @@ fn main() {
     if args.lsp {
         let request: Vec<&str> =
             [&args.method, &args.uri].into_iter().flatten().chain(args.body.iter()).map(String::as_str).collect();
-        let beside = match (&document, &args.all) {
+        let beside = match (&document, &file_run) {
             (Some(document), _) => Some(format!("{} prints a document", document)),
-            (None, Some(file)) => Some(format!("-a {} runs a file", file)),
+            (None, Some(file_run)) => Some(file_run.clone()),
             (None, None) if !request.is_empty() => Some(format!("{} is a request", request.join(" "))),
             (None, None) => None,
         };
@@ -5089,7 +5113,7 @@ fn main() {
     if let Some(file) = &args.describe {
         exit_process(print_describe_block(file, args.raw));
     }
-    if let Some(file) = &args.assert {
+    if let Some(file) = &args.asserts {
         let api_path = if args.me { "/api/me/v1" } else { "/api/v1" };
         exit_process(print_assertions(file, api_path, args.raw));
     }
@@ -5097,14 +5121,23 @@ fn main() {
     // `-a` runs a file, and the words beside it are a request of their own.
     // Which of the two was meant is not something to guess, and running one
     // of them without a word about the other is worse.
-    if let (Some(file), Some(_)) = (&args.all, &args.method) {
+    // So is a file named as the argument with a request behind it (`api
+    // seed.api GET /people`), which would be read as the name of one file.
+    if let (None, Some(file), Some(word)) = (&file_run, &args.method, &args.uri) {
+        if names_api_file(file) && !file.contains(char::is_whitespace) && starts_a_request(word) {
+            let request: Vec<&str> = std::iter::once(word).chain(args.body.iter()).map(String::as_str).collect();
+            errln!("error: {} runs a file and {} is a request: give one of the two", file, request.join(" "));
+            exit_process(1);
+        }
+    }
+    if let (Some(file_run), Some(_)) = (&file_run, &args.method) {
         let request: Vec<&str> = [&args.method, &args.uri]
             .into_iter()
             .flatten()
             .chain(args.body.iter())
             .map(String::as_str)
             .collect();
-        errln!("error: -a {} runs a file and {} is a request: give one of the two", file, request.join(" "));
+        errln!("error: {} and {} is a request: give one of the two", file_run, request.join(" "));
         exit_process(1);
     }
 
@@ -5118,6 +5151,39 @@ fn main() {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(".api-credentials.json"));
         enable_no_keychain(path);
+    }
+
+    // `-t abc` is the tenant's host, https://abc.app.heads.com, and with it
+    // the credential of the one saved connection for that host: what `-c
+    // abc.app.heads.com` chooses. Where none is saved it is `-b` with that
+    // URL, and beside `-c` it is the `-b` that lends the connection's
+    // credential to the tenant's host.
+    if let Some(name) = args.tenant.as_deref() {
+        let other = match (&args.base_uri, &args.one_password) {
+            (Some(_), _) => Some("-b a base URL"),
+            (None, Some(_)) => Some("--1p one in 1Password"),
+            (None, None) => None,
+        };
+        if let Some(other) = other {
+            errln!("error: -t names a tenant's host and {}: give one of the two", other);
+            exit_process(1);
+        }
+        // Beside `-c` no saved connection is looked for: one is named.
+        let saved: Vec<(String, String)> = match args.connection {
+            Some(_) => Vec::new(),
+            None => list_connections()
+                .into_iter()
+                .filter_map(|alias| load_connection(&alias).map(|env| (alias, env.url)))
+                .collect(),
+        };
+        match tenant_target(name, &saved) {
+            Ok(TenantTarget::Connection(alias)) => args.connection = Some(alias),
+            Ok(TenantTarget::Url(url)) => args.base_uri = Some(url),
+            Err(problem) => {
+                errln!("{}", problem);
+                exit_process(1);
+            }
+        }
     }
 
     let mut config = Config::default();
@@ -5156,9 +5222,9 @@ fn main() {
         exit_process(1);
     }
     // What a `set` line can change too. Given here it holds for the whole
-    // run. Streaming is opt-in: --no-streaming beats --stream beats
-    // API_STREAMING.
-    config.no_streaming = args.no_streaming;
+    // run. Streaming is opt-in: --no-stream beats --stream beats
+    // API_STREAM.
+    config.no_streaming = args.no_stream;
     config.stream_by_env = !args.stream && env_streaming_requested();
     config.given = Settings {
         export: args.export.clone(),
@@ -5166,7 +5232,7 @@ fn main() {
         fail_fast: args.fail_fast,
         ndjson: args.ndjson,
         raw: args.raw,
-        stream: !args.no_streaming && (args.stream || config.stream_by_env),
+        stream: !args.no_stream && (args.stream || config.stream_by_env),
         timeout: args.timeout,
     };
     config.apply_settings();
@@ -5215,17 +5281,6 @@ fn main() {
     // Parse positional args like bash client
     let body_arg = if args.body.is_empty() { None } else { Some(args.body.join(" ")) };
     let (method, uri, body) = parse_positional_args(args.method, args.uri, body_arg);
-
-    // `-t` used to take a bearer token and now means --stream, so an old
-    // invocation leaves the token sitting in the method slot. Say so rather
-    // than letting it become a request to a nonsense method.
-    if args.stream && looks_like_bearer_token(&method) {
-        errln!(
-            "{}",
-            "error: -t is now --stream. Use --token <TOKEN> for a bearer token.".red()
-        );
-        exit_process(1);
-    }
 
     // The arguments as one line, read the way a `.api` file reads it: a body
     // comment, a raw newline in a string, or a `> file` in an argument of its
@@ -5662,9 +5717,9 @@ fn main() {
             errln!("error: `set` alone sends nothing. Give the setting as an option with a request (`-i`, `--export <name>`), or put the line in a .api file.");
             exit_process(1);
         }
-        // The file named on the line is the file being run, so `-m` prints
-        // its describe block, as `-ma` on the file would.
-        // It is printed where a `-ma` run prints one: when the file has been
+        // The file named on the line is the file being run, so `-d` prints
+        // its describe block, as `-da` on the file would.
+        // It is printed where a `-da` run prints one: when the file has been
         // read, its imports are fetched and its `url` gate has passed.
         if config.describe_first {
             config.named_describe = describe_block_of_named_file(&line);
@@ -5732,9 +5787,68 @@ fn main() {
     }
 }
 
-/// Whether a positional method slot is really a bearer token left over from the
-/// old `-t <TOKEN>` spelling. Deliberately narrow: a JWT-shaped string (three
-/// dot-separated segments, no slashes) that could never be an HTTP method.
+/// The domain a tenant's host is under: `abc` is `abc.app.heads.com`.
+const TENANT_DOMAIN: &str = ".app.heads.com";
+
+/// The base URL `-t <name>` stands for, or why the value names no tenant.
+/// The value is not repeated in what is said: `-t` has been a bearer token
+/// and a URL may hold a password.
+fn tenant_url(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    // `-t` took a bearer token once, and turned streaming on after that
+    // (`api -t GET /people`): neither is sent to a host made of it.
+    if looks_like_bearer_token(name) {
+        return Err("-t names a tenant. Use --token <TOKEN> for a bearer token.".to_string());
+    }
+    if ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"].iter().any(|m| m.eq_ignore_ascii_case(name)) {
+        return Err(format!(
+            "invalid value for -t: {} is a method, not a tenant. -t names a tenant, and --stream turns streaming on.",
+            name.to_ascii_uppercase()
+        ));
+    }
+    let is_label = !name.is_empty()
+        && name.len() <= 63
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && !name.starts_with('-')
+        && !name.ends_with('-');
+    if !is_label {
+        return Err(format!(
+            "invalid value for -t: a tenant is one name of letters, digits and `-`, as `abc` is for https://abc{}. Give a URL with -b.",
+            TENANT_DOMAIN
+        ));
+    }
+    Ok(format!("https://{}{}", name.to_ascii_lowercase(), TENANT_DOMAIN))
+}
+
+/// What `-t <name>` chooses: a saved connection, or a base URL alone.
+#[derive(Debug, PartialEq)]
+enum TenantTarget {
+    /// The alias of the one saved connection for the tenant's host.
+    Connection(String),
+    /// The tenant's base URL, where no saved connection is for it.
+    Url(String),
+}
+
+/// What `-t <name>` chooses among the saved connections, given as alias and
+/// URL: the one whose URL is the tenant's, as `-c <url>` chooses it. Which
+/// of several credentials to send is not guessed, as it is not for `-c`.
+fn tenant_target(name: &str, saved: &[(String, String)]) -> Result<TenantTarget, String> {
+    let url = tenant_url(name).map_err(|problem| format!("error: {}", problem))?;
+    let fits: Vec<&str> =
+        saved.iter().filter(|(_, stored)| url_selects(stored, &url)).map(|(alias, _)| alias.as_str()).collect();
+    match fits[..] {
+        [] => Ok(TenantTarget::Url(url)),
+        [alias] => Ok(TenantTarget::Connection(alias.to_string())),
+        _ => Err(format!(
+            "Tenant \"{}\" fits several saved connections: {}. Name one of them with -c.",
+            name.trim(),
+            fits.join(", ")
+        )),
+    }
+}
+
+/// Whether a value is a bearer token where none belongs: a JWT-shaped string
+/// (three dot-separated segments, no slashes). Deliberately narrow.
 fn looks_like_bearer_token(method: &str) -> bool {
     let methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
     // A file to run is no token, however long its name and whatever dots
@@ -7788,7 +7902,7 @@ impl Config {
     fn overriding_option(&self, setting: &Setting) -> Option<String> {
         if let Setting::Stream(true) = setting {
             if self.no_streaming {
-                return Some("--no-streaming".to_string());
+                return Some("--no-stream".to_string());
             }
         }
         let held = self.given.get(setting);
@@ -7801,7 +7915,7 @@ impl Config {
             Setting::FailFast(_) => "-f".to_string(),
             Setting::Ndjson(_) => "--ndjson".to_string(),
             Setting::Raw(_) => "-r".to_string(),
-            Setting::Stream(_) if self.stream_by_env => "API_STREAMING".to_string(),
+            Setting::Stream(_) if self.stream_by_env => "API_STREAM".to_string(),
             Setting::Stream(_) => "--stream".to_string(),
             Setting::Timeout(seconds) => format!("--timeout {}", seconds.unwrap_or_default()),
         })
@@ -8345,11 +8459,11 @@ fn format_status(status: reqwest::StatusCode, expect_falsy: bool) -> String {
 /// Status is checked first — only a 2xx can be truthy. A 404 (and other non-auth
 /// 4xx) is a definite "no" that merely stops the chain, while auth failures, 5xx,
 /// and timeouts are errors.
-/// `API_STREAMING` asks for streaming globally, the way `--stream` does per-run.
+/// `API_STREAM` asks for streaming globally, the way `--stream` does per-run.
 /// Anything other than the listed truthy words is off, so a stray value never
 /// silently changes how responses are written.
 fn env_streaming_requested() -> bool {
-    std::env::var("API_STREAMING")
+    std::env::var("API_STREAM")
         .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false)
 }
@@ -12267,7 +12381,7 @@ fn run_language_server() -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// `--install-syntax <editor>`: syntax highlighting for `.api` files.
+// `--install-editor <editor>`: syntax highlighting for `.api` files.
 //
 // The grammars are the files of `editors/`, compiled in, so the highlighting
 // a client installs is the one for the syntax that client reads.
@@ -12297,7 +12411,7 @@ const VIM_FILES: [(&str, &str); 3] = [
     ("ftplugin/api.vim", include_str!("../editors/vim/ftplugin/api.vim")),
 ];
 
-/// What `--install-syntax` takes.
+/// What `--install-editor` takes.
 const SYNTAX_EDITORS: [&str; 6] = ["sublime", "vscode", "cursor", "rider", "vim", "nvim"];
 
 /// An editor that installs a `.vsix` from its command line.
@@ -12309,7 +12423,7 @@ struct VsixEditor {
 const VSCODE: VsixEditor = VsixEditor { name: "VS Code", command: "code" };
 const CURSOR: VsixEditor = VsixEditor { name: "Cursor", command: "cursor" };
 
-/// `--install-syntax <editor>`: write the highlighting for `.api` files where
+/// `--install-editor <editor>`: write the highlighting for `.api` files where
 /// the editor reads it. Each path written is a line on stdout; what is left
 /// to do, if anything, is said on stderr. Returns the exit code.
 fn install_syntax(editor: &str) -> i32 {
@@ -12428,7 +12542,7 @@ fn install_vim_package(dir: Result<PathBuf, String>, name: &str) -> Result<Strin
     // Loaded when the editor starts: the client that installed the package,
     // which the package asks unless `g:api_binary` names another.
     let named = format!(
-        "\" Written by `api --install-syntax`: the client that installed this package.\nlet g:api_installed_client = '{}'\n",
+        "\" Written by `api --install-editor`: the client that installed this package.\nlet g:api_installed_client = '{}'\n",
         installing_client()?.replace('\'', "''")
     );
     write_syntax_file(&dir.join("plugin").join("api.vim"), named.as_bytes())?;
@@ -12669,7 +12783,7 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// The lines `-m` prints for a describe block: the title, the description
+/// The lines `-d` prints for a describe block: the title, the description
 /// wrapped to `width`, and the link.
 fn describe_first_lines(block: &DescribeBlock, locale: Option<&str>, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
@@ -12685,7 +12799,7 @@ fn describe_first_lines(block: &DescribeBlock, locale: Option<&str>, width: usiz
     lines
 }
 
-/// `-m`: say on stderr what the file about to run is, from its describe
+/// `-d`: say on stderr what the file about to run is, from its describe
 /// block, with an empty line under it.
 fn print_describe_first(block: &DescribeBlock) {
     let _colour = ForStderr::new();
@@ -12753,7 +12867,7 @@ fn collect_assertions(program: &BulkProgram, api_path: &str) -> Result<Vec<serde
     Ok(assertions)
 }
 
-/// `--assert <file>`: what the file asserts, as one JSON array on stdout.
+/// `--asserts <file>`: what the file asserts, as one JSON array on stdout.
 /// Returns the exit code.
 fn print_assertions(file: &str, api_path: &str, raw: bool) -> i32 {
     let assertions = read_api_file(file).and_then(|(contents, base_dir)| {
@@ -13527,7 +13641,7 @@ fn run_bulk_program(config: &mut Config, contents: &str, base_dir: Option<&std::
     for warning in &program.describe_warnings {
         errln!("warning: {}", warning);
     }
-    // `-m`: say what the file is before the preview asks whether to run it.
+    // `-d`: say what the file is before the preview asks whether to run it.
     if config.describe_first {
         if let Some(block) = program.describe.as_ref().or(config.named_describe.as_ref()) {
             print_describe_first(block);
@@ -14436,7 +14550,7 @@ fn run_non_interactive(config: &mut Config, method: &str, uri: &str, body: &str)
     };
     let is_clipboard = target.as_ref().is_some_and(|t| t.is_clipboard());
 
-    // Streaming is opt-in and already resolved from --stream/API_STREAMING, so
+    // Streaming is opt-in and already resolved from --stream/API_STREAM, so
     // there is no per-request feature-flag round trip here. A server that
     // doesn't stream ignores the unknown `;stream=true` media-type parameter.
     // `--export` rewrites the whole body, so it is read whole: streaming is
@@ -17382,10 +17496,10 @@ fn run_program_steps(
                     log_directive_line(state, stdout, line.shown.dimmed().to_string())?;
                     for (held, option) in overridden {
                         // What the session has set is what holds, but for
-                        // `--no-streaming`, which it was started with and
+                        // `--no-stream`, which it was started with and
                         // which no `set` line of its own is behind.
                         let note = match option.as_str() {
-                            "--no-streaming" => "↳ ignored: --no-streaming is set".to_string(),
+                            "--no-stream" => "↳ ignored: --no-stream is set".to_string(),
                             _ => format!("↳ ignored: the session has {}", held.line()),
                         };
                         log_directive_line(state, stdout, note.dimmed().to_string())?;
@@ -18486,10 +18600,10 @@ fn set_for_session(state: &mut AppState, setting: &Setting) -> String {
     if matches!(setting, Setting::Stream(true)) && !state.config.server_streaming {
         return "streaming not available on this server".to_string();
     }
-    // `--no-streaming` is the one option that keeps a setting off, for the
+    // `--no-stream` is the one option that keeps a setting off, for the
     // session as for a run: saying `on` here would be saying what is not so.
     if matches!(setting, Setting::Stream(true)) && state.config.no_streaming {
-        return "streaming is off: the session was started with --no-streaming".to_string();
+        return "streaming is off: the session was started with --no-stream".to_string();
     }
     state.config.given.put(setting);
     state.config.apply_settings();
@@ -25077,16 +25191,16 @@ mod tests {
             assert_eq!(apply_set_step(&mut config, &Some(set_of(setting)), &file(&[setting.clone()])), []);
         }
 
-        // `--no-streaming` and `API_STREAMING`.
+        // `--no-stream` and `API_STREAM`.
         let mut config = Config { no_streaming: true, ..Config::default() };
         let stream = Setting::Stream(true);
         let options = |said: Vec<(Setting, String)>| said.into_iter().map(|(_, option)| option).collect::<Vec<_>>();
-        assert_eq!(options(apply_set_step(&mut config, &Some(set_of(&stream)), &file(&[stream.clone()]))), ["--no-streaming"]);
+        assert_eq!(options(apply_set_step(&mut config, &Some(set_of(&stream)), &file(&[stream.clone()]))), ["--no-stream"]);
         assert!(!config.stream_requested);
         let mut config = Config { stream_by_env: true, ..Config::default() };
         config.given.stream = true;
         let off = Setting::Stream(false);
-        assert_eq!(options(apply_set_step(&mut config, &Some(set_of(&off)), &file(&[]))), ["API_STREAMING"]);
+        assert_eq!(options(apply_set_step(&mut config, &Some(set_of(&off)), &file(&[]))), ["API_STREAM"]);
         assert!(config.stream_requested);
     }
 
@@ -30395,7 +30509,7 @@ mod tests {
         assert!(rows[0].starts_with("  Include nulls") && rows[4].starts_with("› Timeout"), "{rows:?}");
     }
 
-    /// `--no-streaming` keeps streaming off for the session it started, and
+    /// `--no-stream` keeps streaming off for the session it started, and
     /// the menu's row and a typed `set stream` say so and not that it is on.
     #[test]
     fn streaming_is_not_said_to_be_on_in_a_session_started_without_it() {
@@ -30404,7 +30518,7 @@ mod tests {
         state.config.no_streaming = true;
         state.config.apply_settings();
         let said = set_for_session(&mut state, &Setting::Stream(true));
-        assert_eq!(said, "streaming is off: the session was started with --no-streaming");
+        assert_eq!(said, "streaming is off: the session was started with --no-stream");
         assert!(!state.config.given.stream && !state.config.streaming && !state.config.stream_requested);
         assert_eq!(settings_menu(&state)[0].1, "off");
         assert!(state.streaming_flash_at.is_none());
@@ -31378,7 +31492,7 @@ mod tests {
         );
     }
 
-    // ----- describe blocks, -m, --describe and --assert -----
+    // ----- describe blocks, -m, --describe and --asserts -----
 
     fn describe_of(src: &str) -> DescribeBlock {
         split_bulk_requests(src, None).unwrap().describe.expect("a describe block")
@@ -37152,6 +37266,80 @@ mod tests {
         ] {
             assert!(!looks_like_bearer_token(not_one), "{not_one}");
         }
+    }
+
+    /// `-t abc` is `https://abc.app.heads.com`, in lower case. What is no
+    /// name is refused without being repeated: a URL, a host with its
+    /// domain, a method (the `-t` that turned streaming on) and a token.
+    #[test]
+    fn a_tenant_is_a_name_and_its_url_is_the_host_under_the_domain() {
+        assert_eq!(tenant_url("abc").unwrap(), "https://abc.app.heads.com");
+        assert_eq!(tenant_url(" My-Shop2 ").unwrap(), "https://my-shop2.app.heads.com");
+        assert_eq!(tenant_url(&"a".repeat(63)).unwrap(), format!("https://{}.app.heads.com", "a".repeat(63)));
+        for no_name in [
+            "",
+            " ",
+            "abc.app.heads.com",
+            "https://abc.app.heads.com",
+            "https://user:secret@abc.app.heads.com",
+            "abc/tenant",
+            "abc:5000",
+            "a b",
+            "-abc",
+            "abc-",
+            "åbc",
+            "seed.api",
+            &"a".repeat(64),
+        ] {
+            let said = tenant_url(no_name).unwrap_err();
+            assert!(said.starts_with("invalid value for -t: a tenant is one name"), "{no_name}: {said}");
+            assert!(!said.contains("secret"), "{said}");
+        }
+        for method in ["GET", "get", "Put", "DELETE", "OPTIONS"] {
+            let said = tenant_url(method).unwrap_err();
+            assert!(said.contains("is a method, not a tenant") && said.contains("--stream"), "{method}: {said}");
+        }
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
+        assert_eq!(tenant_url(jwt).unwrap_err(), "-t names a tenant. Use --token <TOKEN> for a bearer token.");
+    }
+
+    /// `-t` takes the one saved connection for the tenant's host, however
+    /// its URL is written, a base URL alone where none is saved, and none
+    /// of several.
+    #[test]
+    fn a_tenant_takes_the_one_saved_connection_for_its_host() {
+        let saved = |list: &[(&str, &str)]| -> Vec<(String, String)> {
+            list.iter().map(|(alias, url)| (alias.to_string(), url.to_string())).collect()
+        };
+        let all = saved(&[
+            ("prod", "https://abc.app.heads.com"),
+            ("bare", "shop.app.heads.com"),
+            ("spelled", "HTTPS://Loud.app.heads.com/api/v1/"),
+            ("one", "https://dup.app.heads.com"),
+            ("two", "dup.app.heads.com/api/v1"),
+            ("plain", "http://plain.app.heads.com"),
+            ("below", "https://deep.app.heads.com/tenant"),
+            ("other", "https://abc.example.com"),
+            ("local", "http://localhost:5000"),
+        ]);
+        let connection = |alias: &str| Ok(TenantTarget::Connection(alias.to_string()));
+        let url = |name: &str| Ok(TenantTarget::Url(format!("https://{}.app.heads.com", name)));
+        assert_eq!(tenant_target("abc", &all), connection("prod"));
+        assert_eq!(tenant_target("ABC", &all), connection("prod"));
+        assert_eq!(tenant_target("shop", &all), connection("bare"));
+        assert_eq!(tenant_target("loud", &all), connection("spelled"));
+        // A credential saved for `http://` is not sent to `https://`, nor
+        // one saved for a path below the host to the host.
+        assert_eq!(tenant_target("plain", &all), url("plain"));
+        assert_eq!(tenant_target("deep", &all), url("deep"));
+        assert_eq!(tenant_target("localhost", &all), url("localhost"));
+        assert_eq!(tenant_target("nobody", &all), url("nobody"));
+        assert_eq!(tenant_target("abc", &[]), url("abc"));
+        assert_eq!(
+            tenant_target("dup", &all).unwrap_err(),
+            "Tenant \"dup\" fits several saved connections: one, two. Name one of them with -c."
+        );
+        assert!(tenant_target("abc.app.heads.com", &all).unwrap_err().starts_with("error: invalid value for -t: "));
     }
 
     #[test]

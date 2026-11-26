@@ -1,5 +1,5 @@
 //! Syntax highlighting for `.api` files: the grammars of `editors/` and
-//! `--install-syntax`, which writes them where an editor reads them.
+//! `--install-editor`, which writes them where an editor reads them.
 //!
 //! Nothing here needs a server, a network or an editor. An install goes to a
 //! home directory made for the test, and the `code` it runs is a script of
@@ -1449,7 +1449,7 @@ fn the_vim_package_completes_with_what_the_client_offers() {
     assert_eq!(laid_out, [FORMATTED, EXPANDED, FORMATTED]);
 }
 
-// ------------------------------------------------------------ --install-syntax
+// ------------------------------------------------------------ --install-editor
 
 /// The client with `home` as the home directory and nothing of this machine
 /// on the `PATH` but what `bin` holds.
@@ -1499,7 +1499,7 @@ fn install_syntax_for_sublime_writes_the_syntax_into_its_user_package() {
     let (home, bin) = (tempdir().unwrap(), tempdir().unwrap());
 
     // No Sublime Text: nothing is made up for it.
-    let output = api(home.path(), bin.path()).args(["--install-syntax", "sublime"]).output().unwrap();
+    let output = api(home.path(), bin.path()).args(["--install-editor", "sublime"]).output().unwrap();
     assert_eq!(output.status.code(), Some(1));
     assert!(stderr(&output).starts_with("error: Sublime Text has no folder at "), "{}", stderr(&output));
     assert!(stdout_lines(&output).is_empty());
@@ -1511,7 +1511,7 @@ fn install_syntax_for_sublime_writes_the_syntax_into_its_user_package() {
     let commands = sublime_packages(home.path()).join("User/API.sublime-commands");
     let client = sublime_packages(home.path()).join("User/api_client.json");
     for _ in 0..2 {
-        let output = api(home.path(), bin.path()).args(["--install-syntax", "Sublime"]).output().unwrap();
+        let output = api(home.path(), bin.path()).args(["--install-editor", "Sublime"]).output().unwrap();
         assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
         assert_eq!(stdout_lines(&output), [&target, &plugin, &commands, &client].map(|path| path.display().to_string()));
         assert_eq!(fs::read_to_string(&target).unwrap(), read("editors/sublime/API.sublime-syntax"));
@@ -1570,7 +1570,7 @@ fn install_syntax_for_vim_and_neovim_writes_a_package() {
     for (editor, package) in
         [("vim", ".vim/pack/commerceos/start/api"), ("nvim", ".local/share/nvim/site/pack/commerceos/start/api")]
     {
-        let output = api(home.path(), bin.path()).args(["--install-syntax", editor]).output().unwrap();
+        let output = api(home.path(), bin.path()).args(["--install-editor", editor]).output().unwrap();
         assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
         let package = home.path().join(package);
         let mut written = files.map(|file| package.join(file).display().to_string()).to_vec();
@@ -1592,7 +1592,7 @@ fn install_syntax_for_vim_and_neovim_writes_a_package() {
     let data = tempdir().unwrap();
     let output = api(home.path(), bin.path())
         .env("XDG_DATA_HOME", data.path())
-        .args(["--install-syntax", "nvim"])
+        .args(["--install-editor", "nvim"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
@@ -1603,7 +1603,7 @@ fn install_syntax_for_vim_and_neovim_writes_a_package() {
 #[cfg(unix)]
 fn install_syntax_for_rider_writes_a_bundle_and_says_the_step_that_is_left() {
     let (home, bin) = (tempdir().unwrap(), tempdir().unwrap());
-    let output = api(home.path(), bin.path()).args(["--install-syntax", "rider"]).output().unwrap();
+    let output = api(home.path(), bin.path()).args(["--install-editor", "rider"]).output().unwrap();
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     let bundle = home.path().join(".local/share/api/editors/commerceos-api");
     let server = home.path().join(".local/share/api/editors/commerceos-api-lsp");
@@ -1664,7 +1664,7 @@ fn install_syntax_for_vscode_and_cursor_hands_a_vsix_to_the_editors_command() {
         let vsix = home.path().join(".local/share/api/editors/commerceos-api.vsix");
 
         // The command is not there: the file is written, and the rest is said.
-        let output = api(home.path(), bin.path()).args(["--install-syntax", editor]).output().unwrap();
+        let output = api(home.path(), bin.path()).args(["--install-editor", editor]).output().unwrap();
         assert_eq!(output.status.code(), Some(1));
         assert_eq!(stdout_lines(&output), [vsix.display().to_string()]);
         assert!(stderr(&output).starts_with(&format!("error: `{}` is not on the PATH", command)), "{}", stderr(&output));
@@ -1705,7 +1705,7 @@ fn install_syntax_for_vscode_and_cursor_hands_a_vsix_to_the_editors_command() {
 
         // The command is there: it is asked to install that file.
         fake_command(bin.path(), command, 0);
-        let output = api(home.path(), bin.path()).args(["--install-syntax", editor]).output().unwrap();
+        let output = api(home.path(), bin.path()).args(["--install-editor", editor]).output().unwrap();
         assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
         assert_eq!(stdout_lines(&output), [vsix.display().to_string()]);
         assert_eq!(
@@ -1715,7 +1715,7 @@ fn install_syntax_for_vscode_and_cursor_hands_a_vsix_to_the_editors_command() {
 
         // The command refuses: what it said is passed on.
         fake_command(bin.path(), command, 3);
-        let output = api(home.path(), bin.path()).args(["--install-syntax", editor]).output().unwrap();
+        let output = api(home.path(), bin.path()).args(["--install-editor", editor]).output().unwrap();
         assert_eq!(output.status.code(), Some(1));
         assert!(
             stderr(&output).starts_with(&format!("error: `{}` could not install the extension: refused", command)),
@@ -1729,19 +1729,19 @@ fn install_syntax_for_vscode_and_cursor_hands_a_vsix_to_the_editors_command() {
 fn install_syntax_refuses_an_editor_it_does_not_know_and_what_stands_beside_it() {
     let (home, bin) = (tempdir().unwrap(), tempdir().unwrap());
     let cases: [(&[&str], &str); 5] = [
-        (&["--install-syntax", "emacs"], "error: unknown editor `emacs` (one of sublime, vscode, cursor, rider, vim, nvim)\n"),
-        (&["--install-syntax"], "error: --install-syntax needs a value\n"),
+        (&["--install-editor", "emacs"], "error: unknown editor `emacs` (one of sublime, vscode, cursor, rider, vim, nvim)\n"),
+        (&["--install-editor"], "error: --install-editor needs a value\n"),
         (
-            &["--install-syntax", "vim", "GET", "/people"],
-            "error: --install-syntax vim installs files and GET /people is a request: give one of the two\n",
+            &["--install-editor", "vim", "GET", "/people"],
+            "error: --install-editor vim installs files and GET /people is a request: give one of the two\n",
         ),
         (
-            &["--install-syntax", "vim", "-a", "seed.api"],
-            "error: --install-syntax vim installs files and -a seed.api runs a file: give one of the two\n",
+            &["--install-editor", "vim", "-a", "seed.api"],
+            "error: --install-editor vim installs files and -a seed.api runs a file: give one of the two\n",
         ),
         (
-            &["--install-syntax", "vim", "--describe", "seed.api"],
-            "error: --install-syntax vim installs files and --describe seed.api prints a document: give one of the two\n",
+            &["--install-editor", "vim", "--describe", "seed.api"],
+            "error: --install-editor vim installs files and --describe seed.api prints a document: give one of the two\n",
         ),
     ];
     for (args, said) in cases {

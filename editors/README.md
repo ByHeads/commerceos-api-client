@@ -5,12 +5,12 @@ per editor format, and beside each what makes its editor complete and format. Th
 compiled into the client, which installs them:
 
 ```sh
-api --install-syntax sublime    # Sublime Text
-api --install-syntax vscode     # VS Code
-api --install-syntax cursor     # Cursor
-api --install-syntax rider      # Rider and the other JetBrains IDEs
-api --install-syntax vim        # Vim
-api --install-syntax nvim       # Neovim
+api --install-editor sublime    # Sublime Text
+api --install-editor vscode     # VS Code
+api --install-editor cursor     # Cursor
+api --install-editor rider      # Rider and the other JetBrains IDEs
+api --install-editor vim        # Vim
+api --install-editor nvim       # Neovim
 ```
 
 Run it again after the client is updated: it replaces what it wrote before.
@@ -81,7 +81,7 @@ alone, and an editor offers what the client that is installed reads.
   lacks `--complete` or `--format`, and an editor falls back without a word
   when it gets no answer. So: install with the client the editor should
   use. A client built in this repository (`target/debug/api
-  --install-syntax sublime`) is asked until it is cleaned away.
+  --install-editor sublime`) is asked until it is cleaned away.
 - An editor that was not started from a shell may have no `PATH` to speak
   of. Where the installing client is gone, the Sublime plugin and the
   extension look where a client is usually installed (`/opt/homebrew/bin`,
@@ -138,7 +138,7 @@ that runs a language server it is given. Once:
 The folder holds one file, `template.json`: the name of the server, the
 command that starts it and the files it is for (`*.api`, by name, so that
 the TextMate bundle goes on colouring them). The command is the client by
-the path `--install-syntax rider` was run as, since an IDE that is started
+the path `--install-editor rider` was run as, since an IDE that is started
 from the Dock has no `PATH` to find `api` on. When the client has moved, run
 the install again and import the folder again, or change the command in the
 server's settings.
@@ -158,7 +158,7 @@ cargo test --test editors
 
 holds the Sublime syntax to `sample.api` (through `syntect`, which reads the
 same format), checks that it finds no error in any `.api` file of this
-repository, and holds `--install-syntax`, `--complete` and `--format`. Each
+repository, and holds `--install-editor`, `--complete` and `--format`. Each
 caller of the two is run where its interpreter is on the `PATH`, and a
 session is held with `--lsp`: the Sublime
 plugin by `python3`, the extension by `node` against a `vscode` module of
@@ -187,9 +187,9 @@ open `sample.api`, or ask for the group under the cursor:
 
 ## The extension outside the client
 
-`vscode/package.json` has version `0.0.0`: `--install-syntax` puts the
+`vscode/package.json` has version `0.0.0`: `--install-editor` puts the
 client's version in, so that an editor takes the extension of a newer client
-for an update. The `.vsix` that `api --install-syntax vscode` writes is a
+for an update. The `.vsix` that `api --install-editor vscode` writes is a
 complete extension and can be attached to a release as it is: the
 `client.json` in it names a client of the machine that packed it, and on a
 machine that has no client there the extension asks the `api` on the `PATH`. It is not

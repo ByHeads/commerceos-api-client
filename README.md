@@ -69,7 +69,7 @@ api "GET /people/123 || PUT /people/123 {\"name\":\"Joe\"}"   # chain, quoted wh
 api GET /people/123 "||" PUT /people/123 '{"name":"Joe"}'    # or with the separator quoted
 api assert /companies/com.heads.seedID=ours                  # exit 1 unless truthy
 api sleep 5 while not /imports~count                         # poll until it flips
-api seed.api                                                 # run a file, same as -a seed.api
+api seed.api                                                 # run a file
 ```
 
 `--export <external-id>` turns a response into seed data that can be `PUT` back where it was read or
@@ -141,7 +141,7 @@ line or the `&&` itself (see [One-shot requests](#one-shot-requests)).
 
 ### Streaming
 
-Off by default. With `--stream` (or `API_STREAMING=1`; `--no-streaming` overrides both)
+Off by default. With `--stream` (or `API_STREAM=1`; `--no-stream` overrides both)
 the body is written as it arrives, which is what large exports and `~map(...)` want.
 
 | Destination | Streamed? |
@@ -178,18 +178,18 @@ printed to the terminal.
 
 ## Batch files
 
-`api -a file.api` runs the requests in a file top to bottom; `-a -` or a pipe reads stdin.
+`api file.api` runs the requests in a file top to bottom; `api -` runs the file on stdin.
 `-s` makes it a compact log of one status line per request; `-p` previews the requests and
 asks before sending. It is not a dry run: Enter sends them. With no terminal the answer is
-read from stdin (`echo n | api -spa seed.api` prints the program and sends nothing), and a
+read from stdin (`echo n | api -sp seed.api` prints the program and sends nothing), and a
 question nobody answered sends nothing and exits 1.
 
 ```sh
-api -sa seed.api
-api -spa seed.api        # preview first
-api -spma seed.api       # say what the file is, then preview
+api -s seed.api
+api -sp seed.api         # preview first
+api -spd seed.api        # say what the file is, then preview
 api --describe seed.api  # its describe block as JSON, nothing sent
-api --assert seed.api    # every PUT /assert body it sends, as one JSON array, nothing sent
+api --asserts seed.api   # every PUT /assert body it sends, as one JSON array, nothing sent
 api --imports seed.api   # every import it reads and the directory it resolved to, nothing sent
 ```
 
@@ -240,7 +240,7 @@ GET /people~take(5) > /tmp/people.json
 The client installs highlighting for `.api` files in the editor you name:
 
 ```sh
-api --install-syntax sublime    # or vscode, cursor, rider, vim, nvim
+api --install-editor sublime    # or vscode, cursor, rider, vim, nvim
 ```
 
 It writes the grammar that belongs to this version of the client where the editor reads
@@ -348,10 +348,13 @@ two can't be told apart: set the terminal to send DEL (`0x7f`) for Backspace.
 
 ## Connections and authentication
 
-- `-b URL -k KEY` sends the key as Basic auth. `--token TOKEN` sends a Bearer token (long form only; `-t` is `--stream`).
+- `-b URL -k KEY` sends the key as Basic auth. `--token TOKEN` sends a Bearer token (long form only).
 - With neither, the client prompts for credentials; `ctrl+s` saves the connection, `ctrl+q` switches.
 - `-c alias` (or `-c url`) picks a saved connection: `api -c staging GET /people`.
   A URL that several saved connections share is an error that lists their aliases.
+- `-t name` is a tenant's host: `api -t abc GET /people` goes to `https://abc.app.heads.com`,
+  with the credential of the one saved connection for that host. Without one it is `-b` with
+  that URL, and `-k` or `--token` gives the credential.
 - A key or token without `-b` uses the default saved connection's URL.
 - `-k`, `--token` and `-b` win over what a saved connection has stored, with `-c` too:
   `api -c staging -k OTHERKEY GET /people`.
@@ -364,41 +367,44 @@ two can't be told apart: set the terminal to send DEL (`0x7f`) for Backspace.
 ```
 Usage: api [OPTIONS] [METHOD] [URI] [BODY]
 
-  -b, --base-uri <URI>            Base URI
+  -b, --base-url <URL>            Base URL of the server
+  -t, --tenant <NAME>             A tenant's host: abc is https://abc.app.heads.com, with its saved connection
   -k, --key <KEY>                 API key (Basic auth)
       --token <TOKEN>             Bearer token
   -c, --connection <ALIAS|URL>    Use a saved connection
       --no-keychain               Read/write connections from a plaintext JSON file
       --me                        Use /api/me/v1 instead of /api/v1
-  -a, --all [FILE]                Run requests from FILE (stdin if omitted or `-`)
-  -s, --silent                    No status output; with -a, one status line per request
+  -s, --silent                    No status output; for a file, one status line per request
   -p, --preview                   Show the request(s) and confirm before sending
   -f, --fail-fast                 Stop at the first response of 400 or above: print its body, exit 1
-  -m, --describe-first            With -a: print the file's describe block before running it
+  -d, --describe-first            Print the describe block of the file being run before running it
       --describe <FILE>           Print the describe block of FILE as JSON; sends nothing
-      --assert <FILE>             Print every `PUT /assert` body FILE sends as one JSON array; sends nothing
+      --asserts <FILE>            Print every `PUT /assert` body FILE sends as one JSON array; sends nothing
       --imports <FILE>            Print every import FILE reads and where it resolved to, as one JSON array; sends nothing
       --complete <FILE>           Print what can stand at a place of FILE, whose text is read from stdin, for an editor; sends nothing
       --at <BYTES>                With --complete: the place, as the bytes in front of it (the end when not given)
       --format <FILE>             Print FILE laid out one way: bodies indented, words a blank apart (- reads stdin); sends nothing
       --expand                    With --format: a line for each member of every object and array
       --lsp                       Serve an editor as a language server on stdin and stdout: completion and formatting; sends nothing
-      --install-syntax <EDITOR>   Install .api syntax highlighting in sublime, vscode, cursor, rider, vim or nvim; sends nothing
+      --install-editor <EDITOR>   Install .api highlighting, completions and formatting in sublime, vscode, cursor, rider, vim or nvim; sends nothing
       --export <EXTERNAL_ID>      Rewrite responses as seed data: keys dropped, a lone one kept as `key?` and EXTERNAL_ID
   -r, --raw                       No pretty-printing
   -i, --include-nulls             Include null values in the response
       --ndjson                    NDJSON request and response
-  -t, --stream                    Stream the response body
-      --no-streaming              Force streaming off
+      --stream                    Stream the response body
+      --no-stream                 Force streaming off
       --timeout <SECONDS>         Request timeout, 0 disables (default 600)
   -x, --experimental              Experimental body completion and highlighting
   -v, --version
   -h, --help
 ```
 
+A file is run by naming it (`api seed.api`), and `-` is the file on stdin. `-a [FILE]`
+(`--all`), which ran a file up to 3.4.4, is still read, and so is `--base-uri`.
+
 | Variable | Effect |
 |---|---|
-| `API_STREAMING` | `1`/`true`/`yes`/`on` turns streaming on |
+| `API_STREAM` | `1`/`true`/`yes`/`on` turns streaming on |
 | `API_CREDENTIALS_FILE` | Credentials file path, used with `--no-keychain` |
 
 ## Tests
@@ -407,7 +413,7 @@ Usage: api [OPTIONS] [METHOD] [URI] [BODY]
 cargo test --bin api                                     # unit tests
 perl -e 'alarm 900; exec @ARGV' cargo test --test parity # what is sent, printed and written, from a file, arguments and the prompt
 cargo test --test imports                                # import git/dir/archive
-cargo test --test editors                                # the grammars of editors/ and --install-syntax
+cargo test --test editors                                # the grammars of editors/ and --install-editor
 cargo test --test cli -- --skip clipboard                # end-to-end, most of it against a local COS
 cargo test --test cli -- clipboard --test-threads=1      # the tests that copy to the clipboard
 ```

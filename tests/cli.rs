@@ -473,26 +473,26 @@ fn stream_flag_enables_streaming() {
 
 #[test]
 fn api_streaming_env_var_enables_streaming() {
-    let headers = captured_request_headers(&[], &[("API_STREAMING", "1")]);
+    let headers = captured_request_headers(&[], &[("API_STREAM", "1")]);
     assert!(
         headers.contains("stream=true"),
-        "API_STREAMING=1 should request streaming: {headers}"
+        "API_STREAM=1 should request streaming: {headers}"
     );
     // A non-truthy value leaves it off rather than enabling on mere presence.
-    let headers = captured_request_headers(&[], &[("API_STREAMING", "0")]);
+    let headers = captured_request_headers(&[], &[("API_STREAM", "0")]);
     assert!(
         !headers.contains("stream=true"),
-        "API_STREAMING=0 should not request streaming: {headers}"
+        "API_STREAM=0 should not request streaming: {headers}"
     );
 }
 
 #[test]
 fn no_streaming_beats_stream_and_env_var() {
     let headers =
-        captured_request_headers(&["--stream", "--no-streaming"], &[("API_STREAMING", "1")]);
+        captured_request_headers(&["--stream", "--no-stream"], &[("API_STREAM", "1")]);
     assert!(
         !headers.contains("stream=true"),
-        "--no-streaming should win over both: {headers}"
+        "--no-stream should win over both: {headers}"
     );
 }
 
@@ -2962,7 +2962,7 @@ fn export_rewrites_ndjson_by_line_and_leaves_csv_alone() {
 fn export_does_not_ask_for_a_streamed_response() {
     let headers = captured_request_headers(&["--stream", "--export", SEED], &[]);
     assert!(!headers.contains("stream=true"), "--export reads the whole body: {headers}");
-    let headers = captured_request_headers(&["--export", SEED], &[("API_STREAMING", "1")]);
+    let headers = captured_request_headers(&["--export", SEED], &[("API_STREAM", "1")]);
     assert!(!headers.contains("stream=true"), "{headers}");
     // And with `--stream` the seed data is what is written, whole.
     let run = run_export(&["--export", SEED, "--stream", "-sr", "GET", "/users", ">", "users.json"], vec![("200 OK", USERS)]);
@@ -3691,10 +3691,10 @@ fn import_dir_runs_a_local_directory_and_logs_where_it_is() {
     assert!(!dir.join(".import-cache").exists());
 }
 
-// ----- describe blocks: --describe, -m, --assert -----
+// ----- describe blocks: --describe, -d, --asserts -----
 //
-// None of these reach a server: `--describe` and `--assert` send nothing, and
-// the `-m` runs are declined at the preview.
+// None of these reach a server: `--describe` and `--asserts` send nothing, and
+// the `-d` runs are declined at the preview.
 
 /// The api binary with nothing configured, in `dir`.
 fn bare_api(dir: &std::path::Path) -> Command {
@@ -3829,21 +3829,21 @@ fn describe_first_prints_the_block_in_the_readers_language_above_the_preview() {
     };
 
     let swedish = "Katalog\nInnehåller x y z.\nhttps://link-to-docs.com\n\nPreview — 3 requests";
-    assert!(run("sv_SE.UTF-8", &["-spma", "cat.api"]).starts_with(swedish));
+    assert!(run("sv_SE.UTF-8", &["-spda", "cat.api"]).starts_with(swedish));
     // Long form, and the file named as a one-shot argument.
     assert!(run("sv_SE.UTF-8", &["-sp", "--describe-first", "-a", "cat.api"]).starts_with(swedish));
-    assert!(run("sv_SE.UTF-8", &["-spm", "cat.api"]).starts_with(swedish));
+    assert!(run("sv_SE.UTF-8", &["-spd", "cat.api"]).starts_with(swedish));
     // English where it is the reader's language or the reader's has no text;
     // the description has only the Swedish.
     let english = "Catalog\nInnehåller x y z.\nhttps://link-to-docs.com\n\nPreview";
     for lang in ["en_GB.UTF-8", "de_DE.UTF-8", "C"] {
-        assert!(run(lang, &["-spma", "cat.api"]).starts_with(english), "{lang}");
+        assert!(run(lang, &["-spda", "cat.api"]).starts_with(english), "{lang}");
     }
-    // Without -m the preview is all there is.
+    // Without -d the preview is all there is.
     assert!(run("sv_SE.UTF-8", &["-spa", "cat.api"]).starts_with("Preview — 3 requests"));
     // A file with no block prints nothing for it.
     std::fs::write(dir.path().join("none.api"), "GET /a\n").unwrap();
-    assert!(run("sv_SE.UTF-8", &["-spma", "none.api"]).starts_with("Preview — 1 request"));
+    assert!(run("sv_SE.UTF-8", &["-spda", "none.api"]).starts_with("Preview — 1 request"));
 }
 
 #[test]
@@ -3872,7 +3872,7 @@ fn assert_flag_lists_every_put_assert_body_in_one_array() {
     std::fs::write(dir.path().join("broken.api"), "PUT /assert { \"a\": }\n").unwrap();
 
     bare_api(dir.path())
-        .args(["-r", "--assert", "cat.api"])
+        .args(["-r", "--asserts", "cat.api"])
         .assert()
         .success()
         .stderr("")
@@ -3884,22 +3884,22 @@ fn assert_flag_lists_every_put_assert_body_in_one_array() {
             "\n"
         ));
     bare_api(dir.path())
-        .args(["--assert", "none.api"])
+        .args(["--asserts", "none.api"])
         .assert()
         .success()
         .stdout("[]\n");
     bare_api(dir.path())
-        .args(["--assert", "broken.api"])
+        .args(["--asserts", "broken.api"])
         .assert()
         .failure()
         .stdout("")
         .stderr(predicate::str::starts_with("error: the body of `PUT /assert` is not JSON: "));
     bare_api(dir.path())
-        .args(["--assert", "cat.api", "--describe", "cat.api"])
+        .args(["--asserts", "cat.api", "--describe", "cat.api"])
         .assert()
         .failure()
         .stdout("")
-        .stderr("error: --describe and --assert each print a document of their own: use one\n");
+        .stderr("error: --describe and --asserts each print a document of their own: use one\n");
 }
 
 #[test]
@@ -3960,25 +3960,25 @@ fn describe_first_follows_the_locale_and_prints_only_the_file_that_is_run() {
     };
 
     // `LC_MESSAGES` is asked before `LANG`, and `LC_ALL` before both.
-    assert!(declined(&[], &["-spma", "cat.api"]).starts_with("Catalog\n"));
-    assert!(declined(&[("LC_MESSAGES", "sv_SE.UTF-8")], &["-spma", "cat.api"]).starts_with("Katalog\n"));
-    assert!(declined(&[("LC_MESSAGES", "sv_SE.UTF-8"), ("LC_ALL", "en_GB.UTF-8")], &["-spma", "cat.api"]).starts_with("Catalog\n"));
-    assert!(declined(&[("LC_ALL", "sv_SE.UTF-8")], &["-spma", "cat.api"]).starts_with("Katalog\n"));
+    assert!(declined(&[], &["-spda", "cat.api"]).starts_with("Catalog\n"));
+    assert!(declined(&[("LC_MESSAGES", "sv_SE.UTF-8")], &["-spda", "cat.api"]).starts_with("Katalog\n"));
+    assert!(declined(&[("LC_MESSAGES", "sv_SE.UTF-8"), ("LC_ALL", "en_GB.UTF-8")], &["-spda", "cat.api"]).starts_with("Catalog\n"));
+    assert!(declined(&[("LC_ALL", "sv_SE.UTF-8")], &["-spda", "cat.api"]).starts_with("Katalog\n"));
 
     // The block of an included file is that file's: it is not printed.
-    let shown = declined(&[], &["-spma", "main.api"]);
+    let shown = declined(&[], &["-spda", "main.api"]);
     assert!(shown.starts_with("Main\n\nPreview — 1 request"), "{shown}");
     assert!(!shown.contains("Included"), "{shown}");
     // A file named with `~/`.
     let mut home = connected(d);
-    let out = home.env("HOME", d).env("LANG", "en_GB.UTF-8").args(["-spm", "~/cat.api"]).write_stdin("n\n").output().unwrap();
+    let out = home.env("HOME", d).env("LANG", "en_GB.UTF-8").args(["-spd", "~/cat.api"]).write_stdin("n\n").output().unwrap();
     let shown = String::from_utf8(out.stderr).unwrap();
     assert_eq!(out.status.code(), Some(0), "{shown}");
     assert!(shown.starts_with("Catalog\n") && shown.ends_with("aborted\n"), "{shown}");
 
     // Without `-p`, and for a file that only describes: the block is
     // printed, nothing is sent, and that is no failure.
-    for args in [&["-sma", "only.api"][..], &["-ma", "only.api"]] {
+    for args in [&["-sda", "only.api"][..], &["-da", "only.api"]] {
         let out = connected(d).env("LANG", "en_GB.UTF-8").args(args).output().unwrap();
         assert!(out.status.success(), "{args:?}");
         assert!(String::from_utf8(out.stderr).unwrap().starts_with("Only\n"), "{args:?}");
@@ -3986,7 +3986,7 @@ fn describe_first_follows_the_locale_and_prints_only_the_file_that_is_run() {
     // The same file read from stdin.
     let out = connected(d)
         .env("LANG", "en_GB.UTF-8")
-        .args(["-sma", "-"])
+        .args(["-sda", "-"])
         .write_stdin("{ \"title\": { \"en\": \"Piped\" } }\n")
         .output()
         .unwrap();
@@ -4007,7 +4007,7 @@ fn assert_flag_reads_every_kind_of_body_and_says_what_it_cannot_read() {
     // request would send.
     file("files.api", b"PUT /assert @asserts.csv~map(com.heads.x)\nPUT /assert @people/*.json\nPUT /assert?x=1 {\"q\":{\"is\":1}}\n");
     bare_api(d)
-        .args(["-r", "--assert", "files.api"])
+        .args(["-r", "--asserts", "files.api"])
         .assert()
         .success()
         .stdout("[{\"api/v1/m\":{\"is\":1}},[{\"api/v1/p1\":{\"is\":1}},{\"api/v1/p2\":{\"is\":2}}],{\"q\":{\"is\":1}}]\n");
@@ -4015,14 +4015,14 @@ fn assert_flag_reads_every_kind_of_body_and_says_what_it_cannot_read() {
     // Indented unless `-r`, from a file and from stdin.
     let indented = "[\n  {\n    \"a\": {\n      \"is\": 1\n    }\n  }\n]\n";
     file("one.api", b"PUT /assert {\"a\":{\"is\":1}}\n");
-    bare_api(d).args(["--assert", "one.api"]).assert().success().stdout(indented);
-    bare_api(d).args(["--assert", "-"]).write_stdin("PUT /assert {\"a\":{\"is\":1}}\n").assert().success().stdout(indented);
+    bare_api(d).args(["--asserts", "one.api"]).assert().success().stdout(indented);
+    bare_api(d).args(["--asserts", "-"]).write_stdin("PUT /assert {\"a\":{\"is\":1}}\n").assert().success().stdout(indented);
 
     // A byte order mark and CRLF, and the endpoint under `--me`.
     file("bom.api", "\u{feff}{ \"title\": {} }\r\nPUT /assert { \"a\": { \"is\": 1 } }\r\n".as_bytes());
-    bare_api(d).args(["-r", "--assert", "bom.api"]).assert().success().stdout("[{\"a\":{\"is\":1}}]\n");
+    bare_api(d).args(["-r", "--asserts", "bom.api"]).assert().success().stdout("[{\"a\":{\"is\":1}}]\n");
     file("me.api", b"PUT /assert { \"x\": { \"is\": 1 } }\nPUT /api/me/v1/assert { \"y\": { \"is\": 2 } }\nPUT /people/assert { \"z\": 1 }\n");
-    for flags in [&["-r", "--assert", "me.api"][..], &["--me", "-r", "--assert", "me.api"]] {
+    for flags in [&["-r", "--asserts", "me.api"][..], &["--me", "-r", "--asserts", "me.api"]] {
         bare_api(d).args(flags).assert().success().stdout("[{\"x\":{\"is\":1}},{\"y\":{\"is\":2}}]\n");
     }
 
@@ -4039,6 +4039,6 @@ fn assert_flag_reads_every_kind_of_body_and_says_what_it_cannot_read() {
         ("nofile.api", "error: "),
         ("missing.api", "error: could not read missing.api"),
     ] {
-        bare_api(d).args(["--assert", name]).assert().failure().stdout("").stderr(predicate::str::starts_with(says));
+        bare_api(d).args(["--asserts", name]).assert().failure().stdout("").stderr(predicate::str::starts_with(says));
     }
 }

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Completions and formatting for `.api` batch files in Sublime Text.
 
-Installed beside `API.sublime-syntax` by `api --install-syntax sublime`.
+Installed beside `API.sublime-syntax` by `api --install-editor sublime`.
 What can stand where the cursor is, is the client's to say: this plugin asks
 it (`api --complete`) and hands the answer to the editor. So what is offered
 is what the client that is installed reads. The command `api_format` lays
